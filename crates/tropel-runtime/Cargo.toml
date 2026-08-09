@@ -13,7 +13,6 @@ tropel-core.workspace = true
 tropel-pm.workspace = true
 tropel-js.workspace = true
 tropel-variables.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,3 +21,9 @@ async-trait.workspace = true
 [dev-dependencies]
 # Test-only concrete DriverHttpClient wrapper (TestHttpClient) in runner.rs.
 tropel-http.workspace = true
+# tokio is TEST-ONLY in this crate (`#[tokio::test]` + `tokio::time::timeout`
+# in runner.rs). Declaring it as a dev-dep keeps the library build free of
+# tokio's wasm-incompatible features (`net`/`signal`/`rt-multi-thread` don't
+# exist on wasm32) — the P5b browser slice can check this crate for wasm
+# without dragging the full tokio feature set into the wasm graph.
+tokio.workspace = true
