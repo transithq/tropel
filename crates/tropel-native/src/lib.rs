@@ -67,6 +67,11 @@ mod tests {
             "__tropel_native_sha3_256",
             "__tropel_native_keccak",
             "__tropel_native_ripemd160",
+            // k6/crypto one-shots + dispatcher (backlog line 126)
+            "__tropel_native_sha512_224",
+            "__tropel_native_sha512_256",
+            "__tropel_native_md4",
+            "__tropel_native_hmac",
             "__tropel_native_hmac_md5",
             "__tropel_native_hmac_sha1",
             "__tropel_native_hmac_sha256",

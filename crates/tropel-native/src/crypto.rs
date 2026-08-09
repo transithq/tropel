@@ -63,6 +63,35 @@ impl NativeModule for CryptoModule {
                 Func::from(|data: Vec<u8>| -> Vec<u8> { ripemd160(&data) }),
             );
 
+            // k6/crypto one-shots (backlog line 126): sha512_224 / sha512_256
+            // (sha2 crate truncations) and md4 were missing — k6's crypto
+            // module exports all nine one-shot hashes, and CryptoJS-shaped
+            // shims don't satisfy `crypto.sha512_224(s, 'hex')` call sites.
+            let _ = globals.set(
+                "__tropel_native_sha512_224",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { sha512_224(&data) }),
+            );
+            let _ = globals.set(
+                "__tropel_native_sha512_256",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { sha512_256(&data) }),
+            );
+            let _ = globals.set(
+                "__tropel_native_md4",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { md4(&data) }),
+            );
+
+            // k6/crypto `hmac(alg, key, data, enc)` / `createHMAC` dispatcher.
+            // Accepts the k6 algorithm names md4/md5/sha1/sha256/sha384/sha512/
+            // sha512_224/sha512_256/ripemd160; None on unknown (k6 throws).
+            let _ = globals.set(
+                "__tropel_native_hmac",
+                Func::from(
+                    |algorithm: String, key: Vec<u8>, data: Vec<u8>| -> Option<Vec<u8>> {
+                        hmac_dispatch(&algorithm, &key, &data)
+                    },
+                ),
+            );
+
             // ── HMACs ──
             let _ = globals.set(
                 "__tropel_native_hmac_sha256",
@@ -182,6 +211,31 @@ pub fn sha1(data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+/// Compute SHA-512/224 (truncated) hash — k6/crypto `sha512_224`.
+pub fn sha512_224(data: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha512_224::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+/// Compute SHA-512/256 (truncated) hash — k6/crypto `sha512_256`.
+pub fn sha512_256(data: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha512_256::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+/// Compute MD4 hash — k6/crypto `md4`. (md-5 0.11 dropped Md4, so this
+/// crate pulls the standalone md4 crate.)
+pub fn md4(data: &[u8]) -> Vec<u8> {
+    use md4::Digest;
+    let mut hasher = md4::Md4::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
 /// Compute MD5 hash.
 pub fn md5(data: &[u8]) -> Vec<u8> {
     let mut hasher = Md5::new();
@@ -262,6 +316,39 @@ pub fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = <hmac::Hmac<md5::Md5> as KeyInit>::new_from_slice(key).expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
+}
+
+/// k6/crypto `hmac` dispatcher — HMAC with any of the nine k6 algorithm
+/// names. `md4` sits on digest 0.10 (see the hmac012 workspace alias); all
+/// the others are digest 0.11 and use hmac 0.13.
+pub fn hmac_dispatch(algorithm: &str, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    macro_rules! run_hmac11 {
+        ($digest:ty) => {{
+            use hmac::digest::KeyInit;
+            use hmac::Mac;
+            let mut mac = <hmac::Hmac<$digest> as KeyInit>::new_from_slice(key).ok()?;
+            mac.update(data);
+            Some(mac.finalize().into_bytes().to_vec())
+        }};
+    }
+    match algorithm {
+        "md4" => {
+            use hmac012::digest::KeyInit;
+            use hmac012::Mac;
+            let mut mac = <hmac012::Hmac<md4::Md4> as KeyInit>::new_from_slice(key).ok()?;
+            mac.update(data);
+            Some(mac.finalize().into_bytes().to_vec())
+        }
+        "md5" => run_hmac11!(md5::Md5),
+        "sha1" => run_hmac11!(sha1::Sha1),
+        "sha256" => run_hmac11!(sha2::Sha256),
+        "sha384" => run_hmac11!(sha2::Sha384),
+        "sha512" => run_hmac11!(sha2::Sha512),
+        "sha512_224" => run_hmac11!(sha2::Sha512_224),
+        "sha512_256" => run_hmac11!(sha2::Sha512_256),
+        "ripemd160" => run_hmac11!(ripemd::Ripemd160),
+        _ => None,
+    }
 }
 
 /// Generate `n` cryptographically secure random bytes using the OS CSPRNG.
@@ -616,6 +703,57 @@ mod tests {
     fn test_hmac_sha256() {
         let result = hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog");
         assert_eq!(result.len(), 32);
+    }
+
+    #[test]
+    fn test_sha512_truncated_known_vectors() {
+        // NIST FIPS 180-4 test vectors for the truncated variants.
+        let hex_224 = hex::encode(sha512_224(b"abc"));
+        assert_eq!(
+            hex_224,
+            "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa"
+        );
+        let hex_256 = hex::encode(sha512_256(b"abc"));
+        assert_eq!(
+            hex_256,
+            "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23"
+        );
+        // Output lengths are 28 and 32 bytes respectively.
+        assert_eq!(sha512_224(b"abc").len(), 28);
+        assert_eq!(sha512_256(b"abc").len(), 32);
+    }
+
+    #[test]
+    fn test_md4_known_vector() {
+        // RFC 1320 test suite.
+        assert_eq!(hex::encode(md4(b"")), "31d6cfe0d16ae931b73c59d7e0c089c0");
+        assert_eq!(hex::encode(md4(b"abc")), "a448017aaf21d8525fc10ae87aa6729d");
+    }
+
+    #[test]
+    fn test_hmac_dispatch() {
+        // RFC 4231 test case 1: HMAC-SHA256, key 0x0b x20, "Hi There".
+        let key = vec![0x0b; 20];
+        let data = b"Hi There";
+        let out = hmac_dispatch("sha256", &key, data).unwrap();
+        assert_eq!(
+            hex::encode(out),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // HMAC-MD4 must work (k6 parity) via the digest-0.10 hmac alias.
+        let md4_out = hmac_dispatch(
+            "md4",
+            b"key",
+            b"The quick brown fox jumps over the lazy dog",
+        )
+        .unwrap();
+        assert_eq!(md4_out.len(), 16);
+        // ripemd160 and the truncated variants resolve too.
+        assert_eq!(hmac_dispatch("ripemd160", b"k", b"d").unwrap().len(), 20);
+        assert_eq!(hmac_dispatch("sha512_224", b"k", b"d").unwrap().len(), 28);
+        assert_eq!(hmac_dispatch("sha512_256", b"k", b"d").unwrap().len(), 32);
+        // Unknown algorithm -> None (the shim throws, k6 parity).
+        assert!(hmac_dispatch("nope", b"k", b"d").is_none());
     }
 
     #[test]

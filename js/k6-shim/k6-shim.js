@@ -1084,6 +1084,623 @@ if (typeof Trend !== 'function') {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// k6/crypto + k6/encoding + k6/timers + randomSeed + k6/crypto/x509
+// (backlog lines 125/126/131/132) — the missing module surfaces.
+// ══════════════════════════════════════════════════════════════════
+
+// ── byte marshalling helpers ──
+
+function k6Utf8Encode(str) {
+    var bytes = [];
+    for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c < 0x80) {
+            bytes.push(c);
+        } else if (c < 0x800) {
+            bytes.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+        } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) {
+            var lo = str.charCodeAt(i + 1);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                var cp = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+                i++;
+                continue;
+            }
+            bytes.push(0xEF, 0xBF, 0xBD);
+        } else {
+            bytes.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+        }
+    }
+    return bytes;
+}
+
+function k6Utf8Decode(bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i++) {
+        var b = bytes[i];
+        if (b < 0x80) {
+            out += String.fromCharCode(b);
+        } else if (b < 0xE0 && i + 1 < bytes.length) {
+            out += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i + 1] & 0x3F));
+            i++;
+        } else if (b < 0xF0 && i + 2 < bytes.length) {
+            var cp = ((b & 0x0F) << 12) | ((bytes[i + 1] & 0x3F) << 6) | (bytes[i + 2] & 0x3F);
+            out += String.fromCharCode(cp);
+            i += 2;
+        } else if (i + 3 < bytes.length) {
+            var cp2 = ((b & 0x07) << 18) | ((bytes[i + 1] & 0x3F) << 12) | ((bytes[i + 2] & 0x3F) << 6) | (bytes[i + 3] & 0x3F);
+            out += String.fromCharCode(0xD800 + ((cp2 - 0x10000) >> 10), 0xDC00 + ((cp2 - 0x10000) & 0x3FF));
+            i += 3;
+        } else {
+            out += String.fromCharCode(b);
+        }
+    }
+    return out;
+}
+
+// k6's common.ToBytes: string → UTF-8 bytes, ArrayBuffer → bytes.
+function k6ToBytes(input) {
+    if (typeof input === 'string') {
+        return k6Utf8Encode(input);
+    }
+    if (input instanceof ArrayBuffer) {
+        return Array.prototype.slice.call(new Uint8Array(input));
+    }
+    if (typeof Uint8Array !== 'undefined' && input instanceof Uint8Array) {
+        return Array.prototype.slice.call(input);
+    }
+    throw new TypeError('k6 input must be a string or ArrayBuffer');
+}
+
+function k6BytesToHex(bytes) {
+    var hex = '';
+    for (var i = 0; i < bytes.length; i++) {
+        var b = bytes[i] & 0xFF;
+        hex += (b < 16 ? '0' : '') + b.toString(16);
+    }
+    return hex;
+}
+
+// ── k6/crypto (backlog line 126) ──
+
+var __k6_native_hash = {};
+if (typeof __tropel_native_md4 === 'function') __k6_native_hash.md4 = __tropel_native_md4;
+if (typeof __tropel_native_md5 === 'function') __k6_native_hash.md5 = __tropel_native_md5;
+if (typeof __tropel_native_sha1 === 'function') __k6_native_hash.sha1 = __tropel_native_sha1;
+if (typeof __tropel_native_sha256 === 'function') __k6_native_hash.sha256 = __tropel_native_sha256;
+if (typeof __tropel_native_sha384 === 'function') __k6_native_hash.sha384 = __tropel_native_sha384;
+if (typeof __tropel_native_sha512 === 'function') __k6_native_hash.sha512 = __tropel_native_sha512;
+if (typeof __tropel_native_sha512_224 === 'function') __k6_native_hash.sha512_224 = __tropel_native_sha512_224;
+if (typeof __tropel_native_sha512_256 === 'function') __k6_native_hash.sha512_256 = __tropel_native_sha512_256;
+if (typeof __tropel_native_ripemd160 === 'function') __k6_native_hash.ripemd160 = __tropel_native_ripemd160;
+
+// k6's crypto Digest() output encodings: hex, base64, base64url (padded
+// URLEncoding), base64rawurl (unpadded URLEncoding), binary (ArrayBuffer).
+function k6DigestOutput(bytes, outputEncoding) {
+    var enc = outputEncoding || 'hex';
+    switch (enc) {
+        case 'hex':
+            return k6BytesToHex(bytes);
+        case 'base64':
+            return bytesToBase64(bytes);
+        case 'base64url': {
+            var s = bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_');
+            var r = s.length % 4;
+            if (r === 2) return s + '==';
+            if (r === 3) return s + '=';
+            return s;
+        }
+        case 'base64rawurl':
+            return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        case 'binary':
+            return new Uint8Array(bytes).buffer;
+        default:
+            throw new Error('invalid output encoding: ' + enc);
+    }
+}
+
+// One-shot k6/crypto hash: (input, outputEncoding) → string | ArrayBuffer.
+function k6OneShotHash(alg) {
+    return function (input, outputEncoding) {
+        var fn = __k6_native_hash[alg];
+        if (typeof fn !== 'function') {
+            throw new Error('k6/crypto: algorithm unavailable: ' + alg);
+        }
+        return k6DigestOutput(fn(k6ToBytes(input)), outputEncoding);
+    };
+}
+
+// Stateful Hasher (createHash / createHMAC). Buffers inputs; the one-shot
+// native hasher runs at digest() time — identical to k6's streaming hash
+// for concatenated updates.
+function K6Hasher(alg, keyBytes) {
+    this.alg = alg;
+    this.key = keyBytes || null;
+    this.buf = [];
+}
+K6Hasher.prototype.update = function (input) {
+    var b = k6ToBytes(input);
+    for (var i = 0; i < b.length; i++) this.buf.push(b[i]);
+    return this;
+};
+K6Hasher.prototype.digest = function (outputEncoding) {
+    var out;
+    if (this.key) {
+        if (typeof __tropel_native_hmac !== 'function') {
+            throw new Error('k6/crypto: hmac unavailable');
+        }
+        out = __tropel_native_hmac(this.alg, this.key, this.buf);
+        if (!out) throw new Error('invalid algorithm: ' + this.alg);
+    } else {
+        var fn = __k6_native_hash[this.alg];
+        if (typeof fn !== 'function') throw new Error('invalid algorithm: ' + this.alg);
+        out = fn(this.buf);
+    }
+    return k6DigestOutput(out, outputEncoding);
+};
+
+function k6CreateHash(algorithm) {
+    return new K6Hasher(algorithm, null);
+}
+
+function k6CreateHmac(algorithm, secret) {
+    return new K6Hasher(algorithm, k6ToBytes(secret));
+}
+
+function k6Hmac(algorithm, secret, input, outputEncoding) {
+    if (typeof __tropel_native_hmac !== 'function') {
+        throw new Error('k6/crypto: hmac unavailable');
+    }
+    var out = __tropel_native_hmac(algorithm, k6ToBytes(secret), k6ToBytes(input));
+    if (!out) throw new Error('invalid algorithm: ' + algorithm);
+    return k6DigestOutput(out, outputEncoding);
+}
+
+function k6RandomBytes(size) {
+    if (typeof size !== 'number' || size < 1) {
+        throw new Error('invalid size');
+    }
+    var bytes = __tropel_native_random_bytes(size);
+    return new Uint8Array(bytes).buffer;
+}
+
+function k6HexEncode(input) {
+    return k6BytesToHex(k6ToBytes(input));
+}
+
+var crypto = {};
+crypto.md4 = k6OneShotHash('md4');
+crypto.md5 = k6OneShotHash('md5');
+crypto.sha1 = k6OneShotHash('sha1');
+crypto.sha256 = k6OneShotHash('sha256');
+crypto.sha384 = k6OneShotHash('sha384');
+crypto.sha512 = k6OneShotHash('sha512');
+crypto.sha512_224 = k6OneShotHash('sha512_224');
+crypto.sha512_256 = k6OneShotHash('sha512_256');
+crypto.ripemd160 = k6OneShotHash('ripemd160');
+crypto.hmac = k6Hmac;
+crypto.createHash = k6CreateHash;
+crypto.createHMAC = k6CreateHmac;
+crypto.randomBytes = k6RandomBytes;
+crypto.hexEncode = k6HexEncode;
+
+// Named-import parity: `import { sha256 } from 'k6/crypto'` is stripped to a
+// bare `sha256(...)` call, so every export is also a bare global (mirrors how
+// check/group/sleep/fail are exposed). Guarded so we never clobber an
+// existing binding.
+// NOTE: the `crypto` object itself is intentionally NOT exposed as a bare
+// global — only its members are (k6 exports the functions, not a namespace).
+// Keeping `crypto` unclaimed also avoids colliding with a future WebCrypto
+// global or a user script that declares `var crypto`.
+// NOTE: each fallback declares the binding with `var` inside the block. A
+// bare `name = value` assignment to a never-declared global is a ReferenceError
+// under QuickJS's strict eval; the hoisted `var` makes it a legal assignment.
+if (typeof md4 === 'undefined') { var md4 = crypto.md4; }
+if (typeof md5 === 'undefined') { var md5 = crypto.md5; }
+if (typeof sha1 === 'undefined') { var sha1 = crypto.sha1; }
+if (typeof sha256 === 'undefined') { var sha256 = crypto.sha256; }
+if (typeof sha384 === 'undefined') { var sha384 = crypto.sha384; }
+if (typeof sha512 === 'undefined') { var sha512 = crypto.sha512; }
+if (typeof sha512_224 === 'undefined') { var sha512_224 = crypto.sha512_224; }
+if (typeof sha512_256 === 'undefined') { var sha512_256 = crypto.sha512_256; }
+if (typeof ripemd160 === 'undefined') { var ripemd160 = crypto.ripemd160; }
+if (typeof hmac === 'undefined') { var hmac = crypto.hmac; }
+if (typeof createHash === 'undefined') { var createHash = crypto.createHash; }
+if (typeof createHMAC === 'undefined') { var createHMAC = crypto.createHMAC; }
+if (typeof randomBytes === 'undefined') { var randomBytes = crypto.randomBytes; }
+if (typeof hexEncode === 'undefined') { var hexEncode = crypto.hexEncode; }
+
+// ── k6/encoding (backlog line 125) ──
+// b64encode(input, encoding) / b64decode(input, encoding, format).
+// encodings: std (default), rawstd, url, rawurl. Unknown → silently std.
+// b64decode format: 's' → string, anything else → ArrayBuffer.
+
+function k6B64Encode(input, encodingName) {
+    var enc = encodingName || 'std';
+    var bytes = k6ToBytes(input);
+    var isUrl = (enc === 'url' || enc === 'rawurl');
+    var raw = (enc === 'rawstd' || enc === 'rawurl');
+    var s;
+    if (isUrl) {
+        // native URL_SAFE_NO_PAD; k6's 'url' adds padding, 'rawurl' doesn't.
+        s = __tropel_native_base64url_encode(bytes);
+        if (!raw) {
+            var r = s.length % 4;
+            if (r === 2) s += '==';
+            else if (r === 3) s += '=';
+        }
+    } else {
+        s = __tropel_native_base64_encode(bytes); // STANDARD, padded
+        if (raw) s = s.replace(/=+$/, '');
+    }
+    return s;
+}
+
+function k6B64Decode(input, encodingName, format) {
+    var enc = encodingName || 'std';
+    var s = typeof input === 'string' ? input : k6Utf8Decode(k6ToBytes(input));
+    var isUrl = (enc === 'url' || enc === 'rawurl');
+    var norm = s;
+    if (isUrl) norm = s.replace(/-/g, '+').replace(/_/g, '/');
+    var r = norm.length % 4;
+    if (r === 2) norm += '==';
+    else if (r === 3) norm += '=';
+    var bytes = __tropel_native_base64_decode(norm);
+    if (!bytes) throw new Error('invalid base64 data');
+    if (format === 's') {
+        // Known approximation: k6 (Go) returns the raw bytes as a Go string,
+        // which goja surfaces with U+FFFD replacement for invalid UTF-8; our
+        // k6Utf8Decode keeps the bytes as Latin-1-ish code units instead.
+        return k6Utf8Decode(bytes);
+    }
+    return new Uint8Array(bytes).buffer;
+}
+
+var encoding = {};
+encoding.b64encode = k6B64Encode;
+encoding.b64decode = k6B64Decode;
+if (typeof b64encode === 'undefined') { var b64encode = k6B64Encode; }
+if (typeof b64decode === 'undefined') { var b64decode = k6B64Decode; }
+
+// ── k6/timers (backlog line 131) — globals, the module is a pure re-export ──
+// k6's timers fire on the VU event loop; Tropel runs JS synchronously, so
+// due timers are pumped by the driver at iteration boundaries via
+// __tropel_pump_timers(). This is what unblocks lodash debounce/throttle.
+
+var __tropel_timers = {};
+var __tropel_timer_seq = 0;
+
+function setTimeout(fn, ms) {
+    var id = ++__tropel_timer_seq;
+    __tropel_timers[id] = { fn: fn, at: Date.now() + (ms || 0), interval: false, ms: ms || 0 };
+    return id;
+}
+function clearTimeout(id) { delete __tropel_timers[id]; }
+function setInterval(fn, ms) {
+    var id = ++__tropel_timer_seq;
+    __tropel_timers[id] = { fn: fn, at: Date.now() + (ms || 0), interval: true, ms: ms || 0 };
+    return id;
+}
+function clearInterval(id) { delete __tropel_timers[id]; }
+
+// NOTE: ids are snapshotted, so a timer REGISTERED inside a callback only
+// fires on the next pump — deliberate, avoids infinite same-pump re-triggers.
+// A throwing callback is caught and dropped (k6 logs and continues): for
+// intervals the re-arm already happened, so the interval keeps firing;
+// one-shots are already deleted, so they don't retry.
+function __tropel_pump_timers() {
+    var now = Date.now();
+    var ids = Object.keys(__tropel_timers);
+    for (var i = 0; i < ids.length; i++) {
+        var id = ids[i];
+        var t = __tropel_timers[id];
+        if (!t || now < t.at) continue;
+        if (t.interval) {
+            t.at = now + t.ms;
+        } else {
+            delete __tropel_timers[id];
+        }
+        try {
+            t.fn();
+        } catch (e) {
+            // Ignore: k6 reports timer errors without aborting the iteration.
+        }
+    }
+}
+
+// ── randomSeed(seed) (backlog line 132) — per-VU deterministic Math.random ──
+// Each VU owns its JsContext, so replacing Math.random here is naturally
+// per-VU, exactly k6's contract. k6 requires an integer seed.
+function randomSeed(seed) {
+    if (typeof seed !== 'number' || !isFinite(seed) || Math.floor(seed) !== seed) {
+        throw new TypeError('randomSeed requires an integer seed');
+    }
+    var state = seed >>> 0;
+    Math.random = function () {
+        // mulberry32
+        state = (state + 0x6D2B79F5) | 0;
+        var t = state;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// ── k6/crypto/x509 (backlog line 126) — parse / getSubject / getIssuer /
+// getAltNames. Minimal DER reader for the standard certificate layout.
+// ──
+
+var x509 = {};
+
+var X509_SIG_OID_NAMES = {
+    '1.2.840.113549.1.1.5': 'SHA1-RSA',
+    '1.2.840.113549.1.1.11': 'SHA256-RSA',
+    '1.2.840.113549.1.1.12': 'SHA384-RSA',
+    '1.2.840.113549.1.1.13': 'SHA512-RSA',
+    '1.2.840.113549.1.1.4': 'MD5-RSA',
+    '1.2.840.10045.4.1': 'ECDSA-SHA1',
+    '1.2.840.10045.4.3.2': 'ECDSA-SHA256',
+    '1.2.840.10045.4.3.3': 'ECDSA-SHA384',
+    '1.2.840.10045.4.3.4': 'ECDSA-SHA512'
+};
+
+// Read one DER TLV from bytes at pos. Returns {tag, valueStart, valueEnd, end}.
+function x509ReadTlv(bytes, pos) {
+    var tag = bytes[pos];
+    var p = pos + 1;
+    var len = bytes[p++];
+    if (len & 0x80) {
+        var n = len & 0x7F;
+        len = 0;
+        for (var i = 0; i < n; i++) len = (len << 8) | bytes[p++];
+    }
+    return { tag: tag, valueStart: p, valueEnd: p + len, end: p + len };
+}
+
+function x509ReadOid(bytes) {
+    var vals = [];
+    var b0 = bytes[0];
+    vals.push(Math.floor(b0 / 40), b0 % 40);
+    var v = 0;
+    for (var i = 1; i < bytes.length; i++) {
+        v = (v << 7) | (bytes[i] & 0x7F);
+        if ((bytes[i] & 0x80) === 0) { vals.push(v); v = 0; }
+    }
+    return vals.join('.');
+}
+
+function x509StringFromTlv(bytes, tag) {
+    if (tag === 0x1E) { // BMPString: 2 bytes per code unit
+        var s = '';
+        for (var i = 0; i + 1 < bytes.length; i += 2) {
+            s += String.fromCharCode((bytes[i] << 8) | bytes[i + 1]);
+        }
+        return s;
+    }
+    return k6Utf8Decode(bytes);
+}
+
+// Name ::= RDNSequence ::= SEQUENCE OF RDN; RDN ::= SET OF ATV;
+// ATV ::= SEQUENCE { OID, value }. Returns [{type, value}].
+function x509ParseName(bytes) {
+    var attrs = [];
+    var p = 0;
+    while (p < bytes.length) {
+        var rdn = x509ReadTlv(bytes, p); // SET
+        var q = rdn.valueStart;
+        while (q < rdn.valueEnd) {
+            var atv = x509ReadTlv(bytes, q); // SEQUENCE
+            var oid = x509ReadTlv(bytes, atv.valueStart);
+            var val = x509ReadTlv(bytes, oid.end);
+            attrs.push({
+                type: x509ReadOid(bytes.slice(oid.valueStart, oid.valueEnd)),
+                value: x509StringFromTlv(bytes.slice(val.valueStart, val.valueEnd), val.tag)
+            });
+            q = atv.end;
+        }
+        p = rdn.end;
+    }
+    return attrs;
+}
+
+function x509ParseTime(bytes, tag) {
+    var s = k6Utf8Decode(bytes);
+    var year, rest;
+    if (tag === 0x17) { // UTCTime: YYMMDDHHMMSSZ, 2-digit year
+        var yy = parseInt(s.substr(0, 2), 10);
+        year = (yy >= 50 ? 1900 : 2000) + yy;
+        rest = s.substr(2);
+    } else { // GeneralizedTime: YYYYMMDDHHMMSSZ
+        year = parseInt(s.substr(0, 4), 10);
+        rest = s.substr(4);
+    }
+    return year + '-' + rest.substr(0, 2) + '-' + rest.substr(2, 2) +
+        'T' + rest.substr(4, 2) + ':' + rest.substr(6, 2) + ':' + rest.substr(8, 2) + 'Z';
+}
+
+function x509SubjectObject(attrs) {
+    var obj = {
+        commonName: '', country: '', postalCode: '', stateOrProvinceName: '',
+        localityName: '', streetAddress: '', organizationName: '',
+        organizationalUnitName: [], names: attrs
+    };
+    for (var i = 0; i < attrs.length; i++) {
+        var t = attrs[i].type, v = attrs[i].value;
+        if (t === '2.5.4.3' && !obj.commonName) obj.commonName = v;
+        else if (t === '2.5.4.6' && !obj.country) obj.country = v;
+        else if (t === '2.5.4.17' && !obj.postalCode) obj.postalCode = v;
+        else if (t === '2.5.4.8' && !obj.stateOrProvinceName) obj.stateOrProvinceName = v;
+        else if (t === '2.5.4.7' && !obj.localityName) obj.localityName = v;
+        else if (t === '2.5.4.9' && !obj.streetAddress) obj.streetAddress = v;
+        else if (t === '2.5.4.10' && !obj.organizationName) obj.organizationName = v;
+        else if (t === '2.5.4.11') obj.organizationalUnitName.push(v);
+    }
+    return obj;
+}
+
+function x509IssuerObject(attrs) {
+    var obj = {
+        commonName: '', country: '', stateOrProvinceName: '',
+        localityName: '', organizationName: '', names: attrs
+    };
+    for (var i = 0; i < attrs.length; i++) {
+        var t = attrs[i].type, v = attrs[i].value;
+        if (t === '2.5.4.3' && !obj.commonName) obj.commonName = v;
+        else if (t === '2.5.4.6' && !obj.country) obj.country = v;
+        else if (t === '2.5.4.8' && !obj.stateOrProvinceName) obj.stateOrProvinceName = v;
+        else if (t === '2.5.4.7' && !obj.localityName) obj.localityName = v;
+        else if (t === '2.5.4.10' && !obj.organizationName) obj.organizationName = v;
+    }
+    return obj;
+}
+
+// k6 altNames order: DNSNames, EmailAddresses, IPs, URIs.
+function x509AltNames(exts) {
+    var dns = [], email = [], ip = [], uri = [];
+    for (var i = 0; i < exts.length; i++) {
+        if (exts[i].oid !== '2.5.29.17') continue;
+        var v = exts[i].value;
+        var seq = x509ReadTlv(v, 0); // GeneralNames ::= SEQUENCE OF GeneralName
+        var p = seq.valueStart;
+        while (p < seq.valueEnd) {
+            var gn = x509ReadTlv(v, p);
+            var val = v.slice(gn.valueStart, gn.valueEnd);
+            if (gn.tag === 0x82) dns.push(k6Utf8Decode(val));       // dNSName
+            else if (gn.tag === 0x81) email.push(k6Utf8Decode(val)); // rfc822Name
+            else if (gn.tag === 0x87) {                              // iPAddress
+                var parts = [];
+                for (var k = 0; k < val.length; k++) parts.push(val[k]);
+                ip.push(parts.join('.'));
+            } else if (gn.tag === 0x86) uri.push(k6Utf8Decode(val)); // URI
+            p = gn.end;
+        }
+    }
+    return dns.concat(email, ip, uri);
+}
+
+function x509ParseExtensions(extBytes) {
+    var exts = [];
+    var p = 0;
+    while (p < extBytes.length) {
+        var ext = x509ReadTlv(extBytes, p); // SEQUENCE
+        var oid = x509ReadTlv(extBytes, ext.valueStart);
+        var q = oid.end;
+        var first = x509ReadTlv(extBytes, q);
+        var octet;
+        if (first.tag === 0x01) octet = x509ReadTlv(extBytes, first.end); // critical BOOLEAN
+        else octet = first;
+        exts.push({
+            oid: x509ReadOid(extBytes.slice(oid.valueStart, oid.valueEnd)),
+            value: extBytes.slice(octet.valueStart, octet.valueEnd)
+        });
+        p = ext.end;
+    }
+    return exts;
+}
+
+// Decode PEM armor → DER bytes.
+function x509PemToDer(pem) {
+    var b64 = String(pem).replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+    var bytes = __tropel_native_base64_decode(b64);
+    if (!bytes) throw new Error('failed to decode certificate PEM file');
+    return bytes;
+}
+
+function x509ParseCert(encoded) {
+    var der = x509PemToDer(encoded);
+    var tlv = x509ReadTlv(der, 0); // Certificate ::= SEQUENCE
+    var p = tlv.valueStart;
+
+    var tbs = x509ReadTlv(der, p); // TBSCertificate ::= SEQUENCE
+    var tbsBytes = der.slice(tbs.valueStart, tbs.valueEnd);
+
+    // Walk TBSCertificate fields: version [0]?, serial, sigAlg, issuer,
+    // validity, subject, spki, then optional [1]/[2]/[3] extensions.
+    var items = [];
+    var q = 0;
+    while (q < tbsBytes.length) {
+        var it = x509ReadTlv(tbsBytes, q);
+        items.push({ tag: it.tag, start: it.valueStart, end: it.valueEnd, bytes: tbsBytes.slice(it.valueStart, it.valueEnd) });
+        q = it.end;
+    }
+    var idx = 0;
+    if (items[idx] && items[idx].tag === 0xA0) idx++; // version [0] EXPLICIT
+    // idx+0 serialNumber, idx+1 signature AlgId, idx+2 issuer, idx+3 validity,
+    // idx+4 subject, idx+5 spki, idx+6.. extensions.
+    var sigAlg = items[idx + 1];
+    var issuer = items[idx + 2];
+    var validity = items[idx + 3];
+    var subject = items[idx + 4];
+    var spki = items[idx + 5];
+
+    var issuerAttrs = x509ParseName(issuer.bytes);
+    var subjectAttrs = x509ParseName(subject.bytes);
+
+    // validity ::= SEQUENCE { notBefore Time, notAfter Time }
+    var nb = x509ReadTlv(validity.bytes, 0);
+    var na = x509ReadTlv(validity.bytes, nb.end);
+
+    // signatureAlgorithm: tbs signature AlgId OID → Go String() name.
+    var sigOid = x509ReadTlv(sigAlg.bytes, 0);
+    var sigOidStr = x509ReadOid(sigAlg.bytes.slice(sigOid.valueStart, sigOid.valueEnd));
+    var signatureAlgorithm = X509_SIG_OID_NAMES[sigOidStr] || 'UnknownSignatureAlgorithm';
+
+    // publicKey.algorithm from SPKI AlgId OID.
+    var spkiAlg = x509ReadTlv(spki.bytes, 0);
+    var spkiOid = x509ReadTlv(spki.bytes, spkiAlg.valueStart);
+    var spkiOidStr = x509ReadOid(spki.bytes.slice(spkiOid.valueStart, spkiOid.valueEnd));
+    var keyAlgorithm = 'Unknown';
+    if (spkiOidStr === '1.2.840.113549.1.1.1') keyAlgorithm = 'RSA';
+    else if (spkiOidStr === '1.2.840.10045.2.1') keyAlgorithm = 'ECDSA';
+    else if (spkiOidStr === '1.2.840.10040.4.1') keyAlgorithm = 'DSA';
+
+    // extensions [3] EXPLICIT (0xA3) → Extensions ::= SEQUENCE OF Extension.
+    // The 0xA3 value is the WRAPPING Extensions SEQUENCE; descend one level so
+    // each top-level TLV is a single Extension (else only the first extension
+    // — usually subjectKeyIdentifier, never the SAN — is parsed).
+    var extItems = [];
+    for (var e = idx + 6; e < items.length; e++) {
+        if (items[e].tag === 0xA3) {
+            var wrap = x509ReadTlv(items[e].bytes, 0);
+            extItems = items[e].bytes.slice(wrap.valueStart, wrap.valueEnd);
+        }
+    }
+    var exts = extItems.length ? x509ParseExtensions(extItems) : [];
+    var altNames = x509AltNames(exts);
+
+    // fingerPrint: SHA-1 of the raw cert DER (k6: sha1.Sum(parsed.Raw)).
+    var fingerPrint = __tropel_native_sha1(der);
+
+    return {
+        subject: x509SubjectObject(subjectAttrs),
+        issuer: x509IssuerObject(issuerAttrs),
+        notBefore: x509ParseTime(validity.bytes.slice(nb.valueStart, nb.valueEnd), nb.tag),
+        notAfter: x509ParseTime(validity.bytes.slice(na.valueStart, na.valueEnd), na.tag),
+        altNames: altNames,
+        signatureAlgorithm: signatureAlgorithm,
+        fingerPrint: fingerPrint,
+        publicKey: { algorithm: keyAlgorithm, key: spki.bytes }
+    };
+}
+
+x509.parse = function (encoded) {
+    return x509ParseCert(encoded);
+};
+x509.getSubject = function (encoded) {
+    return x509ParseCert(encoded).subject;
+};
+x509.getIssuer = function (encoded) {
+    return x509ParseCert(encoded).issuer;
+};
+x509.getAltNames = function (encoded) {
+    return x509ParseCert(encoded).altNames;
+};
+if (typeof parse === 'undefined') { var parse = x509.parse; }
+if (typeof getSubject === 'undefined') { var getSubject = x509.getSubject; }
+if (typeof getIssuer === 'undefined') { var getIssuer = x509.getIssuer; }
+if (typeof getAltNames === 'undefined') { var getAltNames = x509.getAltNames; }
+
+// ══════════════════════════════════════════════════════════════════
 // Helpers
 // ══════════════════════════════════════════════════════════════════
 

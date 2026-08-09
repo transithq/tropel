@@ -1067,6 +1067,26 @@ impl DriverInstance for K6DriverInstance {
             ctx.abort(Some(msg));
         }
 
+        // k6/timers (backlog line 131): fire due setTimeout/setInterval
+        // callbacks at the iteration boundary. k6 runs its timers on the VU
+        // event loop; Tropel executes JS synchronously per iteration, so the
+        // closest equivalent is pumping them here — which is exactly what
+        // unblocks the lodash debounce/throttle shims. A throwing callback
+        // is logged (not fatal), matching a best-effort event loop.
+        // NOTE: the pump runs BEFORE the error return below so timers armed
+        // in this iteration still drain even when the iteration itself threw
+        // (strict event-loop behavior — timers are not hostage to a throw).
+        let _ = self.js_ctx.with_ctx(|rq_ctx| {
+            if let Ok(pump) = rq_ctx
+                .globals()
+                .get::<_, rquickjs::Function>("__tropel_pump_timers")
+            {
+                if let Err(e) = pump.call::<_, rquickjs::Value>(()) {
+                    tracing::warn!("k6 timer callback error: {}", e);
+                }
+            }
+        });
+
         // A rejected/thrown default export must fail the iteration (the
         // engine logs it and bumps the error path), not be swallowed.
         if let Err(e) = iter_result {
@@ -5411,6 +5431,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_lodash_debounce_single_trailing_invocation() {
+        // Backlog line 131: k6/timers now defines real global setTimeout, so
+        // lodash's debounce schedules an actual 100ms timer instead of the
+        // timer-less microtask fallback. The driver pumps due timers at
+        // iteration boundaries — sleep past the wait, then pump, and the
+        // 3 sync calls must still coalesce into ONE trailing invocation.
         let mut ctx = ctx_with_base_shims().await;
         let out = ctx
             .eval_async(
@@ -5418,11 +5443,8 @@ mod tests {
                 var n = 0;
                 var d = _.debounce(function(){ n++; }, 100);
                 d(); d(); d();
-                // eval_async uses plain ctx.eval (no top-level await). Return
-                // a promise instead: finish_promise drives the job queue in
-                // FIFO order, so the debounce's coalesced flush (queued by
-                // the 3 d() calls, BEFORE this .then) runs first, then this
-                // callback reads n.
+                __tropel_native_sleep(150);
+                __tropel_pump_timers();
                 Promise.resolve().then(function(){ return n; })
                 "#,
             )
@@ -6201,5 +6223,292 @@ mod tests {
         inst.run_iteration(&mut ctx)
             .await
             .expect("iteration must succeed with numeric __VU/__ITER");
+    }
+
+    // ── k6/crypto + k6/encoding + k6/timers + randomSeed + x509 ──
+
+    #[tokio::test]
+    async fn test_k6_crypto_one_shots_all_encodings() {
+        // Backlog line 126: crypto.sha256(s,'hex') call sites. All nine
+        // one-shot hashes must resolve and the five output encodings must
+        // match k6 (binary → ArrayBuffer, base64rawurl = unpadded urlsafe).
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    crypto.sha256('hello', 'hex'),
+                    crypto.sha1('hello', 'hex'),
+                    crypto.md5('hello', 'hex'),
+                    crypto.md4('abc', 'hex'),
+                    crypto.sha512_224('abc', 'hex'),
+                    crypto.sha512_256('abc', 'hex'),
+                    crypto.ripemd160('hello', 'hex'),
+                    crypto.sha256('hello', 'base64'),
+                    crypto.sha256('hello', 'base64url'),
+                    crypto.sha256('hello', 'base64rawurl'),
+                    Array.from(new Uint8Array(crypto.sha256('hello', 'binary'))).join(','),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                "[\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\",",
+                "\"aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d\",",
+                "\"5d41402abc4b2a76b9719d911017c592\",",
+                "\"a448017aaf21d8525fc10ae87aa6729d\",",
+                "\"4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa\",",
+                "\"53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23\",",
+                "\"108f07b8382412612c048d07d13f814118445acd\",",
+                "\"LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=\",",
+                "\"LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=\",",
+                "\"LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ\",",
+                "\"44,242,77,186,95,176,163,14,38,232,59,42,197,185,226,158,27,22,30,92,31,167,66,94,115,4,51,98,147,139,152,36\"",
+                "]"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_k6_crypto_hmac_and_hasher_stateful() {
+        // RFC 4231 test case 1 (HMAC-SHA256) + k6's stateful Hasher:
+        // createHash/createHMAC return {update, digest} and update chains.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var key = [11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11];
+                var keyBuf = new Uint8Array(key).buffer;
+                JSON.stringify([
+                    crypto.hmac('sha256', keyBuf, 'Hi There', 'hex'),
+                    crypto.createHash('sha256').update('he').update('llo').digest('hex'),
+                    crypto.createHMAC('sha256', keyBuf).update('Hi').update(' There').digest('hex'),
+                    // Exercising the digest-0.11 md5 arm of the hmac dispatcher
+                    // (RFC 1320 test suite: HMAC-MD5 of "what do ya want for
+                    // nothing?" with key "Jefe" = 750c783e6ab0b503eaa86e310a5db738).
+                    // Strings are passed straight through (k6ToBytes output is a
+                    // plain JS array, which the shim's k6ToBytes rejects).
+                    crypto.hmac('md5', 'Jefe', 'what do ya want for nothing?', 'hex'),
+                    crypto.hexEncode('hello'),
+                    new Uint8Array(crypto.randomBytes(8)).length,
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                "[\"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7\",",
+                "\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\",",
+                "\"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7\",",
+                "\"750c783e6ab0b503eaa86e310a5db738\",",
+                "\"68656c6c6f\",8]"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_k6_encoding_b64_roundtrips() {
+        // Backlog line 125: b64encode/b64decode with std/rawstd/url/rawurl;
+        // b64decode returns a string only for format 's' else ArrayBuffer;
+        // unknown encodings silently fall back to std.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    encoding.b64encode('hello', 'std'),
+                    encoding.b64encode('hello', 'rawstd'),
+                    encoding.b64encode(new Uint8Array([251,255,239]).buffer, 'url'),
+                    encoding.b64encode(new Uint8Array([251,255,239]).buffer, 'rawurl'),
+                    encoding.b64decode('aGVsbG8=', 'std', 's'),
+                    encoding.b64decode('aGVsbG8', 'rawstd', 's'),
+                    encoding.b64decode('-_8', 'rawurl', 's'),
+                    Array.from(new Uint8Array(encoding.b64decode('aGVsbG8=', 'std'))).join(','),
+                    encoding.b64decode('aGVsbG8=', 'bogus', 's'),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                "[\"aGVsbG8=\",\"aGVsbG8\",\"-__v\",\"-__v\",\"hello\",\"hello\",",
+                "\"ûÿ\",\"104,101,108,108,111\",\"hello\"]"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_k6_timers_fire_on_pump() {
+        // Backlog line 131: setTimeout/clearTimeout/setInterval globals; the
+        // driver pumps due timers at the iteration boundary.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var fired = 0;
+                var id = setTimeout(function () { fired = 1; }, 5);
+                clearTimeout(id);
+                __tropel_pump_timers();
+                var afterClear = fired;
+                // ms=0 keeps the test deterministic: a due interval fires on
+                // every pump and re-arms (no wall-clock dependency).
+                var iv = setInterval(function () { fired++; }, 0);
+                __tropel_pump_timers();
+                __tropel_pump_timers();
+                clearInterval(iv);
+                var afterClearInterval = fired;
+                __tropel_pump_timers();
+                JSON.stringify([afterClear, afterClearInterval, fired])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "[0,2,2]",
+            "cleared timeout must not fire; interval re-arms per pump; clearInterval stops it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_pumps_timers_at_iteration_boundary() {
+        // Backlog line 131 (reviewer follow-up): the iteration-boundary pump
+        // in run_iteration must actually fire due timers in a real driver
+        // run — a timer armed in iteration N fires at the N+1 boundary.
+        let driver = K6Driver;
+        // The script asserts the invariant itself (throwing on violation) —
+        // the VuContext has no eval, so the driver's run_iteration success/fail
+        // IS the observable. The call counter is a JS-internal global rather
+        // than `__ITER`: a bare VuContext::new(...) never advances ctx.iteration
+        // between run_iteration calls (the engine does that in production), so
+        // gating on __ITER would silently skip the assertion entirely (a false
+        // positive). ms=0 keeps the test deterministic (same trick as the
+        // standalone timers test): a 0ms one-shot is due IMMEDIATELY, so the
+        // pump at the end of call 1 fires it — no wall-clock dependency.
+        let script = br#"
+            export default function (data) {
+                var n = (globalThis.__calls = (globalThis.__calls || 0) + 1);
+                if (n === 1) {
+                    setTimeout(function () { globalThis.__timer_fired = true; }, 0);
+                } else if (n === 3) {
+                    if (globalThis.__timer_fired !== true) {
+                        throw new Error('iteration-boundary pump never fired the due timer');
+                    }
+                }
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        for _ in 0..3 {
+            inst.run_iteration(&mut ctx)
+                .await
+                .expect("iteration must succeed — the boundary pump fires the timer");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_k6_random_seed_is_deterministic() {
+        // Backlog line 132: randomSeed() makes Math.random reproducible per
+        // VU (each VU owns its JsContext, so this is naturally per-VU).
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                randomSeed(42);
+                var a = Math.random();
+                randomSeed(42);
+                var b = Math.random();
+                randomSeed(7);
+                var c = Math.random();
+                JSON.stringify([a === b, a !== c, a, c])
+                "#,
+            )
+            .await
+            .unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed[0].as_bool(),
+            Some(true),
+            "same seed must reproduce the sequence"
+        );
+        assert_eq!(
+            parsed[1].as_bool(),
+            Some(true),
+            "different seed must diverge"
+        );
+        // mulberry32(42) first value: deterministic, stable across runs.
+        assert!(
+            (parsed[2].as_f64().unwrap() - 0.6011037519201636).abs() < 1e-12,
+            "mulberry32(42) first value must be deterministic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_k6_x509_parse_against_real_cert() {
+        // Backlog line 126: k6/crypto/x509 parse/getSubject/getIssuer/
+        // getAltNames against a real self-signed cert (openssl-generated,
+        // embedded verbatim below).
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var pem = `-----BEGIN CERTIFICATE-----
+MIIDzTCCArWgAwIBAgIUcrmV4E5ut2K1ZnLmrzw238cQsXkwDQYJKoZIhvcNAQEL
+BQAwTTELMAkGA1UEBhMCVVMxFDASBgNVBAoMC1Ryb3BlbCBUZXN0MQswCQYDVQQL
+DAJRQTEbMBkGA1UEAwwSdHJvcGVsLmV4YW1wbGUuY29tMB4XDTI2MDgwODIwMDUy
+NloXDTI3MDgwODIwMDUyNlowTTELMAkGA1UEBhMCVVMxFDASBgNVBAoMC1Ryb3Bl
+bCBUZXN0MQswCQYDVQQLDAJRQTEbMBkGA1UEAwwSdHJvcGVsLmV4YW1wbGUuY29t
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu2YbuIwcsDs5A3pSrlUG
+ZCGmUcTBVCN1WSSRXb2hfxvaiAaOPEcgrH50rJE42ElBS5NiDn78G+B3B54mDgzV
+SoJD5OoPUt6XQag13BpyEaz+wdpI9vqNI4x3Xj2krFqIcw7xCbtLliiMwKvlDF8j
+9JIXOu+Mv6teYWYCahysZ7+l9ICkuvkfdgdJnhXk/UfSpuCE/dKmlH9A6xf34ZIX
+cTFspYlpMhqRe43cxqEv2f1sdShl9J948y38c55xG6CDFV96kKqz6y7mYf92lohe
+kPnqgyIIL/tzYnIZONMjgxo7IQscOBiL4AFIeWx0t2w8PtbnNAUOlnj7bennUPsh
+3wIDAQABo4GkMIGhMB0GA1UdDgQWBBTpDo4pBzz/fJGZzP4JLQYk59H1RTAfBgNV
+HSMEGDAWgBTpDo4pBzz/fJGZzP4JLQYk59H1RTAPBgNVHRMBAf8EBTADAQH/ME4G
+A1UdEQRHMEWCEnRyb3BlbC5leGFtcGxlLmNvbYIWd3d3LnRyb3BlbC5leGFtcGxl
+LmNvbYcEfwAAAYERYWRtaW5AZXhhbXBsZS5jb20wDQYJKoZIhvcNAQELBQADggEB
+AFDK10h1Hv42MMFlkWpKhw66OHQsnO+m55Qz4SkW5wR1cs++4dW1hQR7kCTtxf9I
+9ZzdmK5F59RMrq24QxTN1D+OdQddiXLVoaeqn4/5nrniD7+gVIjyplqwAs1zTQAE
+Jkl+yvsXfsK6LubdeYbJ6o47WRTkqp9/t/5G8ZJhB5V76K45puWuooVuzfFYRsZ2
+ZBMe25FkBzGAQEuuQjzBC1iLhIDB/lj+HPuUOGHgAF0KB5x0Uxk74h4Qc+0XMtCy
+wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
++Cy9E1kAs+8uHJKbres43a4=
+-----END CERTIFICATE-----`;
+                var c = x509.parse(pem);
+                JSON.stringify([
+                    c.subject.commonName,
+                    c.subject.organizationName,
+                    c.subject.organizationalUnitName[0],
+                    c.subject.country,
+                    c.issuer.commonName,
+                    c.signatureAlgorithm,
+                    c.publicKey.algorithm,
+                    c.altNames,
+                    c.fingerPrint.length,
+                    c.notBefore.slice(0, 10),
+                    c.notAfter.slice(0, 10),
+                    x509.getAltNames(pem).length,
+                    x509.getSubject(pem).commonName,
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                "[\"tropel.example.com\",\"Tropel Test\",\"QA\",\"US\",",
+                "\"tropel.example.com\",\"SHA256-RSA\",\"RSA\",",
+                "[\"tropel.example.com\",\"www.tropel.example.com\",\"admin@example.com\",",
+                "\"127.0.0.1\"],20,\"2026-08-08\",\"2027-08-08\",4,\"tropel.example.com\"]"
+            )
+        );
     }
 }
