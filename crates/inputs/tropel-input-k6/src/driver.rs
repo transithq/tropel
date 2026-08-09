@@ -1745,7 +1745,7 @@ fn register_http_bridges<'js>(
 impl K6DriverInstance {
     /// Lazily register the script-state bridges (`__tropel_pm_test`,
     /// `__tropel_pm_custom_metric_add`, `__tropel_exec_*`, `__tropel_test_abort`).
-    /// The k6 driver doesn't depend on tropel-pm (which installs these for the
+    /// The k6 driver doesn't depend on tropel-sandbox (which installs these for the
     /// declarative path), so it installs its own equivalents backed by the
     /// per-VU sample_sink / exec_state / abort flag.
     fn register_script_bridges(&mut self) {

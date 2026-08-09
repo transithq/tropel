@@ -1,5 +1,5 @@
 [package]
-name = "tropel-pm"
+name = "tropel-sandbox"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [features]
-# pm.sendRequest is the ENTIRE tropel-pm → tropel-http dependency (P4).
+# pm.sendRequest is the ENTIRE tropel-sandbox → tropel-http dependency (P4).
 # Gate it so the browser slice can compile pm without reqwest/tokio-net.
 # A consumer that only uses pm.response/pm.environment/etc. can set
 # default-features = false and drop tropel-http entirely.

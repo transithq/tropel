@@ -4186,9 +4186,9 @@ dependencies = [
  "tropel-js",
  "tropel-metrics",
  "tropel-native",
- "tropel-pm",
  "tropel-report",
  "tropel-runtime",
+ "tropel-sandbox",
  "tropel-scheduler",
  "tropel-sdk",
  "tropel-variables",
@@ -4385,25 +4385,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tropel-pm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rquickjs",
- "serde_json",
- "simd-json",
- "thiserror",
- "tokio",
- "tracing",
- "tropel-core",
- "tropel-http",
- "tropel-js",
- "tropel-native",
- "tropel-sdk",
- "tropel-variables",
-]
-
-[[package]]
 name = "tropel-report"
 version = "0.1.0"
 dependencies = [
@@ -4434,7 +4415,26 @@ dependencies = [
  "tropel-core",
  "tropel-http",
  "tropel-js",
- "tropel-pm",
+ "tropel-sandbox",
+ "tropel-sdk",
+ "tropel-variables",
+]
+
+[[package]]
+name = "tropel-sandbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rquickjs",
+ "serde_json",
+ "simd-json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tropel-core",
+ "tropel-http",
+ "tropel-js",
+ "tropel-native",
  "tropel-sdk",
  "tropel-variables",
 ]

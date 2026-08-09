@@ -276,7 +276,7 @@ pub struct PmBridge {
     state: SharedPmState,
     /// Per-VU HTTP client for executing pm.sendRequest synchronously.
     /// Gated behind the `send-request` feature (P4) — the entire
-    /// tropel-pm → tropel-http dependency.
+    /// tropel-sandbox → tropel-http dependency.
     #[cfg(feature = "send-request")]
     http_client: Arc<HttpClient>,
 }
@@ -1514,6 +1514,67 @@ mod tests {
                 )
                 .unwrap();
             assert!(readonly, "pm/tropel/wire must be non-writable");
+        });
+    }
+
+    /// P4b open item: alias configuration is part of the public API.
+    /// Evaluating [`SandboxConfig::render_js_preamble`] BEFORE the pm.js
+    /// shim must make the canonical binding appear under the configured
+    /// namespace, with the configured aliases as TRUE aliases (identical
+    /// object, not a proxy). The default `tropel`/`wire` pair is absent when
+    /// a custom namespace replaces it, and error strings still name the
+    /// invoked namespace.
+    #[test]
+    fn test_sandbox_config_drives_namespace_and_aliases() {
+        use crate::config::SandboxConfig;
+
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let cfg = SandboxConfig {
+                namespace: "trp".into(),
+                aliases: vec!["product".into(), "wire".into()],
+            };
+            ctx.eval::<(), _>(cfg.render_js_preamble())
+                .expect("config preamble should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+
+            // Custom canonical installed; aliases are true aliases of it.
+            let installed: bool = ctx
+                .eval(
+                    "typeof trp === 'object' && typeof product === 'object' \
+                     && typeof wire === 'object' && product === trp && wire === trp",
+                )
+                .unwrap();
+            assert!(installed, "trp canonical with product/wire aliases must be installed");
+
+            // The DEFAULT tropel binding must NOT be present when the config
+            // renames the canonical namespace.
+            let no_default: bool = ctx.eval("typeof tropel === 'undefined'").unwrap();
+            assert!(no_default, "default tropel must not leak alongside custom namespace");
+
+            // pm is still the frozen Postman-compat peer view, distinct object.
+            let peer_views: bool = ctx.eval("typeof pm === 'object' && pm !== trp").unwrap();
+            assert!(peer_views, "pm must remain a peer view, not trp's alias");
+
+            // Error strings name the CONFIGURED namespace.
+            let err: String = ctx
+                .eval(
+                    "(function(){ try { trp.response.json(); return 'no-error'; } \
+                      catch (e) { return e.message; } })()",
+                )
+                .unwrap();
+            assert!(err.contains("trp.response.json()"), "error must name trp: {err}");
+
+            // Configured bindings installed read-only too.
+            let readonly: bool = ctx
+                .eval(
+                    "Object.getOwnPropertyDescriptor(globalThis, 'trp').writable === false \
+                     && Object.getOwnPropertyDescriptor(globalThis, 'product').writable === false",
+                )
+                .unwrap();
+            assert!(readonly, "trp/product must be non-writable");
         });
     }
 }

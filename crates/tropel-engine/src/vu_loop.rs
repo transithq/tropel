@@ -26,6 +26,7 @@ use tropel_ext::registry::ExtensionRegistry;
 use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
+use tropel_sandbox::config::SandboxConfig;
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
 use tropel_sdk::traits::{Driver, DriverHttpClient, Protocol};
 use tropel_sdk::types::{Request, Response, Sample, TagMap};
@@ -589,9 +590,14 @@ pub(crate) async fn run_scenario_vus(
                 );
                 let pm_state = runner.state_handle();
 
-                let js_ctx =
-                    create_vu_js_context(vu_id, &pm_state, &bridge_client, &ShimBundle::default())
-                        .await;
+                let js_ctx = create_vu_js_context(
+                    vu_id,
+                    &pm_state,
+                    &bridge_client,
+                    &ShimBundle::default(),
+                    &SandboxConfig::default(),
+                )
+                .await;
                 if let Some(ctx) = js_ctx {
                     runner = runner.with_js_context(Box::new(ctx));
                 }

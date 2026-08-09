@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 tropel-sdk.workspace = true
 tropel-core.workspace = true
-tropel-pm.workspace = true
+tropel-sandbox.workspace = true
 tropel-js.workspace = true
 tropel-variables.workspace = true
 tracing.workspace = true

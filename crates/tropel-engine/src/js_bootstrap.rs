@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tropel_http::client::HttpClient;
-use tropel_pm::state::SharedPmState;
+use tropel_sandbox::config::SandboxConfig;
+use tropel_sandbox::state::SharedPmState;
 use tropel_sdk::error::TropelError;
 use tropel_sdk::Result;
 
@@ -117,6 +118,7 @@ pub(crate) async fn create_vu_js_context(
     pm_state: &SharedPmState,
     http_client: &Arc<HttpClient>,
     shim: &ShimBundle,
+    config: &SandboxConfig,
 ) -> Option<tropel_js::JsContext> {
     let mut ctx = match tropel_js::JsContext::new(
         Some(10 * 1024 * 1024),
@@ -135,6 +137,25 @@ pub(crate) async fn create_vu_js_context(
         }
     };
 
+    // P4b: a NON-default sandbox config (custom canonical name / aliases)
+    // must be installed as `__tropel_sandbox_config` BEFORE the shim bundle
+    // evals, so pm.js's install tail exposes the configured names. The
+    // default config is skipped — pm.js's own fallback (`tropel` + `wire`)
+    // is byte-identical, and skipping keeps the default path untouched.
+    if config != &SandboxConfig::default() {
+        if let Err(e) = ctx.eval(&config.render_js_preamble()).await {
+            // Loud, like the shim-bootstrap failure: the embedder asked for a
+            // specific canonical name and silently getting `tropel.*` would
+            // make every `trp.*` script throw ReferenceError at runtime.
+            tracing::warn!(
+                "VU {}: Failed to set sandbox config preamble: {} — failing the VU context",
+                vu_id,
+                e
+            );
+            return None;
+        }
+    }
+
     if let Err(e) = bootstrap_shims(&mut ctx, vu_id, shim).await {
         // Backlog line 238: a shim-eval failure must be LOUD — warn-only left
         // every script throwing `ReferenceError: pm is not defined`. Fail the
@@ -152,7 +173,7 @@ pub(crate) async fn create_vu_js_context(
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
     }
 
-    let bridge = tropel_pm::bindings::pm::PmBridge::new(pm_state.clone(), http_client.clone());
+    let bridge = tropel_sandbox::bindings::pm::PmBridge::new(pm_state.clone(), http_client.clone());
     if let Err(e) = bridge.install(&mut ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }
@@ -256,5 +277,56 @@ async fn bootstrap_shims(ctx: &mut tropel_js::JsContext, vu_id: u32, shim: &Shim
         ctx.bootstrap_library(JS_SHIM_BUNDLE)
             .await
             .map_err(|e| TropelError::Js(format!("VU {vu_id}: shim source eval failed: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tropel_core::config::HttpConfig;
+    use tropel_http::client::HttpClient;
+    use tropel_sandbox::state::new_pm_state;
+
+    /// P4b: the engine bootstrap must honor a NON-default SandboxConfig.
+    /// The VU loop always passes the default (so the config branch would be
+    /// provably inert without this test) — an embedder passing a custom
+    /// namespace + aliases must get those names installed, and the default
+    /// `tropel` must be absent. This runs through the SAME path as
+    /// production: preamble eval before bootstrap_shims, then the (default)
+    /// ShimBundle — the bytecode cache path is exercised since this test
+    /// runs after other VU contexts compiled it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_vu_js_context_honors_custom_sandbox_config() {
+        let pm_state = new_pm_state();
+        let client = Arc::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        );
+        let config = SandboxConfig {
+            namespace: "trp".into(),
+            aliases: vec!["product".into(), "wire".into()],
+        };
+        let mut ctx = create_vu_js_context(
+            7,
+            &pm_state,
+            &client,
+            &ShimBundle::default(),
+            &config,
+        )
+        .await
+        .expect("context must be created");
+
+        let check = ctx
+            .eval(
+                "typeof trp === 'object' && typeof product === 'object' \
+                 && product === trp && wire === trp && typeof pm === 'object' \
+                 && typeof tropel === 'undefined'",
+            )
+            .await
+            .expect("probe should eval");
+        assert_eq!(
+            check, "true",
+            "custom namespace/aliases must be installed via the preamble; default tropel absent — got: {check}"
+        );
     }
 }

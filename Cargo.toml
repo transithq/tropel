@@ -8,7 +8,7 @@ members = [
     "crates/tropel-collection",
     "crates/tropel-variables",
     "crates/tropel-js",
-    "crates/tropel-pm",
+    "crates/tropel-sandbox",
     "crates/tropel-native",
     "crates/tropel-http",
     "crates/tropel-auth",
@@ -184,7 +184,7 @@ tropel-collection = { path = "crates/tropel-collection" }
 tropel-variables = { path = "crates/tropel-variables" }
 tropel-js = { path = "crates/tropel-js" }
 tropel-native = { path = "crates/tropel-native" }
-tropel-pm = { path = "crates/tropel-pm" }
+tropel-sandbox = { path = "crates/tropel-sandbox" }
 tropel-http = { path = "crates/tropel-http" }
 tropel-auth = { path = "crates/tropel-auth" }
 tropel-runtime = { path = "crates/tropel-runtime", version = "0.1.0" }

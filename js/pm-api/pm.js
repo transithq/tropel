@@ -1302,26 +1302,55 @@ Trend.prototype.add = function (value, tags) {
     return pm;
 }
 
-// ── Install: pm (frozen Postman-compat) + tropel (canonical) + wire (true alias) ──
+// ── Install: pm (frozen Postman-compat peer view) + canonical + aliases ──
+// The canonical name and its aliases come from the host-set global
+// `__tropel_sandbox_config` (written by SandboxConfig::render_js_preamble
+// before this bundle evals — P4b). Absent a config, the historical
+// hardcoded install is preserved: canonical `tropel` + `wire` alias.
+//
+// Scoped in an IIFE so the helper vars don't leak onto globalThis (pm.js is
+// non-strict, so a top-level `var` becomes a global — and a leaked
+// `canonical` could collide with an embedder's chosen namespace). Only `pm`
+// and `__tropel_build_binding` remain global, exactly as before.
 var pm = __tropel_build_binding('pm');
-var tropel = __tropel_build_binding('tropel');
-// True alias — identical object, one line, not a proxy (P4b).
-var wire = tropel;
-
-var __tropel_g = typeof globalThis !== 'undefined' ? globalThis : null;
-if (__tropel_g) {
-    [['pm', pm], ['tropel', tropel], ['wire', wire]].forEach(function (entry) {
-        try {
-            Object.defineProperty(__tropel_g, entry[0], {
-                value: entry[1], writable: false, configurable: false
-            });
-        } catch (e) {
-            // Tolerate double eval in the same context: the binding is
-            // already installed read-only, and the `var` no-ops against the
-            // non-writable global, so the FIRST eval's bindings win.
+(function () {
+    var cfg = (typeof __tropel_sandbox_config === 'object' && __tropel_sandbox_config) || {};
+    var namespace = (typeof cfg.namespace === 'string' && cfg.namespace.length > 0)
+        ? cfg.namespace
+        : 'tropel';
+    var aliases = Array.isArray(cfg.aliases) ? cfg.aliases : ['wire'];
+    var canonical = __tropel_build_binding(namespace);
+    // True alias — identical object, one line, not a proxy (P4b).
+    var install = [['pm', pm]];
+    // `pm` is the frozen Postman-compat peer view — it owns its name. A
+    // namespace or alias of 'pm' would collide with the already-installed
+    // non-configurable binding and silently fail, so it is skipped.
+    if (namespace !== 'pm') {
+        install.push([namespace, canonical]);
+    }
+    for (var i = 0; i < aliases.length; i++) {
+        var alias = aliases[i];
+        if (typeof alias === 'string' && alias.length > 0
+            && alias !== namespace && alias !== 'pm') {
+            install.push([alias, canonical]);
         }
-    });
-}
+    }
+    var g = typeof globalThis !== 'undefined' ? globalThis : null;
+    if (g) {
+        install.forEach(function (entry) {
+            try {
+                Object.defineProperty(g, entry[0], {
+                    value: entry[1], writable: false, configurable: false
+                });
+            } catch (e) {
+                // Tolerate double eval in the same context: the binding is
+                // already installed read-only, and the first eval's bindings
+                // win (the `var pm` above no-ops against the non-writable
+                // global).
+            }
+        });
+    }
+})();
 
 // ── Export for module systems ──
 if (typeof module !== 'undefined' && module.exports) {
