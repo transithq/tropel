@@ -9,7 +9,7 @@ publish = false
 description = "TypeScript transpilation and ES module bundling for Tropel load-test scripts"
 
 [dependencies]
-tropel-core.workspace = true
+tropel-sdk.workspace = true
 pathdiff = "0.2.3"
 once_cell.workspace = true
 anyhow.workspace = true

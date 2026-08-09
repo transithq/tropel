@@ -1,20 +1,21 @@
 //! # tropel-core
 //!
-//! Protocol-agnostic domain types shared across all Tropel crates.
-//! This crate is a leaf — it depends on nothing in the workspace.
+//! Engine-internal domain types: configuration, clock, execution segments.
+//! After the P1 inversion, the shared contract types (`types`, `scenario`,
+//! `error`, `duration`) and extension traits (`traits`, `registration`)
+//! live in `tropel-sdk` — this crate now depends on the leaf and keeps only
+//! what the engine (not adapter authors) needs.
 
 pub mod clock;
 pub mod config;
-pub mod duration;
-pub mod error;
-pub mod scenario;
 pub mod segment;
-pub mod types;
 
 pub use clock::*;
-pub use config::*;
-pub use duration::*;
-pub use error::*;
-pub use scenario::*;
 pub use segment::*;
-pub use types::*;
+
+// Explicit re-exports (not a glob — a glob over a module that itself
+// re-exports from tropel-sdk triggers an unused-import lint).
+pub use config::{
+    ArrivalRateStage, ExecutionConfig, ExpectedStatus, HttpConfig, JobConfig, OutputConfig,
+    ScenarioConfig, Stage, status_is_expected, ThinkTimeConfig, ThresholdConfig, TlsConfig,
+};

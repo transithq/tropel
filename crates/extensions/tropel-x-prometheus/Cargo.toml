@@ -16,3 +16,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+tropel-ext.workspace = true  # test resolves the registered output via ExtensionRegistry (lives in tropel-ext)

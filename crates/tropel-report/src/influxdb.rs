@@ -27,8 +27,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
-use tropel_core::types::Sample;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::types::Sample;
+use tropel_sdk::{Result, TropelError};
 
 use crate::output::TagPolicy;
 use crate::Output;
@@ -387,7 +387,7 @@ impl Output for InfluxdbOutput {
 mod tests {
     use super::*;
     use std::time::SystemTime;
-    use tropel_core::types::{Sample, SampleType, TagMap};
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
 
     fn sample(metric: &str, value: f64, tags: &[(&str, &str)]) -> Sample {
         let mut map = TagMap::new();

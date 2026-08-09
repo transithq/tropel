@@ -1,4 +1,4 @@
-use crate::traits::*;
+use tropel_sdk::traits::*;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -267,9 +267,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::Value;
-    use tropel_core::scenario::Scenario;
-    use tropel_core::types::{Request, Sample};
-    use tropel_core::TropelError;
+    use tropel_sdk::scenario::Scenario;
+    use tropel_sdk::types::{Request, Sample};
+    use tropel_sdk::TropelError;
 
     // ── Stubs (pure-content detection, no real parsing) ──
     struct StubAdapter {
@@ -283,7 +283,7 @@ mod tests {
         fn detect(&self, bytes: &[u8]) -> bool {
             bytes.starts_with(self.detect_prefix)
         }
-        fn parse(&self, _bytes: &[u8]) -> tropel_core::Result<Scenario> {
+        fn parse(&self, _bytes: &[u8]) -> tropel_sdk::Result<Scenario> {
             Err(TropelError::Other(
                 "stub adapter parse not implemented".into(),
             ))
@@ -306,7 +306,7 @@ mod tests {
             _bytes: &[u8],
             _source_path: Option<&std::path::Path>,
             _exec: Option<&str>,
-        ) -> tropel_core::Result<Box<dyn DriverInstance>> {
+        ) -> tropel_sdk::Result<Box<dyn DriverInstance>> {
             Err(TropelError::Other(
                 "stub driver init not implemented".into(),
             ))
@@ -325,7 +325,7 @@ mod tests {
             &self,
             _req: &Request,
             _config: Option<&Value>,
-        ) -> tropel_core::Result<ProtocolOutcome> {
+        ) -> tropel_sdk::Result<ProtocolOutcome> {
             Err(TropelError::Other(
                 "stub protocol execute not implemented".into(),
             ))
@@ -340,10 +340,10 @@ mod tests {
         fn name(&self) -> &str {
             self.id
         }
-        async fn emit(&self, _batch: &[Sample]) -> tropel_core::Result<()> {
+        async fn emit(&self, _batch: &[Sample]) -> tropel_sdk::Result<()> {
             Ok(())
         }
-        async fn flush(&self) -> tropel_core::Result<()> {
+        async fn flush(&self) -> tropel_sdk::Result<()> {
             Ok(())
         }
     }

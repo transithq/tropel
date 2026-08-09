@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tropel_core::config::{HttpConfig, TlsConfig};
-use tropel_core::types::*;
-use tropel_core::Result;
-use tropel_core::TropelError;
+use tropel_sdk::types::*;
+use tropel_sdk::Result;
+use tropel_sdk::TropelError;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MULTIPART_BOUNDARY: &str = "------------------------tropel-boundary-7a2f24b9";
@@ -866,7 +866,7 @@ impl HttpClient {
             // but the bytes are still read so the pooled connection survives.
             let receiving_start = std::time::Instant::now();
             let discard = self.discard_bodies
-                || request.response_type == tropel_core::types::ResponseType::None;
+                || request.response_type == tropel_sdk::types::ResponseType::None;
             // When the body is discarded (global `discardResponseBodies` or the
             // per-request k6 `responseType: "none"`), we must STILL read the body
             // off the wire so reqwest can return the connection to the pool.
@@ -1019,7 +1019,7 @@ fn check_literal_blacklist(blacklist: &[IpCidr], url: &str) -> Result<()> {
     Ok(())
 }
 
-/// HTTP response data (mirrors `tropel_core::Response` but from reqwest).
+/// HTTP response data (mirrors `tropel_sdk::Response` but from reqwest).
 /// Body text and JSON are lazily decoded ONCE and memoized — see
 /// `body_text()` / `body_json()`.
 #[derive(Debug, Clone)]
@@ -1049,9 +1049,9 @@ pub struct HttpResponse {
     pub redirects: Vec<HttpResponse>,
 }
 
-impl From<&HttpResponse> for tropel_core::types::Response {
+impl From<&HttpResponse> for tropel_sdk::types::Response {
     fn from(resp: &HttpResponse) -> Self {
-        tropel_core::types::Response {
+        tropel_sdk::types::Response {
             url: resp.url.clone(),
             status_code: resp.status_code,
             status_text: resp.status_text.clone(),
@@ -1297,9 +1297,9 @@ mod multipart_tests {
     }
 }
 
-/// Delegate to the canonical `tropel_core::parse_duration`.
+/// Delegate to the canonical `tropel_sdk::parse_duration`.
 pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
-    tropel_core::parse_duration(s)
+    tropel_sdk::parse_duration(s)
 }
 
 #[cfg(test)]
@@ -1598,7 +1598,7 @@ mod tests {
         let req = Request {
             url: format!("http://{addr}/hi"),
             method: Method::GET,
-            response_type: tropel_core::types::ResponseType::None,
+            response_type: tropel_sdk::types::ResponseType::None,
             ..Default::default()
         };
         let start = std::time::Instant::now();
@@ -1981,7 +1981,7 @@ mod tests {
         let req = Request {
             url: format!("http://{}/", addr),
             method: Method::GET,
-            response_type: tropel_core::types::ResponseType::None,
+            response_type: tropel_sdk::types::ResponseType::None,
             ..Default::default()
         };
 

@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tropel_core::types::{Sample, TagMap};
-use tropel_core::Result;
+use tropel_sdk::types::{Sample, TagMap};
+use tropel_sdk::Result;
 
 /// Tag forwarding policy for network outputs (prometheus/otlp/statsd/influxdb).
 ///
@@ -73,10 +73,10 @@ const PROGRESS_INTERVAL_SECS: u64 = 2;
 /// The report crate previously defined its own `Output` trait (with
 /// `sample`/`stop`), forcing the reference `tropel-x-prometheus` extension
 /// to alias-import (`use tropel_report::Output as _`) past the name clash
-/// with `tropel_ext::traits::Output`. Both traits were shape-identical;
+/// with `tropel_sdk::traits::Output`. Both traits were shape-identical;
 /// the duplicate is gone — report outputs implement the SDK trait directly,
 /// mapping `sample`→`emit` and `stop`→`flush`.
-pub use tropel_ext::traits::Output;
+pub use tropel_sdk::traits::Output;
 
 /// A live progress display printed to stdout during the test run.
 ///
@@ -372,7 +372,7 @@ impl LiveState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tropel_core::types::TagMap;
+    use tropel_sdk::types::TagMap;
 
     fn tagmap(pairs: &[(&str, &str)]) -> TagMap {
         TagMap::from_pairs(pairs.iter().map(|(k, v)| (*k, *v)))
@@ -384,7 +384,7 @@ mod tests {
             value,
             tags: std::sync::Arc::new(tags),
             timestamp: std::time::SystemTime::now(),
-            sample_type: tropel_core::types::SampleType::Point,
+            sample_type: tropel_sdk::types::SampleType::Point,
         }
     }
 

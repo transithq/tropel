@@ -7,10 +7,10 @@ use crate::vu_loop::{VuIterationOutcome, VuIterationSource};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tropel_core::types::{Sample, TagMap};
+use tropel_sdk::types::{Sample, TagMap};
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
-use tropel_ext::traits::{DriverHttpClient, DriverInstance, Protocol, VuContext};
+use tropel_sdk::traits::{DriverHttpClient, DriverInstance, Protocol, VuContext};
 use tropel_pm::bridge::SharedPmState;
 
 // ── Scenario source: VURunner (Postman pm.* declarative execution) ──
@@ -140,7 +140,7 @@ impl VuIterationSource for DriverVuSource {
                 value: 0.0,
                 tags: Arc::new(tags),
                 timestamp: std::time::SystemTime::now(),
-                sample_type: tropel_core::types::SampleType::Rate,
+                sample_type: tropel_sdk::types::SampleType::Rate,
             });
         }
         let abort_message = if ctx.abort_requested {
@@ -166,8 +166,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tropel_core::config::{ExecutionConfig, ThinkTimeConfig};
-    use tropel_core::types::{Request, Response};
-    use tropel_core::Result;
+    use tropel_sdk::types::{Request, Response};
+    use tropel_sdk::Result;
 
     /// Stub protocol whose presence in the context proves the driver path
     /// received the registry's protocol map (backlog line 230).
@@ -181,8 +181,8 @@ mod tests {
             &self,
             _req: &Request,
             _config: Option<&serde_json::Value>,
-        ) -> Result<tropel_ext::traits::ProtocolOutcome> {
-            Ok(tropel_ext::traits::ProtocolOutcome {
+        ) -> Result<tropel_sdk::traits::ProtocolOutcome> {
+            Ok(tropel_sdk::traits::ProtocolOutcome {
                 samples: vec![],
                 response: None,
             })
@@ -209,7 +209,7 @@ mod tests {
     #[async_trait]
     impl DriverHttpClient for StubHttpClient {
         async fn execute(&self, _req: &Request) -> Result<Response> {
-            Err(tropel_core::TropelError::Other("stub".into()))
+            Err(tropel_sdk::TropelError::Other("stub".into()))
         }
     }
 

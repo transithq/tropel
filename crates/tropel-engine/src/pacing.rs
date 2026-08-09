@@ -6,7 +6,7 @@
 use rand::RngExt;
 use std::time::Duration;
 use tropel_core::config::{ExecutionConfig, ThinkTimeConfig};
-use tropel_core::Result;
+use tropel_sdk::Result;
 
 pub(crate) fn extract_think_time(exec_cfg: &ExecutionConfig) -> ThinkTimeConfig {
     match exec_cfg {
@@ -27,7 +27,7 @@ pub(crate) fn parse_duration_str(s: &str) -> Result<Duration> {
     if s.is_empty() || s == "0" || s == "0s" {
         return Ok(Duration::ZERO);
     }
-    tropel_core::parse_duration(s)
+    tropel_sdk::parse_duration(s)
 }
 
 // ── Think time ──

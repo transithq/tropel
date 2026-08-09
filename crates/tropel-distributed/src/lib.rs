@@ -30,7 +30,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 use tropel_core::config::JobConfig;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_metrics::thresholds::evaluate_thresholds;
 use tropel_report::create_reporter;

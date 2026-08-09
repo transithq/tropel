@@ -38,8 +38,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use tropel_core::types::{Sample, SampleType};
-use tropel_core::{Result, TropelError};
+use tropel_sdk::types::{Sample, SampleType};
+use tropel_sdk::{Result, TropelError};
 
 use crate::output::TagPolicy;
 use crate::Output;
@@ -96,7 +96,7 @@ struct SeriesKey {
 }
 
 impl SeriesKey {
-    fn from_parts(metric: &str, tags: &tropel_core::types::TagMap) -> Self {
+    fn from_parts(metric: &str, tags: &tropel_sdk::types::TagMap) -> Self {
         let mut labels: Vec<(String, String)> = tags
             .iter()
             .filter(|(k, _)| k != &"__name__") // avoid duplicate __name__ label
@@ -454,7 +454,7 @@ fn write_varint_field(buf: &mut Vec<u8>, field: u32, v: u64) {
 mod tests {
     use super::*;
     use std::time::SystemTime;
-    use tropel_core::types::{Sample, SampleType, TagMap};
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
 
     fn sample(metric: &str, value: f64, tags: TagMap) -> Sample {
         sample_typed(metric, value, tags, SampleType::Point)

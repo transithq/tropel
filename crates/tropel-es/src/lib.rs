@@ -24,7 +24,7 @@ pub mod transpiler;
 pub use transpiler::*;
 
 use std::path::Path;
-use tropel_core::Result;
+use tropel_sdk::Result;
 
 /// Transpile a script file at the given path into plain JavaScript.
 ///
@@ -42,14 +42,14 @@ pub fn transpile_file(path: &Path) -> Result<String> {
         .to_lowercase();
 
     // Read the source
-    let source = std::fs::read_to_string(path).map_err(tropel_core::TropelError::Io)?;
+    let source = std::fs::read_to_string(path).map_err(tropel_sdk::TropelError::Io)?;
 
     let is_typescript = matches!(ext.as_str(), "ts" | "mts" | "tsx");
 
     // Strip TypeScript types if needed, otherwise pass through as-is.
     if is_typescript {
         transpiler::typescript_to_javascript(&source, &path.to_string_lossy())
-            .map_err(|e| tropel_core::TropelError::Parse(format!("TS transpile error: {}", e)))
+            .map_err(|e| tropel_sdk::TropelError::Parse(format!("TS transpile error: {}", e)))
     } else {
         Ok(source)
     }

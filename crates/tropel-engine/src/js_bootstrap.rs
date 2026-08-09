@@ -5,8 +5,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tropel_core::error::TropelError;
-use tropel_core::Result;
+use tropel_sdk::error::TropelError;
+use tropel_sdk::Result;
 use tropel_http::client::HttpClient;
 use tropel_pm::bridge::SharedPmState;
 

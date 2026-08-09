@@ -1,7 +1,7 @@
 use crate::Reporter;
 use async_trait::async_trait;
 use std::path::PathBuf;
-use tropel_core::Result;
+use tropel_sdk::Result;
 use tropel_metrics::collector::MetricsResult;
 
 /// Writes metrics to a CSV file.
@@ -53,7 +53,7 @@ impl Reporter for CsvReporter {
         if let Some(path) = &self.output_path {
             tokio::fs::write(path, &csv_output)
                 .await
-                .map_err(tropel_core::TropelError::Io)?;
+                .map_err(tropel_sdk::TropelError::Io)?;
         } else {
             // Print to stdout
             println!("{}", csv_output);

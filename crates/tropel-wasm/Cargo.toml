@@ -9,8 +9,7 @@ publish = false
 description = "WASM plugin runtime for Tropel — loads and runs WebAssembly plugins via wasmtime"
 
 [dependencies]
-tropel-core.workspace = true
-tropel-ext.workspace = true
+tropel-sdk.workspace = true
 tropel-http.workspace = true
 async-trait.workspace = true
 inventory.workspace = true

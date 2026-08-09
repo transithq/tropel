@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 use tropel_core::config::{
     ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig,
 };
-use tropel_core::scenario::{Scenario, ScenarioItem};
-use tropel_core::types::{Request, Response, Sample, TagMap};
-use tropel_core::Result;
+use tropel_sdk::scenario::{Scenario, ScenarioItem};
+use tropel_sdk::types::{Request, Response, Sample, TagMap};
+use tropel_sdk::Result;
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::{VUScheduler, VuLease};
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_ext::traits::{Driver, DriverHttpClient, Protocol};
+use tropel_sdk::traits::{Driver, DriverHttpClient, Protocol};
 use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
@@ -197,14 +197,14 @@ async fn run_vu_loop(
                 value: 1.0,
                 tags: empty_tags.clone(),
                 timestamp: now,
-                sample_type: tropel_core::types::SampleType::Counter,
+                sample_type: tropel_sdk::types::SampleType::Counter,
             });
             iter_samples.push(Sample {
                 metric: "iteration_duration".into(),
                 value: iter_dur.as_secs_f64() * 1000.0,
                 tags: empty_tags,
                 timestamp: now,
-                sample_type: tropel_core::types::SampleType::Trend,
+                sample_type: tropel_sdk::types::SampleType::Trend,
             });
             // Merge per-scenario tags into every sample so tag-scoped
             // thresholds (e.g. {scenario=load}) work end-to-end.
@@ -404,7 +404,7 @@ where
                     value: dropped as f64,
                     tags: Arc::new(dropped_tags),
                     timestamp: std::time::SystemTime::now(),
-                    sample_type: tropel_core::types::SampleType::Counter,
+                    sample_type: tropel_sdk::types::SampleType::Counter,
                 })
                 .await;
         }
@@ -927,7 +927,7 @@ async fn utils_emit_vus_metrics(
                 value: active as f64,
                 tags: vus_tags.clone(),
                 timestamp: now,
-                sample_type: tropel_core::types::SampleType::Point,
+                sample_type: tropel_sdk::types::SampleType::Point,
             },
             Sample {
                 metric: "vus_max".into(),
@@ -937,7 +937,7 @@ async fn utils_emit_vus_metrics(
                 value: peak as f64,
                 tags: vus_tags,
                 timestamp: now,
-                sample_type: tropel_core::types::SampleType::Point,
+                sample_type: tropel_sdk::types::SampleType::Point,
             },
         ])
         .await;

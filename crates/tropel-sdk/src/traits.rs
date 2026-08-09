@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tropel_core::config::{ExecutionConfig, OutputConfig, ScenarioConfig, ThresholdConfig};
-use tropel_core::scenario::Scenario;
-use tropel_core::types::{Request, Response, Sample};
-use tropel_core::Result;
+use crate::config::{ExecutionConfig, OutputConfig, ScenarioConfig, ThresholdConfig};
+use crate::scenario::Scenario;
+use crate::types::{Request, Response, Sample};
+use crate::Result;
 
 /// A new protocol/request executor (beyond HTTP): gRPC, WebSocket, MQTT, ...
 ///
@@ -151,13 +151,13 @@ impl VuContext {
     }
 
     /// Record a metric sample.
-    pub fn emit_sample(&mut self, metric: &str, value: f64, tags: tropel_core::types::TagMap) {
+    pub fn emit_sample(&mut self, metric: &str, value: f64, tags: crate::types::TagMap) {
         self.samples.push(Sample {
             metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
             tags: std::sync::Arc::new(tags),
             timestamp: std::time::SystemTime::now(),
-            sample_type: tropel_core::types::SampleType::Point,
+            sample_type: crate::types::SampleType::Point,
         });
     }
 
@@ -374,8 +374,10 @@ pub trait DriverInstance: Send {
 // ── Registration types for inventory ──
 // The four `*Registration` structs, their `inventory::collect!` declarations
 // and their unit tests moved to `registration.rs` (pure move — see P7).
-// Re-exported here so existing `tropel_ext::traits::{…Registration}` paths
+// Re-exported here so existing `tropel_sdk::traits::{…Registration}` paths
 // (registry.rs, tropel-sdk, tropel-wasm) keep resolving unchanged.
+// Gated behind the `registration` feature (on by default) — see lib.rs.
+#[cfg(feature = "registration")]
 pub use crate::registration::*;
 
 #[cfg(test)]
@@ -405,7 +407,7 @@ mod tests {
     #[test]
     fn vu_context_emit_sample_and_abort() {
         let mut ctx = VuContext::new(1, 0, "s".into());
-        let mut tags = tropel_core::types::TagMap::new();
+        let mut tags = crate::types::TagMap::new();
         tags.insert("group", "::g");
         ctx.emit_sample("custom", 1.5, tags);
         assert_eq!(ctx.samples.len(), 1);

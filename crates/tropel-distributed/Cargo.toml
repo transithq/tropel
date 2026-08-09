@@ -20,6 +20,7 @@ name = "tropel-cloud-run"
 path = "src/bin/cloud_run.rs"
 
 [dependencies]
+tropel-sdk.workspace = true
 tropel-core.workspace = true
 tropel-engine.workspace = true
 tropel-ext.workspace = true

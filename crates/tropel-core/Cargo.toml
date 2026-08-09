@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+tropel-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true

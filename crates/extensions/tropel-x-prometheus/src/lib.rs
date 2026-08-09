@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tropel_report::PrometheusRemoteWriteOutput;
-use tropel_sdk::{Output, OutputConfig, OutputRegistration, Result, Sample};
+use tropel_sdk::config::OutputConfig;
+use tropel_sdk::{Output, OutputRegistration, Result, Sample};
 
 /// How often buffered samples are pushed to the endpoint while the run is
 /// in progress (the engine driver only calls `flush` once, at stream close;
@@ -147,7 +148,7 @@ mod tests {
 
     #[test]
     fn registers_prometheus_output() {
-        let registry = tropel_sdk::ExtensionRegistry::new();
+        let registry = tropel_ext::ExtensionRegistry::new();
         let output = registry
             .get_output("prometheus")
             .expect("prometheus output must be registered via inventory");

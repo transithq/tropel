@@ -3,7 +3,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 use tropel_ext::registry::ExtensionRegistry;
 
 /// Build the extension registry exactly like `run_command` does: built-in

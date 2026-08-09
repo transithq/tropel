@@ -13,7 +13,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use tropel_core::config::*;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 
 /// A partial `JobConfig` — every field optional so a config file (or the
 /// env parser) can override only what it sets. `None`/empty means "not

@@ -185,7 +185,7 @@ pub fn check_abort_on_fail(
 
 /// Parse a duration string like "30s", "1m", "500ms" into a Duration.
 fn parse_duration(s: &str) -> std::result::Result<Duration, ()> {
-    tropel_core::parse_duration(s).map_err(|_| ())
+    tropel_sdk::parse_duration(s).map_err(|_| ())
 }
 
 /// Parse a tag-scoped metric reference like `"http_req_duration{status=200}.p95"`

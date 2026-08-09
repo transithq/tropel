@@ -3,7 +3,8 @@
 //! `tropel-sdk` is the **single dependency** a third-party adapter/driver/output
 //! author needs. It re-exports the types and traits that form the public contract
 //! without exposing internal crate structure. Backing crates (`tropel-core`,
-//! `tropel-ext`) can refactor internally as long as the SDK's surface is stable.
+//! `tropel-ext`) now depend on this leaf, not the other way around — the SDK is
+//! the published identity with a written semver policy.
 //!
 //! ## Semver policy
 //!
@@ -68,17 +69,35 @@
 //! | `Output` trait | ✅ Wired — engine drives registered outputs from the sample stream (emit per batch, flush on close); see the `prometheus` reference extension (`unstable-output`) |
 //! | `Driver` / `DriverInstance` / `VuContext` | ✅ Stable — re-exported and used by the k6 driver (`tropel-input-k6`) |
 //! | `WASM` / `WIT` interface | 🔶 Resolves (parses) — `wit/adapter.wit` in the crate root is validated as a *parseable* WIT package by a `wit-parser` unit test, nothing more. It is the forward-looking Component-Model contract and intentionally lags the shipped C-ABI path; WASM plugins currently use the C ABI in `tropel-wasm`. |
+//! | Engine config (`config` module) | 🔒 NOT re-exported at the root — engine-owned; only the contract-referenced subset lives here and is reachable via `tropel_sdk::config::*` |
+
+// ═══════════════════════════════════════════════════════════════════
+// Module tree — the SDK owns these files (moved in the P1 inversion)
+// ═══════════════════════════════════════════════════════════════════
+
+pub mod config;
+pub mod duration;
+pub mod error;
+pub mod scenario;
+pub mod types;
+
+/// The extension-contract traits (`InputAdapter`, `Driver`, `Protocol`,
+/// `Output`, `VuContext`, …).
+pub mod traits;
+
+/// The four `*Registration` structs + `inventory::collect!` declarations.
+/// Gated behind the `registration` feature (on by default) so a consumer
+/// that only writes adapters against the traits can opt out of the
+/// inventory dependency entirely.
+#[cfg(feature = "registration")]
+pub mod registration;
 
 // ═══════════════════════════════════════════════════════════════════
 // Core types — the shared Scenario IR used by all adapters
 // ═══════════════════════════════════════════════════════════════════
 
-pub use tropel_core::config::{
-    ArrivalRateStage, ExecutionConfig, HttpConfig, OutputConfig, ScenarioConfig, Stage,
-    ThinkTimeConfig, ThresholdConfig, TlsConfig,
-};
-pub use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-pub use tropel_core::types::{
+pub use scenario::{Scenario, ScenarioInfo, ScenarioItem};
+pub use types::{
     ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response,
     ResponseType, Sample, SampleType, Timings,
 };
@@ -88,12 +107,18 @@ pub use tropel_core::types::{
 // ═══════════════════════════════════════════════════════════════════
 
 // InputAdapter is the stable, primary extension trait — always available.
-pub use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
+// The `*Registration` structs come from the gated `registration` module
+// (they pull in the `inventory` dep), so their re-exports are gated too.
+pub use traits::InputAdapter;
+#[cfg(feature = "registration")]
+pub use traits::InputAdapterRegistration;
 
 // Driver/DriverInstance + VuContext are stable — the imperative input contract.
-pub use tropel_ext::traits::{
-    Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
+pub use traits::{
+    Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, VuContext,
 };
+#[cfg(feature = "registration")]
+pub use traits::DriverRegistration;
 
 // Protocol and Output traits are gated behind feature flags so a consumer
 // that only writes input adapters never pays for (or is confused by) the
@@ -105,22 +130,25 @@ pub use tropel_ext::traits::{
 
 /// Unstable protocol extension trait (requires `unstable-protocol` feature).
 #[cfg(feature = "unstable-protocol")]
-pub use tropel_ext::traits::{Protocol, ProtocolOutcome, ProtocolRegistration};
+pub use traits::{Protocol, ProtocolOutcome, ProtocolRegistration};
 
 /// Unstable output extension trait (requires `unstable-output` feature).
 #[cfg(feature = "unstable-output")]
-pub use tropel_ext::traits::{Output, OutputRegistration};
+pub use traits::{Output, OutputRegistration};
 
 // ═══════════════════════════════════════════════════════════════════
 // Error types
 // ═══════════════════════════════════════════════════════════════════
 
-pub use tropel_core::{parse_duration, Result, TropelError};
+pub use duration::parse_duration;
+pub use error::{Result, TropelError};
 
 // ═══════════════════════════════════════════════════════════════════
 // Re-export inventory so adapter crates don't need their own dep
+// (requires the `registration` feature, on by default)
 // ═══════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "registration")]
 pub use inventory;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -130,16 +158,10 @@ pub use inventory;
 pub use async_trait::async_trait;
 
 // ═══════════════════════════════════════════════════════════════════
-// Registry access for programmatic use (advanced)
-// ═══════════════════════════════════════════════════════════════════
-
-pub use tropel_ext::registry::ExtensionRegistry;
-
-// ═══════════════════════════════════════════════════════════════════
 // Tag map type for metric tags
 // ═══════════════════════════════════════════════════════════════════
 
-pub use tropel_core::types::TagMap;
+pub use types::TagMap;
 
 /// Version string for the SDK — adapter authors can check this at build time
 /// to verify compatibility. Bumped whenever the public API changes.
@@ -189,6 +211,7 @@ mod tests {
     }
 
     /// Verify InputAdapterRegistration is constructible with const fn + fn pointer.
+    #[cfg(feature = "registration")]
     #[test]
     fn test_registration_const_compatible() {
         fn factory() -> Box<dyn InputAdapter> {
@@ -224,6 +247,7 @@ mod tests {
 
     /// Verify the inventory crate re-export is accessible.
     /// inventory::submit! is a compile-time macro — we just check the module resolves.
+    #[cfg(feature = "registration")]
     #[test]
     fn test_inventory_re_export() {
         // Verify the inventory crate path works (submit! is compile-time only).

@@ -5,10 +5,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tropel_core::config::ExpectedStatus;
-use tropel_core::scenario::{Scenario, ScenarioItem};
-use tropel_core::types::{Sample, SampleType, TagMap};
-use tropel_core::Result;
-use tropel_ext::traits::Protocol;
+use tropel_sdk::scenario::{Scenario, ScenarioItem};
+use tropel_sdk::types::{Sample, SampleType, TagMap};
+use tropel_sdk::Result;
+use tropel_sdk::traits::Protocol;
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 use tropel_pm::bridge::{PmState, SharedPmState};
@@ -316,7 +316,7 @@ impl VURunner {
                         .map(|b| resolve_body(b, &resolver, &scope));
 
                     // Build the fully resolved request
-                    let resolved_req = tropel_core::types::Request {
+                    let resolved_req = tropel_sdk::types::Request {
                         url: resolved_url.clone(),
                         method: request.method.clone(),
                         headers: resolved_headers,
@@ -399,7 +399,7 @@ impl VURunner {
                                     ("error", e.to_string()),
                                 ]));
                                 let now = std::time::SystemTime::now();
-                                result.samples.push(tropel_core::types::Sample {
+                                result.samples.push(tropel_sdk::types::Sample {
                                     metric: "errors".into(),
                                     value: 1.0,
                                     tags: err_tags,
@@ -439,7 +439,7 @@ impl VURunner {
                             Ok(http_response) => {
                                 // Convert to core Response and store in PM state (by move — no shared slot)
                                 let pm_response =
-                                    tropel_core::types::Response::from(&http_response);
+                                    tropel_sdk::types::Response::from(&http_response);
                                 {
                                     let mut state = self.pm_state.lock().unwrap();
                                     state.response = Some(pm_response);
@@ -576,14 +576,14 @@ impl VURunner {
                                 // a transport error silently drops the request from
                                 // the summary — the distributed merge undercounts
                                 // http_reqs by exactly the number of failed hops.
-                                result.samples.push(tropel_core::types::Sample {
+                                result.samples.push(tropel_sdk::types::Sample {
                                     metric: "http_reqs".into(),
                                     value: 1.0,
                                     tags: err_tags.clone(),
                                     timestamp: now,
                                     sample_type: SampleType::Counter,
                                 });
-                                result.samples.push(tropel_core::types::Sample {
+                                result.samples.push(tropel_sdk::types::Sample {
                                     metric: "errors".into(),
                                     value: 1.0,
                                     tags: err_tags.clone(),
@@ -591,7 +591,7 @@ impl VURunner {
                                     sample_type: SampleType::Counter,
                                 });
                                 // Connection errors always count as failed requests
-                                result.samples.push(tropel_core::types::Sample {
+                                result.samples.push(tropel_sdk::types::Sample {
                                     metric: "http_req_failed".into(),
                                     value: 1.0,
                                     tags: err_tags,
@@ -682,7 +682,7 @@ impl VURunner {
         if let Some(ctx) = js_ctx {
             ctx.run_script_cached(code, source_url)
                 .await
-                .map_err(|e| tropel_core::TropelError::Other(format!("Script error: {}", e)))?;
+                .map_err(|e| tropel_sdk::TropelError::Other(format!("Script error: {}", e)))?;
         } else {
             tracing::trace!(
                 "Script execution skipped (no JS context): {} chars",
@@ -743,12 +743,12 @@ pub fn flatten_execution_items(items: &[ScenarioItem]) -> Vec<ScenarioItem> {
 
 /// Resolve variables in a request body.
 fn resolve_body(
-    body: &tropel_core::types::Body,
+    body: &tropel_sdk::types::Body,
     resolver: &tropel_variables::VariableResolver,
     scope: &tropel_variables::VariableScope,
-) -> tropel_core::types::Body {
+) -> tropel_sdk::types::Body {
     match body {
-        tropel_core::types::Body::Raw(s) => {
+        tropel_sdk::types::Body::Raw(s) => {
             // A Raw body that looks like JSON must resolve with JSON-string
             // escaping so a data value containing a quote/backslash/newline
             // does not produce a broken document (backlog line 96: the Json
@@ -758,41 +758,41 @@ fn resolve_body(
             let trimmed = s.trim_start();
             let looks_like_json = trimmed.starts_with('{') || trimmed.starts_with('[');
             if looks_like_json {
-                tropel_core::types::Body::Raw(resolver.resolve_json_deep(s, scope, 5))
+                tropel_sdk::types::Body::Raw(resolver.resolve_json_deep(s, scope, 5))
             } else {
-                tropel_core::types::Body::Raw(resolver.resolve_deep(s, scope, 5))
+                tropel_sdk::types::Body::Raw(resolver.resolve_deep(s, scope, 5))
             }
         }
-        tropel_core::types::Body::Json(val) => {
+        tropel_sdk::types::Body::Json(val) => {
             // Resolve variables in JSON values by stringifying and re-parsing
             // with JSON-string escaping, so a substituted value cannot break
             // the document (previously a quote in the data fell back to the
             // UNRESOLVED value — the substitution silently never happened).
             let s = serde_json::to_string(val).unwrap_or_default();
             let resolved = resolver.resolve_json_deep(&s, scope, 5);
-            tropel_core::types::Body::Json(
+            tropel_sdk::types::Body::Json(
                 serde_json::from_str(&resolved).unwrap_or_else(|_| val.clone()),
             )
         }
-        tropel_core::types::Body::FormData(map) => {
+        tropel_sdk::types::Body::FormData(map) => {
             let resolved: HashMap<String, String> = map
                 .iter()
                 .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, scope, 5)))
                 .collect();
-            tropel_core::types::Body::FormData(resolved)
+            tropel_sdk::types::Body::FormData(resolved)
         }
-        tropel_core::types::Body::UrlEncoded(map) => {
+        tropel_sdk::types::Body::UrlEncoded(map) => {
             let resolved: HashMap<String, String> = map
                 .iter()
                 .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, scope, 5)))
                 .collect();
-            tropel_core::types::Body::UrlEncoded(resolved)
+            tropel_sdk::types::Body::UrlEncoded(resolved)
         }
-        tropel_core::types::Body::Binary(data) => {
+        tropel_sdk::types::Body::Binary(data) => {
             // Binary bodies can't have variables — pass through
-            tropel_core::types::Body::Binary(data.clone())
+            tropel_sdk::types::Body::Binary(data.clone())
         }
-        tropel_core::types::Body::GraphQL { query, variables } => {
+        tropel_sdk::types::Body::GraphQL { query, variables } => {
             // GraphQL query text is not JSON — raw substitution; the
             // variables map IS JSON and gets the same quote-safe resolution
             // as the Json arm (backlog line 96).
@@ -802,7 +802,7 @@ fn resolve_body(
                 let resolved = resolver.resolve_json_deep(&s, scope, 5);
                 serde_json::from_str(&resolved).unwrap_or_else(|_| vars.clone())
             });
-            tropel_core::types::Body::GraphQL {
+            tropel_sdk::types::Body::GraphQL {
                 query: resolved_query,
                 variables: resolved_vars,
             }
@@ -813,12 +813,12 @@ fn resolve_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tropel_core::types::{Method, ResponseType};
+    use tropel_sdk::types::{Method, ResponseType};
 
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
             name: name.to_string(),
-            request: Some(tropel_core::types::Request {
+            request: Some(tropel_sdk::types::Request {
                 url: format!("http://example.com/{name}"),
                 method: Method::GET,
                 headers: HashMap::new(),
@@ -887,10 +887,10 @@ mod tests {
             ..Default::default()
         };
 
-        let raw = tropel_core::types::Body::Raw(r#"{"s":"{{name}}"}"#.to_string());
+        let raw = tropel_sdk::types::Body::Raw(r#"{"s":"{{name}}"}"#.to_string());
         let resolved = resolve_body(&raw, &resolver, &scope);
         match resolved {
-            tropel_core::types::Body::Raw(s) => {
+            tropel_sdk::types::Body::Raw(s) => {
                 let parsed: serde_json::Value =
                     serde_json::from_str(&s).expect("resolved raw JSON body must stay valid");
                 assert_eq!(parsed["s"], "he said \"hi\"");
@@ -908,10 +908,10 @@ mod tests {
             env: HashMap::from([("msg".into(), "hi\"there".into())]),
             ..Default::default()
         };
-        let raw = tropel_core::types::Body::Raw("<m>{{msg}}</m>".to_string());
+        let raw = tropel_sdk::types::Body::Raw("<m>{{msg}}</m>".to_string());
         let resolved = resolve_body(&raw, &resolver, &scope);
         match resolved {
-            tropel_core::types::Body::Raw(s) => assert_eq!(s, "<m>hi\"there</m>"),
+            tropel_sdk::types::Body::Raw(s) => assert_eq!(s, "<m>hi\"there</m>"),
             other => panic!("Raw body must stay Raw, got {:?}", other),
         }
     }
@@ -939,7 +939,7 @@ mod tests {
         script_set: HashMap<String, String>,
     ) -> (VURunner, tropel_variables::VariableScope) {
         let scenario = Arc::new(Scenario {
-            info: tropel_core::scenario::ScenarioInfo {
+            info: tropel_sdk::scenario::ScenarioInfo {
                 name: "scope-test".into(),
                 description: None,
                 schema: None,
@@ -1041,7 +1041,7 @@ mod tests {
         // loop, so the run never terminated. The jump guard must abort the
         // iteration with a failed check instead of hanging.
         let scenario = Arc::new(Scenario {
-            info: tropel_core::scenario::ScenarioInfo {
+            info: tropel_sdk::scenario::ScenarioInfo {
                 name: "loop".into(),
                 description: None,
                 schema: None,
@@ -1132,7 +1132,7 @@ mod tests {
         // scope used for {{var}} substitution sees it — no literal `Bearer
         // {{token}}` sent, no 401).
         let scenario = Arc::new(Scenario {
-            info: tropel_core::scenario::ScenarioInfo {
+            info: tropel_sdk::scenario::ScenarioInfo {
                 name: "folder-scripts".into(),
                 description: None,
                 schema: None,

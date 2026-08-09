@@ -29,7 +29,7 @@
 use std::path::Path;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 use tropel_metrics::collector::MetricsResult;
 
 use crate::controller::run_controller;
@@ -339,7 +339,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener as TokioListener;
     use tropel_core::config::{ExecutionConfig, ThinkTimeConfig};
-    use tropel_core::Result;
+    use tropel_sdk::Result;
 
     /// Minimal HTTP/1.1 server answering every request with 200.
     async fn start_http_server() -> std::net::SocketAddr {

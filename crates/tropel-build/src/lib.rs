@@ -35,7 +35,7 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 
 /// Configuration for building a custom Tropel binary.
 pub struct BuildConfig {

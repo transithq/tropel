@@ -20,10 +20,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig, ScenarioConfig};
-use tropel_core::types::Sample;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::types::Sample;
+use tropel_sdk::{Result, TropelError};
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_ext::traits::Protocol;
+use tropel_sdk::traits::Protocol;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::validate_thresholds;
 use tropel_report::{

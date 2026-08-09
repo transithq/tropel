@@ -149,9 +149,9 @@ mod tests {
     use crate::traits::{DriverInstance, ProtocolOutcome};
     use async_trait::async_trait;
     use serde_json::Value;
-    use tropel_core::scenario::Scenario;
-    use tropel_core::types::{Request, Sample};
-    use tropel_core::{Result, TropelError};
+    use crate::scenario::Scenario;
+    use crate::types::{Request, Sample};
+    use crate::{Result, TropelError};
 
     // ── Stub impls for registration tests ──
     struct StubAdapter;

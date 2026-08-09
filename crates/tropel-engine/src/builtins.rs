@@ -15,7 +15,7 @@
 //! `register_builtins()` is invoked from the CLI at startup, before the
 //! `ExtensionRegistry` performs its `collect_inventory()` pass.
 
-use tropel_ext::traits::{Driver, InputAdapter, Protocol};
+use tropel_sdk::traits::{Driver, InputAdapter, Protocol};
 
 /// Force-link every built-in input adapter and driver by constructing it.
 /// Returns the total number of built-ins so the call is observable.

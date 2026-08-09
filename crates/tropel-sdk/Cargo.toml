@@ -26,18 +26,25 @@ depending on internal crate details.
 # the URL-scheme registry, Output from the sample stream); the flag just
 # controls whether the SDK re-exports them. Breaking changes to these
 # traits only require a minor version bump (pre-1.0) or a patch (post-1.0).
+#
+# `registration` (on by default) enables the `*Registration` structs and
+# the `inventory` dependency. A consumer that only writes adapters against
+# the traits can set default-features = false and drop inventory entirely.
 [features]
-default = []
+default = ["registration"]
+registration = ["dep:inventory"]
 unstable-protocol = []
 unstable-output = []
 
 [dependencies]
-tropel-core.workspace = true
-tropel-ext.workspace = true
-inventory.workspace = true
+# This crate is a LEAF: it must not depend on any tropel-* crate.
+# The contract types/traits live here directly (see src/).
+inventory = { workspace = true, optional = true }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+simd-json.workspace = true
+rustc-hash.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

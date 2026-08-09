@@ -83,12 +83,12 @@ const MAX_FRAME: usize = 512 * 1024 * 1024;
 pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: Serialize>(
     stream: &mut W,
     msg: &T,
-) -> tropel_core::Result<()> {
+) -> tropel_sdk::Result<()> {
     let data = serde_json::to_vec(msg).map_err(|e| {
-        tropel_core::TropelError::Parse(format!("distributed protocol serialize: {e}"))
+        tropel_sdk::TropelError::Parse(format!("distributed protocol serialize: {e}"))
     })?;
     if data.len() > MAX_FRAME {
-        return Err(tropel_core::TropelError::Parse(format!(
+        return Err(tropel_sdk::TropelError::Parse(format!(
             "distributed protocol frame too large: {} bytes",
             data.len()
         )));
@@ -109,13 +109,13 @@ pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: Serialize>(
 /// allocation. The frame cap still bounds the final allocation.
 pub async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     stream: &mut R,
-) -> tropel_core::Result<T> {
+) -> tropel_sdk::Result<T> {
     use tokio::io::AsyncReadExt;
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME {
-        return Err(tropel_core::TropelError::Parse(format!(
+        return Err(tropel_sdk::TropelError::Parse(format!(
             "distributed protocol frame too large: {len} bytes"
         )));
     }
@@ -129,7 +129,7 @@ pub async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::Deseriali
         remaining -= take;
     }
     serde_json::from_slice(&data).map_err(|e| {
-        tropel_core::TropelError::Parse(format!("distributed protocol deserialize: {e}"))
+        tropel_sdk::TropelError::Parse(format!("distributed protocol deserialize: {e}"))
     })
 }
 

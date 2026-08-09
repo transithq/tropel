@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 use std::sync::Mutex;
-use tropel_core::types::{Request, Response, Sample, TagMap};
+use tropel_sdk::types::{Request, Response, Sample, TagMap};
 
 /// The mutable state for a single VU's pm.* API.
 /// Shared between the JS context and the native executor.
@@ -143,7 +143,7 @@ impl PmState {
             value: if passed { 1.0 } else { 0.0 },
             tags: Arc::new(tags),
             timestamp: tropel_core::clock::monotonic_wall_now(),
-            sample_type: tropel_core::types::SampleType::Rate,
+            sample_type: tropel_sdk::types::SampleType::Rate,
         });
     }
 
@@ -205,7 +205,7 @@ mod tests {
         let s = &st.samples[0];
         assert_eq!(s.metric, "checks");
         assert_eq!(s.value, 1.0);
-        assert_eq!(s.sample_type, tropel_core::types::SampleType::Rate);
+        assert_eq!(s.sample_type, tropel_sdk::types::SampleType::Rate);
         assert_eq!(s.tags.get("check"), Some("status is 200"));
         let s = &st.samples[1];
         assert_eq!(s.value, 0.0);

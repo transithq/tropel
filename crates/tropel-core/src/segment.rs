@@ -19,7 +19,7 @@
 //! `executionSegmentSequence` so the sequence validation enforces it.
 
 use crate::config::{ArrivalRateStage, ExecutionConfig, Stage};
-use crate::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 
 /// A deterministic workload partition: `[from, to)` of the unit interval.
 #[derive(Debug, Clone, Copy, PartialEq)]

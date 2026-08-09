@@ -3,9 +3,9 @@ use rquickjs::function::Func;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tropel_core::error::TropelError;
-use tropel_core::types::{AuthConfig, Body, Method, Request};
-use tropel_core::Result;
+use tropel_sdk::error::TropelError;
+use tropel_sdk::types::{AuthConfig, Body, Method, Request};
+use tropel_sdk::Result;
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 
@@ -928,17 +928,17 @@ impl PmBridge {
                     // Emit group_duration sample (Trend) in ms — the public
                     // unit end-to-end (backlog §0). The JS side already
                     // measures in ms, so no µs conversion here.
-                    let mut tags = tropel_core::types::TagMap::new();
+                    let mut tags = tropel_sdk::types::TagMap::new();
                     tags.insert("group", name.clone());
                     if let Some(ref path) = st.current_group {
                         tags.insert("group_path", path.clone());
                     }
-                    st.samples.push(tropel_core::types::Sample {
+                    st.samples.push(tropel_sdk::types::Sample {
                         metric: "group_duration".into(),
                         value: duration_ms,
                         tags: Arc::new(tags),
                         timestamp: tropel_core::clock::monotonic_wall_now(),
-                        sample_type: tropel_core::types::SampleType::Trend,
+                        sample_type: tropel_sdk::types::SampleType::Trend,
                     });
                 }),
             );
@@ -954,15 +954,15 @@ impl PmBridge {
                     st.custom_metrics.insert(name.clone(), value);
                     // Emit a metric sample with the appropriate type
                     let sample_type = match metric_type_str.as_str() {
-                        "counter" => tropel_core::types::SampleType::Counter,
-                        "gauge" => tropel_core::types::SampleType::Point,
-                        "rate" => tropel_core::types::SampleType::Rate,
-                        _ => tropel_core::types::SampleType::Trend,
+                        "counter" => tropel_sdk::types::SampleType::Counter,
+                        "gauge" => tropel_sdk::types::SampleType::Point,
+                        "rate" => tropel_sdk::types::SampleType::Rate,
+                        _ => tropel_sdk::types::SampleType::Trend,
                     };
-                    st.samples.push(tropel_core::types::Sample {
+                    st.samples.push(tropel_sdk::types::Sample {
                         metric: name.into(),
                         value,
-                        tags: Arc::new(tropel_core::types::TagMap::new()),
+                        tags: Arc::new(tropel_sdk::types::TagMap::new()),
                         timestamp: tropel_core::clock::monotonic_wall_now(),
                         sample_type,
                     });
@@ -989,11 +989,11 @@ impl PmBridge {
                         let mut st = state_clone.lock().unwrap();
                         // Parse tags from JSON string
                         let tags = if tags_json.is_empty() || tags_json == "{}" {
-                            tropel_core::types::TagMap::new()
+                            tropel_sdk::types::TagMap::new()
                         } else {
                             let parsed: std::collections::HashMap<String, String> =
                                 serde_json::from_str(&tags_json).unwrap_or_default();
-                            tropel_core::types::TagMap::from_pairs(parsed)
+                            tropel_sdk::types::TagMap::from_pairs(parsed)
                         };
 
                         // Track the current value per metric+tags combo
@@ -1001,13 +1001,13 @@ impl PmBridge {
 
                         // Determine sample type from type string
                         let sample_type = match metric_type_str.as_str() {
-                            "counter" => tropel_core::types::SampleType::Counter,
-                            "gauge" => tropel_core::types::SampleType::Point,
-                            "rate" => tropel_core::types::SampleType::Rate,
-                            _ => tropel_core::types::SampleType::Trend,
+                            "counter" => tropel_sdk::types::SampleType::Counter,
+                            "gauge" => tropel_sdk::types::SampleType::Point,
+                            "rate" => tropel_sdk::types::SampleType::Rate,
+                            _ => tropel_sdk::types::SampleType::Trend,
                         };
 
-                        st.samples.push(tropel_core::types::Sample {
+                        st.samples.push(tropel_sdk::types::Sample {
                             metric: name.into(),
                             value,
                             tags: Arc::new(tags),
@@ -1179,7 +1179,7 @@ impl PmBridge {
                             certificate: None,
                             follow_redirects: true,
                             timeout,
-                            response_type: tropel_core::types::ResponseType::from_k6(
+                            response_type: tropel_sdk::types::ResponseType::from_k6(
                                 &response_type,
                             ),
                         };

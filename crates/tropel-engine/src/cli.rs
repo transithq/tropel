@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tropel_core::config::*;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 use tropel_metrics::thresholds::evaluate_thresholds;
 
 use crate::cli_commands::{

@@ -2,7 +2,7 @@ use crate::NativeModule;
 use md5::Md5;
 use rquickjs::function::Func;
 use sha2::Digest;
-use tropel_core::Result;
+use tropel_sdk::Result;
 use tropel_js::JsContext;
 
 pub struct CryptoModule;
@@ -262,7 +262,7 @@ pub fn keccak(data: &[u8], output_bits: u32) -> Result<Vec<u8>> {
         384 => sha3::Keccak384::digest(data).to_vec(),
         512 => sha3::Keccak512::digest(data).to_vec(),
         n => {
-            return Err(tropel_core::TropelError::Crypto(format!(
+            return Err(tropel_sdk::TropelError::Crypto(format!(
                 "Keccak output length must be 224, 256, 384, or 512 bits (got {})",
                 n
             )))
@@ -410,9 +410,9 @@ pub fn aes_gcm_encrypt(key: &[u8], nonce: &[u8], plaintext: &[u8]) -> Result<Vec
     use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
 
     let nonce_arr = Nonce::try_from(nonce)
-        .map_err(|_| tropel_core::TropelError::Crypto("AES-GCM nonce must be 12 bytes".into()))?;
+        .map_err(|_| tropel_sdk::TropelError::Crypto("AES-GCM nonce must be 12 bytes".into()))?;
     let err_key = |n: usize| {
-        tropel_core::TropelError::Crypto(format!(
+        tropel_sdk::TropelError::Crypto(format!(
             "AES-GCM key must be 16, 24, or 32 bytes (got {})",
             n
         ))
@@ -423,7 +423,7 @@ pub fn aes_gcm_encrypt(key: &[u8], nonce: &[u8], plaintext: &[u8]) -> Result<Vec
                 &aes_gcm::Key::<Aes128Gcm>::try_from(key).map_err(|_| err_key(key.len()))?,
             );
             cipher.encrypt(&nonce_arr, plaintext).map_err(|e| {
-                tropel_core::TropelError::Crypto(format!("AES-GCM encrypt failed: {}", e))
+                tropel_sdk::TropelError::Crypto(format!("AES-GCM encrypt failed: {}", e))
             })
         }
         24 => {
@@ -431,7 +431,7 @@ pub fn aes_gcm_encrypt(key: &[u8], nonce: &[u8], plaintext: &[u8]) -> Result<Vec
                 &aes_gcm::Key::<Aes192Gcm>::try_from(key).map_err(|_| err_key(key.len()))?,
             );
             cipher.encrypt(&nonce_arr, plaintext).map_err(|e| {
-                tropel_core::TropelError::Crypto(format!("AES-GCM encrypt failed: {}", e))
+                tropel_sdk::TropelError::Crypto(format!("AES-GCM encrypt failed: {}", e))
             })
         }
         32 => {
@@ -439,7 +439,7 @@ pub fn aes_gcm_encrypt(key: &[u8], nonce: &[u8], plaintext: &[u8]) -> Result<Vec
                 &aes_gcm::Key::<Aes256Gcm>::try_from(key).map_err(|_| err_key(key.len()))?,
             );
             cipher.encrypt(&nonce_arr, plaintext).map_err(|e| {
-                tropel_core::TropelError::Crypto(format!("AES-GCM encrypt failed: {}", e))
+                tropel_sdk::TropelError::Crypto(format!("AES-GCM encrypt failed: {}", e))
             })
         }
         n => Err(err_key(n)),
@@ -453,14 +453,14 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Ve
     use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
 
     if ciphertext.len() < 16 {
-        return Err(tropel_core::TropelError::Crypto(
+        return Err(tropel_sdk::TropelError::Crypto(
             "AES-GCM ciphertext too short (must include 16-byte tag)".into(),
         ));
     }
     let nonce_arr = Nonce::try_from(nonce)
-        .map_err(|_| tropel_core::TropelError::Crypto("AES-GCM nonce must be 12 bytes".into()))?;
+        .map_err(|_| tropel_sdk::TropelError::Crypto("AES-GCM nonce must be 12 bytes".into()))?;
     let err_key = |n: usize| {
-        tropel_core::TropelError::Crypto(format!(
+        tropel_sdk::TropelError::Crypto(format!(
             "AES-GCM key must be 16, 24, or 32 bytes (got {})",
             n
         ))
@@ -471,7 +471,7 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Ve
                 &aes_gcm::Key::<Aes128Gcm>::try_from(key).map_err(|_| err_key(key.len()))?,
             );
             cipher.decrypt(&nonce_arr, ciphertext).map_err(|e| {
-                tropel_core::TropelError::Crypto(format!("AES-GCM decrypt failed: {}", e))
+                tropel_sdk::TropelError::Crypto(format!("AES-GCM decrypt failed: {}", e))
             })
         }
         24 => {
@@ -479,7 +479,7 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Ve
                 &aes_gcm::Key::<Aes192Gcm>::try_from(key).map_err(|_| err_key(key.len()))?,
             );
             cipher.decrypt(&nonce_arr, ciphertext).map_err(|e| {
-                tropel_core::TropelError::Crypto(format!("AES-GCM decrypt failed: {}", e))
+                tropel_sdk::TropelError::Crypto(format!("AES-GCM decrypt failed: {}", e))
             })
         }
         32 => {
@@ -487,7 +487,7 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Ve
                 &aes_gcm::Key::<Aes256Gcm>::try_from(key).map_err(|_| err_key(key.len()))?,
             );
             cipher.decrypt(&nonce_arr, ciphertext).map_err(|e| {
-                tropel_core::TropelError::Crypto(format!("AES-GCM decrypt failed: {}", e))
+                tropel_sdk::TropelError::Crypto(format!("AES-GCM decrypt failed: {}", e))
             })
         }
         n => Err(err_key(n)),
@@ -500,17 +500,17 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8
     use cbc::cipher::{Array, BlockModeEncrypt, KeyIvInit as _};
 
     if iv.len() != 16 {
-        return Err(tropel_core::TropelError::Crypto(
+        return Err(tropel_sdk::TropelError::Crypto(
             "AES-CBC iv must be 16 bytes".into(),
         ));
     }
     let iv_arr = Array::<u8, aes::cipher::consts::U16>::try_from(iv)
-        .map_err(|_| tropel_core::TropelError::Crypto("AES-CBC iv must be 16 bytes".into()))?;
+        .map_err(|_| tropel_sdk::TropelError::Crypto("AES-CBC iv must be 16 bytes".into()))?;
 
     let mut buf = vec![0u8; plaintext.len() + 16];
     buf[..plaintext.len()].copy_from_slice(plaintext);
     let err_key = |n: usize| {
-        tropel_core::TropelError::Crypto(format!(
+        tropel_sdk::TropelError::Crypto(format!(
             "AES-CBC key must be 16, 24, or 32 bytes (got {})",
             n
         ))
@@ -538,7 +538,7 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8
     };
     encrypted
         .map(|out| out.to_vec())
-        .map_err(|e| tropel_core::TropelError::Crypto(format!("AES-CBC encrypt failed: {}", e)))
+        .map_err(|e| tropel_sdk::TropelError::Crypto(format!("AES-CBC encrypt failed: {}", e)))
 }
 
 /// AES-CBC decrypt with PKCS7 padding, key-size dispatch (16/24/32 bytes).
@@ -547,20 +547,20 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u
     use cbc::cipher::{Array, BlockModeDecrypt, KeyIvInit as _};
 
     if iv.len() != 16 {
-        return Err(tropel_core::TropelError::Crypto(
+        return Err(tropel_sdk::TropelError::Crypto(
             "AES-CBC iv must be 16 bytes".into(),
         ));
     }
     if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
-        return Err(tropel_core::TropelError::Crypto(
+        return Err(tropel_sdk::TropelError::Crypto(
             "AES-CBC ciphertext must be non-empty and block-aligned (16 bytes)".into(),
         ));
     }
     let iv_arr = Array::<u8, aes::cipher::consts::U16>::try_from(iv)
-        .map_err(|_| tropel_core::TropelError::Crypto("AES-CBC iv must be 16 bytes".into()))?;
+        .map_err(|_| tropel_sdk::TropelError::Crypto("AES-CBC iv must be 16 bytes".into()))?;
     let mut buf = ciphertext.to_vec();
     let err_key = |n: usize| {
-        tropel_core::TropelError::Crypto(format!(
+        tropel_sdk::TropelError::Crypto(format!(
             "AES-CBC key must be 16, 24, or 32 bytes (got {})",
             n
         ))
@@ -585,7 +585,7 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u
     };
     decrypted
         .map(|out| out.to_vec())
-        .map_err(|e| tropel_core::TropelError::Crypto(format!("AES-CBC decrypt failed: {}", e)))
+        .map_err(|e| tropel_sdk::TropelError::Crypto(format!("AES-CBC decrypt failed: {}", e)))
 }
 
 #[cfg(test)]

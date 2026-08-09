@@ -70,10 +70,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_core::types::{AuthConfig, Body, Method, Request};
-use tropel_core::{Result, TropelError};
-use tropel_ext::traits::InputAdapter;
+use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
+use tropel_sdk::types::{AuthConfig, Body, Method, Request};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::traits::InputAdapter;
 use wasmtime::{
     Config, Engine, ExternType, Instance, InstanceAllocationStrategy, InstancePre, Linker, Memory,
     MemoryType, Module, PoolingAllocationConfig, Store,
@@ -1055,7 +1055,7 @@ fn convert_request(wr: &WasmRequest) -> Result<Request> {
         certificate: None,
         follow_redirects: wr.follow_redirects,
         timeout: wr.timeout_ms.map(std::time::Duration::from_millis),
-        response_type: tropel_core::types::ResponseType::Text,
+        response_type: tropel_sdk::types::ResponseType::Text,
     })
 }
 
@@ -1076,7 +1076,7 @@ fn convert_auth(wa: &WasmAuth) -> Option<AuthConfig> {
             Some(AuthConfig::ApiKey {
                 key: parts.first().unwrap_or(&"").to_string(),
                 value: parts.get(1).unwrap_or(&"").to_string(),
-                location: tropel_core::types::ApiKeyLocation::Header,
+                location: tropel_sdk::types::ApiKeyLocation::Header,
             })
         }
         _ => None,

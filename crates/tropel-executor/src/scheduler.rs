@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tropel_core::config::ExecutionConfig;
-use tropel_core::Result;
+use tropel_sdk::Result;
 
 /// Hard bound on the trailing VU-handle join. After `grace` expires the
 /// scheduler force-stops; if a VU still ignores that (e.g. a runaway JS
@@ -1551,7 +1551,7 @@ fn graceful_stop_duration(s: &Option<String>) -> Duration {
 }
 
 fn parse_duration(s: &str) -> Result<Duration> {
-    tropel_core::parse_duration(s)
+    tropel_sdk::parse_duration(s)
 }
 
 #[cfg(test)]

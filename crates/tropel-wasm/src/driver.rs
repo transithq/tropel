@@ -76,9 +76,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tropel_core::types::{Body, Method, Request, Sample, SampleType, TagMap};
-use tropel_core::{Result, TropelError};
-use tropel_ext::traits::{Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
+use tropel_sdk::types::{Body, Method, Request, Sample, SampleType, TagMap};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::traits::{Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
 use wasmtime::{Caller, Extern, Linker, Memory, Module, Store, TypedFunc};
 
 // ══════════════════════════════════════════════════════════════════
@@ -647,7 +647,7 @@ impl WasmHttpRequest {
                     Some(Duration::from_millis(ms as u64))
                 }
             }),
-            response_type: tropel_core::types::ResponseType::Text,
+            response_type: tropel_sdk::types::ResponseType::Text,
         })
     }
 }
@@ -1001,7 +1001,7 @@ inventory::submit!(DriverRegistration::new("wasm", || Box::new(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use tropel_core::types::Response;
+    use tropel_sdk::types::Response;
 
     const DRIVER_WAT: &str = r#"
 (module
@@ -1473,7 +1473,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             driver_ok.sample_type,
-            tropel_core::types::SampleType::Counter
+            tropel_sdk::types::SampleType::Counter
         );
     }
 

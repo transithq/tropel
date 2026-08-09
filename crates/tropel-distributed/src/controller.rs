@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
 use tropel_core::segment::ExecutionSegment;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 use tropel_metrics::collector::{merge_snapshots, MetricsResult, MetricsSnapshot};
 
 /// Base timeout for a single agent to connect+run and ship its snapshot.
@@ -223,7 +223,7 @@ fn agent_timeout(config: &JobConfig) -> Duration {
 /// Parse a k6-style duration string; invalid values degrade to zero rather
 /// than panicking the controller.
 fn parse_duration(s: &str) -> Duration {
-    tropel_core::parse_duration(s).unwrap_or(Duration::ZERO)
+    tropel_sdk::parse_duration(s).unwrap_or(Duration::ZERO)
 }
 
 #[cfg(test)]
@@ -233,7 +233,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener as TokioListener;
     use tropel_core::config::{ExecutionConfig, ThinkTimeConfig};
-    use tropel_core::Result;
+    use tropel_sdk::Result;
 
     /// Start a minimal HTTP/1.1 server that answers every request with 200.
     async fn start_http_server() -> std::net::SocketAddr {

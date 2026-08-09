@@ -4,10 +4,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tropel_core::scenario::Scenario;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::scenario::Scenario;
+use tropel_sdk::{Result, TropelError};
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_ext::traits::{Driver, InputAdapter};
+use tropel_sdk::traits::{Driver, InputAdapter};
 
 pub(crate) enum ResolvedInput {
     Scenario(Arc<Scenario>),

@@ -19,9 +19,8 @@ alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
-tropel-core.workspace = true
+tropel-sdk.workspace = true
 tropel-engine.workspace = true
-tropel-ext.workspace = true
 tropel-metrics.workspace = true
 # Reference extension: links its inventory-registered outputs (e.g.
 # "prometheus") into the binary so ExtensionRegistry can find them.

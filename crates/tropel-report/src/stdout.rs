@@ -1,6 +1,6 @@
 use crate::Reporter;
 use async_trait::async_trait;
-use tropel_core::Result;
+use tropel_sdk::Result;
 use tropel_metrics::collector::{trend_stat_value, MetricSummary, MetricsResult};
 use tropel_metrics::thresholds::evaluate_thresholds;
 

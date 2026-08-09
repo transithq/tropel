@@ -2,7 +2,7 @@ use crate::Reporter;
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
-use tropel_core::Result;
+use tropel_sdk::Result;
 use tropel_metrics::collector::MetricsResult;
 
 /// Writes metrics to a JSON file.
@@ -53,7 +53,7 @@ impl JsonReporter {
         });
 
         serde_json::to_string_pretty(&output).map_err(|e| {
-            tropel_core::TropelError::Report(format!("JSON serialization error: {}", e))
+            tropel_sdk::TropelError::Report(format!("JSON serialization error: {}", e))
         })
     }
 }
@@ -70,7 +70,7 @@ impl Reporter for JsonReporter {
         if let Some(path) = &self.output_path {
             tokio::fs::write(path, &json_str)
                 .await
-                .map_err(tropel_core::TropelError::Io)?;
+                .map_err(tropel_sdk::TropelError::Io)?;
         } else {
             // Print to stdout
             println!("{}", json_str);

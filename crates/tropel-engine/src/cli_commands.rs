@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tropel_core::scenario::{Scenario, ScenarioItem};
-use tropel_core::{Result, TropelError};
-use tropel_ext::traits::{Driver, InputAdapter};
+use tropel_sdk::scenario::{Scenario, ScenarioItem};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::traits::{Driver, InputAdapter};
 
 use crate::cli_registry::build_registry;
 

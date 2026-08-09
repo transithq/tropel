@@ -12,10 +12,10 @@
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
-use tropel_sdk::{
-    ArrivalRateStage, DriverDeclaredOptions, ExecutionConfig, ScenarioConfig, Stage,
-    ThinkTimeConfig, ThresholdConfig,
+use tropel_sdk::config::{
+    ArrivalRateStage, ExecutionConfig, ScenarioConfig, Stage, ThinkTimeConfig, ThresholdConfig,
 };
+use tropel_sdk::DriverDeclaredOptions;
 
 /// k6 `export const options = { … }` — top level.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -614,7 +614,7 @@ mod tests {
         let scenarios = decl.scenarios.expect("scenarios present");
         let sc = scenarios.get("s").expect("scenario s");
         match &sc.execution {
-            tropel_sdk::ExecutionConfig::RampingVus {
+            tropel_sdk::config::ExecutionConfig::RampingVus {
                 start_vus, stages, ..
             } => {
                 assert_eq!(

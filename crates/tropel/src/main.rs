@@ -29,7 +29,7 @@ fn outer_worker_threads() -> usize {
         .clamp(1, 128)
 }
 
-fn main() -> tropel_core::Result<()> {
+fn main() -> tropel_sdk::Result<()> {
     let workers = outer_worker_threads();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)

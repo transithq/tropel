@@ -6,7 +6,7 @@
 
 use clap::Parser;
 use std::path::PathBuf;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 use tropel_distributed::resolve_token;
 
 #[derive(Parser)]

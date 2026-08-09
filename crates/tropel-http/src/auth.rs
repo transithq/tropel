@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tropel_core::types::{ApiKeyLocation, AuthConfig};
-use tropel_core::Result;
-use tropel_core::TropelError;
+use tropel_sdk::types::{ApiKeyLocation, AuthConfig};
+use tropel_sdk::Result;
+use tropel_sdk::TropelError;
 
 /// RFC 3986 unreserved characters: `A-Z a-z 0-9 - . _ ~` stay unencoded.
 const UNRESERVED: AsciiSet = NON_ALPHANUMERIC
@@ -1876,7 +1876,7 @@ mod tests {
 
     #[test]
     fn build_auth_signer_covers_all_variants() {
-        use tropel_core::types::AuthConfig;
+        use tropel_sdk::types::AuthConfig;
         let cases = vec![
             (AuthConfig::Bearer { token: "t".into() }, "bearer"),
             (

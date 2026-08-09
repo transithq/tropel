@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tropel_core::Result;
+use tropel_sdk::Result;
 use tropel_executor::scheduler::VUScheduler;
 
 /// Handle the control server task. Runs until the listener errors or the
@@ -33,7 +33,7 @@ pub async fn serve_control_api(port: u16, scheduler: Arc<VUScheduler>) -> Result
         Ok(l) => l,
         Err(e) => {
             tracing::error!("control API: failed to bind {}: {}", addr, e);
-            return Err(tropel_core::TropelError::Config(format!(
+            return Err(tropel_sdk::TropelError::Config(format!(
                 "control API: failed to bind {}: {}",
                 addr, e
             )));

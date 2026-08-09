@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tropel_core::config::{
     ExecutionConfig, JobConfig, OutputConfig, ThinkTimeConfig, ThresholdConfig,
 };
-use tropel_core::Result;
+use tropel_sdk::Result;
 use tropel_engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_metrics::thresholds::evaluate_thresholds;

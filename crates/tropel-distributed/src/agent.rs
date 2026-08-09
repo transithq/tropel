@@ -2,7 +2,7 @@
 
 use crate::protocol::{read_frame, token_matches, write_frame, AssignMsg, HelloMsg, SnapshotMsg};
 use tokio::net::TcpStream;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 use tropel_engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
 

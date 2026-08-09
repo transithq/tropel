@@ -16,7 +16,7 @@
 use std::sync::{mpsc::sync_channel, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 
 /// How long the caller spins (polling the rendezvous channel with `try_recv`,
 /// a lock-free check with no syscall) before parking on `recv`.
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn execute_blocking_propagates_error() {
-        let result: tropel_core::Result<i32> =
+        let result: tropel_sdk::Result<i32> =
             execute_blocking(async { Err::<i32, _>(TropelError::Http("boom".into())) });
         let err = result.unwrap_err();
         assert_eq!(format!("{}", err), "HTTP error: boom");

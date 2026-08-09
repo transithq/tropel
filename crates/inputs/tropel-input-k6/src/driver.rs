@@ -5944,7 +5944,7 @@ mod tests {
         assert!(decl.execution.is_some());
         assert!(decl.scenarios.is_none());
         match decl.execution.unwrap() {
-            tropel_sdk::ExecutionConfig::SharedIterations {
+            tropel_sdk::config::ExecutionConfig::SharedIterations {
                 iterations, vus, ..
             } => {
                 assert_eq!(iterations, 10);

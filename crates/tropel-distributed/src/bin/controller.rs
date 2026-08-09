@@ -8,7 +8,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
-use tropel_core::{Result, TropelError};
+use tropel_sdk::{Result, TropelError};
 use tropel_distributed::{generate_token, has_token_source, resolve_token};
 
 #[derive(Parser)]

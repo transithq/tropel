@@ -367,9 +367,9 @@ mod tests {
 
         let cfg = tropel_core::config::HttpConfig::default();
         let client = super::super::client::HttpClient::new(&cfg).unwrap();
-        let req = tropel_core::types::Request {
+        let req = tropel_sdk::types::Request {
             url: format!("http://{}/", addr),
-            method: tropel_core::types::Method::GET,
+            method: tropel_sdk::types::Method::GET,
             ..Default::default()
         };
 
@@ -453,9 +453,9 @@ mod tests {
             ..Default::default()
         };
         let client = super::super::client::HttpClient::new(&cfg).unwrap();
-        let req = tropel_core::types::Request {
+        let req = tropel_sdk::types::Request {
             url: format!("http://{}/", addr),
-            method: tropel_core::types::Method::GET,
+            method: tropel_sdk::types::Method::GET,
             ..Default::default()
         };
 

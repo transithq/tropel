@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
-use tropel_core::types::{Sample, SampleType};
-use tropel_core::{Result, TropelError};
+use tropel_sdk::types::{Sample, SampleType};
+use tropel_sdk::{Result, TropelError};
 
 /// Information about the type of a metric — stored alongside MetricSet so the
 /// aggregator can report type-appropriate summary statistics.
@@ -64,7 +64,7 @@ impl MetricKey {
     /// Build a key from a metric name and tag map.
     /// Tags are sorted for deterministic hash/eq.
     /// Uses `to_sorted_arc_vec()` which clones Arc references (ref-count bump, no string copy).
-    pub fn new(metric: &str, tags: &tropel_core::types::TagMap) -> Self {
+    pub fn new(metric: &str, tags: &tropel_sdk::types::TagMap) -> Self {
         let tags = tags.to_sorted_arc_vec();
         Self {
             metric: Arc::from(metric),
@@ -1157,7 +1157,7 @@ impl Aggregator {
     /// indistinguishable from a clean run.
     fn absorb_snapshot(&mut self, snap: &MetricsSnapshot) -> Result<()> {
         for s in &snap.series {
-            let mut tags = tropel_core::types::TagMap::new();
+            let mut tags = tropel_sdk::types::TagMap::new();
             for (k, v) in &s.tags {
                 tags.insert(k.clone(), v.clone());
             }
@@ -1648,11 +1648,11 @@ mod tests {
 
     #[test]
     fn test_metric_key_equality() {
-        let mut tags1 = tropel_core::types::TagMap::new();
+        let mut tags1 = tropel_sdk::types::TagMap::new();
         tags1.insert("status", "200");
         tags1.insert("method", "GET");
 
-        let mut tags2 = tropel_core::types::TagMap::new();
+        let mut tags2 = tropel_sdk::types::TagMap::new();
         tags2.insert("method", "GET");
         tags2.insert("status", "200");
 
@@ -1668,7 +1668,7 @@ mod tests {
 
     #[test]
     fn test_metric_key_different_metric() {
-        let tags = tropel_core::types::TagMap::new();
+        let tags = tropel_sdk::types::TagMap::new();
         let key1 = MetricKey::new("http_reqs", &tags);
         let key2 = MetricKey::new("errors", &tags);
         assert_ne!(key1, key2);
@@ -1676,10 +1676,10 @@ mod tests {
 
     #[test]
     fn test_metric_key_different_tags() {
-        let mut tags1 = tropel_core::types::TagMap::new();
+        let mut tags1 = tropel_sdk::types::TagMap::new();
         tags1.insert("status", "200");
 
-        let mut tags2 = tropel_core::types::TagMap::new();
+        let mut tags2 = tropel_sdk::types::TagMap::new();
         tags2.insert("status", "404");
 
         let key1 = MetricKey::new("http_req_duration", &tags1);
@@ -1689,7 +1689,7 @@ mod tests {
 
     #[test]
     fn test_metric_key_to_string() {
-        let mut tags = tropel_core::types::TagMap::new();
+        let mut tags = tropel_sdk::types::TagMap::new();
         tags.insert("status", "200");
         let key = MetricKey::new("http_req_duration", &tags);
         let s = key.to_key_string();
@@ -1862,7 +1862,7 @@ mod tests {
         // Headline accumulators must match the metric name EXACTLY.
         let mut agg = Aggregator::new();
         let ts = std::time::SystemTime::now();
-        let tags = Arc::new(tropel_core::types::TagMap::new());
+        let tags = Arc::new(tropel_sdk::types::TagMap::new());
 
         // Real checks Rate: 1 pass + 1 fail → total 2, passed 1.
         agg.record(Sample {
@@ -1914,7 +1914,7 @@ mod tests {
                    value: f64,
                    st: SampleType,
                    tags: Vec<(&str, &str)>| {
-            let mut t = tropel_core::types::TagMap::new();
+            let mut t = tropel_sdk::types::TagMap::new();
             for (k, v) in tags {
                 t.insert(k, v);
             }
@@ -2110,7 +2110,7 @@ mod tests {
         // headline (prefix matching used to capture it).
         let mut agg = Aggregator::new();
         let ts = std::time::SystemTime::now();
-        let tags = Arc::new(tropel_core::types::TagMap::new());
+        let tags = Arc::new(tropel_sdk::types::TagMap::new());
 
         // Real emission: one http_reqs Counter sample (value 1.0) per request.
         for _ in 0..3 {
@@ -2146,7 +2146,7 @@ mod tests {
         // PASS) with the correct value sitting in `sum`.
         let mut agg = Aggregator::new();
         let ts = std::time::SystemTime::now();
-        let tags = Arc::new(tropel_core::types::TagMap::new());
+        let tags = Arc::new(tropel_sdk::types::TagMap::new());
 
         // Custom counter: 5 adds of value 5.0 each.
         for _ in 0..5 {
@@ -2181,7 +2181,7 @@ mod tests {
         // the first series was empty). Both must be the accumulated value.
         let mut agg = Aggregator::new();
         let ts = std::time::SystemTime::now();
-        let tags = Arc::new(tropel_core::types::TagMap::new());
+        let tags = Arc::new(tropel_sdk::types::TagMap::new());
 
         // A counter that adds value 2.0 per event (not 1.0): sample count 3
         // but accumulated value 6 — the headline must be 6, matching the
@@ -2211,7 +2211,7 @@ mod tests {
             fresh.record(Sample {
                 metric: "http_reqs".into(),
                 value: 2.0,
-                tags: Arc::new(tropel_core::types::TagMap::new()),
+                tags: Arc::new(tropel_sdk::types::TagMap::new()),
                 timestamp: ts2,
                 sample_type: SampleType::Counter,
             });
@@ -2227,7 +2227,7 @@ mod tests {
         // its cap must report what was actually observed.
         let mut agg = Aggregator::new();
         let ts = std::time::SystemTime::now();
-        let tags = Arc::new(tropel_core::types::TagMap::new());
+        let tags = Arc::new(tropel_sdk::types::TagMap::new());
 
         // Observed active VUs over time: peak 5.
         for v in [2.0, 5.0, 3.0] {
@@ -2447,7 +2447,7 @@ mod tests {
         // change must not break the happy path (2 histograms -> exact total).
         let mut agg = Aggregator::new();
         let ts = std::time::SystemTime::now();
-        let tags = Arc::new(tropel_core::types::TagMap::new());
+        let tags = Arc::new(tropel_sdk::types::TagMap::new());
         for ms in [1u64, 2, 3] {
             agg.record(Sample {
                 metric: "http_req_duration".into(),
@@ -2464,7 +2464,7 @@ mod tests {
             agg2.record(Sample {
                 metric: "http_req_duration".into(),
                 value: (ms * 1000) as f64,
-                tags: Arc::new(tropel_core::types::TagMap::new()),
+                tags: Arc::new(tropel_sdk::types::TagMap::new()),
                 timestamp: ts,
                 sample_type: SampleType::Trend,
             });
@@ -2529,7 +2529,7 @@ mod tests {
         let ts = std::time::SystemTime::now();
 
         for (metric, url) in [("http_req_duration", "/a"), ("http_req_duration", "/b")] {
-            let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
+            let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
                 ("url", url),
                 ("name", url),
             ]));
@@ -2544,7 +2544,7 @@ mod tests {
         assert_eq!(agg.data.len(), 2);
 
         // A third distinct URL is dropped (counted, not stored).
-        let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
+        let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
             ("url", "/c"),
             ("name", "/c"),
         ]));
@@ -2559,7 +2559,7 @@ mod tests {
         assert_eq!(agg.series_dropped, 1, "dropped series must be counted");
 
         // Existing series still record.
-        let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
+        let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
             ("url", "/a"),
             ("name", "/a"),
         ]));
@@ -2591,7 +2591,7 @@ mod tests {
         let ts = std::time::SystemTime::now();
         for url in ["/a", "/b"] {
             for ms in [10u64, 20, 30] {
-                let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
+                let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
                     ("url", url),
                     ("name", url),
                     ("group", "http"),
@@ -2610,7 +2610,7 @@ mod tests {
             agg.record(Sample {
                 metric: "iteration_duration".into(),
                 value: 42_000.0,
-                tags: Arc::new(tropel_core::types::TagMap::new()),
+                tags: Arc::new(tropel_sdk::types::TagMap::new()),
                 timestamp: ts,
                 sample_type: SampleType::Trend,
             });

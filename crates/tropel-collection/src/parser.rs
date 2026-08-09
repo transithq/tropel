@@ -1,8 +1,8 @@
 use crate::error::*;
 use crate::model::*;
 use std::collections::HashMap;
-use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_core::types::*;
+use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
+use tropel_sdk::types::*;
 
 /// Parse a Postman Collection from JSON bytes.
 pub fn parse_collection(bytes: &[u8]) -> Result<Collection> {

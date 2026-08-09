@@ -305,7 +305,7 @@ impl Protocol for WebSocketProtocol {
 }
 
 /// Parse a duration string (`"1s"`, `"500ms"`, `"1m30s"`, `"100"` = 100 s)
-/// into a `Duration`. Delegates to the canonical `tropel_core::parse_duration`
+/// into a `Duration`. Delegates to the canonical `tropel_sdk::parse_duration`
 /// so every consumer shares ONE implementation and the same unit semantics
 /// (the old local copy treated a bare number as MILLISECONDS — a third
 /// divergent impl, backlog line 136).

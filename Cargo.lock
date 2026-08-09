@@ -4059,10 +4059,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tropel-core",
  "tropel-engine",
- "tropel-ext",
  "tropel-metrics",
+ "tropel-sdk",
  "tropel-x-prometheus",
 ]
 
@@ -4090,7 +4089,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
- "tropel-core",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -4102,7 +4101,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "tropel-core",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -4117,6 +4116,7 @@ dependencies = [
  "simd-json",
  "thiserror",
  "tracing",
+ "tropel-sdk",
  "url",
 ]
 
@@ -4136,6 +4136,7 @@ dependencies = [
  "tropel-ext",
  "tropel-metrics",
  "tropel-report",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -4171,6 +4172,7 @@ dependencies = [
  "tropel-native",
  "tropel-pm",
  "tropel-report",
+ "tropel-sdk",
  "tropel-variables",
  "tropel-wasm",
  "tropel-x-grpc",
@@ -4197,7 +4199,7 @@ dependencies = [
  "pathdiff",
  "serde_json",
  "tracing",
- "tropel-core",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -4213,12 +4215,12 @@ dependencies = [
  "tracing",
  "tropel-collection",
  "tropel-core",
- "tropel-ext",
  "tropel-http",
  "tropel-js",
  "tropel-metrics",
  "tropel-native",
  "tropel-pm",
+ "tropel-sdk",
  "tropel-variables",
 ]
 
@@ -4234,7 +4236,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "tropel-core",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -4264,6 +4266,7 @@ dependencies = [
  "tracing",
  "tropel-core",
  "tropel-metrics",
+ "tropel-sdk",
  "url",
 ]
 
@@ -4366,6 +4369,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tropel-core",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -4394,8 +4398,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tropel-core",
  "tropel-js",
+ "tropel-sdk",
  "uuid",
 ]
 
@@ -4411,10 +4415,10 @@ dependencies = [
  "tokio",
  "tracing",
  "tropel-core",
- "tropel-ext",
  "tropel-http",
  "tropel-js",
  "tropel-native",
+ "tropel-sdk",
  "tropel-variables",
 ]
 
@@ -4433,8 +4437,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tropel-core",
- "tropel-ext",
  "tropel-metrics",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -4443,11 +4447,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "inventory",
+ "rustc-hash",
  "serde",
  "serde_json",
+ "simd-json",
  "thiserror",
- "tropel-core",
- "tropel-ext",
  "wit-parser",
 ]
 
@@ -4462,7 +4466,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "tropel-core",
  "uuid",
 ]
 
@@ -4482,9 +4485,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tropel-core",
- "tropel-ext",
  "tropel-http",
+ "tropel-sdk",
  "wasmtime",
 ]
 
@@ -4521,6 +4523,7 @@ dependencies = [
  "inventory",
  "tokio",
  "tracing",
+ "tropel-ext",
  "tropel-report",
  "tropel-sdk",
 ]

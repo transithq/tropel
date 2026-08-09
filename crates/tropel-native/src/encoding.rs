@@ -1,6 +1,6 @@
 use crate::NativeModule;
 use rquickjs::function::Func;
-use tropel_core::Result;
+use tropel_sdk::Result;
 use tropel_js::JsContext;
 
 pub struct EncodingModule;
@@ -71,7 +71,7 @@ pub fn base64_decode(data: &str) -> Result<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD
         .decode(data)
-        .map_err(|e| tropel_core::TropelError::Parse(format!("Base64 decode error: {}", e)))
+        .map_err(|e| tropel_sdk::TropelError::Parse(format!("Base64 decode error: {}", e)))
 }
 
 /// Base64 URL-safe encode.
@@ -85,7 +85,7 @@ pub fn base64url_decode(data: &str) -> Result<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(data)
-        .map_err(|e| tropel_core::TropelError::Parse(format!("Base64 URL decode error: {}", e)))
+        .map_err(|e| tropel_sdk::TropelError::Parse(format!("Base64 URL decode error: {}", e)))
 }
 
 /// Hex encode.
@@ -96,7 +96,7 @@ pub fn hex_encode(data: &[u8]) -> String {
 /// Hex decode.
 pub fn hex_decode(data: &str) -> Result<Vec<u8>> {
     hex::decode(data)
-        .map_err(|e| tropel_core::TropelError::Parse(format!("Hex decode error: {}", e)))
+        .map_err(|e| tropel_sdk::TropelError::Parse(format!("Hex decode error: {}", e)))
 }
 
 /// URL encode a string.
@@ -109,7 +109,7 @@ pub fn url_decode(data: &str) -> Result<String> {
     percent_encoding::percent_decode_str(data)
         .decode_utf8()
         .map(|c| c.to_string())
-        .map_err(|e| tropel_core::TropelError::Parse(format!("URL decode error: {}", e)))
+        .map_err(|e| tropel_sdk::TropelError::Parse(format!("URL decode error: {}", e)))
 }
 
 #[cfg(test)]

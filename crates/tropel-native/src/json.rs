@@ -1,7 +1,7 @@
 use crate::NativeModule;
 use rquickjs::function::Func;
 use serde_json::Value;
-use tropel_core::Result;
+use tropel_sdk::Result;
 use tropel_js::JsContext;
 
 pub struct JsonModule;
@@ -25,7 +25,7 @@ impl NativeModule for JsonModule {
             // canonical JSON string for JS-side JSON.parse().
             // Uses simd-json internally for ~2-4x faster parsing.
             // Returns Option<String> (None on parse error) because rquickjs
-            // Func::from doesn't support tropel_core::Result error types.
+            // Func::from doesn't support tropel_sdk::Result error types.
             let _ = globals.set(
                 "__tropel_native_json_parse",
                 Func::from(|s: String| -> Option<String> {
@@ -69,7 +69,7 @@ impl NativeModule for JsonModule {
 pub fn json_parse(s: &str) -> Result<Value> {
     let mut bytes = s.as_bytes().to_vec();
     simd_json::serde::from_slice(&mut bytes)
-        .map_err(|e| tropel_core::TropelError::Parse(format!("JSON parse error: {}", e)))
+        .map_err(|e| tropel_sdk::TropelError::Parse(format!("JSON parse error: {}", e)))
 }
 
 /// Fast JSON stringify using serde_json (stringify is already efficient).
@@ -77,7 +77,7 @@ pub fn json_parse(s: &str) -> Result<Value> {
 /// to_string on Value is already optimal.
 pub fn json_stringify(value: &Value) -> Result<String> {
     serde_json::to_string(value)
-        .map_err(|e| tropel_core::TropelError::Parse(format!("JSON stringify error: {}", e)))
+        .map_err(|e| tropel_sdk::TropelError::Parse(format!("JSON stringify error: {}", e)))
 }
 
 /// Extract a value from a JSON document using a dot-path.

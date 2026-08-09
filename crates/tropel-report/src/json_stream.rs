@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tropel_core::types::{Sample, SampleType};
-use tropel_core::{Result, TropelError};
+use tropel_sdk::types::{Sample, SampleType};
+use tropel_sdk::{Result, TropelError};
 
 use crate::Output;
 
@@ -230,7 +230,7 @@ impl Output for JsonStreamOutput {
 mod tests {
     use super::*;
     use std::time::SystemTime;
-    use tropel_core::types::{Sample, SampleType, TagMap};
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
 
     fn sample(metric: &str, value: f64) -> Sample {
         let mut tags = TagMap::new();
