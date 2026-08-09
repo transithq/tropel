@@ -12,10 +12,10 @@
 //! same state, and its name + aliases are configurable by embedders via
 //! [`config::SandboxConfig`].
 
+pub mod bindings;
 pub mod config;
 pub mod state;
-pub mod bindings;
 
+pub use bindings::*;
 pub use config::*;
 pub use state::*;
-pub use bindings::*;

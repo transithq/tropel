@@ -1105,7 +1105,8 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
-        let mut runner = ScenarioRunner::new(scenario, execution_items, names, client, 0, "loop".into());
+        let mut runner =
+            ScenarioRunner::new(scenario, execution_items, names, client, 0, "loop".into());
 
         // Wire a real JS context with the pm shim + bridge so the prerequest
         // script can actually call setNextRequest.

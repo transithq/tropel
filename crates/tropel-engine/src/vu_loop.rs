@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 use tropel_core::config::{
     ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig,
 };
-use tropel_runtime::ScenarioRunner;
-use tropel_scheduler::{VUScheduler, VuLease};
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
+use tropel_runtime::ScenarioRunner;
 use tropel_sandbox::config::SandboxConfig;
+use tropel_scheduler::{VUScheduler, VuLease};
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
 use tropel_sdk::traits::{Driver, DriverHttpClient, Protocol};
 use tropel_sdk::types::{Request, Response, Sample, TagMap};
@@ -522,9 +522,8 @@ pub(crate) async fn run_scenario_vus(
     // every VU — a large collection must not be re-flattened/re-cloned per
     // VU at runner construction (ScenarioRunner::new). Request names for
     // setNextRequest are derived from the same flatten and shared too.
-    let flattened_c: Arc<Vec<ScenarioItem>> = Arc::new(
-        tropel_runtime::flatten_execution_items(&scenario.items),
-    );
+    let flattened_c: Arc<Vec<ScenarioItem>> =
+        Arc::new(tropel_runtime::flatten_execution_items(&scenario.items));
     let names_c: Arc<Vec<String>> =
         Arc::new(flattened_c.iter().map(|item| item.name.clone()).collect());
 

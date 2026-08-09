@@ -73,11 +73,26 @@ impl ShimBundle {
 impl Default for ShimBundle {
     fn default() -> Self {
         Self(vec![
-            ShimEntry("pm-api", std::borrow::Cow::Borrowed(include_str!("../../../js/pm-api/pm.js"))),
-            ShimEntry("chai-shim", std::borrow::Cow::Borrowed(include_str!("../../../js/chai/chai-shim.js"))),
-            ShimEntry("lodash-shim", std::borrow::Cow::Borrowed(include_str!("../../../js/lodash/lodash-shim.js"))),
-            ShimEntry("cryptojs-shim", std::borrow::Cow::Borrowed(include_str!("../../../js/cryptojs-shim/cryptojs.js"))),
-            ShimEntry("exec-shim", std::borrow::Cow::Borrowed(include_str!("../../../js/exec/exec.js"))),
+            ShimEntry(
+                "pm-api",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/pm-api/pm.js")),
+            ),
+            ShimEntry(
+                "chai-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/chai/chai-shim.js")),
+            ),
+            ShimEntry(
+                "lodash-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/lodash/lodash-shim.js")),
+            ),
+            ShimEntry(
+                "cryptojs-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/cryptojs-shim/cryptojs.js")),
+            ),
+            ShimEntry(
+                "exec-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/exec/exec.js")),
+            ),
         ])
     }
 }
@@ -224,7 +239,11 @@ pub(crate) async fn create_vu_js_context(
 /// path (bytecode compile failed + source eval failed, or bytecode run
 /// failed + source eval failed) — a true `pm is not defined` condition that
 /// the caller must surface loudly.
-async fn bootstrap_shims(ctx: &mut tropel_js::JsContext, vu_id: u32, shim: &ShimBundle) -> Result<()> {
+async fn bootstrap_shims(
+    ctx: &mut tropel_js::JsContext,
+    vu_id: u32,
+    shim: &ShimBundle,
+) -> Result<()> {
     // A non-default (injected) bundle skips the bytecode cache entirely — the
     // process-wide cache is keyed to the single JS_SHIM_BUNDLE and must not
     // serve a different bundle's bytecode (see SHIM_BYTECODE note).
@@ -307,15 +326,9 @@ mod tests {
             namespace: "acme".into(),
             aliases: vec!["product".into(), "wire".into()],
         };
-        let mut ctx = create_vu_js_context(
-            7,
-            &pm_state,
-            &client,
-            &ShimBundle::default(),
-            &config,
-        )
-        .await
-        .expect("context must be created");
+        let mut ctx = create_vu_js_context(7, &pm_state, &client, &ShimBundle::default(), &config)
+            .await
+            .expect("context must be created");
 
         let check = ctx
             .eval(

@@ -1494,7 +1494,10 @@ mod tests {
 
             // pm and trp are distinct peer views (not the same object).
             let peer_views: bool = ctx.eval("pm !== trp").unwrap();
-            assert!(peer_views, "pm and trp must be peer views, not the same object");
+            assert!(
+                peer_views,
+                "pm and trp must be peer views, not the same object"
+            );
 
             // Error strings name the invoked namespace.
             let pm_err: String = ctx
@@ -1588,7 +1591,10 @@ mod tests {
                       catch (e) { return e.message; } })()",
                 )
                 .unwrap();
-            assert!(err.contains("acme.response.json()"), "error must name acme: {err}");
+            assert!(
+                err.contains("acme.response.json()"),
+                "error must name acme: {err}"
+            );
 
             // Configured bindings installed read-only too.
             let readonly: bool = ctx

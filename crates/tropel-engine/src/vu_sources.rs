@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tropel_runtime::ScenarioRunner;
-use tropel_scheduler::VUScheduler;
 use tropel_sandbox::state::SharedPmState;
+use tropel_scheduler::VUScheduler;
 use tropel_sdk::traits::{DriverHttpClient, DriverInstance, Protocol, VuContext};
 use tropel_sdk::types::{Sample, TagMap};
 

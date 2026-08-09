@@ -8,11 +8,11 @@ use std::collections::HashMap;
 // the HTTP config types (HttpConfig, TlsConfig) live in tropel-http (P3c:
 // the runtime publish set must stop resolving tropel-core). All re-exported
 // so engine crates keep resolving tropel_core::config::* unchanged.
+pub use tropel_http::config::{HttpConfig, TlsConfig};
 pub use tropel_sdk::config::{
     status_is_expected, ArrivalRateStage, ExecutionConfig, ExpectedStatus, OutputConfig,
     ScenarioConfig, Stage, ThinkTimeConfig, ThresholdConfig,
 };
-pub use tropel_http::config::{HttpConfig, TlsConfig};
 
 /// Full configuration for a load test job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
