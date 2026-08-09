@@ -115,6 +115,29 @@ jobs:
           # toolchain download into the container on every run.
           rust-version: 1.85.0
 
+  sdk-gates:
+    name: sdk gates (leaf · wasm · out-of-workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sdk-gates
+      # The enforcement that replaces a repo boundary (TROPEL_MODULARIZATION_TODO.md → P2):
+      #   1. tropel-sdk must stay a leaf (zero tropel-* deps) — the P1 inversion,
+      #      made permanent. A stray `tropel-core` dep added later would silently
+      #      destroy the publishable-isolated-crate property this enforces.
+      #   2. tropel-sdk must compile for wasm32 (browser slice target), with and
+      #      without the inventory-bearing registration feature.
+      #   3. the `cargo package`d artifact must build from a consumer outside the
+      #      workspace — catches missing files / broken feature defaults that the
+      #      in-repo build never sees.
+      - run: bash scripts/sdk-gates.sh
+
   smoke:
     name: "e2e smoke (samples: k6, postman, openapi, har)"
     runs-on: ubuntu-latest
@@ -250,7 +273,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [fmt, clippy, test, msrv, deny, smoke]
+    needs: [fmt, clippy, test, msrv, deny, sdk-gates, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
