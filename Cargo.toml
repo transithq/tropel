@@ -182,7 +182,7 @@ csv = "1.4.0"
 
 
 # ── Internal workspace crate paths ────────────────────
-tropel-core = { path = "crates/tropel-core" }
+tropel-core = { path = "crates/tropel-core", version = "0.1.0" }
 tropel-collection = { path = "crates/tropel-collection" }
 tropel-variables = { path = "crates/tropel-variables" }
 tropel-js = { path = "crates/tropel-js" }
@@ -192,8 +192,8 @@ tropel-http = { path = "crates/tropel-http" }
 tropel-executor = { path = "crates/tropel-executor" }
 tropel-metrics = { path = "crates/tropel-metrics" }
 tropel-report = { path = "crates/tropel-report" }
-tropel-ext = { path = "crates/tropel-ext" }
-tropel-sdk = { path = "crates/tropel-sdk" }
+tropel-ext = { path = "crates/tropel-ext", version = "0.1.0" }
+tropel-sdk = { path = "crates/tropel-sdk", version = "0.1.0" }
 tropel-engine = { path = "crates/tropel-engine" }
 tropel-build = { path = "crates/tropel-build" }
 tropel-input-postman = { path = "crates/inputs/tropel-input-postman" }
