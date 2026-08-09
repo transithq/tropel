@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **License: dual MIT OR Apache-2.0 → Apache-2.0 only.** `LICENSE-MIT` removed; `LICENSE-APACHE` now carries the full canonical text (previously a placeholder stub) and is copied into `crates/tropel-sdk/` so published artifacts include it. `deny.toml` keeps `MIT` on the *dependency* allowlist (third-party crates only).
+
 ## [0.1.0] - 2026-07-29
 
 ### Added

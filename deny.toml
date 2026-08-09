@@ -3,6 +3,9 @@ allow = [
     # NOTE: the allow list only accepts `license-id [WITH exception]` — no
     # compound expressions (spdx 0.13). Crates declaring `MIT OR Apache-2.0`
     # still pass because both branches are allowed individually.
+    # IMPORTANT: this list governs THIRD-PARTY DEPENDENCIES only. The project's
+    # own license is Apache-2.0 (see root Cargo.toml + LICENSE-APACHE); MIT
+    # stays here because many deps are MIT-licensed. Do not remove it.
     "MIT",
     "Apache-2.0",
     # wasmtime's cranelift crates are Apache-2.0 WITH LLVM-exception.

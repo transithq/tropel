@@ -143,9 +143,4 @@ cargo bench -p tropel-bench --bench perf --profile dev  # fast, disk-light
 
 ## License
 
-Licensed under either of:
-
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-
-at your option.
+Licensed under the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)).

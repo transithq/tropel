@@ -371,7 +371,7 @@ pub(crate) fn print_version() -> Result<()> {
     // crates) so the banner can never drift from the manifest again — the
     // literal URL went stale twice (prasadthx → transithq).
     println!("Repository: {}", env!("CARGO_PKG_REPOSITORY"));
-    println!("License: MIT OR Apache-2.0");
+    println!("License: Apache-2.0");
     Ok(())
 }
 

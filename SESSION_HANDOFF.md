@@ -70,7 +70,7 @@ The full workspace compiles successfully. **87 files, 10,977 lines** committed.
 | `CONTRIBUTING.md` | ✅ |
 | `CODE_OF_CONDUCT.md` | ✅ |
 | `CHANGELOG.md` | ✅ Keep-a-changelog format |
-| `LICENSE-MIT` / `LICENSE-APACHE` | ✅ Dual license |
+| `LICENSE-APACHE` | ✅ Apache-2.0 (MIT dual removed 2026-08-09) |
 | `.github/workflows/ci.yml` | ✅ CI: fmt → clippy → test → build (linux/macos/windows) |
 | `examples/collections/simple-api.json` | ✅ Simple Postman collection for smoke tests |
 
