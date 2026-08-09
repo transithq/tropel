@@ -1,11 +1,12 @@
 //! Embedder-facing sandbox configuration (P4b).
 //!
-//! The script sandbox exposes a **canonical binding** (the product's own API,
-//! currently `tropel.*`) plus a set of **aliases** that are true references
-//! to the same object (identical identity, never proxies — see
-//! `TROPEL_MODULARIZATION_TODO.md` P4b). `pm.*` is always installed as the
-//! frozen Postman-compat peer view; this config only controls the canonical
-//! name and its aliases.
+//! The script sandbox exposes a **canonical binding** — **`trp.*`**, by
+//! Postman convention (`pm.*` is Postman's sole namespace, so `trp.*` is
+//! Tropel's; see `TROPEL_MODULARIZATION_TODO.md` P4b) — plus an optional set
+//! of **aliases** that are true references to the same object (identical
+//! identity, never proxies). `pm.*` is always installed as the frozen
+//! Postman-compat peer view; this config only controls the canonical name
+//! and its aliases.
 //!
 //! Third-party embedders (e.g. the API client, or anyone building on
 //! `tropel-sandbox`) set the canonical binding name here — that name is what
@@ -16,24 +17,25 @@
 /// Which namespaces a script context exposes, and under what names.
 ///
 /// - [`SandboxConfig::namespace`] — the canonical binding name. Defaults to
-///   `"tropel"`; embedders set their own (e.g. the API client's product name).
+///   `"trp"` (Postman convention); embedders set their own (e.g. the API
+///   client's product name).
 /// - [`SandboxConfig::aliases`] — extra globals that reference the SAME
-///   object as the canonical binding (true aliases, not proxies). Defaults to
-///   `["wire"]`, preserving today's `wire === tropel`.
+///   object as the canonical binding (true aliases, not proxies). Defaults
+///   to `[]` — aliases are opt-in per embedder, not part of the stock install.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxConfig {
-    /// Canonical binding name installed on `globalThis`. Default: `"tropel"`.
+    /// Canonical binding name installed on `globalThis`. Default: `"trp"`.
     pub namespace: String,
     /// Names aliased to the canonical binding (identical object identity).
-    /// Default: `["wire"]`.
+    /// Default: `[]` (opt-in).
     pub aliases: Vec<String>,
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            namespace: "tropel".into(),
-            aliases: vec!["wire".into()],
+            namespace: "trp".into(),
+            aliases: Vec::new(),
         }
     }
 }
@@ -44,9 +46,9 @@ impl SandboxConfig {
     /// consume. Evaluate this BEFORE the shim bundle so the canonical name
     /// and aliases are in place when `pm.js` installs its bindings.
     ///
-    /// The default config renders to a no-op equivalent of today's hardcoded
-    /// behavior (`tropel` canonical + `wire` alias), so the preamble is
-    /// always safe to emit.
+    /// The default config renders to a no-op equivalent of the stock
+    /// install (`trp` canonical, no aliases), so the preamble is always safe
+    /// to emit.
     pub fn render_js_preamble(&self) -> String {
         let aliases = self
             .aliases
@@ -73,25 +75,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_preserves_tropel_wire() {
+    fn default_config_is_trp_canonical_only() {
         let cfg = SandboxConfig::default();
-        assert_eq!(cfg.namespace, "tropel");
-        assert_eq!(cfg.aliases, vec!["wire"]);
+        assert_eq!(cfg.namespace, "trp");
+        assert!(cfg.aliases.is_empty());
         assert_eq!(
             cfg.render_js_preamble(),
-            "globalThis.__tropel_sandbox_config = { namespace: \"tropel\", aliases: [\"wire\"] };"
+            "globalThis.__tropel_sandbox_config = { namespace: \"trp\", aliases: [] };"
         );
     }
 
     #[test]
     fn custom_config_renders_namespace_and_aliases() {
         let cfg = SandboxConfig {
-            namespace: "trp".into(),
+            namespace: "acme".into(),
             aliases: vec!["wire".into(), "product".into()],
         };
         assert_eq!(
             cfg.render_js_preamble(),
-            "globalThis.__tropel_sandbox_config = { namespace: \"trp\", aliases: [\"wire\", \"product\"] };"
+            "globalThis.__tropel_sandbox_config = { namespace: \"acme\", aliases: [\"wire\", \"product\"] };"
         );
     }
 

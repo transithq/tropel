@@ -184,7 +184,14 @@ tropel-collection = { path = "crates/tropel-collection" }
 tropel-variables = { path = "crates/tropel-variables" }
 tropel-js = { path = "crates/tropel-js" }
 tropel-native = { path = "crates/tropel-native" }
-tropel-sandbox = { path = "crates/tropel-sandbox" }
+# P5b (TROPEL_WASM_BUILD.md): default-features must be declared at the
+# WORKSPACE level — a member-level `default-features = false` override on a
+# workspace dep is ignored (cargo warns) unless the workspace entry declares
+# it. sandbox's default `send-request` drags tropel-http → reqwest →
+# tokio-net into the graph, which cannot compile on wasm. The browser slice
+# builds with --no-default-features; consumers that need pm.sendRequest
+# (engine, and runtime via its forwarding feature) opt back in explicitly.
+tropel-sandbox = { path = "crates/tropel-sandbox", default-features = false }
 tropel-http = { path = "crates/tropel-http" }
 tropel-auth = { path = "crates/tropel-auth" }
 tropel-runtime = { path = "crates/tropel-runtime", version = "0.1.0" }

@@ -7,10 +7,18 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# P5b (TROPEL_WASM_BUILD.md Step 4): tropel-sandbox's default `send-request`
+# feature drags tropel-http → reqwest → tokio-net into the wasm graph, which
+# cannot compile on wasm32. Forward the feature so the native default keeps
+# pm.sendRequest while the browser slice builds with --no-default-features.
+default = ["send-request"]
+send-request = ["tropel-sandbox/send-request"]
+
 [dependencies]
 tropel-sdk.workspace = true
 tropel-core.workspace = true
-tropel-sandbox.workspace = true
+tropel-sandbox = { workspace = true, default-features = false }
 tropel-js.workspace = true
 tropel-variables.workspace = true
 tracing.workspace = true

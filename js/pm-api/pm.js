@@ -3,8 +3,10 @@
 // It delegates heavy operations to native Rust functions.
 
 // P4b: the binding is built by a factory so the namespace is a parameter —
-// `pm` (frozen Postman-compat) and `tropel` (canonical) are peer views over
-// the same shared state; `wire` is a true alias of the canonical binding.
+// `pm` (frozen Postman-compat) and `trp` (canonical, Postman convention:
+// `pm.*` is Postman's sole namespace, so `trp.*` is Tropel's) are peer
+// views over the same shared state. Product aliases are opt-in via
+// SandboxConfig, not installed by default.
 function __tropel_build_binding(namespace) {
     var pm = {};
     var __ns = namespace || 'pm';
@@ -1305,8 +1307,9 @@ Trend.prototype.add = function (value, tags) {
 // ── Install: pm (frozen Postman-compat peer view) + canonical + aliases ──
 // The canonical name and its aliases come from the host-set global
 // `__tropel_sandbox_config` (written by SandboxConfig::render_js_preamble
-// before this bundle evals — P4b). Absent a config, the historical
-// hardcoded install is preserved: canonical `tropel` + `wire` alias.
+// before this bundle evals — P4b). Absent a config, the stock install
+// applies: canonical `trp`, NO default aliases (Postman convention — one
+// canonical namespace; aliases are opt-in per embedder).
 //
 // Scoped in an IIFE so the helper vars don't leak onto globalThis (pm.js is
 // non-strict, so a top-level `var` becomes a global — and a leaked
@@ -1317,8 +1320,8 @@ var pm = __tropel_build_binding('pm');
     var cfg = (typeof __tropel_sandbox_config === 'object' && __tropel_sandbox_config) || {};
     var namespace = (typeof cfg.namespace === 'string' && cfg.namespace.length > 0)
         ? cfg.namespace
-        : 'tropel';
-    var aliases = Array.isArray(cfg.aliases) ? cfg.aliases : ['wire'];
+        : 'trp';
+    var aliases = Array.isArray(cfg.aliases) ? cfg.aliases : [];
     var canonical = __tropel_build_binding(namespace);
     // True alias — identical object, one line, not a proxy (P4b).
     var install = [['pm', pm]];

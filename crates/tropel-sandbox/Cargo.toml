@@ -22,10 +22,23 @@ tropel-js.workspace = true
 tropel-native.workspace = true
 tropel-variables.workspace = true
 tropel-http = { workspace = true, optional = true }
-rquickjs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true
 anyhow.workspace = true
+
+# P5b (TROPEL_WASM_BUILD.md Step 3): same per-target split as tropel-js.
+# The workspace rquickjs is `full-async` (dyn-load/parallel — dlopen +
+# threads, impossible on wasm) and the workspace tokio carries
+# net/signal/rt-multi-thread (compile_error! on wasm). Native keeps the
+# workspace sets; wasm32 gets the narrowed rquickjs set (mirrors tropel-js)
+# and tokio's documented wasm-supported set (sync, macros, io-util, rt,
+# time).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rquickjs.workspace = true
 tokio.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rquickjs = { version = "0.12.2", default-features = false, features = ["std", "classes", "properties", "array-buffer", "futures", "loader", "macro"] }
+tokio = { version = "1.53.1", default-features = false, features = ["sync", "macros", "io-util", "rt", "time"] }

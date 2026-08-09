@@ -19,7 +19,10 @@ tropel-http.workspace = true
 tropel-variables.workspace = true
 tropel-collection.workspace = true
 tropel-js.workspace = true
-tropel-sandbox.workspace = true
+# P5b: sandbox's send-request is no longer a default feature (workspace
+# declares default-features = false so the wasm graph stays reqwest-free).
+# The engine is native-only and uses pm.sendRequest, so opt back in.
+tropel-sandbox = { workspace = true, features = ["send-request"] }
 tropel-native.workspace = true
 tropel-es.workspace = true
 tropel-build.workspace = true

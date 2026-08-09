@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 use tropel_sdk::error::TropelError;
-use tropel_sdk::types::{AuthConfig, Body, Method, Request};
+#[cfg(feature = "send-request")]
+use tropel_sdk::types::Request;
+use tropel_sdk::types::{AuthConfig, Body, Method};
 use tropel_sdk::Result;
 
 /// Convert a serde_json::Value to a string suitable for JS consumption.
@@ -102,6 +104,10 @@ fn response_json_string(body: &[u8]) -> Option<String> {
 /// Searches environment, collection vars, and globals in order.
 /// Uses a cursor-based approach that builds the result string by pushing
 /// segments — no in-place mutation, no infinite-loop risk.
+///
+/// Only used by the `send-request` bridge (`pm.sendRequest`); gated so the
+/// browser slice (`--no-default-features`) doesn't carry dead code.
+#[cfg(feature = "send-request")]
 fn resolve_vars(
     url: &str,
     environment: &HashMap<String, String>,
@@ -178,6 +184,7 @@ fn resolve_vars(
 /// `Bearer {{token}}` header or `{{"key":"{{val}}"}}` body went out with the
 /// literal placeholder). Extracted as a pure function so the resolution
 /// contract is unit-testable without a live JS context.
+#[cfg(feature = "send-request")]
 fn resolve_send_request(
     url: &str,
     headers_json: &str,
@@ -209,7 +216,7 @@ fn resolve_send_request(
     (resolved_url, headers, request_body)
 }
 
-/// Parse headers from a JSON string that may be either:
+/// Parses headers from a JSON string that may be either:
 /// - Object form: {"Content-Type": "application/json"}
 /// - Postman array form: [{"key": "Content-Type", "value": "application/json"}]
 ///
@@ -219,6 +226,7 @@ fn resolve_send_request(
 /// whenever ANY value was non-string — silently dropping EVERY header
 /// (backlog P3). Non-string scalars are now stringified; null/complex values
 /// are skipped.
+#[cfg(feature = "send-request")]
 fn parse_headers(json: &str) -> HashMap<String, String> {
     if json.is_empty() || json == "{}" || json == "[]" {
         return HashMap::new();
@@ -1349,6 +1357,7 @@ mod tests {
     /// `{{var}}` placeholders in the URL, headers, AND body — the old code
     /// resolved the URL only, so `Authorization: Bearer {{token}}` or a
     /// body containing a placeholder went out with the literal braces.
+    #[cfg(feature = "send-request")]
     #[test]
     fn test_resolve_send_request_resolves_url_headers_body() {
         let env = HashMap::from([("token".to_string(), "s3cret".to_string())]);
@@ -1429,6 +1438,7 @@ mod tests {
     /// 123}) — the `HashMap<String, String>` parse failed, the array fallback
     /// failed, and EVERY header was silently dropped. Non-string scalars must
     /// be stringified and the rest preserved.
+    #[cfg(feature = "send-request")]
     #[test]
     fn parse_headers_non_string_object_values_are_stringified() {
         let headers = parse_headers(
@@ -1457,10 +1467,11 @@ mod tests {
     }
 
     /// P4b conformance: the pm.js binding is namespace-parameterized. `pm`
-    /// (frozen Postman-compat) and `tropel` (canonical) are peer views over
-    /// the same state; `wire` is a true alias of `tropel` (identical object,
-    /// not a proxy). Error strings name the invoked namespace, and the
-    /// top-level bindings are installed read-only.
+    /// (frozen Postman-compat) and `trp` (canonical, Postman convention) are
+    /// peer views over the same state. The STOCK install exposes ONLY those
+    /// two — no default aliases (aliases are opt-in via SandboxConfig).
+    /// Error strings name the invoked namespace, and the top-level bindings
+    /// are installed read-only.
     #[test]
     fn test_binding_namespace_conformance() {
         let rt = rquickjs::Runtime::new().unwrap();
@@ -1469,18 +1480,21 @@ mod tests {
             ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
                 .expect("pm shim should eval");
 
-            // All three globals installed; wire is a true alias of tropel.
+            // Stock install: pm + trp only — no aliases, no tropel.
             let installed: bool = ctx
                 .eval(
-                    "typeof pm === 'object' && typeof tropel === 'object' \
-                     && typeof wire === 'object' && wire === tropel",
+                    "typeof pm === 'object' && typeof trp === 'object' \
+                     && typeof wire === 'undefined' && typeof tropel === 'undefined'",
                 )
                 .unwrap();
-            assert!(installed, "pm/tropel/wire must be installed with wire === tropel");
+            assert!(
+                installed,
+                "pm + trp must be installed; no default aliases or tropel globals"
+            );
 
-            // pm and tropel are distinct peer views (not the same object).
-            let peer_views: bool = ctx.eval("pm !== tropel").unwrap();
-            assert!(peer_views, "pm and tropel must be peer views, not the same object");
+            // pm and trp are distinct peer views (not the same object).
+            let peer_views: bool = ctx.eval("pm !== trp").unwrap();
+            assert!(peer_views, "pm and trp must be peer views, not the same object");
 
             // Error strings name the invoked namespace.
             let pm_err: String = ctx
@@ -1496,24 +1510,23 @@ mod tests {
 
             let tr_err: String = ctx
                 .eval(
-                    "(function(){ try { tropel.response.json(); return 'no-error'; } \
+                    "(function(){ try { trp.response.json(); return 'no-error'; } \
                       catch (e) { return e.message; } })()",
                 )
                 .unwrap();
             assert!(
-                tr_err.contains("tropel.response.json()"),
-                "tropel error must name tropel: {tr_err}"
+                tr_err.contains("trp.response.json()"),
+                "trp error must name trp: {tr_err}"
             );
 
             // Top-level bindings installed read-only (writable: false).
             let readonly: bool = ctx
                 .eval(
                     "Object.getOwnPropertyDescriptor(globalThis, 'pm').writable === false \
-                     && Object.getOwnPropertyDescriptor(globalThis, 'tropel').writable === false \
-                     && Object.getOwnPropertyDescriptor(globalThis, 'wire').writable === false",
+                     && Object.getOwnPropertyDescriptor(globalThis, 'trp').writable === false",
                 )
                 .unwrap();
-            assert!(readonly, "pm/tropel/wire must be non-writable");
+            assert!(readonly, "pm/trp must be non-writable");
         });
     }
 
@@ -1521,8 +1534,8 @@ mod tests {
     /// Evaluating [`SandboxConfig::render_js_preamble`] BEFORE the pm.js
     /// shim must make the canonical binding appear under the configured
     /// namespace, with the configured aliases as TRUE aliases (identical
-    /// object, not a proxy). The default `tropel`/`wire` pair is absent when
-    /// a custom namespace replaces it, and error strings still name the
+    /// object, not a proxy). The default `trp` canonical is absent when a
+    /// custom namespace replaces it, and error strings still name the
     /// invoked namespace.
     #[test]
     fn test_sandbox_config_drives_namespace_and_aliases() {
@@ -1531,8 +1544,10 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
+            // A namespace distinct from the `trp` default proves the config
+            // actually drives the canonical name.
             let cfg = SandboxConfig {
-                namespace: "trp".into(),
+                namespace: "acme".into(),
                 aliases: vec!["product".into(), "wire".into()],
             };
             ctx.eval::<(), _>(cfg.render_js_preamble())
@@ -1543,38 +1558,46 @@ mod tests {
             // Custom canonical installed; aliases are true aliases of it.
             let installed: bool = ctx
                 .eval(
-                    "typeof trp === 'object' && typeof product === 'object' \
-                     && typeof wire === 'object' && product === trp && wire === trp",
+                    "typeof acme === 'object' && typeof product === 'object' \
+                     && typeof wire === 'object' && product === acme && wire === acme",
                 )
                 .unwrap();
-            assert!(installed, "trp canonical with product/wire aliases must be installed");
+            assert!(
+                installed,
+                "acme canonical with product/wire aliases must be installed"
+            );
 
-            // The DEFAULT tropel binding must NOT be present when the config
+            // The DEFAULT trp binding must NOT be present when the config
             // renames the canonical namespace.
-            let no_default: bool = ctx.eval("typeof tropel === 'undefined'").unwrap();
-            assert!(no_default, "default tropel must not leak alongside custom namespace");
+            let no_default: bool = ctx
+                .eval("typeof trp === 'undefined' && typeof tropel === 'undefined'")
+                .unwrap();
+            assert!(
+                no_default,
+                "default trp must not leak alongside the custom namespace"
+            );
 
             // pm is still the frozen Postman-compat peer view, distinct object.
-            let peer_views: bool = ctx.eval("typeof pm === 'object' && pm !== trp").unwrap();
-            assert!(peer_views, "pm must remain a peer view, not trp's alias");
+            let peer_views: bool = ctx.eval("typeof pm === 'object' && pm !== acme").unwrap();
+            assert!(peer_views, "pm must remain a peer view, not acme's alias");
 
             // Error strings name the CONFIGURED namespace.
             let err: String = ctx
                 .eval(
-                    "(function(){ try { trp.response.json(); return 'no-error'; } \
+                    "(function(){ try { acme.response.json(); return 'no-error'; } \
                       catch (e) { return e.message; } })()",
                 )
                 .unwrap();
-            assert!(err.contains("trp.response.json()"), "error must name trp: {err}");
+            assert!(err.contains("acme.response.json()"), "error must name acme: {err}");
 
             // Configured bindings installed read-only too.
             let readonly: bool = ctx
                 .eval(
-                    "Object.getOwnPropertyDescriptor(globalThis, 'trp').writable === false \
+                    "Object.getOwnPropertyDescriptor(globalThis, 'acme').writable === false \
                      && Object.getOwnPropertyDescriptor(globalThis, 'product').writable === false",
                 )
                 .unwrap();
-            assert!(readonly, "trp/product must be non-writable");
+            assert!(readonly, "acme/product must be non-writable");
         });
     }
 }

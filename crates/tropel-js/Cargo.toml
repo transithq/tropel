@@ -9,7 +9,6 @@ publish = false
 
 [dependencies]
 tropel-core.workspace = true
-rquickjs.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -18,3 +17,16 @@ anyhow.workspace = true
 # wasm32. tropel-js only needs time (tokio::time::sleep in tests), macros +
 # rt (for #[tokio::test]), and sync (rquickjs async plumbing via the driver).
 tokio = { version = "1.53.1", default-features = false, features = ["sync", "macros", "time", "rt"] }
+
+# P5b (TROPEL_WASM_BUILD.md Step 3): the workspace rquickjs is
+# `full-async` = full + futures, and `full` pulls in `dyn-load` (dlopen) and
+# `parallel` (threads) — neither can work on wasm. Native keeps the
+# workspace set; wasm32 gets a narrowed set. rquickjs's own `full-wasi`
+# omits dyn-load/parallel, but the doc's minimal set + std (String/HashMap
+# interop) + loader (tropel-js uses rquickjs::loader::Resolver/Loader) is
+# the deliberate trim; add features back only if the compiler demands them.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rquickjs.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rquickjs = { version = "0.12.2", default-features = false, features = ["std", "classes", "properties", "array-buffer", "futures", "loader", "macro"] }

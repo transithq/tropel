@@ -292,10 +292,11 @@ mod tests {
     /// The VU loop always passes the default (so the config branch would be
     /// provably inert without this test) — an embedder passing a custom
     /// namespace + aliases must get those names installed, and the default
-    /// `tropel` must be absent. This runs through the SAME path as
-    /// production: preamble eval before bootstrap_shims, then the (default)
-    /// ShimBundle — the bytecode cache path is exercised since this test
-    /// runs after other VU contexts compiled it.
+    /// `trp` canonical must be absent (a namespace distinct from the default
+    /// proves the config drives the name). This runs through the SAME path
+    /// as production: preamble eval before bootstrap_shims, then the
+    /// (default) ShimBundle — the bytecode cache path is exercised since
+    /// this test runs after other VU contexts compiled it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_vu_js_context_honors_custom_sandbox_config() {
         let pm_state = new_pm_state();
@@ -303,7 +304,7 @@ mod tests {
             HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
         );
         let config = SandboxConfig {
-            namespace: "trp".into(),
+            namespace: "acme".into(),
             aliases: vec!["product".into(), "wire".into()],
         };
         let mut ctx = create_vu_js_context(
@@ -318,15 +319,15 @@ mod tests {
 
         let check = ctx
             .eval(
-                "typeof trp === 'object' && typeof product === 'object' \
-                 && product === trp && wire === trp && typeof pm === 'object' \
-                 && typeof tropel === 'undefined'",
+                "typeof acme === 'object' && typeof product === 'object' \
+                 && product === acme && wire === acme && typeof pm === 'object' \
+                 && typeof trp === 'undefined' && typeof tropel === 'undefined'",
             )
             .await
             .expect("probe should eval");
         assert_eq!(
             check, "true",
-            "custom namespace/aliases must be installed via the preamble; default tropel absent — got: {check}"
+            "custom namespace/aliases must be installed via the preamble; default trp absent — got: {check}"
         );
     }
 }

@@ -10,7 +10,6 @@ publish = false
 [dependencies]
 tropel-sdk.workspace = true
 tropel-js.workspace = true
-rquickjs.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 sha3.workspace = true
@@ -32,6 +31,16 @@ serde_json.workspace = true
 simd-json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# P5b (TROPEL_WASM_BUILD.md Step 3): the workspace rquickjs is
+# `full-async` (dyn-load/parallel — dlopen + threads, impossible on wasm).
+# tropel-native only uses rquickjs::function (ungated), so the same
+# narrowed wasm32 set as tropel-js applies.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rquickjs.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rquickjs = { version = "0.12.2", default-features = false, features = ["std", "classes", "properties", "array-buffer", "futures", "loader", "macro"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

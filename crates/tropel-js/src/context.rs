@@ -1106,17 +1106,35 @@ fn console_args_to_string<'js>(ctx: &rquickjs::Ctx<'js>, args: &[rquickjs::Value
 /// the rejection tracker's `is_handled=false`/`is_handled=true` callbacks for
 /// the SAME promise: QuickJS passes the promise object to both, and promises
 /// are objects, so the raw `JSValue` bits (union pointer + tag) are stable for
-/// the promise's lifetime. `JSValue` is a 16-byte repr(C) struct (size
-/// asserted in rquickjs-sys), so transmuting it to two `u64`s is
-/// bit-preserving and we only ever use it as a HashMap key.
+/// the promise's lifetime.
+///
+/// `JSValue` is `repr(C)` = `JSValueUnion { void *ptr } + int64 tag` — 16
+/// bytes on 64-bit hosts, **8 bytes on wasm32** (4-byte union + 4-byte tag,
+/// P5b). A `[u64; 2]` transmute assumes 64-bit pointers and fails to compile
+/// on wasm32, so the hash splits by pointer width; the result is only ever a
+/// HashMap key, so the two layouts produce different (but stable) keys per
+/// platform.
 fn promise_identity(value: &rquickjs::Value) -> u64 {
     let raw = value.as_raw();
-    let bits: [u64; 2] = unsafe { std::mem::transmute(raw) };
-    // FNV-1a mix of the 16 raw bytes.
+    // FNV-1a mix of the raw JSValue words.
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in bits {
-        h ^= b;
-        h = h.wrapping_mul(0x100000001b3);
+    #[cfg(target_pointer_width = "64")]
+    {
+        // union (8B) + tag (8B) — bit-preserving, no padding.
+        let bits: [u64; 2] = unsafe { std::mem::transmute(raw) };
+        for b in bits {
+            h ^= b;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        // union (4B) + tag (4B) — wasm32 layout.
+        let bits: [u32; 2] = unsafe { std::mem::transmute(raw) };
+        for b in bits {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
     }
     h
 }
