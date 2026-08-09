@@ -135,27 +135,11 @@ mod tests {
         );
     }
 
-    /// Holds the deterministic values the fn-pointer source reports.
-    static FAKE: OnceLock<(u64, SystemTime)> = OnceLock::new();
-
-    fn fake_source() -> (u64, SystemTime) {
-        *FAKE.get().expect("fake source values set before install")
-    }
-
-    #[test]
-    fn set_clock_source_overrides_time() {
-        // P6 differential harness: a deterministic source must be honored.
-        // Capture real values first, then install a source that reports them
-        // exactly. Deriving from the real clock (rather than a fixed epoch)
-        // keeps every other invariant test in this module valid regardless of
-        // parallel test order — the OnceLock source can't be unset, so a
-        // hardcoded 2023 timestamp would break wall_now_is_aligned_to_real_clock
-        // when the alignment test happens to run after this one.
-        let wall = monotonic_wall_now() + std::time::Duration::from_secs(5);
-        let nanos = monotonic_now_nanos() + 42;
-        let _ = FAKE.set((nanos, wall));
-        set_clock_source(fake_source);
-        assert_eq!(monotonic_now_nanos(), nanos);
-        assert_eq!(monotonic_wall_now(), wall);
-    }
+    // NOTE: the set_clock_source override test deliberately does NOT live
+    // here. Installing the process-global, un-removable source inside this
+    // lib test binary would poison parallel tests that rely on the clock
+    // advancing — most critically infinite_loop_interrupted_within_two_seconds,
+    // whose interrupt deadline would never trip against a constant clock,
+    // hanging the suite forever. It lives in tests/clock_override.rs, a
+    // separate process.
 }
