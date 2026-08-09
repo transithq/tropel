@@ -2,8 +2,12 @@
 // This JS glue layer provides the Postman pm.* API surface.
 // It delegates heavy operations to native Rust functions.
 
-// Global pm object
-var pm = pm || {};
+// P4b: the binding is built by a factory so the namespace is a parameter —
+// `pm` (frozen Postman-compat) and `tropel` (canonical) are peer views over
+// the same shared state; `wire` is a true alias of the canonical binding.
+function __tropel_build_binding(namespace) {
+    var pm = {};
+    var __ns = namespace || 'pm';
 
 // ── pm.environment ──
 pm.environment = {
@@ -295,9 +299,9 @@ pm.response.json = function () {
         if (raw) {
             return JSON.parse(raw);
         }
-        throw new Error('pm.response.json() — response body is not valid JSON or no response available');
+        throw new Error(__ns + '.response.json() — response body is not valid JSON or no response available');
     }
-    throw new Error('pm.response.json() is not available in this runtime');
+    throw new Error(__ns + '.response.json() is not available in this runtime');
 };
 
 pm.response.header = function (key) {
@@ -404,7 +408,7 @@ pm.test = function (name, fn) {
         if (typeof __tropel_pm_test === 'function') {
             __tropel_pm_test(name + ' (error)', false, '');
         }
-        console.error('pm.test error:', e);
+        console.error(__ns + '.test error:', e);
         return false;
     }
 };
@@ -1039,7 +1043,7 @@ pm.sendRequest = function (options, callback) {
     }
 
     // No native function available - throw a clear error
-    throw new Error('pm.sendRequest is not available in this runtime (native __tropel_pm_send_request not found)');
+    throw new Error(__ns + '.sendRequest is not available in this runtime (native __tropel_pm_send_request not found)');
 };
 
 // ── pm.execution ──
@@ -1284,6 +1288,40 @@ Trend.prototype.add = function (value, tags) {
     }
     return this;
 };
+
+    // Expose the k6-style globals the shim also provides (unchanged behavior).
+    if (typeof globalThis !== 'undefined') {
+        globalThis.check = check;
+        globalThis.group = group;
+        globalThis.Counter = Counter;
+        globalThis.Gauge = Gauge;
+        globalThis.Rate = Rate;
+        globalThis.Trend = Trend;
+        globalThis.postman = postman;
+    }
+    return pm;
+}
+
+// ── Install: pm (frozen Postman-compat) + tropel (canonical) + wire (true alias) ──
+var pm = __tropel_build_binding('pm');
+var tropel = __tropel_build_binding('tropel');
+// True alias — identical object, one line, not a proxy (P4b).
+var wire = tropel;
+
+var __tropel_g = typeof globalThis !== 'undefined' ? globalThis : null;
+if (__tropel_g) {
+    [['pm', pm], ['tropel', tropel], ['wire', wire]].forEach(function (entry) {
+        try {
+            Object.defineProperty(__tropel_g, entry[0], {
+                value: entry[1], writable: false, configurable: false
+            });
+        } catch (e) {
+            // Tolerate double eval in the same context: the binding is
+            // already installed read-only, and the `var` no-ops against the
+            // non-writable global, so the FIRST eval's bindings win.
+        }
+    });
+}
 
 // ── Export for module systems ──
 if (typeof module !== 'undefined' && module.exports) {

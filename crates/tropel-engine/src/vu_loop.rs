@@ -8,7 +8,7 @@
 //! one shared per-VU iteration loop ([`run_vu_loop`]), parameterized by a
 //! per-iteration source ([`VuIterationSource`]).
 
-use crate::js_bootstrap::create_vu_js_context;
+use crate::js_bootstrap::{create_vu_js_context, ShimBundle};
 use crate::pacing::{apply_think_time, extract_think_time};
 use crate::vu_sources::{DriverVuSource, ScenarioVuSource};
 use crate::worker::VUWorkerPool;
@@ -589,7 +589,9 @@ pub(crate) async fn run_scenario_vus(
                 );
                 let pm_state = runner.state_handle();
 
-                let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client).await;
+                let js_ctx =
+                    create_vu_js_context(vu_id, &pm_state, &bridge_client, &ShimBundle::default())
+                        .await;
                 if let Some(ctx) = js_ctx {
                     runner = runner.with_js_context(Box::new(ctx));
                 }

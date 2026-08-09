@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tropel_http::client::HttpClient;
-use tropel_pm::bridge::SharedPmState;
+use tropel_pm::state::SharedPmState;
 use tropel_sdk::error::TropelError;
 use tropel_sdk::Result;
 
@@ -28,6 +28,58 @@ const JS_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: exec-shim ====\n",
     include_str!("../../../js/exec/exec.js"),
 );
+
+/// One shim library: a name + its source text.
+pub struct ShimEntry(pub &'static str, pub std::borrow::Cow<'static, str>);
+
+/// The shim bundle for a JS context (P4b: injectable, defaults to the
+/// embedded set).
+///
+/// - **Native / CLI keeps the embedded default** — reproducibility matters; a
+///   load test's semantics must not change because someone dropped a
+///   different `pm.js` beside the binary.
+/// - **The web client supplies its own** — a `pm.*` fix ships as a JS asset
+///   with the web app: no wasm rebuild, no Tropel release.
+pub struct ShimBundle(pub Vec<ShimEntry>);
+
+impl ShimBundle {
+    /// Render the bundle to source text, concatenated with section headers
+    /// (byte-identical to the compile-time [`JS_SHIM_BUNDLE`] for the
+    /// default bundle).
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for ShimEntry(name, src) in &self.0 {
+            out.push_str(&format!("// ==== shim: {name} ====\n"));
+            out.push_str(src);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// True if this bundle is the embedded default (same entries as
+    /// [`ShimBundle::default`]).
+    pub fn is_default(&self) -> bool {
+        let d = Self::default();
+        self.0.len() == d.0.len()
+            && self
+                .0
+                .iter()
+                .zip(d.0.iter())
+                .all(|(a, b)| a.0 == b.0 && a.1 == b.1)
+    }
+}
+
+impl Default for ShimBundle {
+    fn default() -> Self {
+        Self(vec![
+            ShimEntry("pm-api", std::borrow::Cow::Borrowed(include_str!("../../../js/pm-api/pm.js"))),
+            ShimEntry("chai-shim", std::borrow::Cow::Borrowed(include_str!("../../../js/chai/chai-shim.js"))),
+            ShimEntry("lodash-shim", std::borrow::Cow::Borrowed(include_str!("../../../js/lodash/lodash-shim.js"))),
+            ShimEntry("cryptojs-shim", std::borrow::Cow::Borrowed(include_str!("../../../js/cryptojs-shim/cryptojs.js"))),
+            ShimEntry("exec-shim", std::borrow::Cow::Borrowed(include_str!("../../../js/exec/exec.js"))),
+        ])
+    }
+}
 
 /// Process-wide cache of the compiled shim bundle bytecode.
 ///
@@ -64,6 +116,7 @@ pub(crate) async fn create_vu_js_context(
     vu_id: u32,
     pm_state: &SharedPmState,
     http_client: &Arc<HttpClient>,
+    shim: &ShimBundle,
 ) -> Option<tropel_js::JsContext> {
     let mut ctx = match tropel_js::JsContext::new(
         Some(10 * 1024 * 1024),
@@ -82,7 +135,7 @@ pub(crate) async fn create_vu_js_context(
         }
     };
 
-    if let Err(e) = bootstrap_shims(&mut ctx, vu_id).await {
+    if let Err(e) = bootstrap_shims(&mut ctx, vu_id, shim).await {
         // Backlog line 238: a shim-eval failure must be LOUD — warn-only left
         // every script throwing `ReferenceError: pm is not defined`. Fail the
         // VU's JS context (scripts are skipped) and log at error level so the
@@ -99,7 +152,7 @@ pub(crate) async fn create_vu_js_context(
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
     }
 
-    let bridge = tropel_pm::bridge_fns::PmBridge::new(pm_state.clone(), http_client.clone());
+    let bridge = tropel_pm::bindings::pm::PmBridge::new(pm_state.clone(), http_client.clone());
     if let Err(e) = bridge.install(&mut ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }
@@ -150,7 +203,17 @@ pub(crate) async fn create_vu_js_context(
 /// path (bytecode compile failed + source eval failed, or bytecode run
 /// failed + source eval failed) — a true `pm is not defined` condition that
 /// the caller must surface loudly.
-async fn bootstrap_shims(ctx: &mut tropel_js::JsContext, vu_id: u32) -> Result<()> {
+async fn bootstrap_shims(ctx: &mut tropel_js::JsContext, vu_id: u32, shim: &ShimBundle) -> Result<()> {
+    // A non-default (injected) bundle skips the bytecode cache entirely — the
+    // process-wide cache is keyed to the single JS_SHIM_BUNDLE and must not
+    // serve a different bundle's bytecode (see SHIM_BYTECODE note).
+    if !shim.is_default() {
+        let src = shim.render();
+        return ctx.bootstrap_library(&src).await.map_err(|e| {
+            TropelError::Js(format!("VU {vu_id}: injected shim bundle eval failed: {e}"))
+        });
+    }
+
     let bytecode = SHIM_BYTECODE.get_or_init(|| {
         if SHIM_BYTECODE_FAILED.load(Ordering::Relaxed) {
             return None;

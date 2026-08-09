@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tropel_core::config::ExpectedStatus;
 use tropel_js::JsContext;
-use tropel_pm::bridge::{PmState, SharedPmState};
+use tropel_pm::state::{PmState, SharedPmState};
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
 use tropel_sdk::traits::{DriverHttpClient, Protocol};
 use tropel_sdk::types::{Sample, SampleType, TagMap};
@@ -1122,7 +1122,7 @@ mod tests {
             HttpClient::new(&tropel_core::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
-        tropel_pm::bridge_fns::PmBridge::new(runner.pm_state().clone(), bridge_client)
+        tropel_pm::bindings::pm::PmBridge::new(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);
@@ -1226,7 +1226,7 @@ mod tests {
             HttpClient::new(&tropel_core::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
-        tropel_pm::bridge_fns::PmBridge::new(runner.pm_state().clone(), bridge_client)
+        tropel_pm::bindings::pm::PmBridge::new(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);

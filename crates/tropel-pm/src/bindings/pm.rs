@@ -1,4 +1,4 @@
-use crate::bridge::SharedPmState;
+use crate::state::SharedPmState;
 use rquickjs::function::Func;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1454,5 +1454,66 @@ mod tests {
         // Array form still works unchanged.
         let headers = parse_headers(r#"[{"key":"X","value":"y"}]"#);
         assert_eq!(headers.get("X").map(String::as_str), Some("y"));
+    }
+
+    /// P4b conformance: the pm.js binding is namespace-parameterized. `pm`
+    /// (frozen Postman-compat) and `tropel` (canonical) are peer views over
+    /// the same state; `wire` is a true alias of `tropel` (identical object,
+    /// not a proxy). Error strings name the invoked namespace, and the
+    /// top-level bindings are installed read-only.
+    #[test]
+    fn test_binding_namespace_conformance() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+
+            // All three globals installed; wire is a true alias of tropel.
+            let installed: bool = ctx
+                .eval(
+                    "typeof pm === 'object' && typeof tropel === 'object' \
+                     && typeof wire === 'object' && wire === tropel",
+                )
+                .unwrap();
+            assert!(installed, "pm/tropel/wire must be installed with wire === tropel");
+
+            // pm and tropel are distinct peer views (not the same object).
+            let peer_views: bool = ctx.eval("pm !== tropel").unwrap();
+            assert!(peer_views, "pm and tropel must be peer views, not the same object");
+
+            // Error strings name the invoked namespace.
+            let pm_err: String = ctx
+                .eval(
+                    "(function(){ try { pm.response.json(); return 'no-error'; } \
+                      catch (e) { return e.message; } })()",
+                )
+                .unwrap();
+            assert!(
+                pm_err.contains("pm.response.json()"),
+                "pm error must name pm: {pm_err}"
+            );
+
+            let tr_err: String = ctx
+                .eval(
+                    "(function(){ try { tropel.response.json(); return 'no-error'; } \
+                      catch (e) { return e.message; } })()",
+                )
+                .unwrap();
+            assert!(
+                tr_err.contains("tropel.response.json()"),
+                "tropel error must name tropel: {tr_err}"
+            );
+
+            // Top-level bindings installed read-only (writable: false).
+            let readonly: bool = ctx
+                .eval(
+                    "Object.getOwnPropertyDescriptor(globalThis, 'pm').writable === false \
+                     && Object.getOwnPropertyDescriptor(globalThis, 'tropel').writable === false \
+                     && Object.getOwnPropertyDescriptor(globalThis, 'wire').writable === false",
+                )
+                .unwrap();
+            assert!(readonly, "pm/tropel/wire must be non-writable");
+        });
     }
 }
