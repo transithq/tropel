@@ -6013,6 +6013,7 @@ mod tests {
                 timings: None,
                 cookies: vec![],
                 size: 2,
+                request_body_size: 0,
                 redirects: vec![],
             })
         }

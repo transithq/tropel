@@ -8,8 +8,7 @@ use tropel_core::config::ExpectedStatus;
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
 use tropel_sdk::types::{Sample, SampleType, TagMap};
 use tropel_sdk::Result;
-use tropel_sdk::traits::Protocol;
-use tropel_http::client::HttpClient;
+use tropel_sdk::traits::{DriverHttpClient, Protocol};
 use tropel_js::JsContext;
 use tropel_pm::bridge::{PmState, SharedPmState};
 
@@ -42,9 +41,12 @@ const MAX_SET_NEXT_REQUEST_JUMPS: usize = 10_000;
 
 /// Per-VU iteration runner with full HTTP/JS/PM integration.
 ///
-/// Each VU owns its own `HttpClient` (own connection pool, cookie jar,
-/// and discard_bodies setting) — eliminating connection contention and
-/// the N1 race condition where VUs shared a response slot.
+/// Each VU owns its own HTTP client behind the `DriverHttpClient` trait
+/// (own connection pool, cookie jar, and discard_bodies setting) —
+/// eliminating connection contention and the N1 race condition where VUs
+/// shared a response slot. The trait object is what decouples this crate
+/// from `tropel-http` (P4): the executor talks to HTTP only through the
+/// SDK trait, so a browser/wasm slice can supply its own implementation.
 pub struct VURunner {
     scenario: Arc<Scenario>,
     /// Depth-first flatten of the scenario item tree into execution order.
@@ -56,7 +58,7 @@ pub struct VURunner {
     /// `setNextRequest` indexing/name lookup consistent with run order.
     execution_items: Arc<Vec<ScenarioItem>>,
     pm_state: SharedPmState,
-    client: HttpClient,
+    client: Arc<dyn DriverHttpClient>,
     config: RunnerConfig,
     js_ctx: Option<Box<JsContext>>,
     /// Registered protocols keyed by URL scheme (e.g. `grpc`, `ws`, or any
@@ -81,7 +83,7 @@ impl VURunner {
         scenario: Arc<Scenario>,
         execution_items: Arc<Vec<ScenarioItem>>,
         execution_names: Arc<Vec<String>>,
-        client: HttpClient,
+        client: Arc<dyn DriverHttpClient>,
         vu_id: u32,
         scenario_name: String,
     ) -> Self {
@@ -316,7 +318,7 @@ impl VURunner {
                         .map(|b| resolve_body(b, &resolver, &scope));
 
                     // Build the fully resolved request
-                    let resolved_req = tropel_sdk::types::Request {
+                    let mut resolved_req = tropel_sdk::types::Request {
                         url: resolved_url.clone(),
                         method: request.method.clone(),
                         headers: resolved_headers,
@@ -412,21 +414,21 @@ impl VURunner {
                         // Warned above; skip — never send a non-HTTP scheme to
                         // the HTTP client (reqwest would fail confusingly).
                     } else {
-                        // Build auth signer from request auth config, or use the scenario-level auth
-                        let auth_signer = resolved_req
-                            .auth
-                            .as_ref()
-                            .or(self.scenario.auth.as_ref())
-                            .and_then(|auth| tropel_http::auth::build_auth_signer(auth));
+                        // Fold the scenario-level auth into the request as a
+                        // fallback (request-level auth wins). The
+                        // `DriverHttpClient` implementation builds the signer
+                        // from `req.auth` internally — the executor no longer
+                        // needs to reference auth signers at all (P4
+                        // decoupling from the HTTP crate).
+                        if resolved_req.auth.is_none() {
+                            resolved_req.auth = self.scenario.auth.clone();
+                        }
 
                         // Execute the request directly via the per-VU HTTP client
                         tracing::trace!("VU runner: executing request to {}", resolved_req.url);
 
                         let exec_start = Instant::now();
-                        let exec_result = self
-                            .client
-                            .execute(&resolved_req, auth_signer.as_deref())
-                            .await;
+                        let exec_result = self.client.execute(&resolved_req).await;
                         let duration = exec_start.elapsed();
 
                         tracing::trace!(
@@ -437,9 +439,11 @@ impl VURunner {
 
                         match exec_result {
                             Ok(http_response) => {
-                                // Convert to core Response and store in PM state (by move — no shared slot)
-                                let pm_response =
-                                    tropel_sdk::types::Response::from(&http_response);
+                                // The DriverHttpClient impl already returns a
+                                // core SDK Response — store it in PM state
+                                // (clone: the redirect-chain loop below still
+                                // borrows the original).
+                                let pm_response = http_response.clone();
                                 {
                                     let mut state = self.pm_state.lock().unwrap();
                                     state.response = Some(pm_response);
@@ -813,7 +817,26 @@ fn resolve_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use tropel_http::client::HttpClient;
     use tropel_sdk::types::{Method, ResponseType};
+
+    /// Test-only `DriverHttpClient`: wraps a real `HttpClient` behind the
+    /// SDK trait (mirrors the engine's `DriverHttpClientImpl`), so runner
+    /// tests exercise the same trait path production VUs use.
+    struct TestHttpClient(HttpClient);
+
+    #[async_trait]
+    impl DriverHttpClient for TestHttpClient {
+        async fn execute(
+            &self,
+            req: &tropel_sdk::types::Request,
+        ) -> Result<tropel_sdk::types::Response> {
+            let signer = req.auth.as_ref().and_then(|a| self.0.get_signer(a));
+            let resp = self.0.execute(req, signer.as_deref()).await?;
+            Ok(tropel_sdk::types::Response::from(&resp))
+        }
+    }
 
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
@@ -951,8 +974,10 @@ mod tests {
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
         let names: Arc<Vec<String>> =
             Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
-        let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
-            .expect("http client should construct");
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_core::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
         let runner = VURunner::new(
             scenario,
             execution_items,
@@ -1076,8 +1101,10 @@ mod tests {
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
         let names: Arc<Vec<String>> =
             Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
-        let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
-            .expect("http client should construct");
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_core::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
         let mut runner = VURunner::new(scenario, execution_items, names, client, 0, "loop".into());
 
         // Wire a real JS context with the pm shim + bridge so the prerequest
@@ -1173,8 +1200,10 @@ mod tests {
         );
         let names: Arc<Vec<String>> =
             Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
-        let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
-            .expect("http client should construct");
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_core::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
         let mut runner = VURunner::new(
             scenario,
             execution_items,

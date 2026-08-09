@@ -13,5 +13,8 @@ rquickjs.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio.workspace = true
 anyhow.workspace = true
+# P4: narrow tokio for the browser slice — `net`/`signal` don't exist on
+# wasm32. tropel-js only needs time (tokio::time::sleep in tests), macros +
+# rt (for #[tokio::test]), and sync (rquickjs async plumbing via the driver).
+tokio = { version = "1.53.1", default-features = false, features = ["sync", "macros", "time", "rt"] }

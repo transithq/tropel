@@ -563,13 +563,20 @@ pub(crate) async fn run_scenario_vus(
 
                 // Cheap struct clone of the shared client (Arc bumps + small
                 // config snapshots) — the pooled reqwest Clients are shared.
-                let client = http_client_vu.as_ref().clone();
-                let bridge_client = Arc::new(client.clone());
+                // The scenario runner now consumes HTTP through the SDK
+                // `DriverHttpClient` trait (P4 decoupling), so wrap the
+                // concrete client in the engine's trait impl. The PM bridge
+                // still wants the concrete `Arc<HttpClient>`.
+                let http_client_handle: Arc<dyn DriverHttpClient> =
+                    Arc::new(DriverHttpClientImpl {
+                        client: http_client_vu.as_ref().clone(),
+                    });
+                let bridge_client = http_client_vu.clone();
                 let mut runner = VURunner::new(
                     scenario,
                     flattened_vu,
                     names_vu,
-                    client,
+                    http_client_handle,
                     vu_id,
                     sc_name_vu.clone(),
                 )

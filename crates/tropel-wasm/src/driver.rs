@@ -1149,6 +1149,7 @@ mod tests {
                 timings: None,
                 cookies: vec![],
                 size: 5,
+                request_body_size: 0,
                 redirects: vec![],
             })
         }

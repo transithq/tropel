@@ -211,6 +211,7 @@ impl Protocol for WebSocketProtocol {
             timings: None,
             cookies: vec![],
             size: body.len() as u64,
+            request_body_size: 0,
             redirects: vec![],
         };
 

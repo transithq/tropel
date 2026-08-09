@@ -11,6 +11,7 @@ members = [
     "crates/tropel-pm",
     "crates/tropel-native",
     "crates/tropel-http",
+    "crates/tropel-auth",
     "crates/tropel-executor",
     "crates/tropel-metrics",
     "crates/tropel-report",
@@ -189,6 +190,7 @@ tropel-js = { path = "crates/tropel-js" }
 tropel-native = { path = "crates/tropel-native" }
 tropel-pm = { path = "crates/tropel-pm" }
 tropel-http = { path = "crates/tropel-http" }
+tropel-auth = { path = "crates/tropel-auth" }
 tropel-executor = { path = "crates/tropel-executor" }
 tropel-metrics = { path = "crates/tropel-metrics" }
 tropel-report = { path = "crates/tropel-report" }

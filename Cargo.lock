@@ -4066,6 +4066,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tropel-auth"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.0",
+ "chrono",
+ "hex",
+ "hmac 0.13.0",
+ "md-5",
+ "percent-encoding",
+ "rand",
+ "reqwest",
+ "sha1",
+ "sha2 0.11.0",
+ "tropel-sdk",
+]
+
+[[package]]
 name = "tropel-bench"
 version = "0.1.0"
 dependencies = [
@@ -4243,31 +4260,16 @@ dependencies = [
 name = "tropel-http"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.23.0",
- "chrono",
- "hex",
- "hmac 0.13.0",
- "indexmap",
- "md-5",
- "percent-encoding",
- "rand",
  "reqwest",
- "serde",
  "serde_json",
  "serde_urlencoded",
- "sha1",
- "sha2 0.11.0",
  "simd-json",
- "thiserror",
  "tokio",
  "tower",
  "tracing",
+ "tropel-auth",
  "tropel-core",
- "tropel-metrics",
  "tropel-sdk",
- "url",
 ]
 
 [[package]]

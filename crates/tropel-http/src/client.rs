@@ -1,4 +1,4 @@
-use crate::auth::AuthSigner;
+use tropel_auth::AuthSigner;
 use crate::dns::{parse_blacklist, DnsResolver, IpCidr};
 use crate::rps::RpsLimiter;
 use std::collections::HashMap;
@@ -977,11 +977,11 @@ impl HttpClient {
     /// Get an auth signer based on the auth config.
     ///
     /// Delegates to the single consolidated signer builder
-    /// ([`crate::auth::build_auth_signer`]) shared with the executor runner,
+    /// ([`tropel_auth::build_auth_signer`]) shared with the executor runner,
     /// so every auth type (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1,
     /// Hawk, Digest) is supported in exactly one place.
     pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
-        crate::auth::build_auth_signer(auth)
+        tropel_auth::build_auth_signer(auth)
     }
 }
 
@@ -1063,6 +1063,7 @@ impl From<&HttpResponse> for tropel_sdk::types::Response {
             timings: resp.timings.clone(),
             cookies: resp.cookies.clone(),
             size: resp.size,
+            request_body_size: resp.request_body_size,
             // Recursively convert the redirect chain so DriverHttpClient / k6
             // driver / pm.response all see per-hop requests (k6 parity).
             redirects: resp.redirects.iter().map(Response::from).collect(),

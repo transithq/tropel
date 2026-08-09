@@ -511,6 +511,7 @@ impl Protocol for GrpcProtocol {
             timings: None,
             cookies: vec![],
             size: body_bytes.len() as u64,
+            request_body_size: 0,
             redirects: vec![],
         };
 

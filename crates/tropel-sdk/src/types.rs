@@ -399,6 +399,12 @@ pub struct Response {
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
     pub size: u64,
+    /// Number of bytes sent in the request body (for `data_sent` tracking).
+    /// Carried on the response so the executor can emit `data_sent` without
+    /// reaching into the HTTP layer (P4 decoupling: the executor talks to
+    /// HTTP only through `DriverHttpClient`).
+    #[serde(default)]
+    pub request_body_size: u64,
     /// Intermediate redirect hops, in order, each captured as its own
     /// request (k6 parity: a 302 chain counts as hops + 1 requests, not
     /// just the final). Empty when the request did not redirect. Callers
@@ -819,6 +825,7 @@ mod tests {
                 timings: None,
                 cookies: Vec::new(),
                 size: 0,
+                request_body_size: 0,
                 redirects: Vec::new(),
             }
         }

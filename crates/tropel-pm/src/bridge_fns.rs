@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tropel_sdk::error::TropelError;
 use tropel_sdk::types::{AuthConfig, Body, Method, Request};
 use tropel_sdk::Result;
+#[cfg(feature = "send-request")]
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 
@@ -274,12 +275,21 @@ fn parse_headers(json: &str) -> HashMap<String, String> {
 pub struct PmBridge {
     state: SharedPmState,
     /// Per-VU HTTP client for executing pm.sendRequest synchronously.
+    /// Gated behind the `send-request` feature (P4) — the entire
+    /// tropel-pm → tropel-http dependency.
+    #[cfg(feature = "send-request")]
     http_client: Arc<HttpClient>,
 }
 
 impl PmBridge {
+    #[cfg(feature = "send-request")]
     pub fn new(state: SharedPmState, http_client: Arc<HttpClient>) -> Self {
         Self { state, http_client }
+    }
+
+    #[cfg(not(feature = "send-request"))]
+    pub fn new(state: SharedPmState) -> Self {
+        Self { state }
     }
 
     /// Register all bridge functions into the given JS context.
@@ -1118,9 +1128,11 @@ impl PmBridge {
             //   response_type: k6 responseType ("text"/"binary"/"none") — "none"
             //     skips reading the response body (saves bandwidth/memory)
             // Returns: JSON-encoded response with code, statusText, body, headers, responseTime
-            let http = self.http_client.clone();
-            let state_for_send = self.state.clone();
-            set_global!(
+            #[cfg(feature = "send-request")]
+            {
+                let http = self.http_client.clone();
+                let state_for_send = self.state.clone();
+                set_global!(
                 "__tropel_pm_send_request",
                 Func::from(
                     move |method: String,
@@ -1222,6 +1234,7 @@ impl PmBridge {
                     },
                 ),
             );
+            }
             failures
         });
 

@@ -7,13 +7,21 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# pm.sendRequest is the ENTIRE tropel-pm → tropel-http dependency (P4).
+# Gate it so the browser slice can compile pm without reqwest/tokio-net.
+# A consumer that only uses pm.response/pm.environment/etc. can set
+# default-features = false and drop tropel-http entirely.
+default = ["send-request"]
+send-request = ["dep:tropel-http"]
+
 [dependencies]
 tropel-sdk.workspace = true
 tropel-core.workspace = true
 tropel-js.workspace = true
 tropel-native.workspace = true
 tropel-variables.workspace = true
-tropel-http.workspace = true
+tropel-http = { workspace = true, optional = true }
 rquickjs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
