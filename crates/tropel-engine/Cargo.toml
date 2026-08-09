@@ -10,7 +10,8 @@ publish = false
 [dependencies]
 tropel-sdk.workspace = true
 tropel-core.workspace = true
-tropel-executor.workspace = true
+tropel-runtime.workspace = true
+tropel-scheduler.workspace = true
 tropel-report.workspace = true
 tropel-metrics.workspace = true
 tropel-ext.workspace = true

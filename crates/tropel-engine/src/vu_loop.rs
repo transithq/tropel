@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use tropel_core::config::{
     ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig,
 };
-use tropel_executor::runner::VURunner;
-use tropel_executor::scheduler::{VUScheduler, VuLease};
+use tropel_runtime::ScenarioRunner;
+use tropel_scheduler::{VUScheduler, VuLease};
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
@@ -456,7 +456,7 @@ impl DriverHttpClient for DriverHttpClientImpl {
 // ── Scenario entry point ──
 
 /// Run a declarative (Postman-style) scenario: each VU builds its own
-/// HttpClient + VURunner + JS context and drives the shared loop through
+/// HttpClient + ScenarioRunner + JS context and drives the shared loop through
 /// [`ScenarioVuSource`]. Returns `(vu_init_failures, script_failures)` —
 /// VUs that failed to START (so the engine can fail the run loudly when the
 /// requested load is not delivered) and script executions that errored (so a
@@ -481,7 +481,7 @@ pub(crate) async fn run_scenario_vus(
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
 ) -> (u32, u64) {
-    // Expected statuses are read by every VU's VURunner — snapshot them once
+    // Expected statuses are read by every VU's ScenarioRunner — snapshot them once
     // and share (the closure no longer captures the whole HttpConfig, which
     // is consumed into the shared client build below).
     let expected_statuses_c = http_cfg.expected_statuses.clone();
@@ -519,10 +519,10 @@ pub(crate) async fn run_scenario_vus(
 
     // Pre-flatten the item tree ONCE per scenario and share the Arcs with
     // every VU — a large collection must not be re-flattened/re-cloned per
-    // VU at runner construction (VURunner::new). Request names for
+    // VU at runner construction (ScenarioRunner::new). Request names for
     // setNextRequest are derived from the same flatten and shared too.
     let flattened_c: Arc<Vec<ScenarioItem>> = Arc::new(
-        tropel_executor::runner::flatten_execution_items(&scenario.items),
+        tropel_runtime::flatten_execution_items(&scenario.items),
     );
     let names_c: Arc<Vec<String>> =
         Arc::new(flattened_c.iter().map(|item| item.name.clone()).collect());
@@ -572,7 +572,7 @@ pub(crate) async fn run_scenario_vus(
                         client: http_client_vu.as_ref().clone(),
                     });
                 let bridge_client = http_client_vu.clone();
-                let mut runner = VURunner::new(
+                let mut runner = ScenarioRunner::new(
                     scenario,
                     flattened_vu,
                     names_vu,

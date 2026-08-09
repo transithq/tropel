@@ -47,7 +47,7 @@ const MAX_SET_NEXT_REQUEST_JUMPS: usize = 10_000;
 /// shared a response slot. The trait object is what decouples this crate
 /// from `tropel-http` (P4): the executor talks to HTTP only through the
 /// SDK trait, so a browser/wasm slice can supply its own implementation.
-pub struct VURunner {
+pub struct ScenarioRunner {
     scenario: Arc<Scenario>,
     /// Depth-first flatten of the scenario item tree into execution order.
     /// Folder items (children present) are containers: their leaf children
@@ -77,7 +77,7 @@ pub struct VURunner {
     pub scenario_name: String,
 }
 
-impl VURunner {
+impl ScenarioRunner {
     /// Create a new VU runner with a dedicated HTTP client.
     pub fn new(
         scenario: Arc<Scenario>,
@@ -638,8 +638,8 @@ impl VURunner {
     ///
     /// Deliberately synchronous (`&self`, no `.await`): the `#[async_trait]`
     /// `VuIterationSource` future must be `Send`, and an async `&self` method
-    /// would hold `&VURunner` across an await — `&VURunner: Send` requires
-    /// `VURunner: Sync`, which the now-`!Sync` `JsContext` can't satisfy.
+    /// would hold `&ScenarioRunner` across an await — `&ScenarioRunner: Send` requires
+    /// `ScenarioRunner: Sync`, which the now-`!Sync` `JsContext` can't satisfy.
     fn build_scope(
         &self,
         data_row: Option<HashMap<String, serde_json::Value>>,
@@ -960,7 +960,7 @@ mod tests {
     fn runner_with_env_override(
         static_env: HashMap<String, String>,
         script_set: HashMap<String, String>,
-    ) -> (VURunner, tropel_variables::VariableScope) {
+    ) -> (ScenarioRunner, tropel_variables::VariableScope) {
         let scenario = Arc::new(Scenario {
             info: tropel_sdk::scenario::ScenarioInfo {
                 name: "scope-test".into(),
@@ -978,7 +978,7 @@ mod tests {
             HttpClient::new(&tropel_core::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
-        let runner = VURunner::new(
+        let runner = ScenarioRunner::new(
             scenario,
             execution_items,
             names,
@@ -1105,7 +1105,7 @@ mod tests {
             HttpClient::new(&tropel_core::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
-        let mut runner = VURunner::new(scenario, execution_items, names, client, 0, "loop".into());
+        let mut runner = ScenarioRunner::new(scenario, execution_items, names, client, 0, "loop".into());
 
         // Wire a real JS context with the pm shim + bridge so the prerequest
         // script can actually call setNextRequest.
@@ -1204,7 +1204,7 @@ mod tests {
             HttpClient::new(&tropel_core::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
-        let mut runner = VURunner::new(
+        let mut runner = ScenarioRunner::new(
             scenario,
             execution_items,
             names,

@@ -12,7 +12,8 @@ members = [
     "crates/tropel-native",
     "crates/tropel-http",
     "crates/tropel-auth",
-    "crates/tropel-executor",
+    "crates/tropel-runtime",
+    "crates/tropel-scheduler",
     "crates/tropel-metrics",
     "crates/tropel-report",
     "crates/tropel-sdk",
@@ -186,7 +187,8 @@ tropel-native = { path = "crates/tropel-native" }
 tropel-pm = { path = "crates/tropel-pm" }
 tropel-http = { path = "crates/tropel-http" }
 tropel-auth = { path = "crates/tropel-auth" }
-tropel-executor = { path = "crates/tropel-executor" }
+tropel-runtime = { path = "crates/tropel-runtime", version = "0.1.0" }
+tropel-scheduler = { path = "crates/tropel-scheduler", version = "0.1.0" }
 tropel-metrics = { path = "crates/tropel-metrics" }
 tropel-report = { path = "crates/tropel-report" }
 tropel-ext = { path = "crates/tropel-ext", version = "0.1.0" }

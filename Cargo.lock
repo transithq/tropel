@@ -4176,7 +4176,6 @@ dependencies = [
  "tropel-collection",
  "tropel-core",
  "tropel-es",
- "tropel-executor",
  "tropel-ext",
  "tropel-http",
  "tropel-input-har",
@@ -4189,6 +4188,8 @@ dependencies = [
  "tropel-native",
  "tropel-pm",
  "tropel-report",
+ "tropel-runtime",
+ "tropel-scheduler",
  "tropel-sdk",
  "tropel-variables",
  "tropel-wasm",
@@ -4217,28 +4218,6 @@ dependencies = [
  "serde_json",
  "tracing",
  "tropel-sdk",
-]
-
-[[package]]
-name = "tropel-executor"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tropel-collection",
- "tropel-core",
- "tropel-http",
- "tropel-js",
- "tropel-metrics",
- "tropel-native",
- "tropel-pm",
- "tropel-sdk",
- "tropel-variables",
 ]
 
 [[package]]
@@ -4440,6 +4419,34 @@ dependencies = [
  "tracing",
  "tropel-core",
  "tropel-metrics",
+ "tropel-sdk",
+]
+
+[[package]]
+name = "tropel-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tropel-core",
+ "tropel-http",
+ "tropel-js",
+ "tropel-pm",
+ "tropel-sdk",
+ "tropel-variables",
+]
+
+[[package]]
+name = "tropel-scheduler"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "tokio",
+ "tracing",
+ "tropel-core",
  "tropel-sdk",
 ]
 

@@ -1047,7 +1047,7 @@ impl PmBridge {
 
             // exec.scenario.executor — executor type string (e.g.,
             // "constant-vus", "ramping-vus"). Piped into PmState by the engine
-            // via VURunner::with_exec_context. Falls back to "" when the
+            // via ScenarioRunner::with_exec_context. Falls back to "" when the
             // engine hasn't attached it (e.g. script-only test harnesses).
             let state_clone = state.clone();
             set_global!(

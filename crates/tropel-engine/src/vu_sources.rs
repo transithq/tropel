@@ -7,16 +7,16 @@ use crate::vu_loop::{VuIterationOutcome, VuIterationSource};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tropel_executor::runner::VURunner;
-use tropel_executor::scheduler::VUScheduler;
+use tropel_runtime::ScenarioRunner;
+use tropel_scheduler::VUScheduler;
 use tropel_pm::bridge::SharedPmState;
 use tropel_sdk::traits::{DriverHttpClient, DriverInstance, Protocol, VuContext};
 use tropel_sdk::types::{Sample, TagMap};
 
-// ── Scenario source: VURunner (Postman pm.* declarative execution) ──
+// ── Scenario source: ScenarioRunner (Postman pm.* declarative execution) ──
 
 pub(crate) struct ScenarioVuSource {
-    pub(crate) runner: VURunner,
+    pub(crate) runner: ScenarioRunner,
     pub(crate) pm_state: SharedPmState,
 }
 
@@ -78,7 +78,7 @@ pub(crate) struct DriverVuSource {
     /// receives it (k6 lifecycle). `None` when the script declares no setup.
     pub(crate) setup_data: Option<String>,
     /// Registered protocols keyed by URL scheme (backlog line 230) — the
-    /// driver-path twin of `VURunner.protocols`, so imperative scripts can
+    /// driver-path twin of `ScenarioRunner.protocols`, so imperative scripts can
     /// reach third-party protocols, not just the declarative runner.
     pub(crate) protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
 }
