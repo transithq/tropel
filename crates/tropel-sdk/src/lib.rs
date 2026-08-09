@@ -14,6 +14,10 @@
 //!
 //! ## Quick start — writing an input adapter
 //!
+//! > The quick-start example and stability table below are **maintained in
+//! > [`README.md`](https://crates.io/crates/tropel-sdk) (crates.io renders it);
+//! > keep the two copies in sync when the surface changes.
+//!
 //! ```rust,ignore
 //! // Single import: `tropel-sdk` re-exports everything you need.
 //! use tropel_sdk::{

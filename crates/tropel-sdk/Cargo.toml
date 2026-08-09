@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["load-testing", "testing", "adapter", "sdk", "benchmark"]
+categories = ["development-tools::testing"]
 description = """
 Stable public API for Tropel extension authors. Re-exports the types and
 traits needed to implement input adapters, protocols, and outputs without
@@ -13,9 +16,11 @@ depending on internal crate details.
 
 # ── Semver policy ──────────────────────────────────────────────────
 # tropel-sdk follows semver strictly. Any breaking change to re-exported
-# types or traits requires a major version bump. Internal refactors in
-# the backing crates (tropel-core, tropel-ext) that don't change the
-# SDK surface are patch-level.
+# types or traits requires a major version bump.
+#
+# Post-P1 the SDK is a LEAF with zero tropel-* dependencies; tropel-core
+# and tropel-ext are its dependents. Their internal refactors cannot
+# affect the SDK surface at all — only changes to files in this crate do.
 #
 # Until 1.0.0, breaking changes bump the minor version (0.x → 0.y).
 
