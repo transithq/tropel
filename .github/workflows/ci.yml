@@ -26,6 +26,24 @@ on:
   push:
     branches: [master]
   pull_request:
+    # P4a (TROPEL_MODULARIZATION_TODO.md): docs-only PRs skip the full matrix.
+    # Everything that can affect a build is covered: crates, the shim bundle,
+    # workspace manifests, CI itself, and the vendored toolchain config.
+    #
+    # Branch-protection note: these trigger-level filters skip EVERY job
+    # (including ci-ok) for out-of-scope PRs, so if ci-ok is a required status,
+    # docs-only PRs will sit as "expected — waiting for status". Either keep
+    # ci-ok required only for code PRs, or switch this to paths-ignore if the
+    # block bites.
+    paths:
+      - 'crates/**'
+      - 'js/**'
+      - 'examples/**'
+      - '.github/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'deny.toml'
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref instead of paying for both.
@@ -116,6 +134,29 @@ jobs:
           key: msrv
       # `check` not `test`: dev-dependencies may legitimately need newer Rust.
       - run: cargo check --workspace --locked
+
+  semver:
+    name: semver-checks (tropel-sdk API breaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # crates/tropel-sdk is a git submodule of transithq/tropel-sdk
+          # (see .gitmodules) — every cargo job needs it populated.
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: semver
+      # P2 (TROPEL_MODULARIZATION_TODO.md): the SDK's 0.1.0 is live, so any
+      # breaking change to the published contract must bump the minor before
+      # release. `check-release` diffs the working tree against the last
+      # version on crates.io and fails on breaking changes.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - run: cargo semver-checks check-release -p tropel-sdk
 
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
@@ -304,7 +345,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [fmt, clippy, test, msrv, deny, sdk-gates, smoke]
+    needs: [fmt, clippy, test, msrv, semver, deny, sdk-gates, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
