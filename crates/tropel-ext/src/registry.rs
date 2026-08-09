@@ -1,7 +1,7 @@
-use tropel_sdk::traits::*;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tropel_sdk::traits::*;
 
 /// The extension registry: collects all registered extensions at startup.
 ///

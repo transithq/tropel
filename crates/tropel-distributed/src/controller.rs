@@ -5,8 +5,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
 use tropel_core::segment::ExecutionSegment;
-use tropel_sdk::{Result, TropelError};
 use tropel_metrics::collector::{merge_snapshots, MetricsResult, MetricsSnapshot};
+use tropel_sdk::{Result, TropelError};
 
 /// Base timeout for a single agent to connect+run and ship its snapshot.
 /// The job's own duration (max_duration / longest stage) is added on top,

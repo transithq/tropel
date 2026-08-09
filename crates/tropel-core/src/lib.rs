@@ -16,6 +16,6 @@ pub use segment::*;
 // Explicit re-exports (not a glob — a glob over a module that itself
 // re-exports from tropel-sdk triggers an unused-import lint).
 pub use config::{
-    ArrivalRateStage, ExecutionConfig, ExpectedStatus, HttpConfig, JobConfig, OutputConfig,
-    ScenarioConfig, Stage, status_is_expected, ThinkTimeConfig, ThresholdConfig, TlsConfig,
+    status_is_expected, ArrivalRateStage, ExecutionConfig, ExpectedStatus, HttpConfig, JobConfig,
+    OutputConfig, ScenarioConfig, Stage, ThinkTimeConfig, ThresholdConfig, TlsConfig,
 };

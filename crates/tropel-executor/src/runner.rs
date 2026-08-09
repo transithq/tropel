@@ -5,12 +5,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tropel_core::config::ExpectedStatus;
-use tropel_sdk::scenario::{Scenario, ScenarioItem};
-use tropel_sdk::types::{Sample, SampleType, TagMap};
-use tropel_sdk::Result;
-use tropel_sdk::traits::{DriverHttpClient, Protocol};
 use tropel_js::JsContext;
 use tropel_pm::bridge::{PmState, SharedPmState};
+use tropel_sdk::scenario::{Scenario, ScenarioItem};
+use tropel_sdk::traits::{DriverHttpClient, Protocol};
+use tropel_sdk::types::{Sample, SampleType, TagMap};
+use tropel_sdk::Result;
 
 /// Result of running a VU iteration.
 #[derive(Debug, Default)]

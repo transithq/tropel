@@ -2,9 +2,9 @@
 
 use crate::protocol::{read_frame, token_matches, write_frame, AssignMsg, HelloMsg, SnapshotMsg};
 use tokio::net::TcpStream;
-use tropel_sdk::{Result, TropelError};
 use tropel_engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
+use tropel_sdk::{Result, TropelError};
 
 /// Total time an agent keeps retrying the controller connection before
 /// giving up (the controller pod may still be scheduling — agents must not

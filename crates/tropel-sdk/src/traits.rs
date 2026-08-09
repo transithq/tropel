@@ -1,11 +1,11 @@
-use async_trait::async_trait;
-use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use crate::config::{ExecutionConfig, OutputConfig, ScenarioConfig, ThresholdConfig};
 use crate::scenario::Scenario;
 use crate::types::{Request, Response, Sample};
 use crate::Result;
+use async_trait::async_trait;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// A new protocol/request executor (beyond HTTP): gRPC, WebSocket, MQTT, ...
 ///

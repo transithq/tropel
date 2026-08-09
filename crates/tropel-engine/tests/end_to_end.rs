@@ -21,10 +21,10 @@ use tokio::net::TcpListener;
 use tropel_core::config::{
     ExecutionConfig, JobConfig, OutputConfig, ThinkTimeConfig, ThresholdConfig,
 };
-use tropel_sdk::Result;
 use tropel_engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_metrics::thresholds::evaluate_thresholds;
+use tropel_sdk::Result;
 
 /// Minimal HTTP/1.1 server that records the `X-E2E` header value it sees on
 /// each request, then answers `200 {"ok":true}`. Header values are pushed

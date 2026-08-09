@@ -3,12 +3,12 @@ use rquickjs::function::Func;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tropel_sdk::error::TropelError;
-use tropel_sdk::types::{AuthConfig, Body, Method, Request};
-use tropel_sdk::Result;
 #[cfg(feature = "send-request")]
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
+use tropel_sdk::error::TropelError;
+use tropel_sdk::types::{AuthConfig, Body, Method, Request};
+use tropel_sdk::Result;
 
 /// Convert a serde_json::Value to a string suitable for JS consumption.
 /// Always JSON-encodes the value so the JS shim can JSON.parse() to
@@ -1133,81 +1133,81 @@ impl PmBridge {
                 let http = self.http_client.clone();
                 let state_for_send = self.state.clone();
                 set_global!(
-                "__tropel_pm_send_request",
-                Func::from(
-                    move |method: String,
-                          url: String,
-                          headers_json: String,
-                          body: String,
-                          timeout_ms: f64,
-                          response_type: String|
-                          -> String {
-                        // Resolve {{variables}} across URL, headers, and body
-                        // (backlog line 147: only the URL was resolved — a
-                        // header like "Authorization: Bearer {{token}}" went
-                        // out with the literal placeholder).
-                        let (resolved_url, headers, request_body) = {
-                            let st = state_for_send.lock().unwrap();
-                            resolve_send_request(
-                                &url,
-                                &headers_json,
-                                &body,
-                                &st.environment,
-                                &st.collection_vars,
-                                &st.globals,
-                            )
-                        };
+                    "__tropel_pm_send_request",
+                    Func::from(
+                        move |method: String,
+                              url: String,
+                              headers_json: String,
+                              body: String,
+                              timeout_ms: f64,
+                              response_type: String|
+                              -> String {
+                            // Resolve {{variables}} across URL, headers, and body
+                            // (backlog line 147: only the URL was resolved — a
+                            // header like "Authorization: Bearer {{token}}" went
+                            // out with the literal placeholder).
+                            let (resolved_url, headers, request_body) = {
+                                let st = state_for_send.lock().unwrap();
+                                resolve_send_request(
+                                    &url,
+                                    &headers_json,
+                                    &body,
+                                    &st.environment,
+                                    &st.collection_vars,
+                                    &st.globals,
+                                )
+                            };
 
-                        let timeout = if timeout_ms > 0.0 {
-                            Some(std::time::Duration::from_millis(timeout_ms as u64))
-                        } else {
-                            Some(std::time::Duration::from_secs(30)) // default 30s
-                        };
+                            let timeout = if timeout_ms > 0.0 {
+                                Some(std::time::Duration::from_millis(timeout_ms as u64))
+                            } else {
+                                Some(std::time::Duration::from_secs(30)) // default 30s
+                            };
 
-                        // A genuinely invalid method token must not silently
-                        // become GET (a write-path "PURGE" must not degrade
-                        // into a read-path GET that reports green). Surfaced
-                        // as a status-0 error response. Valid-but-uncommon
-                        // tokens (PURGE/LINK/…) parse fine via Method::Custom.
-                        let Some(method) = Method::parse(&method) else {
-                            return serde_json::json!({
-                                "error": format!("invalid HTTP method {}", method),
-                                "code": 0,
-                                "statusText": format!("invalid HTTP method {}", method),
-                                "body": "",
-                                "headers": {},
-                                "responseTime": 0,
-                            })
-                            .to_string();
-                        };
+                            // A genuinely invalid method token must not silently
+                            // become GET (a write-path "PURGE" must not degrade
+                            // into a read-path GET that reports green). Surfaced
+                            // as a status-0 error response. Valid-but-uncommon
+                            // tokens (PURGE/LINK/…) parse fine via Method::Custom.
+                            let Some(method) = Method::parse(&method) else {
+                                return serde_json::json!({
+                                    "error": format!("invalid HTTP method {}", method),
+                                    "code": 0,
+                                    "statusText": format!("invalid HTTP method {}", method),
+                                    "body": "",
+                                    "headers": {},
+                                    "responseTime": 0,
+                                })
+                                .to_string();
+                            };
 
-                        let req = Request {
-                            url: resolved_url,
-                            method,
-                            headers,
-                            query_params: HashMap::new(),
-                            body: request_body,
-                            auth: None,
-                            certificate: None,
-                            follow_redirects: true,
-                            timeout,
-                            response_type: tropel_sdk::types::ResponseType::from_k6(
-                                &response_type,
-                            ),
-                        };
+                            let req = Request {
+                                url: resolved_url,
+                                method,
+                                headers,
+                                query_params: HashMap::new(),
+                                body: request_body,
+                                auth: None,
+                                certificate: None,
+                                follow_redirects: true,
+                                timeout,
+                                response_type: tropel_sdk::types::ResponseType::from_k6(
+                                    &response_type,
+                                ),
+                            };
 
-                        // Execute on the dedicated I/O runtime via the shared
-                        // blocking helper — safe from inside ctx.with on a
-                        // current-thread VU runtime.
-                        let http_for_io = http.clone();
-                        let result = tropel_http::blocking::execute_blocking(async move {
-                            http_for_io.execute(&req, None).await
-                        });
-                        match result {
-                            Ok(http_resp) => {
-                                let body_text =
-                                    String::from_utf8(http_resp.body.clone()).unwrap_or_default();
-                                serde_json::json!({
+                            // Execute on the dedicated I/O runtime via the shared
+                            // blocking helper — safe from inside ctx.with on a
+                            // current-thread VU runtime.
+                            let http_for_io = http.clone();
+                            let result = tropel_http::blocking::execute_blocking(async move {
+                                http_for_io.execute(&req, None).await
+                            });
+                            match result {
+                                Ok(http_resp) => {
+                                    let body_text = String::from_utf8(http_resp.body.clone())
+                                        .unwrap_or_default();
+                                    serde_json::json!({
                                     "code": http_resp.status_code,
                                     "statusText": http_resp.status_text,
                                     "body": body_text,
@@ -1215,25 +1215,25 @@ impl PmBridge {
                                     "responseTime": http_resp.response_time.as_secs_f64() * 1000.0,
                                 })
                                 .to_string()
+                                }
+                                // Backlog line 147: transport failures must be
+                                // visible to the universal `if (err)` guard in the
+                                // shim. The `error` field is what the JS side
+                                // checks — code 0 alone is not enough (a 0-status
+                                // reply looks like a "success" to naive callers).
+                                Err(e) => serde_json::json!({
+                                    "error": format!("Request failed: {}", e),
+                                    "code": 0,
+                                    "statusText": format!("Request failed: {}", e),
+                                    "body": "",
+                                    "headers": {},
+                                    "responseTime": 0,
+                                })
+                                .to_string(),
                             }
-                            // Backlog line 147: transport failures must be
-                            // visible to the universal `if (err)` guard in the
-                            // shim. The `error` field is what the JS side
-                            // checks — code 0 alone is not enough (a 0-status
-                            // reply looks like a "success" to naive callers).
-                            Err(e) => serde_json::json!({
-                                "error": format!("Request failed: {}", e),
-                                "code": 0,
-                                "statusText": format!("Request failed: {}", e),
-                                "body": "",
-                                "headers": {},
-                                "responseTime": 0,
-                            })
-                            .to_string(),
-                        }
-                    },
-                ),
-            );
+                        },
+                    ),
+                );
             }
             failures
         });

@@ -19,8 +19,8 @@
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tropel_sdk::Result;
 use tropel_executor::scheduler::VUScheduler;
+use tropel_sdk::Result;
 
 /// Handle the control server task. Runs until the listener errors or the
 /// task is aborted by the scenario finishing.

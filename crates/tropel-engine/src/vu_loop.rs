@@ -20,16 +20,16 @@ use std::time::{Duration, Instant};
 use tropel_core::config::{
     ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig,
 };
-use tropel_sdk::scenario::{Scenario, ScenarioItem};
-use tropel_sdk::types::{Request, Response, Sample, TagMap};
-use tropel_sdk::Result;
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::{VUScheduler, VuLease};
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_sdk::traits::{Driver, DriverHttpClient, Protocol};
 use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
+use tropel_sdk::scenario::{Scenario, ScenarioItem};
+use tropel_sdk::traits::{Driver, DriverHttpClient, Protocol};
+use tropel_sdk::types::{Request, Response, Sample, TagMap};
+use tropel_sdk::Result;
 
 /// Outcome of one VU iteration, normalized across scenario runners and
 /// driver instances so the shared loop can drive either.

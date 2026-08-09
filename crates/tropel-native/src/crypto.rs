@@ -2,8 +2,8 @@ use crate::NativeModule;
 use md5::Md5;
 use rquickjs::function::Func;
 use sha2::Digest;
-use tropel_sdk::Result;
 use tropel_js::JsContext;
+use tropel_sdk::Result;
 
 pub struct CryptoModule;
 

@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tropel_sdk::types::Sample;
 use tropel_sdk::traits::Output;
+use tropel_sdk::types::Sample;
 
 /// Drive a registered extension output from the sample stream.
 ///

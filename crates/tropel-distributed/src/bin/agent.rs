@@ -6,8 +6,8 @@
 
 use clap::Parser;
 use std::path::PathBuf;
-use tropel_sdk::{Result, TropelError};
 use tropel_distributed::resolve_token;
+use tropel_sdk::{Result, TropelError};
 
 #[derive(Parser)]
 #[command(name = "tropel-agent", about = "Distributed load-test worker")]

@@ -8,8 +8,8 @@ use clap::Parser;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
-use tropel_sdk::{Result, TropelError};
 use tropel_distributed::{generate_token, has_token_source, resolve_token};
+use tropel_sdk::{Result, TropelError};
 
 #[derive(Parser)]
 #[command(name = "tropel-controller", about = "Distributed load-test controller")]

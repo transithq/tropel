@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tropel_core::config::*;
-use tropel_sdk::{Result, TropelError};
 use tropel_metrics::thresholds::evaluate_thresholds;
+use tropel_sdk::{Result, TropelError};
 
 use crate::cli_commands::{
     archive_command, build_custom, inspect_command, list_extensions, load_data_file, print_version,

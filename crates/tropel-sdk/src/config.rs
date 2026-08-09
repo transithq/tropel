@@ -61,7 +61,6 @@ pub struct ScenarioConfig {
     pub exec: Option<String>,
 }
 
-
 /// How to execute the load test.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]

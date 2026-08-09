@@ -71,9 +71,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
+use tropel_sdk::traits::InputAdapter;
 use tropel_sdk::types::{AuthConfig, Body, Method, Request};
 use tropel_sdk::{Result, TropelError};
-use tropel_sdk::traits::InputAdapter;
 use wasmtime::{
     Config, Engine, ExternType, Instance, InstanceAllocationStrategy, InstancePre, Linker, Memory,
     MemoryType, Module, PoolingAllocationConfig, Store,

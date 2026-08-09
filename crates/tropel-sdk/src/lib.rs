@@ -118,11 +118,9 @@ pub use traits::InputAdapter;
 pub use traits::InputAdapterRegistration;
 
 // Driver/DriverInstance + VuContext are stable — the imperative input contract.
-pub use traits::{
-    Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, VuContext,
-};
 #[cfg(feature = "registration")]
 pub use traits::DriverRegistration;
+pub use traits::{Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, VuContext};
 
 // Protocol and Output traits are gated behind feature flags so a consumer
 // that only writes input adapters never pays for (or is confused by) the

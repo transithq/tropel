@@ -1,8 +1,8 @@
 use crate::Reporter;
 use async_trait::async_trait;
 use std::path::PathBuf;
-use tropel_sdk::Result;
 use tropel_metrics::collector::MetricsResult;
+use tropel_sdk::Result;
 
 /// Writes metrics to a CSV file.
 pub struct CsvReporter {

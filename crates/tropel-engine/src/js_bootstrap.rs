@@ -5,10 +5,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tropel_sdk::error::TropelError;
-use tropel_sdk::Result;
 use tropel_http::client::HttpClient;
 use tropel_pm::bridge::SharedPmState;
+use tropel_sdk::error::TropelError;
+use tropel_sdk::Result;
 
 /// All shim libraries concatenated at COMPILE TIME (concat!) into a single
 /// `&'static str`, byte-identical for every VU and every scenario.

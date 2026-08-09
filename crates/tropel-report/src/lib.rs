@@ -24,8 +24,8 @@ pub use statsd::*;
 pub use stdout::*;
 
 use async_trait::async_trait;
-use tropel_sdk::Result;
 use tropel_metrics::collector::MetricsResult;
+use tropel_sdk::Result;
 
 /// A reporter that outputs test results.
 #[async_trait]

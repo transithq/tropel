@@ -3,8 +3,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use tropel_sdk::{Result, TropelError};
 use tropel_ext::registry::ExtensionRegistry;
+use tropel_sdk::{Result, TropelError};
 
 /// Build the extension registry exactly like `run_command` does: built-in
 /// adapters/drivers from `inventory` plus any `--subprocess-adapter` and

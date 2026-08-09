@@ -1,7 +1,7 @@
 use crate::NativeModule;
 use rquickjs::function::Func;
-use tropel_sdk::Result;
 use tropel_js::JsContext;
+use tropel_sdk::Result;
 
 pub struct ExtraFunctionsModule;
 

@@ -29,10 +29,10 @@ use tokio::net::TcpListener;
 use tropel_core::config::{
     ExecutionConfig, HttpConfig, JobConfig, OutputConfig, Stage, ThinkTimeConfig, ThresholdConfig,
 };
-use tropel_sdk::Result;
 use tropel_engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_metrics::thresholds::evaluate_thresholds;
+use tropel_sdk::Result;
 
 /// Minimal HTTP/1.1 server that answers `200 {"ok":true}` while tracking
 /// the PEAK number of simultaneously-open connections via an `AtomicUsize`

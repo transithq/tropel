@@ -29,8 +29,8 @@
 use std::path::Path;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
-use tropel_sdk::{Result, TropelError};
 use tropel_metrics::collector::MetricsResult;
+use tropel_sdk::{Result, TropelError};
 
 use crate::controller::run_controller;
 use crate::yaml::YamlDoc;

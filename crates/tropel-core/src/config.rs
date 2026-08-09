@@ -8,8 +8,8 @@ use std::collections::HashMap;
 // (the Driver contract references them); re-exported so engine crates keep
 // resolving tropel_core::config::* unchanged.
 pub use tropel_sdk::config::{
-    ArrivalRateStage, ExecutionConfig, OutputConfig, ScenarioConfig, Stage,
-    ThinkTimeConfig, ThresholdConfig,
+    ArrivalRateStage, ExecutionConfig, OutputConfig, ScenarioConfig, Stage, ThinkTimeConfig,
+    ThresholdConfig,
 };
 
 /// Full configuration for a load test job.

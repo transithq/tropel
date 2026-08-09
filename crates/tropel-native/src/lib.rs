@@ -9,8 +9,8 @@ pub mod encoding;
 pub mod r#fn;
 pub mod json;
 
-use tropel_sdk::Result;
 use tropel_js::JsContext;
+use tropel_sdk::Result;
 
 /// A native module that can be installed into a JS context.
 pub trait NativeModule {

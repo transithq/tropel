@@ -76,9 +76,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+use tropel_sdk::traits::{Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
 use tropel_sdk::types::{Body, Method, Request, Sample, SampleType, TagMap};
 use tropel_sdk::{Result, TropelError};
-use tropel_sdk::traits::{Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
 use wasmtime::{Caller, Extern, Linker, Memory, Module, Store, TypedFunc};
 
 // ══════════════════════════════════════════════════════════════════

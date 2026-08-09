@@ -7,11 +7,11 @@ use crate::vu_loop::{VuIterationOutcome, VuIterationSource};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tropel_sdk::types::{Sample, TagMap};
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
-use tropel_sdk::traits::{DriverHttpClient, DriverInstance, Protocol, VuContext};
 use tropel_pm::bridge::SharedPmState;
+use tropel_sdk::traits::{DriverHttpClient, DriverInstance, Protocol, VuContext};
+use tropel_sdk::types::{Sample, TagMap};
 
 // ── Scenario source: VURunner (Postman pm.* declarative execution) ──
 

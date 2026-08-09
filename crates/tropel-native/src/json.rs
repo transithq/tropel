@@ -1,8 +1,8 @@
 use crate::NativeModule;
 use rquickjs::function::Func;
 use serde_json::Value;
-use tropel_sdk::Result;
 use tropel_js::JsContext;
+use tropel_sdk::Result;
 
 pub struct JsonModule;
 

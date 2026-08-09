@@ -146,12 +146,12 @@ inventory::collect!(ProtocolRegistration);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{DriverInstance, ProtocolOutcome};
-    use async_trait::async_trait;
-    use serde_json::Value;
     use crate::scenario::Scenario;
+    use crate::traits::{DriverInstance, ProtocolOutcome};
     use crate::types::{Request, Sample};
     use crate::{Result, TropelError};
+    use async_trait::async_trait;
+    use serde_json::Value;
 
     // ── Stub impls for registration tests ──
     struct StubAdapter;

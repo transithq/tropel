@@ -1,8 +1,8 @@
 use crate::Reporter;
 use async_trait::async_trait;
-use tropel_sdk::Result;
 use tropel_metrics::collector::{trend_stat_value, MetricSummary, MetricsResult};
 use tropel_metrics::thresholds::evaluate_thresholds;
+use tropel_sdk::Result;
 
 /// Prints a summary report to stdout.
 pub struct StdoutReporter;

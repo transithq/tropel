@@ -2,8 +2,8 @@ use crate::Reporter;
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
-use tropel_sdk::Result;
 use tropel_metrics::collector::MetricsResult;
+use tropel_sdk::Result;
 
 /// Writes metrics to a JSON file.
 pub struct JsonReporter {
