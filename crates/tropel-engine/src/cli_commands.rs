@@ -367,7 +367,10 @@ pub(crate) async fn build_custom(
 
 pub(crate) fn print_version() -> Result<()> {
     println!("Tropel v{}", env!("CARGO_PKG_VERSION"));
-    println!("Repository: https://github.com/prasadthx/tropel");
+    // Derived from [workspace.package] repository (inherited by member
+    // crates) so the banner can never drift from the manifest again — the
+    // literal URL went stale twice (prasadthx → transithq).
+    println!("Repository: {}", env!("CARGO_PKG_REPOSITORY"));
     println!("License: MIT OR Apache-2.0");
     Ok(())
 }
