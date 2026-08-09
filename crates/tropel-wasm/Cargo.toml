@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 description = "WASM plugin runtime for Tropel — loads and runs WebAssembly plugins via wasmtime"
 
 [dependencies]

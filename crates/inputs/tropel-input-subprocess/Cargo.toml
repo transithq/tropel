@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 description = "Subprocess/JSON input adapter — runs an external command that reads bytes on stdin and writes a JSON Scenario on stdout"
 
 [dependencies]
