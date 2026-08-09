@@ -372,6 +372,9 @@ pub(crate) fn print_version() -> Result<()> {
     // literal URL went stale twice (prasadthx → transithq).
     println!("Repository: {}", env!("CARGO_PKG_REPOSITORY"));
     println!("License: Apache-2.0");
+    // P4b: shims are JS-only and version independently of the engine; surface
+    // it so the P6 version handshake has both numbers to compare.
+    println!("Shim bundle: v{}", crate::js_bootstrap::SHIM_BUNDLE_VERSION);
     Ok(())
 }
 

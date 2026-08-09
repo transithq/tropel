@@ -4059,6 +4059,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tropel-distributed",
  "tropel-engine",
  "tropel-metrics",
  "tropel-sdk",

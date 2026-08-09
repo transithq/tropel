@@ -22,6 +22,10 @@ alloc-jemalloc = ["dep:tikv-jemallocator"]
 tropel-sdk.workspace = true
 tropel-engine.workspace = true
 tropel-metrics.workspace = true
+# P6: `tropel agent` — the API client's process boundary. Lives here (not in
+# the engine CLI) because tropel-distributed depends on tropel-engine; a
+# CLI-level reference would be a dependency cycle.
+tropel-distributed.workspace = true
 # Reference extension: links its inventory-registered outputs (e.g.
 # "prometheus") into the binary so ExtensionRegistry can find them.
 tropel-x-prometheus.workspace = true

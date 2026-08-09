@@ -11,6 +11,15 @@ use tropel_sandbox::state::SharedPmState;
 use tropel_sdk::error::TropelError;
 use tropel_sdk::Result;
 
+/// Version of the shim bundle, INDEPENDENT of the engine version (P4b).
+///
+/// The shims (`js/`) are JS-only and can ship as assets without a Tropel
+/// release — so a handshake that compares engine version alone can't tell
+/// whether two runs used the same `pm.*`/`trp.*` semantics. Bump this on any
+/// behavioural change to the bundle. Surfaced in `tropel version`; the
+/// engine↔shim comparison itself is the P6 version-handshake work.
+pub(crate) const SHIM_BUNDLE_VERSION: &str = "0.1.0";
+
 /// All shim libraries concatenated at COMPILE TIME (concat!) into a single
 /// `&'static str`, byte-identical for every VU and every scenario.
 const JS_SHIM_BUNDLE: &str = concat!(
