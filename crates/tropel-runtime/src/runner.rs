@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tropel_core::config::ExpectedStatus;
 use tropel_js::JsContext;
 use tropel_sandbox::state::{PmState, SharedPmState};
+use tropel_sdk::config::ExpectedStatus;
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
 use tropel_sdk::traits::{DriverHttpClient, Protocol};
 use tropel_sdk::types::{Sample, SampleType, TagMap};
@@ -493,7 +493,7 @@ impl ScenarioRunner {
                                     });
 
                                     // http_req_failed (Rate) — true when status not in expected list
-                                    let is_failed = !tropel_core::config::status_is_expected(
+                                    let is_failed = !tropel_sdk::config::status_is_expected(
                                         resp.status_code,
                                         &self.expected_statuses,
                                     );
@@ -975,7 +975,7 @@ mod tests {
         let names: Arc<Vec<String>> =
             Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
         let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
-            HttpClient::new(&tropel_core::config::HttpConfig::default())
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
         let runner = ScenarioRunner::new(
@@ -1102,7 +1102,7 @@ mod tests {
         let names: Arc<Vec<String>> =
             Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
         let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
-            HttpClient::new(&tropel_core::config::HttpConfig::default())
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
         let mut runner = ScenarioRunner::new(scenario, execution_items, names, client, 0, "loop".into());
@@ -1119,7 +1119,7 @@ mod tests {
             .await
             .expect("pm shim should eval");
         let bridge_client = Arc::new(
-            HttpClient::new(&tropel_core::config::HttpConfig::default())
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
         tropel_sandbox::bindings::pm::PmBridge::new(runner.pm_state().clone(), bridge_client)
@@ -1201,7 +1201,7 @@ mod tests {
         let names: Arc<Vec<String>> =
             Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
         let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
-            HttpClient::new(&tropel_core::config::HttpConfig::default())
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
         let mut runner = ScenarioRunner::new(
@@ -1223,7 +1223,7 @@ mod tests {
             .await
             .expect("pm shim should eval");
         let bridge_client = Arc::new(
-            HttpClient::new(&tropel_core::config::HttpConfig::default())
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
         tropel_sandbox::bindings::pm::PmBridge::new(runner.pm_state().clone(), bridge_client)

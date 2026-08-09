@@ -1,3 +1,4 @@
+#![doc = "Internal to tropel-runtime. No stability guarantee — depend on tropel-runtime instead."]
 //! # tropel-runtime
 //!
 //! What happens during one pass through a `Scenario` — resolve, script,

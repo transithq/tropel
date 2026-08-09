@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 tropel-sdk.workspace = true
+tropel-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true

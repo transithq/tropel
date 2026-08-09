@@ -232,10 +232,10 @@ unsafe impl Send for JsContext {}
 /// The interrupt deadline uses a MONOTONIC base (backlog P3: "interrupt
 /// deadline uses SystemTime — an NTP step kills a running script"): a wall-
 /// clock jump must never trip or extend the deadline mid-eval. Shared with
-/// the k6 driver's ws re-arm via `tropel_core::clock` so both sides agree on
-/// the epoch.
+/// the k6 driver's ws re-arm via `tropel_js::clock` (P3c moved the clock
+/// here) so both sides agree on the epoch.
 fn now_nanos() -> u64 {
-    tropel_core::clock::monotonic_now_nanos()
+    crate::clock::monotonic_now_nanos()
 }
 
 impl JsContext {

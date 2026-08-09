@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
+description = "Internal to tropel-runtime. No stability guarantee — depend on tropel-runtime instead."
 
 [features]
 # pm.sendRequest is the ENTIRE tropel-sandbox → tropel-http dependency (P4).
@@ -17,7 +18,6 @@ send-request = ["dep:tropel-http"]
 
 [dependencies]
 tropel-sdk.workspace = true
-tropel-core.workspace = true
 tropel-js.workspace = true
 tropel-native.workspace = true
 tropel-variables.workspace = true

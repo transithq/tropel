@@ -1,3 +1,4 @@
+#![doc = "Internal to tropel-runtime. No stability guarantee — depend on tropel-runtime instead."]
 //! # tropel-sandbox
 //!
 //! The script sandbox: native host functions + the JS glue.

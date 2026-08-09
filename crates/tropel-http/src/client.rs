@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tropel_auth::AuthSigner;
-use tropel_core::config::{HttpConfig, TlsConfig};
 use tropel_sdk::types::*;
+
+use crate::config::{HttpConfig, TlsConfig};
 use tropel_sdk::Result;
 use tropel_sdk::TropelError;
 

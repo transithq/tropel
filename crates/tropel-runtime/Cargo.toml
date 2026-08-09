@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
+description = "Internal to tropel-runtime. No stability guarantee — depend on tropel-runtime instead."
 
 [features]
 # P5b (TROPEL_WASM_BUILD.md Step 4): tropel-sandbox's default `send-request`
@@ -17,7 +18,6 @@ send-request = ["tropel-sandbox/send-request"]
 
 [dependencies]
 tropel-sdk.workspace = true
-tropel-core.workspace = true
 tropel-sandbox = { workspace = true, default-features = false }
 tropel-js.workspace = true
 tropel-variables.workspace = true

@@ -955,7 +955,7 @@ impl PmBridge {
                         metric: "group_duration".into(),
                         value: duration_ms,
                         tags: Arc::new(tags),
-                        timestamp: tropel_core::clock::monotonic_wall_now(),
+                        timestamp: tropel_js::clock::monotonic_wall_now(),
                         sample_type: tropel_sdk::types::SampleType::Trend,
                     });
                 }),
@@ -981,7 +981,7 @@ impl PmBridge {
                         metric: name.into(),
                         value,
                         tags: Arc::new(tropel_sdk::types::TagMap::new()),
-                        timestamp: tropel_core::clock::monotonic_wall_now(),
+                        timestamp: tropel_js::clock::monotonic_wall_now(),
                         sample_type,
                     });
                 }),
@@ -1029,7 +1029,7 @@ impl PmBridge {
                             metric: name.into(),
                             value,
                             tags: Arc::new(tags),
-                            timestamp: tropel_core::clock::monotonic_wall_now(),
+                            timestamp: tropel_js::clock::monotonic_wall_now(),
                             sample_type,
                         });
                     },

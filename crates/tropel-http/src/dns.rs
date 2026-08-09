@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tropel_core::config::HttpConfig;
+use crate::config::HttpConfig;
 
 /// k6's default DNS cache TTL when `options.dns.ttl` is unset (k6: `"5m"`).
 const K6_DEFAULT_TTL: Duration = Duration::from_secs(300);

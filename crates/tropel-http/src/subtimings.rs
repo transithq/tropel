@@ -365,7 +365,7 @@ mod tests {
             }
         });
 
-        let cfg = tropel_core::config::HttpConfig::default();
+        let cfg = crate::config::HttpConfig::default();
         let client = super::super::client::HttpClient::new(&cfg).unwrap();
         let req = tropel_sdk::types::Request {
             url: format!("http://{}/", addr),
@@ -448,7 +448,7 @@ mod tests {
         // `no_connection_reuse` forces a FRESH connection per request — every
         // one of the 4 concurrent requests must perform a real TCP connect,
         // so each must record non-zero connect phases.
-        let cfg = tropel_core::config::HttpConfig {
+        let cfg = crate::config::HttpConfig {
             no_connection_reuse: true,
             ..Default::default()
         };

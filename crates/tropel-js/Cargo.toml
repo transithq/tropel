@@ -6,9 +6,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
+description = "Internal to tropel-runtime. No stability guarantee — depend on tropel-runtime instead."
 
 [dependencies]
-tropel-core.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

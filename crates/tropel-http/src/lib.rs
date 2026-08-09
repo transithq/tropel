@@ -7,10 +7,12 @@
 
 pub mod blocking;
 pub mod client;
+pub mod config;
 pub mod dns;
 pub mod rps;
 pub mod subtimings;
 
 pub use client::*;
+pub use config::*;
 pub use dns::*;
 pub use rps::*;

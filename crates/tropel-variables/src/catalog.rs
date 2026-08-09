@@ -849,7 +849,11 @@ mod tests {
         let catalog = DynamicCatalog::new();
         let result = catalog.resolve("company={{$randomCompany}}");
         assert!(!result.contains("{{$randomCompany}}"));
-        assert!(result.contains(' '));
+        // Some catalog entries are single-word names (e.g. "Initech"), so assert
+        // the placeholder was replaced with a known company rather than that the
+        // pick happens to contain a space. Strip the literal prefix first.
+        let picked = result.strip_prefix("company=").unwrap_or(&result);
+        assert!(COMPANY_NAMES.contains(&picked), "unexpected name: {result}");
     }
 
     #[test]

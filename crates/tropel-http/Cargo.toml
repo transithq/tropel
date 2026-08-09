@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 tropel-sdk.workspace = true
 tropel-auth.workspace = true
-tropel-core.workspace = true
+serde.workspace = true
 reqwest.workspace = true
 tower.workspace = true
 serde_json.workspace = true

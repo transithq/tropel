@@ -4133,6 +4133,7 @@ dependencies = [
  "simd-json",
  "thiserror",
  "tracing",
+ "tropel-http",
  "tropel-sdk",
  "url",
 ]
@@ -4240,6 +4241,7 @@ name = "tropel-http"
 version = "0.1.0"
 dependencies = [
  "reqwest",
+ "serde",
  "serde_json",
  "serde_urlencoded",
  "simd-json",
@@ -4247,7 +4249,6 @@ dependencies = [
  "tower",
  "tracing",
  "tropel-auth",
- "tropel-core",
  "tropel-sdk",
 ]
 
@@ -4332,7 +4333,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tropel-core",
 ]
 
 [[package]]
@@ -4412,7 +4412,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "tropel-core",
  "tropel-http",
  "tropel-js",
  "tropel-sandbox",
@@ -4431,7 +4430,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tropel-core",
  "tropel-http",
  "tropel-js",
  "tropel-native",

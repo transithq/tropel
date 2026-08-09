@@ -822,7 +822,7 @@ fn push_http_samples_for(
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
 ) {
-    let now = tropel_core::clock::monotonic_wall_now();
+    let now = tropel_js::clock::monotonic_wall_now();
     let tags = Arc::new(http_tags_for(
         url,
         method,
@@ -978,7 +978,7 @@ fn push_http_failure(
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
 ) {
-    let now = tropel_core::clock::monotonic_wall_now();
+    let now = tropel_js::clock::monotonic_wall_now();
     let tags = Arc::new(http_tags(req, "0", scenario, extra_tags, group));
 
     let mut v = sink.lock().unwrap();
@@ -1764,7 +1764,7 @@ impl K6DriverInstance {
                 Func::from(
                     move |name: String, passed: bool, tags_json: Option<String>| {
                         let mut v = sink_test.lock().unwrap();
-                        let now = tropel_core::clock::monotonic_wall_now();
+                        let now = tropel_js::clock::monotonic_wall_now();
                         let mut tags = TagMap::with_capacity(2);
                         tags.insert("check", name);
                         if let Some(j) = tags_json {
@@ -1820,7 +1820,7 @@ impl K6DriverInstance {
                             metric: name.into(),
                             value,
                             tags: Arc::new(tags),
-                            timestamp: tropel_core::clock::monotonic_wall_now(),
+                            timestamp: tropel_js::clock::monotonic_wall_now(),
                             sample_type,
                         });
                     },
@@ -1897,7 +1897,7 @@ impl K6DriverInstance {
                         metric: "group_duration".into(),
                         value: duration_ms, // ms — the public unit (k6 semantics)
                         tags: Arc::new(tags),
-                        timestamp: tropel_core::clock::monotonic_wall_now(),
+                        timestamp: tropel_js::clock::monotonic_wall_now(),
                         sample_type: SampleType::Trend,
                     });
                 }),
@@ -2282,7 +2282,7 @@ impl K6DriverInstance {
                             return serde_json::json!({"ok": false}).to_string();
                         };
                         let duration = session.start.elapsed();
-                        let now = tropel_core::clock::monotonic_wall_now();
+                        let now = tropel_js::clock::monotonic_wall_now();
                         let mut tags = TagMap::with_capacity(5);
                         tags.insert("url", session.url.clone());
                         tags.insert("method", String::from("GET"));

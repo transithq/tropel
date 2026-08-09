@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
+description = "Internal to tropel-runtime. No stability guarantee — depend on tropel-runtime instead."
 
 [dependencies]
 serde.workspace = true

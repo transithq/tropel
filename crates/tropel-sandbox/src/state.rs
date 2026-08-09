@@ -142,7 +142,7 @@ impl PmState {
             metric: "checks".into(),
             value: if passed { 1.0 } else { 0.0 },
             tags: Arc::new(tags),
-            timestamp: tropel_core::clock::monotonic_wall_now(),
+            timestamp: tropel_js::clock::monotonic_wall_now(),
             sample_type: tropel_sdk::types::SampleType::Rate,
         });
     }
