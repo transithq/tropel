@@ -11,7 +11,9 @@
 #   variables → js → native → auth → http → sandbox → runtime
 #
 # Notes:
-#   - tropel-sdk is already live (0.1.0) — the leaf everything else builds on.
+#   - tropel-sdk must be live at the workspace version (currently 0.2.0) — the
+#     leaf everything else builds on; publish it before running --execute (the
+#     API-presence gate verifies the exact published artifact).
 #   - tropel-http IS in the set, between auth and sandbox: tropel-sandbox's
 #     DEFAULT feature is `send-request = ["dep:tropel-http"]`, so the
 #     published sandbox pulls tropel-http from the registry at build time —
@@ -50,12 +52,24 @@
 #   crates.io API whether each of the seven names exists. On --execute a taken
 #   name aborts BEFORE any upload; on a dry-run it is informational only.
 #
+#   Published-SDK API presence pre-flight (--execute only): the dry-run's
+#   [patch] overrides resolve tropel-sdk from the LOCAL submodule, masking a
+#   stale PUBLISHED SDK. The real publish resolves tropel-sdk from crates.io,
+#   so a missing API would fail verification of a LATER crate mid-sequence,
+#   after earlier crates already went live. Before flipping anything, the
+#   script downloads the exact published artifact the set will resolve and
+#   greps it for the APIs the set needs (ExpectedStatus/status_is_expected).
+#   Fail-closed: any download or grep failure aborts before a single publish
+#   flag is flipped. Escape hatch: --skip-api-check.
+#
 # Usage:
 #   bash scripts/publish-runtime.sh             # dry-run the whole sequence
 #   bash scripts/publish-runtime.sh --execute   # actually publish, in order
 #   bash scripts/publish-runtime.sh --skip-name-check  # skip the crates.io
 #                                      # name pre-flight (air-gapped / rate-
 #                                      # limited release machines)
+#   bash scripts/publish-runtime.sh --skip-api-check  # skip the published-
+#                                      # SDK API-presence gate
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -63,11 +77,13 @@ CRATES=(tropel-variables tropel-js tropel-native tropel-auth tropel-http tropel-
 
 EXECUTE=0
 SKIP_NAME_CHECK=0
+SKIP_API_CHECK=0
 for arg in "$@"; do
   case "$arg" in
     --execute) EXECUTE=1 ;;
     --skip-name-check) SKIP_NAME_CHECK=1 ;;
-    *) echo "unknown argument: $arg (expected --execute, --skip-name-check)" >&2; exit 2 ;;
+    --skip-api-check) SKIP_API_CHECK=1 ;;
+    *) echo "unknown argument: $arg (expected --execute, --skip-name-check, --skip-api-check)" >&2; exit 2 ;;
   esac
 done
 
@@ -151,6 +167,62 @@ if [[ ${#NAMES_TAKEN[@]} -gt 0 ]]; then
     exit 1
   fi
   echo "   (dry-run: informational only — nothing is uploaded, but a real publish would fail for these.)"
+fi
+
+# ── Pre-flight: published tropel-sdk API presence (--execute only) ─────────
+# The dry-run's [patch] overrides resolve tropel-sdk from the LOCAL submodule,
+# masking a stale PUBLISHED SDK. The real publish resolves tropel-sdk from
+# crates.io, so a missing API would fail the verification build of a LATER
+# crate (tropel-http) mid-sequence, after earlier crates already went live.
+# Download the exact artifact the set will resolve and confirm it carries the
+# APIs the set needs. Fail-closed: any download/extract/grep failure aborts
+# BEFORE a single publish flag is flipped.
+# Fail-closed by design: this gate exists to stop a partial release, so an
+# inability to inspect the published artifact (download/extract/manifest) is
+# itself a reason to abort — never to silently proceed. --skip-api-check is
+# the explicit escape hatch for genuinely broken environments.
+check_published_sdk_api() {
+  local sdk_version tmpdir crate_file src_dir
+  sdk_version=$(sed -n 's/^tropel-sdk = { path = "crates\/tropel-sdk", version = "\([0-9][^"]*\)".*/\1/p' Cargo.toml | head -1)
+  if [[ -z "$sdk_version" ]]; then
+    echo "❌ could not read tropel-sdk version from root Cargo.toml; aborting before any publish."
+    echo "   Fix the tropel-sdk entry in [workspace.dependencies], or pass --skip-api-check to bypass."
+    return 1
+  fi
+  echo "── Pre-flight: published tropel-sdk $sdk_version API presence ──"
+  tmpdir=$(mktemp -d) || { echo "❌ mktemp failed; aborting before any publish."; return 1; }
+  crate_file="$tmpdir/tropel-sdk-$sdk_version.crate"
+  if ! curl -fsSL -H 'User-Agent: tropel-release-gate' -o "$crate_file" \
+      "https://static.crates.io/crates/tropel-sdk/tropel-sdk-$sdk_version.crate" 2>/dev/null; then
+    echo "❌ could not download published tropel-sdk $sdk_version from static.crates.io; aborting before any publish."
+    echo "   Retry when network is available, or pass --skip-api-check to bypass."
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if ! tar xzf "$crate_file" -C "$tmpdir" 2>/dev/null; then
+    echo "❌ could not extract published tropel-sdk $sdk_version; aborting before any publish."
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  src_dir="$tmpdir/tropel-sdk-$sdk_version/src"
+  # Match the exact public surface the set crates call, across ALL sdk modules
+  # (not just config.rs), so a future module move can't false-negative.
+  if grep -rq 'pub enum ExpectedStatus' "$src_dir" 2>/dev/null && grep -rq 'pub fn status_is_expected' "$src_dir" 2>/dev/null; then
+    echo "    ✓ published tropel-sdk $sdk_version carries ExpectedStatus + status_is_expected"
+    rm -rf "$tmpdir"
+    return 0
+  fi
+  echo "❌ published tropel-sdk $sdk_version is MISSING ExpectedStatus/status_is_expected."
+  echo "   The set would fail verification at tropel-http mid-sequence, after a partial release."
+  echo "   Fix: bump + publish tropel-sdk with the new API, update the workspace dep + submodule pointer, then re-run."
+  rm -rf "$tmpdir"
+  return 1
+}
+
+if [[ $EXECUTE -eq 1 && $SKIP_API_CHECK -ne 1 ]]; then
+  if ! check_published_sdk_api; then
+    exit 1
+  fi
 fi
 
 if [[ $EXECUTE -eq 1 ]]; then

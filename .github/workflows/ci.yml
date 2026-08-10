@@ -149,10 +149,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: semver
-      # P2 (TROPEL_MODULARIZATION_TODO.md): the SDK's 0.1.0 is live, so any
-      # breaking change to the published contract must bump the minor before
-      # release. `check-release` diffs the working tree against the last
-      # version on crates.io and fails on breaking changes.
+      # P2 (TROPEL_MODULARIZATION_TODO.md): the SDK is live, so any breaking
+      # change to the published contract must bump the minor before release.
+      # `check-release` diffs the working tree against the last version on
+      # crates.io and fails on breaking changes.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks
