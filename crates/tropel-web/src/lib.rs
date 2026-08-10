@@ -4,7 +4,7 @@
 //! `tropel_alloc` / `tropel_free` manage host-visible buffers, and
 //! `tropel_run` takes a postcard-encoded [`RunRequest`] and returns a packed
 //! pointer to a postcard-encoded [`RunOutcome`]. The JS host (supplied by
-//! `@tropel/exec-wasm`, P6) hides this ABI behind a TypeScript wrapper and
+//! `@tropel/runtime-wasm`, P6) hides this ABI behind a TypeScript wrapper and
 //! implements the `tropel_host_http` import (see [`http`]).
 
 pub mod bootstrap;
@@ -53,7 +53,7 @@ pub unsafe extern "C" fn tropel_free(ptr: *mut u8, len: usize) {
 /// The runtime version string (e.g. `"0.1.0"`), packed as `(ptr << 32) | len`
 /// of a STATIC buffer in linear memory. The host reads it and must NOT free
 /// it (static lifetime). This is the wasm side of the P6 version handshake:
-/// `@tropel/exec-wasm` exposes it as `runtimeVersion`, and the client
+/// `@tropel/runtime-wasm` exposes it as `runtimeVersion`, and the client
 /// compares it against the connected `tropel agent`'s version — a mismatch
 /// yields a visible warning and results marked unverified-parity.
 #[no_mangle]

@@ -254,17 +254,17 @@ jobs:
           TROPEL_REQUIRE_WASM: "1"
         run: cargo test -p tropel-web --test native_vs_wasm
 
-      # P6 (TROPEL_MODULARIZATION_TODO.md): @tropel/exec-wasm — the npm host
+      # P6 (TROPEL_MODULARIZATION_TODO.md): @tropel/runtime-wasm — the npm host
       # that ships the wasm slice. Build the TS wrapper, copy the artifact
       # into the package (build.sh), and drive the same F3 fixture through
       # node:wasi from OUTSIDE Rust — proving the published package works.
       # TROPEL_REQUIRE_WASM=1 turns a missing artifact into a hard failure
       # (same gate as the F3 harness).
-      - name: P6 npm smoke (@tropel/exec-wasm)
+      - name: P6 npm smoke (@tropel/runtime-wasm)
         env:
           TROPEL_REQUIRE_WASM: "1"
         run: |
-          cd packages/exec-wasm
+          cd packages/runtime-wasm
           npm install --no-audit --no-fund
           npm run build
           node smoke.mjs

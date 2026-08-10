@@ -5,8 +5,8 @@
 # The version surfaces that must agree:
 #   - the `tropel` binary crate  (crates/tropel/Cargo.toml)
 #   - the wasm runtime crate     (crates/tropel-web/Cargo.toml) — compiled into
-#     tropel_web.wasm and read back by @tropel/exec-wasm as `runtimeVersion`
-#   - @tropel/exec-wasm           (packages/exec-wasm/package.json)
+#     tropel_web.wasm and read back by @tropel/runtime-wasm as `runtimeVersion`
+#   - @tropel/runtime-wasm        (packages/runtime-wasm/package.json)
 #   - @tropel/shims               (packages/shims/package.json)
 #
 # A drift here is the mixed-version deployment the version handshake exists
@@ -18,13 +18,13 @@ cd "$(dirname "$0")/.."
 
 bin_ver=$(grep -m1 '^version' crates/tropel/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
 web_ver=$(grep -m1 '^version' crates/tropel-web/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
-exec_ver=$(node -p "require('./packages/exec-wasm/package.json').version")
+exec_ver=$(node -p "require('./packages/runtime-wasm/package.json').version")
 shims_ver=$(node -p "require('./packages/shims/package.json').version")
 
 echo "lockstep versions:"
 echo "  binary (tropel)        = $bin_ver"
 echo "  wasm runtime (tropel-web) = $web_ver"
-echo "  @tropel/exec-wasm      = $exec_ver"
+echo "  @tropel/runtime-wasm   = $exec_ver"
 echo "  @tropel/shims          = $shims_ver"
 
 if [[ "$bin_ver" != "$web_ver" || "$web_ver" != "$exec_ver" || "$exec_ver" != "$shims_ver" ]]; then

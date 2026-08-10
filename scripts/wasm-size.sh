@@ -13,24 +13,42 @@ cd "$(dirname "$0")/.."
 echo "── P5b gate: tropel-web builds for wasm32-wasip1 ──"
 cargo build -p tropel-web --target wasm32-wasip1 --release
 
-WASM="target/wasm32-wasip1/release/tropel_web.wasm"
-if [ ! -f "$WASM" ]; then
-  echo "FAIL: $WASM not produced"
+# N1 (TROPEL_MODULARIZATION_REVIEW_R2.md): the shims moved out of the wasm
+# (host import), so the artifact is measured WITHOUT the ~289 KB of embedded
+# JS. Find it under the default target dir (CI) or the machine-local
+# override (C:/tropel-native-target — .cargo/config.toml) like build.sh and
+# the F3 harness do.
+WASM=""
+for c in \
+  "target/wasm32-wasip1/release/tropel_web.wasm" \
+  "C:/tropel-native-target/wasm32-wasip1/release/tropel_web.wasm"; do
+  if [ -f "$c" ]; then WASM="$c"; break; fi
+done
+if [ -z "$WASM" ]; then
+  echo "FAIL: tropel_web.wasm not produced (looked in target/ and C:/tropel-native-target)"
   exit 1
 fi
 
 # Post-opt with wasm-opt when available (binaryen); measure the optimized
-# artifact. The ceiling is deliberately loose: QuickJS alone is ~1–1.5 MB.
+# artifact. QuickJS alone is ~1–1.5 MB; the shim bundle no longer rides along.
 if command -v wasm-opt >/dev/null 2>&1; then
   wasm-opt -Oz -o /tmp/tropel_web_opt.wasm "$WASM"
   WASM=/tmp/tropel_web_opt.wasm
 fi
 
-SIZE=$(stat -f%z "$WASM" 2>/dev/null || stat -c%z "$WASM")
+# Portable size read: stat's format flags differ between BSD (macOS, -f%z)
+# and GNU (Linux/MSYS, where %z is CHANGE-TIME, not size) — wc -c is identical
+# on every platform.
+SIZE=$(wc -c < "$WASM")
 echo "wasm size: $((SIZE/1024)) KiB"
 
-if [ "$SIZE" -ge 8000000 ]; then
-  echo "FAIL: wasm over budget (8 MB)"
+# N3 (TROPEL_MODULARIZATION_REVIEW_R2.md): real measurement + ~15% headroom.
+# Measured 2026-08-10 after N1 (shims → host import): 3,977,788 B unoptimized
+# (~3.8 MB). Gate = 4.6 MB — catches a shim re-embedding or a new dep, not
+# just a catastrophe. Re-tighten after any payload change (see N1 note).
+BUDGET=4600000
+if [ "$SIZE" -ge "$BUDGET" ]; then
+  echo "FAIL: wasm over budget ($((BUDGET/1024/1024)) MB)"
   exit 1
 fi
-echo "PASS: under 8 MB budget"
+echo "PASS: under $((BUDGET/1024/1024)) MB budget ($((SIZE/1024)) KiB)"

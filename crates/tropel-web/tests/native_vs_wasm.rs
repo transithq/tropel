@@ -200,6 +200,43 @@ fn host_http(mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32) -> i
     ((ptr as i64) << 32) | (resp_bytes.len() as i64)
 }
 
+/// Implements the `env.tropel_host_shim` import (bootstrap.rs, N1): the wasm
+/// slice takes its shim bundle from the host instead of embedding it. This
+/// harness supplies the same sources the native leg embeds
+/// (bootstrap.rs::SHIM_SOURCES), joined with "\n" exactly like
+/// `shim_bundle()` does, so the two legs bootstrap identical shims.
+fn host_shim(mut caller: Caller<'_, HostState>) -> i64 {
+    const SHIM_SOURCES: [&str; 6] = [
+        include_str!("../../../js/scripting-api/pm.js"),
+        include_str!("../../../js/chai/chai-shim.js"),
+        include_str!("../../../js/lodash/lodash-shim.js"),
+        include_str!("../../../js/cryptojs-shim/cryptojs.js"),
+        include_str!("../../../js/exec/exec.js"),
+        include_str!("../../../js/scripting-api/bru.js"),
+    ];
+    let bundle = SHIM_SOURCES.join("\n");
+    let bundle_bytes = bundle.as_bytes();
+
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .expect("wasm exports memory");
+    let alloc = caller
+        .get_export("tropel_alloc")
+        .and_then(|e| e.into_func())
+        .expect("tropel_alloc export");
+    let alloc_typed = alloc
+        .typed::<(i32,), (i32,)>(&caller)
+        .expect("typed tropel_alloc");
+    let (ptr,) = alloc_typed
+        .call(&mut caller, (bundle_bytes.len() as i32,))
+        .expect("alloc shim bundle");
+    memory
+        .write(&mut caller, ptr as usize, bundle_bytes)
+        .expect("write shim bundle");
+    ((ptr as i64) << 32) | (bundle_bytes.len() as i64)
+}
+
 /// Run the fixture through the wasm32 build of `tropel-runtime` (the
 /// `tropel_web.wasm` artifact) under wasmtime, mirroring the JS host ABI.
 fn wasm_leg(wasm_path: &Path, req: &RunRequest) -> RunOutcome {
@@ -219,6 +256,14 @@ fn wasm_leg(wasm_path: &Path, req: &RunRequest) -> RunOutcome {
     linker
         .func_wrap("env", "tropel_host_http", host_http)
         .expect("define host http import");
+    // N1 (TROPEL_MODULARIZATION_REVIEW_R2.md): the wasm slice no longer
+    // embeds the shims — the host supplies them via tropel_host_shim. This
+    // host function hands the wasm leg the SAME sources the native leg
+    // embeds, joined the same way bootstrap.rs::shim_bundle() joins them, so
+    // both legs bootstrap byte-identical shims (the diff stays valid).
+    linker
+        .func_wrap("env", "tropel_host_shim", host_shim)
+        .expect("define host shim import");
     // Nothing else should be imported; trap defensively if the artifact
     // unexpectedly references more.
     linker

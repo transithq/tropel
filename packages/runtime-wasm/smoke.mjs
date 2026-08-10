@@ -1,4 +1,4 @@
-// Smoke test for @tropel/exec-wasm: load the REAL tropel_web.wasm artifact,
+// Smoke test for @tropel/runtime-wasm: load the REAL tropel_web.wasm artifact,
 // run the same fixture the Rust F3 harness uses (2 items wired with
 // setNextRequest, a carried variable, status + header assertions), and assert
 // the outcome decodes with the expected trace. Mirrors

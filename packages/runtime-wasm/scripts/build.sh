@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build @tropel/exec-wasm: compile TS, copy the tropel_web.wasm artifact into
+# Build @tropel/runtime-wasm: compile TS, copy the tropel_web.wasm artifact into
 # the package, and dry-run the pack so packaging problems surface pre-publish.
 set -euo pipefail
 cd "$(dirname "$0")/.."

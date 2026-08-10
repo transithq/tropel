@@ -1,4 +1,4 @@
-# @tropel/exec-wasm
+# @tropel/runtime-wasm
 
 Browser/Node host for the **tropel** load-testing engine compiled to
 `wasm32-wasip1` — the same runtime that powers tropel-native, running inside
@@ -13,7 +13,7 @@ the host answering each HTTP request synchronously.
 ## Install
 
 ```bash
-npm install @tropel/exec-wasm
+npm install @tropel/runtime-wasm
 ```
 
 Requires Node ≥ 20 (built-in WASI preview1) or `@bjorn3/browser_wasi_shim`
@@ -22,7 +22,7 @@ for browsers.
 ## Usage
 
 ```js
-import { createExecWasm } from "@tropel/exec-wasm";
+import { createExecWasm } from "@tropel/runtime-wasm";
 
 const exec = await createExecWasm({
   wasmBytes: await fetch("/tropel_web.wasm").then((r) => r.arrayBuffer()),

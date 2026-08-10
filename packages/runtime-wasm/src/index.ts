@@ -1,4 +1,4 @@
-// @tropel/exec-wasm — host for the tropel-web wasm32-wasip1 runtime slice
+// @tropel/runtime-wasm — host for the tropel-web wasm32-wasip1 runtime slice
 // (TROPEL_WASM_BUILD.md Step 5A / Shape A).
 //
 // Loads `tropel_web.wasm`, wires WASI preview1, implements the
@@ -13,6 +13,13 @@ import {
   encodeRunRequest,
 } from "./postcard.js";
 import type { HttpRequest, HttpResponse, RunOutcome, RunRequest } from "./types.js";
+import { render as renderBundle, defaultBundle } from "@tropel/shims";
+
+// N1: the default shim bundle the host supplies to the wasm runtime — the
+// same sources the native engine embeds (ShimBundle::default() order),
+// shipped as an asset via @tropel/shims so a pm.*/trp.* fix needs no wasm
+// rebuild or release.
+const defaultShimSource: string = renderBundle(defaultBundle);
 
 /** How a response is produced for a request the runtime makes. */
 export type Transport = (req: HttpRequest) => HttpResponse;
@@ -29,6 +36,15 @@ export interface ExecWasmOptions {
    * dynamic `node:wasi` import, then falls back to the browser shim.
    */
   wasiImports?: WebAssembly.ModuleImports;
+  /**
+   * The shim bundle source text to feed the runtime's JS contexts (N1,
+   * TROPEL_MODULARIZATION_REVIEW_R2.md): the wasm slice no longer embeds the
+   * shims, so the host supplies them via the `tropel_host_shim` import.
+   * Defaults to `@tropel/shims`' `render(defaultBundle)` when omitted. A
+   * `pm.*`/`trp.*` fix then ships as a JS asset with the app — no wasm
+   * rebuild, no release.
+   */
+  shimSource?: string;
   /** Post-instantiation hook (e.g. `wasi.initialize(instance)`). */
   onInstantiate?: (instance: WebAssembly.Instance) => void;
 }
@@ -144,7 +160,7 @@ async function resolveWasiImports(override?: WebAssembly.ModuleImports): Promise
       };
     } catch {
       throw new Error(
-        "@tropel/exec-wasm: no WASI provider — pass wasiImports, or install " +
+        "@tropel/runtime-wasm: no WASI provider — pass wasiImports, or install " +
           "@bjorn3/browser_wasi_shim (browser) / run on Node ≥ 20"
       );
     }
@@ -163,6 +179,23 @@ export async function createExecWasm(options: ExecWasmOptions): Promise<ExecWasm
   // only exists after instantiation. Captured in a mutable ref — host
   // functions are only ever called during tropel_run, i.e. post-instantiate.
   let instanceRef: WebAssembly.Instance | null = null;
+
+  // N1: the wasm slice imports tropel_host_shim for its shim bundle. The
+  // default bundle is @tropel/shims' render(defaultBundle) — the same
+  // sources the native engine embeds (ShimBundle::default()); callers can
+  // override with their own bundle (e.g. a newer pm.js fix shipped as an
+  // asset). Bytes are copied into linear memory via the module's own
+  // tropel_alloc, packed (ptr << 32) | len; 0 = no bundle (shim-less run).
+  const hostShim = (): bigint => {
+    const src = options.shimSource ?? defaultShimSource;
+    if (!src) return 0n;
+    const instance = instanceRef!;
+    const exports = instance.exports as unknown as WasmExports;
+    const bytes = new TextEncoder().encode(src);
+    const outPtr = exports.tropel_alloc(bytes.length);
+    new Uint8Array(exports.memory.buffer).set(bytes, outPtr);
+    return (BigInt(outPtr) << 32n) | BigInt(bytes.length);
+  };
 
   const hostHttp = (reqPtr: number, reqLen: number): bigint => {
     const instance = instanceRef!;
@@ -185,7 +218,7 @@ export async function createExecWasm(options: ExecWasmOptions): Promise<ExecWasm
 
   const imports: WebAssembly.Imports = {
     wasi_snapshot_preview1: wasiImports,
-    env: { tropel_host_http: hostHttp },
+    env: { tropel_host_http: hostHttp, tropel_host_shim: hostShim },
   };
 
   const { instance } = await WebAssembly.instantiate(
