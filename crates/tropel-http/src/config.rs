@@ -166,6 +166,6 @@ mod tests {
         assert!(cfg.expected_statuses.iter().any(|e| e.matches(304)));
         assert!(!cfg.expected_statuses.iter().any(|e| e.matches(404)));
         assert_eq!(cfg.max_redirects, 10);
-        assert_eq!(cfg.http2, true);
+        assert!(cfg.http2);
     }
 }

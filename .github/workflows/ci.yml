@@ -280,6 +280,12 @@ jobs:
           npm run build
           node smoke.mjs
 
+      # P6 lockstep versioning: one version stamped into the binary, the wasm
+      # runtime, and both npm packages. A drift here breaks the version
+      # handshake (agent vs wasm) before a single load runs.
+      - name: P6 lockstep versioning gate
+        run: bash scripts/version-lockstep.sh
+
   smoke:
     name: "e2e smoke (samples: k6, postman, openapi, har)"
     runs-on: ubuntu-latest

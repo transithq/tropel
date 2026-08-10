@@ -35,7 +35,7 @@ if (!artifact) {
 }
 
 // ── build the wrapper ────────────────────────────────────────────────────
-const { createExecWasm } = await import("./dist/index.js");
+const { createExecWasm, checkVersionParity } = await import("./dist/index.js");
 
 const wasmBytes = readFileSync(artifact);
 let wasiImports;
@@ -125,6 +125,22 @@ const scenario = {
   variables: {},
   auth: null,
 };
+
+// ── P6 version handshake surface ──────────────────────────────────────────
+// The wasm exposes its runtime version; the smoke pins it against the
+// package version so lockstep drift fails the gate.
+const pkgVersion = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version;
+if (typeof exec.runtimeVersion !== "string" || exec.runtimeVersion.length === 0) {
+  console.error("FAIL: runtimeVersion missing from the wasm (tropel_version export)");
+  process.exit(1);
+}
+console.log(`  runtime version: ${exec.runtimeVersion}, package version: ${pkgVersion}`);
+
+const match = checkVersionParity(pkgVersion, exec.runtimeVersion);
+if (!match.matched) {
+  console.error(`FAIL: lockstep — ${match.warning}`);
+  process.exit(1);
+}
 
 const outcome = exec.run({
   scenarioJson: JSON.stringify(scenario),

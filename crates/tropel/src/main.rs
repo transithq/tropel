@@ -60,7 +60,12 @@ fn agent_command() -> tropel_sdk::Result<()> {
     #[derive(Parser, Debug)]
     #[command(
         name = "tropel agent",
-        about = "Distributed load-test worker (API client process boundary)"
+        about = "Distributed load-test worker (API client process boundary)",
+        // P6 version handshake: `tropel agent --version` prints the binary's
+        // version so the API client can feed it to checkVersionParity against
+        // the loaded wasm's runtimeVersion. clap wires this from
+        // CARGO_PKG_VERSION automatically.
+        version
     )]
     struct AgentArgs {
         /// Controller address (host:port).
@@ -81,7 +86,14 @@ fn agent_command() -> tropel_sdk::Result<()> {
 
     // clap::parse() would treat the leading "agent" as an unknown positional;
     // parse_from over args[2..] scopes the subcommand's own argv correctly.
-    let args = AgentArgs::parse_from(std::env::args().skip(2));
+    //
+    // IMPORTANT: parse_from treats its FIRST element as argv[0] (the program
+    // name), so a lone `tropel agent --version` would have "--version" eaten
+    // as the binary name and fall through to the auth check. Prepend a dummy
+    // name so real flags (--version/--help included) land at argv[1..].
+    let args = AgentArgs::parse_from(
+        std::iter::once("tropel agent".to_string()).chain(std::env::args().skip(2)),
+    );
 
     if args.controller.is_empty() {
         return Err(tropel_sdk::TropelError::Config(

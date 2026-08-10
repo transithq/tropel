@@ -24,6 +24,13 @@ use tropel_metrics::collector::MetricsSnapshot;
 pub struct HelloMsg {
     /// Shared secret token. MUST be the first frame an agent sends.
     pub token: String,
+    /// The agent's tropel version (P6 version handshake). The controller
+    /// warns when it differs from its own build — a mixed-version fleet is
+    /// the exact unverified-parity condition the handshake exists to catch.
+    /// `default` keeps an OLD agent (no version field) connectable: the
+    /// handshake's job is to WARN on drift, not hard-reject a mixed fleet.
+    #[serde(default)]
+    pub version: String,
 }
 
 /// Controller → Agent: dispatch a job with this worker's execution segment.
@@ -203,6 +210,7 @@ mod tests {
         let (mut a, mut b) = split_duplex(64 * 1024);
         let payload = serde_json::to_vec(&HelloMsg {
             token: "tok".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
         })
         .unwrap();
         let len = (payload.len() as u32).to_be_bytes();

@@ -135,9 +135,8 @@ static SHIM_BYTECODE_FAILED: AtomicBool = AtomicBool::new(false);
 static SHIM_BYTECODE_RUN_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Create a JS context for one VU, bootstrap the bundled shim libraries
-/// (scripting-api, chai, lodash, crypto, exec), install the native modules and PM
-
-/// bridge functions, and wire a blocking `sleep(seconds)` helper.
+/// (scripting-api, chai, lodash, crypto, exec), install the native modules and
+/// PM bridge functions, and wire a blocking `sleep(seconds)` helper.
 ///
 /// Returns `None` if context creation fails — context-creation failures log
 /// a warning, but a shim bootstrap failure is logged at ERROR level (the VU

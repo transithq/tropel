@@ -42,6 +42,7 @@ pub async fn run_agent(controller_addr: &str, token: &str) -> Result<()> {
         &mut stream,
         &HelloMsg {
             token: token.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
         },
     )
     .await?;

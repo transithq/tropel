@@ -122,6 +122,23 @@ pub async fn run_controller(
                     "agent authentication failed: token mismatch".into(),
                 ));
             }
+            // P6 version handshake: a mixed-version fleet is unverified-
+            // parity — the client marks such results, and here we surface it
+            // loudly at the controller too.
+            let controller_version = env!("CARGO_PKG_VERSION");
+            if hello.version != controller_version {
+                // Distinguish a legacy agent (no version handshake — empty via
+                // #[serde(default)]) from a genuine mixed-version fleet, so
+                // operators don't chase a phantom drift.
+                let detail = if hello.version.is_empty() {
+                    "legacy agent (no version handshake)".to_string()
+                } else {
+                    format!("version {}", hello.version)
+                };
+                tracing::warn!(
+                    "Controller: agent {i} {detail} != controller version {controller_version} — mixed-version fleet; results are unverified-parity"
+                );
+            }
             tracing::debug!("Controller: agent {i} from {peer} authenticated");
 
             let assign = AssignMsg {

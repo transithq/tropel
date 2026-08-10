@@ -40,6 +40,14 @@ export interface ExecWasm {
    * decoded outcome, or `{ iterations: [], error }` on a fatal failure.
    */
   run(req: RunRequest): RunOutcome;
+  /**
+   * The runtime version compiled into the wasm (tropel-web's
+   * `CARGO_PKG_VERSION`, read via the `tropel_version` C ABI export).
+   * P6 version handshake: compare against the connected `tropel agent`'s
+   * version via [`checkVersionParity`] — a mismatch means unverified-parity
+   * results.
+   */
+  runtimeVersion: string;
 }
 
 interface WasmExports {
@@ -47,6 +55,28 @@ interface WasmExports {
   tropel_alloc(len: number): number;
   tropel_free(ptr: number, len: number): void;
   tropel_run(ptr: number, len: number): bigint;
+  tropel_version(): bigint;
+}
+
+/**
+ * P6 version handshake: compare a `tropel agent`'s version against the wasm
+ * runtime version. Returns `{ matched, warning }` — callers should surface
+ * the warning visibly and mark results unverified-parity when `matched` is
+ * false (the API client's load contract, TROPEL_MODULARIZATION_TODO.md P6).
+ */
+export function checkVersionParity(
+  agentVersion: string,
+  wasmVersion: string
+): { matched: boolean; warning: string | null } {
+  if (agentVersion === wasmVersion) {
+    return { matched: true, warning: null };
+  }
+  return {
+    matched: false,
+    warning:
+      `tropel agent ${agentVersion} != wasm runtime ${wasmVersion} — ` +
+      `mixed-version deployment; results marked unverified-parity`,
+  };
 }
 
 // Minimal WASI surface this host needs. Both providers (Node's built-in
@@ -170,7 +200,17 @@ export async function createExecWasm(options: ExecWasmOptions): Promise<ExecWasm
 
   const exports = instance.exports as unknown as WasmExports;
 
+  // Read the runtime version from the wasm (P6 handshake surface).
+  const mem0 = () => new Uint8Array(exports.memory.buffer);
+  const verPacked = exports.tropel_version();
+  const verPtr = Number(verPacked >> 32n);
+  const verLen = Number(verPacked & 0xffff_ffffn);
+  const runtimeVersion = new TextDecoder().decode(
+    mem0().slice(verPtr, verPtr + verLen)
+  );
+
   return {
+    runtimeVersion,
     run(req: RunRequest): RunOutcome {
       const mem = () => new Uint8Array(exports.memory.buffer);
 
