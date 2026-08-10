@@ -285,19 +285,35 @@ pub struct TrpBridge {
     /// Per-VU HTTP client for executing pm.sendRequest synchronously.
     /// Gated behind the `send-request` feature (P4) — the entire
     /// tropel-sandbox → tropel-http dependency.
+    ///
+    /// `Option` so the always-available [`TrpBridge::new`] constructor
+    /// compiles under BOTH feature states (P5b: feature unification turns
+    /// `send-request` on for the whole workspace when the engine opts in,
+    /// so the web slice's 1-arg call must not disappear). When `None`, the
+    /// `send-request` bridge returns a descriptive error instead of
+    /// panicking.
     #[cfg(feature = "send-request")]
-    http_client: Arc<HttpClient>,
+    http_client: Option<Arc<HttpClient>>,
 }
 
 impl TrpBridge {
-    #[cfg(feature = "send-request")]
-    pub fn new(state: SharedPmState, http_client: Arc<HttpClient>) -> Self {
-        Self { state, http_client }
+    /// Always-available constructor with no HTTP client (browser slice,
+    /// `--no-default-features`). Compiles in both feature states.
+    pub fn new(state: SharedPmState) -> Self {
+        Self {
+            state,
+            #[cfg(feature = "send-request")]
+            http_client: None,
+        }
     }
 
-    #[cfg(not(feature = "send-request"))]
-    pub fn new(state: SharedPmState) -> Self {
-        Self { state }
+    /// Constructor with a per-VU HTTP client (enables `pm.sendRequest`).
+    #[cfg(feature = "send-request")]
+    pub fn with_http_client(state: SharedPmState, http_client: Arc<HttpClient>) -> Self {
+        Self {
+            state,
+            http_client: Some(http_client),
+        }
     }
 
     /// Register all bridge functions into the given JS context.
@@ -1206,8 +1222,21 @@ impl TrpBridge {
 
                             // Execute on the dedicated I/O runtime via the shared
                             // blocking helper — safe from inside ctx.with on a
-                            // current-thread VU runtime.
-                            let http_for_io = http.clone();
+                            // current-thread VU runtime. When the bridge was built
+                            // without a client (browser slice), surface a
+                            // descriptive error rather than panicking on None.
+                            let Some(http) = http.clone() else {
+                                return serde_json::json!({
+                                    "error": "pm.sendRequest unavailable in this build (no HTTP client)",
+                                    "code": 0,
+                                    "statusText": "pm.sendRequest unavailable in this build (no HTTP client)",
+                                    "body": "",
+                                    "headers": {},
+                                    "responseTime": 0,
+                                })
+                                .to_string();
+                            };
+                            let http_for_io = http;
                             let result = tropel_http::blocking::execute_blocking(async move {
                                 http_for_io.execute(&req, None).await
                             });

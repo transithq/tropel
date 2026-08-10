@@ -1,0 +1,43 @@
+[package]
+name = "tropel-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Browser slice of Tropel: a wasm32-wasip1 cdylib exposing a postcard C ABI over tropel-runtime (TROPEL_WASM_BUILD.md Step 5A)."
+
+# cdylib exports the C ABI (`tropel_alloc` / `tropel_free` / `tropel_run`)
+# for the wasm build; rlib lets native tests link the crate.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The wasm graph must not drag host-bound crates in (P5b gate): sandbox's
+# default `send-request` pulls tropel-http → reqwest → tokio-net, which
+# cannot compile on wasm. The web slice never needs pm.sendRequest (v1
+# decision), so both sandbox and runtime use default-features = false.
+tropel-runtime = { workspace = true, default-features = false }
+tropel-sandbox = { workspace = true, default-features = false }
+tropel-js.workspace = true
+tropel-native.workspace = true
+tropel-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+# Current-thread runtime to drive the async runner from the synchronous C
+# ABI entry (`tropel_run`). The narrowed feature set is the wasm-safe one
+# (TROPEL_WASM_BUILD.md Step 3): rt + time + sync + macros.
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "time", "sync", "macros"] }
+
+# rquickjs only for the native sleep helper (`Func` in bootstrap.rs); mirror
+# tropel-js's per-target split so the wasm build gets the narrowed set.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rquickjs.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rquickjs = { version = "0.12.2", default-features = false, features = ["std", "classes", "properties", "array-buffer", "futures", "loader", "macro"] }

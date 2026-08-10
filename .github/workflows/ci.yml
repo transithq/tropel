@@ -206,6 +206,41 @@ jobs:
       # the same script at its root.
       - run: bash crates/tropel-sdk/scripts/sdk-gates.sh
 
+  wasm:
+    name: wasm slice (tropel-web builds + size budget)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # crates/tropel-sdk is a git submodule of transithq/tropel-sdk
+          # (see .gitmodules) — every cargo job needs it populated.
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      # TROPEL_WASM_BUILD.md Step 1: the browser slice needs the WASI SDK
+      # (QuickJS is C and needs a libc; wasm32-unknown-unknown has none).
+      # Shell env wins over the committed [env] block, so override the
+      # machine-local Windows paths here.
+      - name: Install WASI SDK
+        run: |
+          curl -fsSL -o /tmp/wasi-sdk.tar.gz \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz
+          sudo mkdir -p /opt/wasi-sdk
+          sudo tar xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+      - name: P5b size-budget gate
+        env:
+          WASI_SDK: /opt/wasi-sdk
+          CC_wasm32_wasip1: /opt/wasi-sdk/bin/clang
+          AR_wasm32_wasip1: /opt/wasi-sdk/bin/llvm-ar
+          BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip1: >-
+            --sysroot=/opt/wasi-sdk/share/wasi-sysroot --target=wasm32-wasi
+        run: bash scripts/wasm-size.sh
+
   smoke:
     name: "e2e smoke (samples: k6, postman, openapi, har)"
     runs-on: ubuntu-latest
@@ -345,7 +380,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [fmt, clippy, test, msrv, semver, deny, sdk-gates, smoke]
+    needs: [fmt, clippy, test, msrv, semver, deny, sdk-gates, wasm, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

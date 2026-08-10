@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tropel_js::JsContext;
+use serde::{Deserialize, Serialize};
 use tropel_sandbox::state::{PmState, SharedPmState};
 use tropel_sdk::config::ExpectedStatus;
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
@@ -13,7 +14,11 @@ use tropel_sdk::types::{Sample, SampleType, TagMap};
 use tropel_sdk::Result;
 
 /// Result of running a VU iteration.
-#[derive(Debug, Default)]
+///
+/// `Serialize`/`Deserialize` support the P5b web slice: `tropel-web`
+/// postcard-encodes `IterationResult`s into `RunOutcome` so the wasm host
+/// can read them (TROPEL_WASM_BUILD.md Step 5A).
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IterationResult {
     pub samples: Vec<Sample>,
     pub iteration_index: u64,
@@ -1123,7 +1128,7 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
-        tropel_sandbox::bindings::trp::TrpBridge::new(runner.pm_state().clone(), bridge_client)
+        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);
@@ -1227,7 +1232,7 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
-        tropel_sandbox::bindings::trp::TrpBridge::new(runner.pm_state().clone(), bridge_client)
+        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);

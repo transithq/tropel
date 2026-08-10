@@ -10,7 +10,10 @@ publish = false
 [dependencies]
 tropel-sdk.workspace = true
 tropel-core.workspace = true
-tropel-runtime.workspace = true
+# P5b: the workspace now declares tropel-runtime default-features = false
+# (browser slice must not drag reqwest/tokio-net into the wasm graph). The
+# native engine needs pm.sendRequest, so opt back in explicitly.
+tropel-runtime = { workspace = true, features = ["send-request"] }
 tropel-scheduler.workspace = true
 tropel-report.workspace = true
 tropel-metrics.workspace = true
