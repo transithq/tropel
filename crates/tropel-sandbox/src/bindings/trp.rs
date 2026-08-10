@@ -280,7 +280,7 @@ fn parse_headers(json: &str) -> HashMap<String, String> {
 /// With rquickjs 0.12+, the following complex types are supported as
 /// Func::from parameter/return types via FromJs/IntoJs: HashMap<String, String>,
 /// Vec<(String, String)>, Option<T>, Vec<T>, and all primitive types.
-pub struct PmBridge {
+pub struct TrpBridge {
     state: SharedPmState,
     /// Per-VU HTTP client for executing pm.sendRequest synchronously.
     /// Gated behind the `send-request` feature (P4) — the entire
@@ -289,7 +289,7 @@ pub struct PmBridge {
     http_client: Arc<HttpClient>,
 }
 
-impl PmBridge {
+impl TrpBridge {
     #[cfg(feature = "send-request")]
     pub fn new(state: SharedPmState, http_client: Arc<HttpClient>) -> Self {
         Self { state, http_client }
@@ -1248,7 +1248,7 @@ impl PmBridge {
 
         if !failures.is_empty() {
             return Err(TropelError::Js(format!(
-                "PM bridge registration failed: {}",
+                "Tropel bridge (trp.*) registration failed: {}",
                 failures.join("; ")
             )));
         }

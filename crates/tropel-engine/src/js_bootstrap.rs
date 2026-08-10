@@ -203,7 +203,7 @@ pub(crate) async fn create_vu_js_context(
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
     }
 
-    let bridge = tropel_sandbox::bindings::trp::PmBridge::new(pm_state.clone(), http_client.clone());
+    let bridge = tropel_sandbox::bindings::trp::TrpBridge::new(pm_state.clone(), http_client.clone());
     if let Err(e) = bridge.install(&mut ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }

@@ -1123,7 +1123,7 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
-        tropel_sandbox::bindings::trp::PmBridge::new(runner.pm_state().clone(), bridge_client)
+        tropel_sandbox::bindings::trp::TrpBridge::new(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);
@@ -1227,7 +1227,7 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
-        tropel_sandbox::bindings::trp::PmBridge::new(runner.pm_state().clone(), bridge_client)
+        tropel_sandbox::bindings::trp::TrpBridge::new(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);

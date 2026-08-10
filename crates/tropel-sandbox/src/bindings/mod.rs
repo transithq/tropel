@@ -8,3 +8,6 @@
 pub mod trp;
 
 pub use trp::*;
+
+/// Backward-compat alias — `PmBridge` is the old Postman-era name.
+pub type PmBridge = trp::TrpBridge;
