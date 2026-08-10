@@ -150,11 +150,26 @@ fn wasm_artifact_path() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidates = [
         // CI's `wasm` job (wasm-size.sh builds to the default target dir).
-        manifest.join("../../target/wasm32-wasip1/release/tropel_web.wasm"),
+        manifest.join("../../target/wasm32-wasip1/release-wasm/tropel_web.wasm"),
         // Machine-local target-dir override (see .cargo/config.toml).
+        PathBuf::from("C:/tropel-native-target/wasm32-wasip1/release-wasm/tropel_web.wasm"),
+        // Back-compat: pre-size-discipline artifacts built with --release.
+        manifest.join("../../target/wasm32-wasip1/release/tropel_web.wasm"),
         PathBuf::from("C:/tropel-native-target/wasm32-wasip1/release/tropel_web.wasm"),
     ];
-    candidates.into_iter().find(|p| p.exists())
+    let found = candidates.into_iter().find(|p| p.exists());
+    // A stale pre-profile release/ artifact (3.98 MB, embedded-shims era)
+    // must never silently pass the differential — the release-wasm profile
+    // is the size-tuned source (API_CLIENT_WEB_PAYLOAD.md §2.4).
+    if let Some(ref p) = found {
+        if p.to_string_lossy().ends_with("/release/tropel_web.wasm") {
+            eprintln!(
+                "WARNING: F3 using pre-profile release/ artifact {} — run scripts/wasm-size.sh to build release-wasm",
+                p.display()
+            );
+        }
+    }
+    found
 }
 
 // ── the wasm leg ─────────────────────────────────────────────────────────

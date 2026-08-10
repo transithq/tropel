@@ -13,10 +13,17 @@ if [[ -n "${TROPEL_WASM_PATH:-}" && -f "${TROPEL_WASM_PATH}" ]]; then
   ARTIFACT="${TROPEL_WASM_PATH}"
 else
   for c in \
+    "$PWD/../../target/wasm32-wasip1/release-wasm/tropel_web.wasm" \
+    "C:/tropel-native-target/wasm32-wasip1/release-wasm/tropel_web.wasm" \
     "$PWD/../../target/wasm32-wasip1/release/tropel_web.wasm" \
     "C:/tropel-native-target/wasm32-wasip1/release/tropel_web.wasm"; do
     if [[ -f "$c" ]]; then ARTIFACT="$c"; break; fi
   done
+  # A stale pre-profile release/ artifact (3.98 MB, embedded-shims era) must
+  # never ship silently — the release-wasm profile is the size-tuned source.
+  if [[ "$ARTIFACT" == *"/release/tropel_web.wasm" ]]; then
+    echo "warning: using pre-profile release/ artifact ($ARTIFACT) — run the wasm job / scripts/wasm-size.sh to build release-wasm" >&2
+  fi
 fi
 if [[ -z "$ARTIFACT" ]]; then
   echo "error: tropel_web.wasm not found — run the wasm job / scripts/wasm-size.sh first, or set TROPEL_WASM_PATH" >&2

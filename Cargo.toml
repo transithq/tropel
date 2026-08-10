@@ -39,6 +39,19 @@ license = "Apache-2.0"
 repository = "https://github.com/transithq/tropel"
 rust-version = "1.85"
 
+# P5b / API_CLIENT_WEB_PAYLOAD.md §2.4 — size discipline for the browser
+# slice. A SEPARATE profile, not [profile.release]: native release builds
+# must stay fast for load generation (k6 competition), so the wasm-only
+# size settings live here. Build with `cargo build -p tropel-web
+# --target wasm32-wasip1 --profile release-wasm` (wasm-size.sh + CI do).
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "test-util"] }
