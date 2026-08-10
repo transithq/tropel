@@ -1,16 +1,18 @@
-//! # Differential harness — native k6 vs wasm driver, one engine
+//! # Driver-parity harness — native k6 driver vs WAT wasm driver, one engine
 //!
-//! P6 (TROPEL_MODULARIZATION_TODO.md) — *"every fixture collection through
-//! native-driven and wasm-driven tropel-exec, diffing the full
-//! IterationOutcome. This is what makes the one-engine claim verifiable
-//! rather than asserted."*
+//! F3 (TROPEL_MODULARIZATION_REVIEW.md): this is a *driver-parity* test —
+//! the native k6 driver (`tropel-input-k6`) vs the WASM driver
+//! (`tropel-wasm`), both running as inventory-registered drivers through the
+//! SAME `Engine::run` → `run_driver_vus` path (same VU loop, same shared
+//! HTTP client, same metrics collector, same scheduler). It verifies the
+//! drivers agree under one native engine — it does NOT compare native
+//! `tropel-runtime` against the `wasm32` build of `tropel-runtime`.
 //!
-//! `tropel-exec` (P5) is not extracted yet, but both the native k6 driver
-//! (`tropel-input-k6`) and the WASM driver (`tropel-wasm`) are
-//! inventory-registered drivers that the engine runs through the SAME
-//! `Engine::run` → `run_driver_vus` path — same VU loop, same shared HTTP
-//! client, same metrics collector, same scheduler. That is the engine whose
-//! oneness this harness verifies.
+//! That real native-vs-wasm32 axis (the same fixture through native
+//! `tropel-runtime` and through the wasm32 build, diffing the full
+//! outcome) lives in `crates/tropel-web/src/native_vs_wasm.rs` — P5a has
+//! landed and `tropel-runtime` exists, so the one-engine claim is verified
+//! there, not asserted here.
 //!
 //! The WASM driver's `env.http_request` host function auto-records the
 //! standard k6 sample set (`http_req_duration` / `http_reqs` /

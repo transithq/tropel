@@ -11,6 +11,12 @@ pub mod bootstrap;
 pub mod http;
 pub mod wire;
 
+// F3 (TROPEL_MODULARIZATION_REVIEW.md): the real native-vs-wasm32 differential
+// harness. `#[cfg(test)]` — it needs the wasmtime dev-deps and the native
+// HTTP seam, so it never ships in the wasm build.
+#[cfg(test)]
+mod native_vs_wasm;
+
 use std::sync::Arc;
 
 use tropel_runtime::{flatten_execution_items, ScenarioRunner};
@@ -34,8 +40,13 @@ pub extern "C" fn tropel_alloc(len: usize) -> *mut u8 {
 }
 
 /// Free a buffer previously returned by [`tropel_alloc`].
+///
+/// # Safety
+///
+/// `ptr`/`len` must exactly match a buffer previously returned by
+/// [`tropel_alloc`] that has not already been freed.
 #[no_mangle]
-pub extern "C" fn tropel_free(ptr: *mut u8, len: usize) {
+pub unsafe extern "C" fn tropel_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
@@ -53,8 +64,13 @@ pub extern "C" fn tropel_free(ptr: *mut u8, len: usize) {
 /// fresh [`tropel_alloc`] buffer — the host must [`tropel_free`] it. Returns
 /// `0` on a fatal internal failure (the outcome itself carries the error
 /// string for ordinary failures).
+///
+/// # Safety
+///
+/// `ptr`/`len` must describe a valid, initialized postcard-encoded
+/// [`RunRequest`] in a buffer previously returned by [`tropel_alloc`].
 #[no_mangle]
-pub extern "C" fn tropel_run(ptr: *const u8, len: usize) -> u64 {
+pub unsafe extern "C" fn tropel_run(ptr: *const u8, len: usize) -> u64 {
     let outcome = if ptr.is_null() {
         RunOutcome::failed("tropel_run: null request pointer")
     } else {
@@ -111,7 +127,7 @@ pub async fn run_request(req: RunRequest) -> RunOutcome {
     let flattened = Arc::new(flatten_execution_items(&scenario.items));
     let names: Arc<Vec<String>> = Arc::new(flattened.iter().map(|i| i.name.clone()).collect());
 
-    let client: Arc<dyn DriverHttpClient> = Arc::new(http::WebHttpClient::default());
+    let client: Arc<dyn DriverHttpClient> = Arc::new(http::WebHttpClient);
 
     let mut runner = ScenarioRunner::new(
         scenario,
@@ -121,7 +137,7 @@ pub async fn run_request(req: RunRequest) -> RunOutcome {
         req.vu_id,
         req.scenario_name.clone(),
     )
-    .with_expected_statuses(req.expected_statuses);
+    .with_expected_statuses(req.parsed_expected_statuses());
 
     let pm_state = runner.state_handle();
     if let Some(ctx) = bootstrap::create_web_js_context(&pm_state).await {
@@ -279,7 +295,7 @@ mod tests {
         // scenario is JSON text, so all Body variants survive the postcard
         // round-trip (JSON → string → JSON is lossless).
         let mut scenario = sample_scenario();
-        let mut inner = scenario.items[0].request.as_mut().unwrap();
+        let inner = scenario.items[0].request.as_mut().unwrap();
         inner.body = Some(Body::Json(serde_json::json!({"a": 1})));
         // Override with UrlEncoded — the last write wins.
         inner.body = Some(Body::UrlEncoded(HashMap::from([("a".into(), "1".into())])));

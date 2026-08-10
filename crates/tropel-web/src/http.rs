@@ -30,23 +30,29 @@ extern "C" {
 // ── native: test seam ──
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod native_seam {
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
 
     use tropel_sdk::types::{Request, Response};
     use tropel_sdk::{Result, TropelError};
 
     pub type Handler = Box<dyn Fn(&Request) -> Result<Response> + Send + Sync>;
 
-    static HANDLER: OnceLock<Handler> = OnceLock::new();
+    // A Mutex (replaceable) rather than OnceLock: the F3 differential harness
+    // installs its own deterministic handler, and unit-test ordering is not
+    // guaranteed — OnceLock's first-wins semantics would let an unrelated
+    // test's handler leak into the harness and silently break the diff.
+    static HANDLER: Mutex<Option<Handler>> = Mutex::new(None);
 
     /// Install the handler native tests use instead of the wasm host import.
+    /// Replaces any previous handler (last install wins).
     #[cfg(test)]
     pub fn set_handler(h: Handler) {
-        let _ = HANDLER.set(h);
+        *HANDLER.lock().unwrap() = Some(h);
     }
 
     pub fn bridge(req: &Request) -> Result<Response> {
-        match HANDLER.get() {
+        let guard = HANDLER.lock().unwrap();
+        match guard.as_ref() {
             Some(h) => h(req),
             None => Err(TropelError::Http(
                 "no native HTTP handler installed (set one in tests)".into(),
@@ -69,8 +75,19 @@ fn bridge(req: &Request) -> Result<Response> {
         // SAFETY: the host contract is that the returned pointer/len describe
         // a valid postcard-encoded Response in this module's linear memory.
         let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-        postcard::from_bytes(slice)
-            .map_err(|e| tropel_sdk::TropelError::Http(format!("decode response: {e}")))
+        let decoded = postcard::from_bytes(slice)
+            .map_err(|e| tropel_sdk::TropelError::Http(format!("decode response: {e}")));
+        // The response buffer was allocated by the HOST via a re-entrant call
+        // into this module's own `tropel_alloc` — reclamation is ours, and
+        // leaking it per request would grow linear memory without bound on a
+        // long-running web run (the F3 reviewer flagged this). The pointer is
+        // valid until freed; decode is complete, so reclaim now.
+        // SAFETY: ptr/len exactly match the buffer the host just allocated
+        // via our `tropel_alloc`, and this is the only free.
+        unsafe {
+            crate::tropel_free(ptr as *mut u8, len);
+        }
+        decoded
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
