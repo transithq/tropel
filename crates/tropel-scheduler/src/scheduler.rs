@@ -229,6 +229,14 @@ impl VUScheduler {
         self.force_stop_requested.load(Ordering::Acquire)
     }
 
+    /// The force-stop flag as an `Arc<AtomicBool>`, so VU-side machinery — JS
+    /// interrupt handlers, blocking `sleep()` loops, and the runner item loop
+    /// — can poll it live without holding the whole scheduler (backlog:
+    /// gracefulStop force-stop was advisory only).
+    pub fn force_stop_flag(&self) -> Arc<AtomicBool> {
+        self.force_stop_requested.clone()
+    }
+
     /// Request a hard stop — sets the force-stop flag and wakes all waiters.
     /// This is the final deadline expiration: VUs should exit as soon as
     /// possible, potentially mid-iteration.
@@ -1428,15 +1436,24 @@ impl VUScheduler {
     /// elapses (the detached tasks are abandoned, matching k6's behaviour of
     /// hard-aborting the run after the grace window).
     async fn await_handles_bounded(handles: &mut [tokio::task::JoinHandle<()>], bound: Duration) {
-        let all_done = futures::future::join_all(handles.iter_mut());
-        tokio::pin!(all_done);
-        match tokio::time::timeout(bound, &mut all_done).await {
+        // Inline the join_all into the timeout so its &mut borrows of `handles`
+        // are released when the timeout yields Err — the abort loop below can
+        // then re-borrow immutably.
+        match tokio::time::timeout(bound, futures::future::join_all(handles.iter_mut())).await {
             Ok(_) => tracing::debug!("All VU handles resolved"),
             Err(_) => {
                 tracing::warn!(
-                    "Timed out after {:?} waiting for VU handles — detaching remaining VUs",
+                    "Timed out after {:?} waiting for VU handles — aborting remaining VUs",
                     bound
                 );
+                // Backlog: VU handles were never aborted, so a VU that ignored
+                // the force-stop signal (e.g. stuck in a non-cooperative native
+                // call) kept issuing HTTP after the run reported finished. Abort
+                // is the backstop; the flag-aware JS interrupt and the
+                // interruptible sleep are the primary mechanism.
+                for handle in handles.iter() {
+                    handle.abort();
+                }
             }
         }
     }

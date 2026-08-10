@@ -120,28 +120,39 @@ impl VuIterationSource for DriverVuSource {
         }
         let mut script_failures = 0u64;
         if let Err(e) = result {
-            tracing::warn!(
-                "VU {} iteration {} failed: {}",
-                self.vu_id,
-                iteration_index,
-                e
-            );
-            // Backlog line 98: a driver iteration that errored was only
-            // warned — iterations still counted it and the run exited 0.
-            // Record a failed check + count so the failure is visible and
-            // drives a non-zero exit. Tag prefix matches the runner's
-            // `script: <name>` convention (a driver iteration is a script
-            // execution too).
-            script_failures = 1;
-            let mut tags = TagMap::with_capacity(1);
-            tags.insert("check", format!("script: driver {} iteration", self.vu_id));
-            ctx.samples.push(Sample {
-                metric: "checks".into(),
-                value: 0.0,
-                tags: Arc::new(tags),
-                timestamp: std::time::SystemTime::now(),
-                sample_type: tropel_sdk::types::SampleType::Rate,
-            });
+            if self.sched.is_force_stop_requested() {
+                // A deliberate force-stop interrupted the driver's eval — not
+                // a script failure; k6 ends such runs neutrally (backlog:
+                // gracefulStop force-stop was advisory only).
+                tracing::debug!(
+                    "VU {} iteration {} interrupted by force-stop",
+                    self.vu_id,
+                    iteration_index
+                );
+            } else {
+                tracing::warn!(
+                    "VU {} iteration {} failed: {}",
+                    self.vu_id,
+                    iteration_index,
+                    e
+                );
+                // Backlog line 98: a driver iteration that errored was only
+                // warned — iterations still counted it and the run exited 0.
+                // Record a failed check + count so the failure is visible and
+                // drives a non-zero exit. Tag prefix matches the runner's
+                // `script: <name>` convention (a driver iteration is a script
+                // execution too).
+                script_failures = 1;
+                let mut tags = TagMap::with_capacity(1);
+                tags.insert("check", format!("script: driver {} iteration", self.vu_id));
+                ctx.samples.push(Sample {
+                    metric: "checks".into(),
+                    value: 0.0,
+                    tags: Arc::new(tags),
+                    timestamp: std::time::SystemTime::now(),
+                    sample_type: tropel_sdk::types::SampleType::Rate,
+                });
+            }
         }
         let abort_message = if ctx.abort_requested {
             Some(format!(

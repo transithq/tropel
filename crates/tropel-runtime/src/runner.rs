@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -75,6 +75,11 @@ pub struct ScenarioRunner {
     /// Expected status codes/ranges that determine request success.
     /// Controls http_req_failed metric: 1.0 when status is NOT expected.
     expected_statuses: Vec<ExpectedStatus>,
+    /// Level-triggered force-stop flag from the scheduler. Checked between
+    /// items inside one iteration so a force-stopped VU stops walking the
+    /// collection promptly instead of finishing it (backlog: gracefulStop
+    /// force-stop was advisory only).
+    force_stop: Arc<AtomicBool>,
     // ── Execution context (k6 exec.* API) ──
     /// Unique VU identifier.
     pub vu_id: u32,
@@ -117,6 +122,7 @@ impl ScenarioRunner {
             protocols: Arc::new(HashMap::new()),
             // Default: 2xx-3xx = success (matches k6 behavior)
             expected_statuses: vec![ExpectedStatus::Range("200-399".to_string())],
+            force_stop: Arc::new(AtomicBool::new(false)),
             vu_id,
             scenario_name,
         }
@@ -145,6 +151,14 @@ impl ScenarioRunner {
     /// Set expected status codes/ranges for http_req_failed evaluation.
     pub fn with_expected_statuses(mut self, expected: Vec<ExpectedStatus>) -> Self {
         self.expected_statuses = expected;
+        self
+    }
+
+    /// Link the runner's item loop to the scheduler's force-stop flag so a
+    /// force-stopped VU stops mid-iteration instead of walking the whole
+    /// collection (backlog: gracefulStop force-stop was advisory only).
+    pub fn with_force_stop_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.force_stop = flag;
         self
     }
 
@@ -206,6 +220,12 @@ impl ScenarioRunner {
         let mut jumps = 0usize;
 
         while current_index < item_count {
+            // Force-stop: stop walking the collection mid-iteration (backlog:
+            // gracefulStop force-stop was advisory only — the item loop had
+            // no stop check).
+            if self.force_stop.load(Ordering::Acquire) {
+                break;
+            }
             // Check for setNextRequest override
             {
                 let mut state = self.pm_state.lock().unwrap();
@@ -255,12 +275,26 @@ impl ScenarioRunner {
                 if let Some(script) = &item.prerequest {
                     let source_url = Some(format!("{}.prerequest.js", item.name));
                     if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await {
-                        tracing::warn!("VU {} prerequest script error: {}", iteration_index, e);
-                        // Backlog line 98: script failures were swallowed —
-                        // no failed check, no metric, exit 0. Record a failed
-                        // check so the failure is visible in the summary and
-                        // drives a non-zero exit.
-                        record_script_failure(&mut result, &format!("{}.prerequest", item.name));
+                        if self.force_stop.load(Ordering::Acquire) {
+                            // A deliberate force-stop interrupted the eval —
+                            // not a script failure; k6 ends such runs neutrally
+                            // (backlog: gracefulStop force-stop was advisory
+                            // only).
+                            tracing::debug!(
+                                "VU {} prerequest interrupted by force-stop",
+                                iteration_index
+                            );
+                        } else {
+                            tracing::warn!("VU {} prerequest script error: {}", iteration_index, e);
+                            // Backlog line 98: script failures were swallowed —
+                            // no failed check, no metric, exit 0. Record a
+                            // failed check so the failure is visible in the
+                            // summary and drives a non-zero exit.
+                            record_script_failure(
+                                &mut result,
+                                &format!("{}.prerequest", item.name),
+                            );
+                        }
                     }
                 }
 
@@ -618,10 +652,24 @@ impl ScenarioRunner {
                         let source_url = Some(format!("{}.test.js", item.name));
                         if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await
                         {
-                            tracing::warn!("VU {} test script error: {}", iteration_index, e);
-                            // Backlog line 98: record a failed check so the
-                            // failure is visible and drives a non-zero exit.
-                            record_script_failure(&mut result, &format!("{}.test", item.name));
+                            if self.force_stop.load(Ordering::Acquire) {
+                                // Deliberate force-stop interrupted the eval —
+                                // not a script failure (k6 parity: such runs end
+                                // neutrally; backlog: gracefulStop force-stop
+                                // was advisory only).
+                                tracing::debug!(
+                                    "VU {} test script interrupted by force-stop",
+                                    iteration_index
+                                );
+                            } else {
+                                tracing::warn!("VU {} test script error: {}", iteration_index, e);
+                                // Backlog line 98: record a failed check so the
+                                // failure is visible and drives a non-zero exit.
+                                record_script_failure(
+                                    &mut result,
+                                    &format!("{}.test", item.name),
+                                );
+                            }
                         }
                     }
                 }
@@ -1060,6 +1108,90 @@ mod tests {
             resolver.resolve("{{authToken}}", &scope2),
             "fresh-token",
             "script-set env must override a stale seeded value"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_stop_flag_breaks_item_loop() {
+        // Backlog: gracefulStop force-stop was advisory only — the runner's
+        // item loop had no stop check, so a force-stopped VU kept walking the
+        // whole collection. The loop now breaks on the linked flag.
+        let flag = Arc::new(AtomicBool::new(false));
+        let scenario = Arc::new(Scenario {
+            info: tropel_sdk::scenario::ScenarioInfo {
+                name: "fs".into(),
+                description: None,
+                schema: None,
+            },
+            variables: HashMap::new(),
+            auth: None,
+            items: vec![
+                ScenarioItem {
+                    name: "item-a".into(),
+                    request: Some(tropel_sdk::types::Request {
+                        url: "http://127.0.0.1:1/a".into(),
+                        method: Method::GET,
+                        headers: HashMap::new(),
+                        query_params: HashMap::new(),
+                        body: None,
+                        auth: None,
+                        certificate: None,
+                        follow_redirects: true,
+                        timeout: None,
+                        response_type: Default::default(),
+                    }),
+                    prerequest: None,
+                    test: None,
+                    assertions: vec![],
+                    items: vec![],
+                },
+                ScenarioItem {
+                    name: "item-b".into(),
+                    request: Some(tropel_sdk::types::Request {
+                        url: "http://127.0.0.1:1/b".into(),
+                        method: Method::GET,
+                        headers: HashMap::new(),
+                        query_params: HashMap::new(),
+                        body: None,
+                        auth: None,
+                        certificate: None,
+                        follow_redirects: true,
+                        timeout: None,
+                        response_type: Default::default(),
+                    }),
+                    prerequest: None,
+                    test: None,
+                    assertions: vec![],
+                    items: vec![],
+                },
+            ],
+        });
+        let execution_items: Arc<Vec<ScenarioItem>> =
+            Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
+        let mut runner = ScenarioRunner::new(scenario, execution_items, names, client, 0, "fs".into())
+            .with_force_stop_flag(flag.clone());
+
+        // Control: without force-stop the items run (the dead-URL requests
+        // still emit http_reqs/errors samples — k6 parity).
+        let control = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert!(
+            !control.samples.is_empty(),
+            "control run must execute items (samples empty)"
+        );
+
+        // Force-stopped: the item loop must break before any item executes.
+        flag.store(true, Ordering::Release);
+        let stopped = runner.run_iteration(1, None, &HashMap::new()).await;
+        assert!(
+            stopped.samples.is_empty(),
+            "force-stopped runner must not execute any items (got {} samples)",
+            stopped.samples.len()
         );
     }
 

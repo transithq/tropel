@@ -147,10 +147,12 @@ pub(crate) async fn create_vu_js_context(
     http_client: &Arc<dyn DriverHttpClient>,
     shim: &ShimBundle,
     config: &SandboxConfig,
+    force_stop: Arc<AtomicBool>,
 ) -> Option<tropel_js::JsContext> {
-    let mut ctx = match tropel_js::JsContext::new(
+    let mut ctx = match tropel_js::JsContext::new_with_force_stop(
         Some(10 * 1024 * 1024),
         Some(Duration::from_secs(10)),
+        force_stop.clone(),
     )
     .await
     {
@@ -215,6 +217,7 @@ pub(crate) async fn create_vu_js_context(
     // 104). Re-arm the deadline after the blocking sleep, like the WS loop
     // does per step.
     let (deadline, max_exec) = ctx.interrupt_deadline_handle();
+    let force_stop_sleep = force_stop.clone();
     ctx.with_ctx(|rq_ctx| {
         let globals = rq_ctx.globals();
         let deadline_sleep = deadline.clone();
@@ -222,7 +225,22 @@ pub(crate) async fn create_vu_js_context(
             "__tropel_native_sleep",
             rquickjs::function::Func::from(move |ms: f64| {
                 if ms > 0.0 {
-                    std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
+                    // Interruptible sleep: poll the force-stop flag in small
+                    // slices. On force-stop, zero the JS interrupt deadline so
+                    // the eval is interrupted the moment control returns to JS
+                    // (the flag-aware handler unwinds it) — backlog: gracefulStop
+                    // force-stop was advisory only.
+                    let step = Duration::from_millis(10);
+                    let mut remaining = Duration::from_secs_f64(ms / 1000.0);
+                    while remaining > Duration::ZERO {
+                        if force_stop_sleep.load(Ordering::Acquire) {
+                            deadline_sleep.store(0, Ordering::Relaxed);
+                            return;
+                        }
+                        let slice = remaining.min(step);
+                        std::thread::sleep(slice);
+                        remaining -= slice;
+                    }
                 }
                 tropel_js::rearm_deadline(&deadline_sleep, max_exec);
             }),
@@ -348,7 +366,7 @@ mod tests {
             namespace: "acme".into(),
             aliases: vec!["product".into(), "wire".into()],
         };
-        let mut ctx = create_vu_js_context(7, &pm_state, &client, &ShimBundle::default(), &config)
+        let mut ctx = create_vu_js_context(7, &pm_state, &client, &ShimBundle::default(), &config, Arc::new(AtomicBool::new(false)))
             .await
             .expect("context must be created");
 

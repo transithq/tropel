@@ -5,7 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -244,6 +244,24 @@ impl JsContext {
         memory_limit: Option<usize>,
         max_execution_time: Option<Duration>,
     ) -> Result<Self> {
+        Self::new_with_force_stop(
+            memory_limit,
+            max_execution_time,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    /// Like [`JsContext::new`] but links the per-eval interrupt to an external
+    /// force-stop flag: the interrupt fires when the wall-clock deadline passes
+    /// OR the flag flips, so a force-stopped VU stops mid-iteration instead of
+    /// running out its full JS budget (backlog: gracefulStop force-stop was
+    /// advisory only).
+    pub async fn new_with_force_stop(
+        memory_limit: Option<usize>,
+        max_execution_time: Option<Duration>,
+        force_stop: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let rt = Runtime::new()
             .map_err(|e| JsError::ContextCreation(format!("Runtime creation failed: {}", e)))?;
 
@@ -256,10 +274,15 @@ impl JsContext {
         let initial_deadline = now_nanos() + max_execution_time.as_nanos() as u64;
         let interrupt_deadline = Arc::new(AtomicU64::new(initial_deadline));
 
-        // Set interrupt handler using atomic deadline (reset per-eval)
+        // Set interrupt handler using atomic deadline (reset per-eval). The
+        // handler ALSO fires when the linked force-stop flag flips, so a hard
+        // stop interrupts the eval promptly (backlog: gracefulStop force-stop
+        // was advisory only).
         let deadline = interrupt_deadline.clone();
+        let force_stop_handler = force_stop.clone();
         rt.set_interrupt_handler(Some(Box::new(move || {
             now_nanos() > deadline.load(Ordering::Relaxed)
+                || force_stop_handler.load(Ordering::Acquire)
         })));
 
         // Install the host promise rejection tracker (backlog line 174).
@@ -1523,6 +1546,35 @@ mod tests {
             "script exceeding the memory cap must error, got Ok"
         );
         // Process survived — the runtime still evaluates.
+        let ok = ctx.eval("'alive'").await.unwrap();
+        assert_eq!(ok, "alive");
+    }
+
+    #[tokio::test]
+    async fn interrupt_fires_on_force_stop_flag() {
+        // Backlog: gracefulStop force-stop was advisory only — the JS interrupt
+        // was a pure wall-clock deadline, never wired to force-stop. The handler
+        // now ALSO fires when the linked flag flips, so a hard-stopped VU stops
+        // mid-eval instead of running out its full budget.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut ctx = JsContext::new_with_force_stop(
+            Some(4 * 1024 * 1024),
+            Some(Duration::from_secs(60)),
+            flag.clone(),
+        )
+        .await
+        .expect("context creation");
+
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        // A busy loop would run the full 60s deadline if the flag were ignored.
+        let err = ctx.eval("while (true) {}").await.err();
+        assert!(
+            err.is_some(),
+            "force-stop flag must interrupt a busy-loop eval, got Ok"
+        );
+
+        // The context survives: with the flag cleared the next eval is healthy.
+        flag.store(false, std::sync::atomic::Ordering::Release);
         let ok = ctx.eval("'alive'").await.unwrap();
         assert_eq!(ok, "alive");
     }

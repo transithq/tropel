@@ -590,7 +590,8 @@ pub(crate) async fn run_scenario_vus(
                     executor_name,
                     sched.active_vus_handle(),
                     sched.total_iterations_handle(),
-                );
+                )
+                .with_force_stop_flag(sched.force_stop_flag());
                 let pm_state = runner.state_handle();
 
                 let js_ctx = create_vu_js_context(
@@ -599,6 +600,7 @@ pub(crate) async fn run_scenario_vus(
                     &bridge_client,
                     &ShimBundle::default(),
                     &SandboxConfig::default(),
+                    sched.force_stop_flag(),
                 )
                 .await;
                 if let Some(ctx) = js_ctx {
@@ -784,7 +786,13 @@ pub(crate) async fn run_driver_vus(
                     .init(&input_bytes, Some(&input_p), sc_exec.as_deref())
                     .await
                 {
-                    Ok(inst) => inst,
+                    Ok(mut inst) => {
+                        // Backlog: gracefulStop force-stop was advisory only —
+                        // link the driver instance to the scheduler's flag so
+                        // its JS interrupt / native sleep stop mid-iteration.
+                        inst.set_force_stop_flag(sched.force_stop_flag());
+                        inst
+                    }
                     Err(e) => {
                         tracing::error!(
                             "Scenario '{}' VU {}: Driver '{}' init failed: {}",
