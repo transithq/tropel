@@ -169,11 +169,7 @@ struct HostState {
 /// (http.rs): read the postcard `Request` from linear memory, answer with the
 /// SAME fixture response, allocate the reply in wasm memory via the module's
 /// own `tropel_alloc`, and return the packed `(ptr << 32) | len`.
-fn host_http(
-    mut caller: Caller<'_, HostState>,
-    req_ptr: i32,
-    req_len: i32,
-) -> i64 {
+fn host_http(mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32) -> i64 {
     let memory = caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
@@ -192,7 +188,9 @@ fn host_http(
         .get_export("tropel_alloc")
         .and_then(|e| e.into_func())
         .expect("tropel_alloc export");
-    let alloc_typed = alloc.typed::<(i32,), (i32,)>(&caller).expect("typed tropel_alloc");
+    let alloc_typed = alloc
+        .typed::<(i32,), (i32,)>(&caller)
+        .expect("typed tropel_alloc");
     let (ptr,) = alloc_typed
         .call(&mut caller, (resp_bytes.len() as i32,))
         .expect("alloc response");
@@ -259,7 +257,9 @@ fn wasm_leg(wasm_path: &Path, req: &RunRequest) -> RunOutcome {
     let out_ptr = (packed >> 32) as usize;
     let out_len = (packed & 0xFFFF_FFFF) as usize;
     let mut out = vec![0u8; out_len];
-    memory.read(&store, out_ptr, &mut out).expect("read outcome");
+    memory
+        .read(&store, out_ptr, &mut out)
+        .expect("read outcome");
 
     let _ = free.call(&mut store, (req_ptr, req_bytes.len() as i32));
     let _ = free.call(&mut store, (out_ptr as i32, out_len as i32));
@@ -283,7 +283,10 @@ fn native_outcome_postcard_roundtrip() {
         .expect("native runtime");
     let outcome = rt.block_on(crate::run_request(req));
     assert!(outcome.error.is_none(), "run error: {:?}", outcome.error);
-    assert!(!outcome.iterations.is_empty(), "expected at least one iteration");
+    assert!(
+        !outcome.iterations.is_empty(),
+        "expected at least one iteration"
+    );
 
     let bytes = postcard::to_stdvec(&outcome).expect("encode RunOutcome");
     let back: RunOutcome = postcard::from_bytes(&bytes).expect("decode RunOutcome");
@@ -300,8 +303,8 @@ fn native_outcome_postcard_roundtrip() {
 fn postcard_bisect_outcome_wire_types() {
     use std::sync::Arc;
     use std::time::SystemTime;
-    use tropel_sdk::types::{Sample, SampleType, TagMap};
     use tropel_runtime::IterationResult;
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
 
     // 1. SystemTime alone (the most exotic wire member).
     {
@@ -486,7 +489,8 @@ fn native_and_wasm_runtime_produce_identical_outcomes() {
     let wasm_norm = normalize(&wasm);
 
     assert_eq!(
-        native_norm, wasm_norm,
+        native_norm,
+        wasm_norm,
         "native and wasm32 outcomes diverged — the one-engine claim fails.\n\
          native:\n{native:#?}\nwasm:\n{wasm:#?}",
         native = native_norm,
@@ -508,7 +512,10 @@ fn native_and_wasm_runtime_produce_identical_outcomes() {
         first.samples
     );
     assert!(
-        reqs.iter().any(|s| s.tags.iter().any(|(k, v)| k == "url" && v == "https://fixture.test/second")),
+        reqs.iter().any(|s| s
+            .tags
+            .iter()
+            .any(|(k, v)| k == "url" && v == "https://fixture.test/second")),
         "the jump target must appear in the trace: {:#?}",
         first.samples
     );

@@ -257,7 +257,11 @@ mod tests {
         })
         .await;
 
-        assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+        assert!(
+            outcome.error.is_none(),
+            "unexpected error: {:?}",
+            outcome.error
+        );
         assert_eq!(outcome.iterations.len(), 2);
         let first = &outcome.iterations[0];
         assert!(first.samples.len() >= 2, "expected http_req_* samples");

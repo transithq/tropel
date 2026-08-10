@@ -7,8 +7,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tropel_sandbox::config::SandboxConfig;
 use tropel_sandbox::state::SharedPmState;
-use tropel_sdk::traits::DriverHttpClient;
 use tropel_sdk::error::TropelError;
+use tropel_sdk::traits::DriverHttpClient;
 use tropel_sdk::Result;
 
 /// Version of the shim bundle, INDEPENDENT of the engine version (P4b).
@@ -86,7 +86,6 @@ impl Default for ShimBundle {
                 "pm-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/scripting-api/pm.js")),
             ),
-
             ShimEntry(
                 "chai-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/chai/chai-shim.js")),
@@ -203,7 +202,10 @@ pub(crate) async fn create_vu_js_context(
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
     }
 
-    let bridge = tropel_sandbox::bindings::trp::TrpBridge::with_http_client(pm_state.clone(), http_client.clone());
+    let bridge = tropel_sandbox::bindings::trp::TrpBridge::with_http_client(
+        pm_state.clone(),
+        http_client.clone(),
+    );
     if let Err(e) = bridge.install(&mut ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }
@@ -341,8 +343,7 @@ mod tests {
     async fn create_vu_js_context_honors_custom_sandbox_config() {
         let pm_state = new_pm_state();
         let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: HttpClient::new(&HttpConfig::default())
-                .expect("http client should construct"),
+            client: HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
         });
         let config = SandboxConfig {
             namespace: "acme".into(),

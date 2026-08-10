@@ -573,10 +573,9 @@ pub(crate) async fn run_scenario_vus(
                     Arc::new(DriverHttpClientImpl {
                         client: http_client_vu.as_ref().clone(),
                     });
-                let bridge_client: Arc<dyn DriverHttpClient> =
-                    Arc::new(DriverHttpClientImpl {
-                        client: http_client_vu.as_ref().clone(),
-                    });
+                let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+                    client: http_client_vu.as_ref().clone(),
+                });
                 let mut runner = ScenarioRunner::new(
                     scenario,
                     flattened_vu,

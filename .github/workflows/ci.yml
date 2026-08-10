@@ -241,6 +241,17 @@ jobs:
             --sysroot=/opt/wasi-sdk/share/wasi-sysroot --target=wasm32-wasi
         run: bash scripts/wasm-size.sh
 
+      # F3 (TROPEL_MODULARIZATION_REVIEW.md): the REAL differential harness —
+      # the same fixture through native tropel-runtime and through the wasm32
+      # build, diffing the full outcome (status, headers, variable state,
+      # assertion results, setNextRequest trace). Requires the artifact from
+      # the size gate above; TROPEL_REQUIRE_WASM=1 turns a missing artifact
+      # into a hard failure rather than the local-dev skip.
+      - name: F3 differential harness (native vs wasm32 runtime)
+        env:
+          TROPEL_REQUIRE_WASM: "1"
+        run: cargo test -p tropel-web --lib native_vs_wasm
+
   smoke:
     name: "e2e smoke (samples: k6, postman, openapi, har)"
     runs-on: ubuntu-latest

@@ -68,7 +68,9 @@ fn bridge(req: &Request) -> Result<Response> {
             .map_err(|e| tropel_sdk::TropelError::Http(format!("encode request: {e}")))?;
         let packed = unsafe { tropel_host_http(bytes.as_ptr(), bytes.len()) };
         if packed == 0 {
-            return Err(tropel_sdk::TropelError::Http("host HTTP bridge returned 0".into()));
+            return Err(tropel_sdk::TropelError::Http(
+                "host HTTP bridge returned 0".into(),
+            ));
         }
         let ptr = (packed >> 32) as usize;
         let len = (packed & 0xFFFF_FFFF) as usize;

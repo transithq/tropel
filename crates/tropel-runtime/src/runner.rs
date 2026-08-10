@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tropel_js::JsContext;
 use serde::{Deserialize, Serialize};
+use tropel_js::JsContext;
 use tropel_sandbox::state::{PmState, SharedPmState};
 use tropel_sdk::config::ExpectedStatus;
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
@@ -1128,9 +1128,12 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         ));
-        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(runner.pm_state().clone(), bridge_client)
-            .install(&mut js_ctx)
-            .expect("pm bridge should install");
+        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(
+            runner.pm_state().clone(),
+            bridge_client,
+        )
+        .install(&mut js_ctx)
+        .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);
 
         let env = HashMap::new();
@@ -1232,9 +1235,12 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         ));
-        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(runner.pm_state().clone(), bridge_client)
-            .install(&mut js_ctx)
-            .expect("pm bridge should install");
+        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(
+            runner.pm_state().clone(),
+            bridge_client,
+        )
+        .install(&mut js_ctx)
+        .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);
 
         let env = HashMap::new();

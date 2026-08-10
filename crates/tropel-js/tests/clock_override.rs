@@ -28,7 +28,8 @@ fn set_clock_source_overrides_time() {
     // the module's invariant tests valid regardless of execution order.
     let wall = monotonic_wall_now() + Duration::from_secs(5);
     let nanos = monotonic_now_nanos() + 42;
-    FAKE.set((nanos, wall)).expect("fake values set exactly once");
+    FAKE.set((nanos, wall))
+        .expect("fake values set exactly once");
     set_clock_source(fake_source);
     assert_eq!(monotonic_now_nanos(), nanos);
     assert_eq!(monotonic_wall_now(), wall);
