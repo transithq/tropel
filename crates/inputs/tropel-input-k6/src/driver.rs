@@ -3606,11 +3606,15 @@ mod tests {
         // (k6's contract — the jslib RNG goes through Math.random, which
         // randomSeed replaces with mulberry32).
         let first = ctx
-            .eval("randomSeed(42); randomIntBetween(1, 100) + ',' + uuidv4() + ',' + randomString(8)")
+            .eval(
+                "randomSeed(42); randomIntBetween(1, 100) + ',' + uuidv4() + ',' + randomString(8)",
+            )
             .await
             .expect("randomSeed + jslib RNG should eval");
         let second = ctx
-            .eval("randomSeed(42); randomIntBetween(1, 100) + ',' + uuidv4() + ',' + randomString(8)")
+            .eval(
+                "randomSeed(42); randomIntBetween(1, 100) + ',' + uuidv4() + ',' + randomString(8)",
+            )
             .await
             .expect("repeat should eval");
         assert_eq!(
@@ -3638,13 +3642,13 @@ mod tests {
             .eval("JSON.stringify(findBetween('x[1]y[2]z', '[', ']', true))")
             .await
             .expect("findBetween repeat should eval");
-        assert_eq!(repeats, "[\"1\",\"2\"]", "findBetween repeat wrong: {repeats}");
+        assert_eq!(
+            repeats, "[\"1\",\"2\"]",
+            "findBetween repeat wrong: {repeats}"
+        );
 
         // uuidv4 shape: 8-4-4-4-12 hex with version 4 + variant bits.
-        let uuid = ctx
-            .eval("uuidv4()")
-            .await
-            .expect("uuidv4 should eval");
+        let uuid = ctx.eval("uuidv4()").await.expect("uuidv4 should eval");
         assert_eq!(uuid.len(), 36, "uuidv4 shape wrong: {uuid}");
         assert_eq!(&uuid[14..15], "4", "uuidv4 version bit wrong: {uuid}");
 
