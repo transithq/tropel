@@ -27,6 +27,7 @@ const DEFAULT_ORDER = [
 ];
 const K6_ORDER = [
   ["k6-shim", "js/k6-shim/k6-shim.js"],
+  ["jslib-shim", "js/k6-shim/jslib-shim.js"],
   ["open-data-shim", "js/k6-shim/open-data-shim.js"],
   ["sleep-shim", "js/k6-shim/sleep-shim.js"],
 ];

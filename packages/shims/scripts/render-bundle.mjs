@@ -28,6 +28,7 @@ const DEFAULT_ORDER = [
 // bundle, but shipped for embedders who run k6-style scripts.
 const K6_ORDER = [
   ["k6-shim", "shim/k6-shim.js"],
+  ["jslib-shim", "shim/jslib-shim.js"],
   ["open-data-shim", "shim/open-data-shim.js"],
   ["sleep-shim", "shim/sleep-shim.js"],
 ];

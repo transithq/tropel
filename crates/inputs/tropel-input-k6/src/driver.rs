@@ -3183,6 +3183,9 @@ const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: k6-shim ====\n",
     include_str!("../../../../js/k6-shim/k6-shim.js"),
     "\n",
+    "// ==== shim: jslib-shim ====\n",
+    include_str!("../../../../js/k6-shim/jslib-shim.js"),
+    "\n",
     "// ==== shim: open-data-shim ====\n",
     include_str!("../../../../js/k6-shim/open-data-shim.js"),
 );
@@ -3571,7 +3574,11 @@ mod tests {
     #[test]
     fn test_module_preprocess_strips_jslib_url_import() {
         // `https://jslib.k6.io/...` imports can't be fetched by the local
-        // module resolver — strip them so init doesn't hard-fail.
+        // module resolver — strip them so init doesn't hard-fail. But the
+        // APIs they import (randomIntBetween / uuidv4 / htmlReport) must
+        // still RESOLVE: the jslib-shim defines them as globals, mirroring
+        // the k6/* virtual-module pattern (backlog line 118 — previously
+        // the import was deleted with ZERO definitions behind it).
         let code =
             "import { randomIntBetween } from 'https://jslib.k6.io/k6-utils/1.4.0/index.js';\nexport default function() {}\n";
         let result = preprocess_k6_source_module(code);
@@ -3582,6 +3589,89 @@ mod tests {
         assert!(
             result.contains("export default function"),
             "default export lost: {result}"
+        );
+    }
+
+    /// Backlog line 118: the jslib symbols must RESOLVE, not just have their
+    /// imports deleted — the preprocessor strip is only safe because the
+    /// jslib-shim provides the APIs as globals. Boots the real shim bundle
+    /// and calls randomIntBetween / uuidv4 / htmlReport / findBetween,
+    /// asserting k6-utils + k6-summary behaviour AND randomSeed
+    /// determinism (all randomness flows through Math.random).
+    #[tokio::test]
+    async fn test_jslib_shim_symbols_resolve_and_are_deterministic() {
+        let mut ctx = ctx_with_base_shims().await;
+
+        // randomSeed(42) must make randomIntBetween/uuidv4 reproducible
+        // (k6's contract — the jslib RNG goes through Math.random, which
+        // randomSeed replaces with mulberry32).
+        let first = ctx
+            .eval("randomSeed(42); randomIntBetween(1, 100) + ',' + uuidv4() + ',' + randomString(8)")
+            .await
+            .expect("randomSeed + jslib RNG should eval");
+        let second = ctx
+            .eval("randomSeed(42); randomIntBetween(1, 100) + ',' + uuidv4() + ',' + randomString(8)")
+            .await
+            .expect("repeat should eval");
+        assert_eq!(
+            first, second,
+            "jslib RNG must be deterministic under randomSeed (k6 parity)"
+        );
+
+        // k6-utils semantics: inclusive bounds, array pick, charset, markers.
+        // randomString's exact draw depends on the mulberry32 state, so
+        // assert its PROPERTIES (length + charset membership), not a pinned
+        // output — the RNG stream position is not a contract.
+        let out = ctx
+            .eval(
+                "randomIntBetween(5, 5) + '|' + randomItem(['only']) + '|' + \
+                 (function(){ var s = randomString(3, 'abc'); \
+                   return s.length + ':' + (/^[abc]{3}$/.test(s) ? 'ok' : s); })() + '|' + \
+                 findBetween('a[bc]d', '[', ']', false)",
+            )
+            .await
+            .expect("k6-utils calls should eval");
+        assert_eq!(out, "5|only|3:ok|bc", "k6-utils semantics wrong: {out}");
+
+        // findBetween with repeat=true returns ALL matches as an array.
+        let repeats = ctx
+            .eval("JSON.stringify(findBetween('x[1]y[2]z', '[', ']', true))")
+            .await
+            .expect("findBetween repeat should eval");
+        assert_eq!(repeats, "[\"1\",\"2\"]", "findBetween repeat wrong: {repeats}");
+
+        // uuidv4 shape: 8-4-4-4-12 hex with version 4 + variant bits.
+        let uuid = ctx
+            .eval("uuidv4()")
+            .await
+            .expect("uuidv4 should eval");
+        assert_eq!(uuid.len(), 36, "uuidv4 shape wrong: {uuid}");
+        assert_eq!(&uuid[14..15], "4", "uuidv4 version bit wrong: {uuid}");
+
+        // k6-summary: htmlReport + textSummary must be functions and
+        // produce non-empty output from a summary-data object (the
+        // handleSummary(data) shape — the silent-degradation path).
+        let html = ctx
+            .eval(
+                "htmlReport({ metrics: { http_reqs: { type: 'counter', contains: 'default', values: { count: 4, rate: 0.8 } } }, state: { iterations: 4, vusMax: 2, http_reqs: 4, checksPassed: 1, checksFailed: 0, testRunDurationMs: 5000 }, thresholds: {} })",
+            )
+            .await
+            .expect("htmlReport should eval");
+        assert!(
+            html.starts_with("<!DOCTYPE html>") && html.contains("http_reqs"),
+            "htmlReport output malformed: {}",
+            &html[..html.len().min(120)]
+        );
+        let text = ctx
+            .eval(
+                "textSummary({ metrics: { http_reqs: { type: 'counter', contains: 'default', values: { count: 4, rate: 0.8 } } }, state: { iterations: 4, vusMax: 2, http_reqs: 4, checksPassed: 1, checksFailed: 0, testRunDurationMs: 5000 }, thresholds: { 'http_reqs{expected_response:true}': true } })",
+            )
+            .await
+            .expect("textSummary should eval");
+        assert!(
+            text.contains("iterations") && text.contains("http_reqs"),
+            "textSummary output malformed: {}",
+            &text[..text.len().min(120)]
         );
     }
 
