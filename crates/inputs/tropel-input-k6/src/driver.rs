@@ -2767,10 +2767,8 @@ async fn eval_module_export_json(
         Arc::new(AtomicBool::new(false)),
         Arc::new(OnceLock::new()),
     )
-        .await
-        .map_err(|e| {
-            TropelError::Other(format!("k6 shim bootstrap failed for options eval: {}", e))
-        })?;
+    .await
+    .map_err(|e| TropelError::Other(format!("k6 shim bootstrap failed for options eval: {}", e)))?;
 
     // Minimal globals a k6 script may reference while building its options.
     // `__ENV` carries the job's env vars so options computed from them
@@ -2835,13 +2833,13 @@ async fn eval_module_handle_summary(
         Arc::new(AtomicBool::new(false)),
         Arc::new(OnceLock::new()),
     )
-        .await
-        .map_err(|e| {
-            TropelError::Other(format!(
-                "k6 shim bootstrap failed for handleSummary eval: {}",
-                e
-            ))
-        })?;
+    .await
+    .map_err(|e| {
+        TropelError::Other(format!(
+            "k6 shim bootstrap failed for handleSummary eval: {}",
+            e
+        ))
+    })?;
 
     // Minimal globals a k6 script may reference while building its summary.
     // Backlog line 142: numbers, not strings (see options eval above).
@@ -2907,10 +2905,10 @@ async fn eval_module_call_export(
         Arc::new(AtomicBool::new(false)),
         Arc::new(OnceLock::new()),
     )
-        .await
-        .map_err(|e| {
-            TropelError::Other(format!("k6 shim bootstrap failed for {export} eval: {}", e))
-        })?;
+    .await
+    .map_err(|e| {
+        TropelError::Other(format!("k6 shim bootstrap failed for {export} eval: {}", e))
+    })?;
 
     // k6 §4 (backlog line 119): setup()/teardown() may make HTTP calls —
     // register the native HTTP bridges against the scenario's shared client
@@ -5393,12 +5391,12 @@ mod tests {
             .await
             .expect("context creation should succeed");
         bootstrap_js_libs(
-        &mut js_ctx,
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(OnceLock::new()),
-    )
-            .await
-            .expect("shim bootstrap should succeed");
+            &mut js_ctx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OnceLock::new()),
+        )
+        .await
+        .expect("shim bootstrap should succeed");
         js_ctx
     }
 
@@ -5416,12 +5414,12 @@ mod tests {
             .await
             .expect("context creation should succeed");
         bootstrap_js_libs(
-        &mut js_ctx,
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(OnceLock::new()),
-    )
-            .await
-            .expect("shim bootstrap should succeed");
+            &mut js_ctx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OnceLock::new()),
+        )
+        .await
+        .expect("shim bootstrap should succeed");
         let out = js_ctx
             .eval("__tropel_native_sleep(2000); 1 + 1")
             .await
