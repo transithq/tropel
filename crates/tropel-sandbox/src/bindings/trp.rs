@@ -3,10 +3,10 @@ use rquickjs::function::Func;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(feature = "send-request")]
-use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 use tropel_sdk::error::TropelError;
+#[cfg(feature = "send-request")]
+use tropel_sdk::traits::DriverHttpClient;
 #[cfg(feature = "send-request")]
 use tropel_sdk::types::Request;
 use tropel_sdk::types::{AuthConfig, Body, Method};
@@ -283,8 +283,8 @@ fn parse_headers(json: &str) -> HashMap<String, String> {
 pub struct TrpBridge {
     state: SharedPmState,
     /// Per-VU HTTP client for executing pm.sendRequest synchronously.
-    /// Gated behind the `send-request` feature (P4) — the entire
-    /// tropel-sandbox → tropel-http dependency.
+    /// Stored as `Arc<dyn DriverHttpClient>` (the SDK trait) so the sandbox
+    /// does not directly depend on `tropel-http` (F1, review fix).
     ///
     /// `Option` so the always-available [`TrpBridge::new`] constructor
     /// compiles under BOTH feature states (P5b: feature unification turns
@@ -293,7 +293,7 @@ pub struct TrpBridge {
     /// `send-request` bridge returns a descriptive error instead of
     /// panicking.
     #[cfg(feature = "send-request")]
-    http_client: Option<Arc<HttpClient>>,
+    http_client: Option<Arc<dyn DriverHttpClient>>,
 }
 
 impl TrpBridge {
@@ -308,8 +308,10 @@ impl TrpBridge {
     }
 
     /// Constructor with a per-VU HTTP client (enables `pm.sendRequest`).
+    /// Accepts `Arc<dyn DriverHttpClient>` so the sandbox does not need a
+    /// direct dependency on `tropel-http` (F1, review fix).
     #[cfg(feature = "send-request")]
-    pub fn with_http_client(state: SharedPmState, http_client: Arc<HttpClient>) -> Self {
+    pub fn with_http_client(state: SharedPmState, http_client: Arc<dyn DriverHttpClient>) -> Self {
         Self {
             state,
             http_client: Some(http_client),
@@ -1129,14 +1131,14 @@ impl TrpBridge {
             );
 
             // ── sendRequest ──
-            // Executes an HTTP request synchronously using the per-VU HTTP client.
-            // The bridge closure runs inside ctx.with() (synchronous), so it uses
-            // the shared tropel_http::blocking::execute_blocking helper: the
-            // caller parks on a plain std channel (no tokio runtime entered on
-            // this thread → no "cannot block from within a runtime" panic), while
-            // the future runs on the dedicated multi-thread I/O runtime's reactor
-            // (no deadlock with the current-thread VU runtime). reqwest's own
-            // per-request timeout still fires normally.
+            // Executes an HTTP request synchronously using the per-VU HTTP client
+            // (routed through the SDK's `DriverHttpClient` trait, F1 — no direct
+            // tropel-http dependency). The bridge closure runs inside ctx.with()
+            // (synchronous), so it spawns a dedicated thread with its own tokio
+            // runtime and block_on: no tokio runtime is entered on the caller's
+            // thread (→ no "cannot block from within a runtime" panic), and the
+            // fresh runtime avoids deadlock with the current-thread VU runtime.
+            // reqwest's own per-request timeout still fires normally.
             //
             // Supports the auth-token-fetch pattern: scripts can call pm.sendRequest
             // to obtain auth tokens or session data, then store them via pm.variables.set().
@@ -1220,11 +1222,12 @@ impl TrpBridge {
                                 ),
                             };
 
-                            // Execute on the dedicated I/O runtime via the shared
-                            // blocking helper — safe from inside ctx.with on a
-                            // current-thread VU runtime. When the bridge was built
-                            // without a client (browser slice), surface a
-                            // descriptive error rather than panicking on None.
+                            // Execute on the dedicated I/O runtime via a
+                            // fresh tokio runtime on a spawned thread — safe
+                            // from inside ctx.with() on a current-thread VU
+                            // runtime. When the bridge was built without a
+                            // client (browser slice), surface a descriptive
+                            // error rather than panicking on None.
                             let Some(http) = http.clone() else {
                                 return serde_json::json!({
                                     "error": "pm.sendRequest unavailable in this build (no HTTP client)",
@@ -1236,10 +1239,15 @@ impl TrpBridge {
                                 })
                                 .to_string();
                             };
-                            let http_for_io = http;
-                            let result = tropel_http::blocking::execute_blocking(async move {
-                                http_for_io.execute(&req, None).await
-                            });
+                            let result = std::thread::spawn(move || {
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .expect("sandbox send-request tokio runtime");
+                                rt.block_on(async move { http.execute(&req).await })
+                            })
+                            .join()
+                            .expect("send-request thread panicked");
                             match result {
                                 Ok(http_resp) => {
                                     let body_text = String::from_utf8(http_resp.body.clone())

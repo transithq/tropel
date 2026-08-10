@@ -4,22 +4,22 @@
 #
 # Cargo resolves every dependency of a published crate from crates.io —
 # nothing is bundled or vendored — so the publish order must be dependency
-# order. This script encodes that order so a release isn't seven hand-typed
+# order. This script encodes that order so a release isn't six hand-typed
 # publishes in the wrong sequence.
 #
 # Order (each crate's deps must already be on the registry):
-#   variables → js → native → auth → http → sandbox → runtime
+#   variables → js → native → auth → sandbox → runtime
 #
 # Notes:
 #   - tropel-sdk must be live at the workspace version (currently 0.2.0) — the
 #     leaf everything else builds on; publish it before running --execute (the
 #     API-presence gate verifies the exact published artifact).
-#   - tropel-http IS in the set, between auth and sandbox: tropel-sandbox's
-#     DEFAULT feature is `send-request = ["dep:tropel-http"]`, so the
-#     published sandbox pulls tropel-http from the registry at build time —
-#     it cannot be skipped. (tropel-runtime additionally dev-depends on it.)
-#     A consumer that only wants pm.response/pm.environment can set
-#     default-features = false, but the default publish must carry it.
+#   - tropel-http is NOT in the set (F1, review fix): it was published by
+#     accident because sandbox's `send-request` used `dep:tropel-http`; the
+#     sandbox now routes pm.sendRequest through the SDK `DriverHttpClient`
+#     trait and `publish = false` blocks future publishes. The already-live
+#     0.1.0 stays on the registry until yanked (cargo yank --version 0.1.0
+#     tropel-http), but no new publish step references it.
 #   - Real publishes happen only after the BACKLOG_V2 Phase 0–2 release gate;
 #     this script defaults to --dry-run so the sequence is exercised, not
 #     executed, until you pass --execute.
@@ -49,7 +49,7 @@
 #
 #   Name availability pre-flight: a dry-run can never catch a taken crates.io
 #   name (nothing is uploaded), so before publishing, the script asks the
-#   crates.io API whether each of the seven names exists. On --execute a taken
+#   crates.io API whether each of the six names exists. On --execute a taken
 #   name aborts BEFORE any upload; on a dry-run it is informational only.
 #
 #   Published-SDK API presence pre-flight (--execute only): the dry-run's
@@ -81,7 +81,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-CRATES=(tropel-variables tropel-js tropel-native tropel-auth tropel-http tropel-sandbox tropel-runtime)
+CRATES=(tropel-variables tropel-js tropel-native tropel-auth tropel-sandbox tropel-runtime)
 
 EXECUTE=0
 SKIP_NAME_CHECK=0
@@ -136,7 +136,7 @@ fi
 # when the name matches a dependency of the crate being packaged.
 PATCH_ARGS=()
 if [[ $EXECUTE -ne 1 ]]; then
-  for dep in tropel-sdk tropel-http tropel-js tropel-native tropel-variables tropel-auth tropel-sandbox tropel-runtime; do
+  for dep in tropel-sdk tropel-js tropel-native tropel-variables tropel-auth tropel-sandbox tropel-runtime; do
     PATCH_ARGS+=(--config "patch.crates-io.$dep.path=\"crates/$dep\"")
   done
 fi
@@ -162,7 +162,7 @@ check_name_available() {
 }
 
 # ── Resume support (--resume) ──────────────────────────────────────────────
-# crates.io limits NEW crate creation (5/window), so a first-time 7-crate
+# crates.io limits NEW crate creation (5/window), so a first-time 6-crate
 # release inherently spans several rate-limit windows. --resume makes the
 # re-run a one-command retry: before each publish it probes static.crates.io
 # for the exact version THIS manifest declares and skips any crate already
@@ -269,7 +269,7 @@ fi
 # The dry-run's [patch] overrides resolve tropel-sdk from the LOCAL submodule,
 # masking a stale PUBLISHED SDK. The real publish resolves tropel-sdk from
 # crates.io, so a missing API would fail the verification build of a LATER
-# crate (tropel-http) mid-sequence, after earlier crates already went live.
+# crate mid-sequence, after earlier crates already went live.
 # Download the exact artifact the set will resolve and confirm it carries the
 # APIs the set needs. Fail-closed: any download/extract/grep failure aborts
 # BEFORE a single publish flag is flipped.
@@ -309,7 +309,7 @@ check_published_sdk_api() {
     return 0
   fi
   echo "❌ published tropel-sdk $sdk_version is MISSING ExpectedStatus/status_is_expected."
-  echo "   The set would fail verification at tropel-http mid-sequence, after a partial release."
+  echo "   The set would fail verification of a later crate mid-sequence, after a partial release."
   echo "   Fix: bump + publish tropel-sdk with the new API, update the workspace dep + submodule pointer, then re-run."
   rm -rf "$tmpdir"
   return 1

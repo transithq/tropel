@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-publish = true
-description = "HTTP protocol implementation for Tropel: reqwest client, connection pooling, redirects, per-VU cookie jar. Auth signers live in tropel-auth."
+# F1 (review): tropel-http was published by accident (sandbox's send-request
+# optional dep forced cargo to publish it). It's internal — depend on
+# tropel-runtime instead. publish = false blocks future publishes.
+publish = false
+description = "HTTP protocol implementation for Tropel: reqwest client, connection pooling, redirects, per-VU cookie jar. Auth signers live in tropel-auth. INTERNAL — not a supported crate; depend on tropel-runtime instead."
 
 [dependencies]
 tropel-sdk.workspace = true

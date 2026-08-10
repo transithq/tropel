@@ -1124,10 +1124,10 @@ mod tests {
             .eval(include_str!("../../../js/scripting-api/pm.js"))
             .await
             .expect("pm shim should eval");
-        let bridge_client = Arc::new(
+        let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
-        );
+        ));
         tropel_sandbox::bindings::trp::TrpBridge::with_http_client(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
@@ -1228,10 +1228,10 @@ mod tests {
             .eval(include_str!("../../../js/scripting-api/pm.js"))
             .await
             .expect("pm shim should eval");
-        let bridge_client = Arc::new(
+        let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
-        );
+        ));
         tropel_sandbox::bindings::trp::TrpBridge::with_http_client(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");

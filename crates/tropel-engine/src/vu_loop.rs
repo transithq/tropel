@@ -439,8 +439,11 @@ where
 
 // ── Driver HTTP client adapter ──
 
-struct DriverHttpClientImpl {
-    client: HttpClient,
+/// pub(crate): reused by js_bootstrap.rs tests to build an
+/// `Arc<dyn DriverHttpClient>` for `create_vu_js_context` (F1 review fix —
+/// HttpClient itself does not implement the trait).
+pub(crate) struct DriverHttpClientImpl {
+    pub(crate) client: HttpClient,
 }
 
 #[async_trait]
@@ -563,15 +566,17 @@ pub(crate) async fn run_scenario_vus(
 
                 // Cheap struct clone of the shared client (Arc bumps + small
                 // config snapshots) — the pooled reqwest Clients are shared.
-                // The scenario runner now consumes HTTP through the SDK
-                // `DriverHttpClient` trait (P4 decoupling), so wrap the
-                // concrete client in the engine's trait impl. The PM bridge
-                // still wants the concrete `Arc<HttpClient>`.
+                // The scenario runner and the PM bridge both consume HTTP
+                // through the SDK `DriverHttpClient` trait (F1 review fix),
+                // so wrap the concrete client in the engine's trait impl.
                 let http_client_handle: Arc<dyn DriverHttpClient> =
                     Arc::new(DriverHttpClientImpl {
                         client: http_client_vu.as_ref().clone(),
                     });
-                let bridge_client = http_client_vu.clone();
+                let bridge_client: Arc<dyn DriverHttpClient> =
+                    Arc::new(DriverHttpClientImpl {
+                        client: http_client_vu.as_ref().clone(),
+                    });
                 let mut runner = ScenarioRunner::new(
                     scenario,
                     flattened_vu,

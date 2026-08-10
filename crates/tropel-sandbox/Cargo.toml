@@ -9,19 +9,21 @@ publish = true
 description = "Internal to tropel-runtime. No stability guarantee — depend on tropel-runtime instead."
 
 [features]
-# pm.sendRequest is the ENTIRE tropel-sandbox → tropel-http dependency (P4).
-# Gate it so the browser slice can compile pm without reqwest/tokio-net.
-# A consumer that only uses pm.response/pm.environment/etc. can set
-# default-features = false and drop tropel-http entirely.
+# pm.sendRequest is now routed through the SDK's `DriverHttpClient` trait
+# (F1, review fix). The `send-request` feature gates the blocking HTTP
+# executor (tokio runtime) and the send-request bridge closure only —
+# no direct dependency on `tropel-http`. NOTE: tokio is already a hard
+# dependency on both targets (see the target tables below), so this is a
+# pure capability flag — `dep:tokio` would fail because tokio is not
+# optional (cargo rejects `dep:` on non-optional deps).
 default = ["send-request"]
-send-request = ["dep:tropel-http"]
+send-request = []
 
 [dependencies]
 tropel-sdk.workspace = true
 tropel-js.workspace = true
 tropel-native.workspace = true
 tropel-variables.workspace = true
-tropel-http = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true

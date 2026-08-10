@@ -5,9 +5,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tropel_http::client::HttpClient;
 use tropel_sandbox::config::SandboxConfig;
 use tropel_sandbox::state::SharedPmState;
+use tropel_sdk::traits::DriverHttpClient;
 use tropel_sdk::error::TropelError;
 use tropel_sdk::Result;
 
@@ -146,7 +146,7 @@ static SHIM_BYTECODE_RUN_FAILED: AtomicBool = AtomicBool::new(false);
 pub(crate) async fn create_vu_js_context(
     vu_id: u32,
     pm_state: &SharedPmState,
-    http_client: &Arc<HttpClient>,
+    http_client: &Arc<dyn DriverHttpClient>,
     shim: &ShimBundle,
     config: &SandboxConfig,
 ) -> Option<tropel_js::JsContext> {
@@ -321,6 +321,12 @@ mod tests {
     use tropel_core::config::HttpConfig;
     use tropel_http::client::HttpClient;
     use tropel_sandbox::state::new_pm_state;
+    use tropel_sdk::traits::DriverHttpClient;
+
+    /// F1: `HttpClient` itself does not implement `DriverHttpClient` — the
+    /// engine wraps it in `DriverHttpClientImpl` (vu_loop.rs). Reuse it here
+    /// so the test builds the same trait object the VU loop passes.
+    use crate::vu_loop::DriverHttpClientImpl;
 
     /// P4b: the engine bootstrap must honor a NON-default SandboxConfig.
     /// The VU loop always passes the default (so the config branch would be
@@ -334,9 +340,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_vu_js_context_honors_custom_sandbox_config() {
         let pm_state = new_pm_state();
-        let client = Arc::new(
-            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-        );
+        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+            client: HttpClient::new(&HttpConfig::default())
+                .expect("http client should construct"),
+        });
         let config = SandboxConfig {
             namespace: "acme".into(),
             aliases: vec!["product".into(), "wire".into()],
