@@ -600,3 +600,74 @@ async fn connection_refused_is_recorded_as_failure() -> Result<()> {
     let _ = std::fs::remove_file(&coll);
     Ok(())
 }
+
+/// k6 script whose default function fires one request then sleeps — the
+/// exact backlog verified path (`gracefulStop force-stop is advisory only`:
+/// 30s duration + `sleep(60)` kept issuing HTTP until t≈90). The sleep must
+/// be INTERRUPTIBLE by a force-stop, not a native thread-block the VU
+/// ignores.
+fn write_k6_sleep_script(base: &str, tag: &str, sleep_secs: u64) -> String {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tropel-k6-e2e-{}-{}.js", std::process::id(), tag));
+    let script = format!(
+        r#"import http from 'k6/http';
+import {{ check, sleep }} from 'k6';
+
+export default function () {{
+  const res = http.get('{base}/');
+  check(res, {{ 'status is 200': (r) => r.status === 200 }});
+  sleep({sleep_secs});
+}}
+"#
+    );
+    std::fs::write(&path, script).unwrap();
+    path.to_string_lossy().to_string()
+}
+
+/// Backlog P1 · gracefulStop force-stop was advisory only: a VU stuck in a
+/// native `sleep(60)` kept issuing HTTP until the sleep returned (verified
+/// path: 30s duration + sleep(60) → traffic until t≈90). The flag-aware JS
+/// interrupt + interruptible sleep must stop the VU within the grace
+/// deadline, so the run terminates in a few seconds — NOT after the 60s
+/// sleep (or the 30s join bound). This is the end-to-end regression for the
+/// four-part fix (runner item loop, JS interrupt, sleep, handle abort).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_stop_interrupts_sleeping_vu() -> Result<()> {
+    let srv = start_echo_server().await;
+    let coll = write_k6_sleep_script(&format!("http://{srv}"), "fsleep", 60);
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("k6".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "2s".to_string(),
+            graceful_stop: Some("1s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let start = Instant::now();
+    let result = engine.run(&config).await?;
+    let elapsed = start.elapsed();
+    let m = &result.metrics;
+
+    // 1. THE regression: the run terminates FAST. 2s duration + 1s grace +
+    //    force-stop must interrupt the 60s sleep — before the fix this took
+    //    ~60s (sleep returned first) or ~33s (30s join bound + detach).
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "force-stop must interrupt the sleeping VU; run took {elapsed:?}"
+    );
+
+    // 2. The script ran at all (sanity: at least the first request fired).
+    assert!(m.http_reqs > 0, "requests fired, got {}", m.http_reqs);
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}

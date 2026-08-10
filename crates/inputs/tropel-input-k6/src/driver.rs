@@ -114,6 +114,10 @@ impl Driver for K6Driver {
         // and the native sleep capture the SAME Arc the engine later links to
         // the scheduler's flag via DriverInstance::set_force_stop_flag.
         let force_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // Direct scheduler-flag link: filled by set_force_stop_flag before the
+        // first iteration. The sleep + pre-check read it lock-free; the JS
+        // interrupt handler keeps polling the instance-local `force_stop`.
+        let sched_link: Arc<OnceLock<Arc<AtomicBool>>> = Arc::new(OnceLock::new());
         let mut js_ctx = JsContext::new_with_force_stop(
             Some(10 * 1024 * 1024),
             Some(Duration::from_secs(10)),
@@ -123,7 +127,7 @@ impl Driver for K6Driver {
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
         // Step 3: Bootstrap shim libraries & native modules
-        bootstrap_js_libs(&mut js_ctx, force_stop.clone()).await?;
+        bootstrap_js_libs(&mut js_ctx, force_stop.clone(), sched_link.clone()).await?;
 
         // Install the k6 file-access bridges (open() + SharedArray cache).
         // Needs the script directory for relative path resolution.
@@ -171,7 +175,7 @@ impl Driver for K6Driver {
             ws_bridges_registered: false,
             globals_seeded: false,
             force_stop,
-            forwarder: None,
+            sched_link,
         }))
     }
 
@@ -563,14 +567,19 @@ const OPEN_DATA_SHIM: &str = include_str!("../../../../js/k6-shim/open-data-shim
 pub struct K6DriverInstance {
     js_ctx: JsContext,
     /// Level-triggered force-stop flag (backlog: gracefulStop force-stop was
-    /// advisory only). Created in init(), linked to the scheduler's flag via
-    /// DriverInstance::set_force_stop_flag; the JS interrupt handler and the
-    /// native sleep poll it so a force-stopped VU stops mid-iteration.
+    /// advisory only). Created in init(); its value is synced from the
+    /// scheduler's flag by `set_force_stop_flag` so the JS interrupt handler
+    /// trips on a force-stop that was ALREADY requested at link time.
     force_stop: Arc<AtomicBool>,
-    /// Abort handle for the force-stop forwarder task (see `set_force_stop_flag`).
-    /// Aborted in `Drop` so a normal run end doesn't leak a per-VU 5ms poller
-    /// (backlog: gracefulStop force-stop was advisory only).
-    forwarder: Option<tokio::task::AbortHandle>,
+    /// Direct link to the SCHEDULER's force-stop flag (backlog: gracefulStop
+    /// force-stop was advisory only). `set_force_stop_flag` stores the engine's
+    /// Arc here, and the native sleep + the iteration pre-check poll it
+    /// DIRECTLY — a forwarding task would be starved while the VU thread is
+    /// blocked inside the native `std::thread::sleep` (the exact bug this
+    /// fixes: a 60s sleep ran to completion because the forwarder never got
+    /// polled, so force-stop never propagated). Filled once per VU before the
+    /// first iteration; `OnceLock` keeps the read lock-free.
+    sched_link: Arc<OnceLock<Arc<AtomicBool>>>,
     _source_path: Option<std::path::PathBuf>,
     /// Whether the native HTTP bridge (__tropel_k6_http_request) has been
     /// registered. Registration happens on the first run_iteration() call
@@ -675,17 +684,6 @@ enum WsCommand {
 // the instance can move to its VU thread but must never be shared across
 // threads — which the thread-per-core loop guarantees.
 unsafe impl Send for K6DriverInstance {}
-
-impl Drop for K6DriverInstance {
-    fn drop(&mut self) {
-        // Stop the force-stop forwarder (see set_force_stop_flag): on a normal
-        // run end the scheduler flag never flips, so without this the 5ms
-        // poller would outlive the VU.
-        if let Some(h) = self.forwarder.take() {
-            h.abort();
-        }
-    }
-}
 
 /// Lock-free interning for the static http tag keys/values: one `Arc<str>`
 /// allocation per key for the whole process instead of one per request.
@@ -1031,34 +1029,35 @@ fn push_http_failure(
 #[async_trait]
 impl DriverInstance for K6DriverInstance {
     fn set_force_stop_flag(&mut self, flag: Arc<AtomicBool>) {
-        // Defensive: if a previous forwarder exists, stop it before replacing
-        // (the engine calls this once per VU, but a re-call must not leak).
-        if let Some(h) = self.forwarder.take() {
-            h.abort();
+        // Link the scheduler's flag DIRECTLY (no forwarding task). The engine
+        // calls this once per VU before the first iteration; the native sleep
+        // and the iteration pre-check poll `sched_link` themselves, so the
+        // flag is observed even while the VU thread is blocked inside a native
+        // `std::thread::sleep` — a tokio forwarder on the VU's thread-per-core
+        // runtime would be starved there (backlog: gracefulStop force-stop was
+        // advisory only).
+        let _ = self.sched_link.set(flag.clone());
+        // If the scheduler already requested force-stop, sync it into the
+        // instance-local flag now so the JS interrupt handler trips immediately
+        // (the handler only polls `force_stop`, not the link).
+        if flag.load(Ordering::Acquire) {
+            self.force_stop.store(true, Ordering::Release);
         }
-        let local = self.force_stop.clone();
-        let handle = tokio::spawn(async move {
-            // Level-triggered forwarding: poll the scheduler's flag into the
-            // instance-local Arc the JS interrupt handler and sleep native
-            // capture. Force-stop is sticky, so stop polling once either flag
-            // is set. The task is aborted in Drop when the VU exits.
-            while !local.load(Ordering::Acquire) {
-                if flag.load(Ordering::Acquire) {
-                    local.store(true, Ordering::Release);
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        });
-        self.forwarder = Some(handle.abort_handle());
     }
 
     async fn run_iteration(&mut self, ctx: &mut VuContext) -> Result<()> {
         // Force-stop: skip the eval so the VU loop observes the level-triggered
         // flag and exits promptly (backlog: gracefulStop force-stop was
-        // advisory only). Mid-eval interruption is handled by the flag-aware
-        // JS interrupt + the interruptible native sleep.
-        if self.force_stop.load(Ordering::Acquire) {
+        // advisory only). Poll the SCHEDULER's flag through the link too — not
+        // just the instance-local copy — because the link is what a mid-run
+        // force-stop flips (the JS interrupt + interruptible native sleep read
+        // it during an eval).
+        if self.force_stop.load(Ordering::Acquire)
+            || self
+                .sched_link
+                .get()
+                .is_some_and(|f| f.load(Ordering::Acquire))
+        {
             return Ok(());
         }
         // Lazy-init: register the native HTTP bridge on the first iteration.
@@ -2763,7 +2762,11 @@ async fn eval_module_export_json(
     // The k6 shim libs (Rate/check/http/…) must be present: options blocks
     // commonly run k6 API at module top level (e.g. `new Rate('errors')`),
     // which threw QuickJS exceptions when the shim was missing.
-    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false)))
+    bootstrap_js_libs(
+        &mut js_ctx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(OnceLock::new()),
+    )
         .await
         .map_err(|e| {
             TropelError::Other(format!("k6 shim bootstrap failed for options eval: {}", e))
@@ -2827,7 +2830,11 @@ async fn eval_module_handle_summary(
         })?;
     // Same k6-shim requirement as the options eval: a script that touches
     // k6 API at module top level must not throw while handleSummary is read.
-    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false)))
+    bootstrap_js_libs(
+        &mut js_ctx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(OnceLock::new()),
+    )
         .await
         .map_err(|e| {
             TropelError::Other(format!(
@@ -2895,7 +2902,11 @@ async fn eval_module_call_export(
         .map_err(|e| {
             TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
         })?;
-    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false)))
+    bootstrap_js_libs(
+        &mut js_ctx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(OnceLock::new()),
+    )
         .await
         .map_err(|e| {
             TropelError::Other(format!("k6 shim bootstrap failed for {export} eval: {}", e))
@@ -3259,7 +3270,11 @@ impl ShimBytecodeCache {
 static K6_BASE_BYTECODE: ShimBytecodeCache = ShimBytecodeCache::new();
 static K6_NATIVE_BYTECODE: ShimBytecodeCache = ShimBytecodeCache::new();
 
-async fn bootstrap_js_libs(ctx: &mut JsContext, force_stop: Arc<AtomicBool>) -> Result<()> {
+async fn bootstrap_js_libs(
+    ctx: &mut JsContext,
+    force_stop: Arc<AtomicBool>,
+    sched_link: Arc<OnceLock<Arc<AtomicBool>>>,
+) -> Result<()> {
     // Phase 1: Base shim libraries (no native dependencies) — compiled to
     // bytecode ONCE per process, run in every context thereafter.
     K6_BASE_BYTECODE.bootstrap(ctx, K6_BASE_SHIM_BUNDLE).await;
@@ -3282,6 +3297,14 @@ async fn bootstrap_js_libs(ctx: &mut JsContext, force_stop: Arc<AtomicBool>) -> 
     // 104). Re-arm the deadline after the blocking sleep, like the WS loop.
     let (deadline, max_exec) = ctx.interrupt_deadline_handle();
     let force_stop_sleep = force_stop.clone();
+    // Direct scheduler-flag link for the sleep: the instance-local flag only
+    // ever flips at LINK time, but a MID-run force-stop flips the scheduler's
+    // flag — which the sleep must see even though the VU thread is blocked
+    // inside `std::thread::sleep` (no runtime task can run there). Poll both:
+    // the local flag covers a force-stop requested before linking, the link
+    // covers one requested during the run (backlog: gracefulStop force-stop
+    // was advisory only).
+    let sched_link_sleep = sched_link.clone();
     ctx.with_ctx(|rq_ctx| {
         let globals = rq_ctx.globals();
         let deadline_sleep = deadline.clone();
@@ -3289,15 +3312,20 @@ async fn bootstrap_js_libs(ctx: &mut JsContext, force_stop: Arc<AtomicBool>) -> 
             "__tropel_native_sleep",
             rquickjs::function::Func::from(move |ms: f64| {
                 if ms > 0.0 {
-                    // Interruptible sleep: poll the force-stop flag in small
+                    // Interruptible sleep: poll the force-stop flags in small
                     // slices. On force-stop, zero the JS interrupt deadline so
                     // the eval is interrupted the moment control returns to JS
                     // (the flag-aware handler unwinds it) — backlog: gracefulStop
                     // force-stop was advisory only.
                     let step = Duration::from_millis(10);
                     let mut remaining = Duration::from_secs_f64(ms / 1000.0);
+                    let link_set = || {
+                        sched_link_sleep
+                            .get()
+                            .is_some_and(|f| f.load(Ordering::Acquire))
+                    };
                     while remaining > Duration::ZERO {
-                        if force_stop_sleep.load(Ordering::Acquire) {
+                        if force_stop_sleep.load(Ordering::Acquire) || link_set() {
                             deadline_sleep.store(0, Ordering::Relaxed);
                             return;
                         }
@@ -5364,7 +5392,11 @@ mod tests {
         let mut js_ctx = JsContext::new(None, Some(Duration::from_secs(10)))
             .await
             .expect("context creation should succeed");
-        bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false)))
+        bootstrap_js_libs(
+        &mut js_ctx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(OnceLock::new()),
+    )
             .await
             .expect("shim bootstrap should succeed");
         js_ctx
@@ -5383,7 +5415,11 @@ mod tests {
         let mut js_ctx = JsContext::new(None, Some(Duration::from_secs(1)))
             .await
             .expect("context creation should succeed");
-        bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false)))
+        bootstrap_js_libs(
+        &mut js_ctx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(OnceLock::new()),
+    )
             .await
             .expect("shim bootstrap should succeed");
         let out = js_ctx
