@@ -269,6 +269,17 @@ jobs:
           npm run build
           node smoke.mjs
 
+      # P6 (@tropel/shims): the js/ shim bundle as an npm package. The smoke
+      # asserts the built bundle is byte-identical to the repo's js/ sources
+      # in the engine's ShimBundle::default() order — the single source of
+      # truth — so a stale copy fails the gate.
+      - name: P6 shims npm smoke (@tropel/shims)
+        run: |
+          cd packages/shims
+          npm install --no-audit --no-fund
+          npm run build
+          node smoke.mjs
+
   smoke:
     name: "e2e smoke (samples: k6, postman, openapi, har)"
     runs-on: ubuntu-latest
