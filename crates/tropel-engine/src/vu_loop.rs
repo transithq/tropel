@@ -21,7 +21,7 @@ use tropel_core::config::{
     ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig,
 };
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_http::client::HttpClient;
+use tropel_http::client::{HttpClient, VuCookieClient};
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
 use tropel_runtime::ScenarioRunner;
@@ -443,7 +443,10 @@ where
 /// `Arc<dyn DriverHttpClient>` for `create_vu_js_context` (F1 review fix —
 /// HttpClient itself does not implement the trait).
 pub(crate) struct DriverHttpClientImpl {
-    pub(crate) client: HttpClient,
+    /// Per-VU client: shares the connection-pooled `HttpClient` but owns its
+    /// own cookie jar (k6 semantics: cookies are per-VU, never shared across
+    /// VUs — backlog V2 §2).
+    pub(crate) client: VuCookieClient,
 }
 
 #[async_trait]
@@ -455,6 +458,37 @@ impl DriverHttpClient for DriverHttpClientImpl {
         let signer = req.auth.as_ref().and_then(|a| self.client.get_signer(a));
         let http_resp = self.client.execute(req, signer.as_deref()).await?;
         Ok(Response::from(&http_resp))
+    }
+}
+/// Pick the per-VU HTTP client for a VU spawn.
+///
+/// k6 `noVUConnectionReuse` forces a FRESH client (own connection pool) per
+/// VU. Default (`false`): every VU shares the one pooled client — clones of
+/// a reqwest::Client share the underlying pool, which is the point (one pool
+/// per run keeps connections warm and TLS sessions reusable).
+///
+/// On per-VU build failure (e.g. a TLS config typo) the shared client is
+/// returned instead, so one bad VU can't take down the whole spawn; the
+/// error is logged.
+fn vu_http_client(
+    shared: &Arc<HttpClient>,
+    http_cfg: &HttpConfig,
+    tls_cfg: &TlsConfig,
+    rps_limiter: &Option<Arc<tropel_http::RpsLimiter>>,
+) -> Arc<HttpClient> {
+    if !http_cfg.no_vu_connection_reuse {
+        return shared.clone();
+    }
+    match HttpClient::with_tls_and_rps(http_cfg, tls_cfg, rps_limiter.clone()) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!(
+                "noVUConnectionReuse: failed to build a per-VU client ({}); \
+                 falling back to the shared client",
+                e
+            );
+            shared.clone()
+        }
     }
 }
 // ── Scenario entry point ──
@@ -544,7 +578,7 @@ pub(crate) async fn run_scenario_vus(
         control_port,
         move |sched, vu_id, shared| {
             let shared = shared.clone();
-            let http_client_vu = shared_client.clone();
+            let http_client_vu = vu_http_client(&shared_client, &http_cfg, &tls_cfg, &rps_limiter);
             let scenario = scenario_c.clone();
             let protocols_vu = protocols_c.clone();
             let pool = pool_c.clone();
@@ -571,10 +605,10 @@ pub(crate) async fn run_scenario_vus(
                 // so wrap the concrete client in the engine's trait impl.
                 let http_client_handle: Arc<dyn DriverHttpClient> =
                     Arc::new(DriverHttpClientImpl {
-                        client: http_client_vu.as_ref().clone(),
+                        client: VuCookieClient::new(http_client_vu.as_ref().clone()),
                     });
                 let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-                    client: http_client_vu.as_ref().clone(),
+                    client: VuCookieClient::new(http_client_vu.as_ref().clone()),
                 });
                 let mut runner = ScenarioRunner::new(
                     scenario,
@@ -707,7 +741,7 @@ pub(crate) async fn run_driver_vus(
     // into metrics right after its call.
     let lifecycle_client: Arc<dyn DriverHttpClient + Send + Sync> =
         Arc::new(DriverHttpClientImpl {
-            client: shared_client.as_ref().clone(),
+            client: VuCookieClient::new(shared_client.as_ref().clone()),
         });
     let setup_sink: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
     let setup_data = driver
@@ -747,7 +781,7 @@ pub(crate) async fn run_driver_vus(
             let input_p = input_p_c.clone();
             let registry = registry_c.clone();
             let sc_exec = sc_exec_c.clone();
-            let http_client_vu = shared_client.clone();
+            let http_client_vu = vu_http_client(&shared_client, &http_cfg, &tls_cfg, &rps_limiter);
             let pool = pool_c.clone();
             let sc_name_vu = sc_name_c.clone();
             let executor_name = shared.executor_name.clone();
@@ -811,7 +845,7 @@ pub(crate) async fn run_driver_vus(
 
                 // Cheap struct clone of the shared client (Arc bumps + small
                 // config snapshots) — the pooled reqwest Clients are shared.
-                let client = http_client_vu.as_ref().clone();
+                let client = VuCookieClient::new(http_client_vu.as_ref().clone());
                 let http_client_handle: Arc<dyn DriverHttpClient + Send + Sync> =
                     Arc::new(DriverHttpClientImpl { client });
 

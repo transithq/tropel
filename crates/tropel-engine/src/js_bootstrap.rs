@@ -338,7 +338,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tropel_core::config::HttpConfig;
-    use tropel_http::client::HttpClient;
+    use tropel_http::client::{HttpClient, VuCookieClient};
     use tropel_sandbox::state::new_pm_state;
     use tropel_sdk::traits::DriverHttpClient;
 
@@ -360,7 +360,9 @@ mod tests {
     async fn create_vu_js_context_honors_custom_sandbox_config() {
         let pm_state = new_pm_state();
         let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+            client: VuCookieClient::new(
+                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+            ),
         });
         let config = SandboxConfig {
             namespace: "acme".into(),

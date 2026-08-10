@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tropel_auth::AuthSigner;
+// Brings `Jar::cookies` into scope — it is a method of the `CookieStore`
+// TRAIT, not inherent to `Jar` — so the per-VU jar wrapper can read cookies.
+use reqwest::cookie::CookieStore as _;
 use tropel_sdk::types::*;
 
 use crate::config::{HttpConfig, TlsConfig};
@@ -196,7 +199,12 @@ impl HttpClient {
             .and_then(|s| parse_duration(s).ok())
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
         let mut builder = reqwest::Client::builder()
-            .cookie_store(true)
+            // NO built-in cookie store. Clones of a reqwest::Client share one
+            // store (and one pool), so a store here would leak ONE global jar
+            // across every VU — the cross-VU cookie leak this module's
+            // per-VU `VuCookieClient` wrapper removes. The wrapper is the
+            // sole cookie authority: `execute_with_jar` injects jar cookies
+            // per hop and stores every Set-Cookie header back into the jar.
             .user_agent(&config.user_agent)
             .pool_max_idle_per_host(max_idle)
             .timeout(request_timeout);
@@ -423,6 +431,23 @@ impl HttpClient {
         request: &Request,
         signer: Option<&dyn AuthSigner>,
     ) -> Result<HttpResponse> {
+        self.execute_with_jar(request, signer, None).await
+    }
+
+    /// Execute a request with an optional per-VU cookie jar.
+    ///
+    /// When `jar` is `Some` (the per-VU [`VuCookieClient`] path), stored
+    /// cookies for each hop's URL are injected into the request — unless the
+    /// request carries an explicit `Cookie` header, which wins (k6:
+    /// `params.headers.Cookie` overrides the jar) — and every `Set-Cookie`
+    /// header on each hop response is stored back into the jar. `None` (the
+    /// plain [`execute`] path) performs no cookie handling.
+    pub(crate) async fn execute_with_jar(
+        &self,
+        request: &Request,
+        signer: Option<&dyn AuthSigner>,
+        jar: Option<&reqwest::cookie::Jar>,
+    ) -> Result<HttpResponse> {
         // Global RPS pacing happens BEFORE the request timer starts, so the
         // wait never inflates http_req_duration / TTFB.
         if let Some(limiter) = &self.rps {
@@ -596,6 +621,28 @@ impl HttpClient {
                 }
             }
 
+            // ── Per-VU cookie jar: inject stored cookies for this hop ──
+            // Skipped on cross-origin redirect hops (credentials must not
+            // leak to another origin — the same rule as the `strip_sensitive`
+            // header check above) and when the request carries an explicit
+            // Cookie header (the caller wins, matching k6). `Jar::cookies`
+            // applies domain/path/secure rules for the hop URL.
+            if !strip_sensitive {
+                if let Some(jar) = jar {
+                    let has_explicit_cookie = request
+                        .headers
+                        .keys()
+                        .any(|k| k.eq_ignore_ascii_case("cookie"));
+                    if !has_explicit_cookie {
+                        if let Ok(url) = reqwest::Url::parse(&current_url) {
+                            if let Some(value) = jar.cookies(&url) {
+                                req_builder = req_builder.header(reqwest::header::COOKIE, value);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Add query parameters. ONLY on hop 0: the original request's
             // query_params describe the ORIGINAL URL. A redirect target URL
             // (Location header) carries its own query — re-appending the
@@ -749,6 +796,19 @@ impl HttpClient {
                 .iter()
                 .filter_map(|v| parse_set_cookie(v.to_str().ok()?))
                 .collect();
+
+            // Feed this hop's Set-Cookie headers into the per-VU jar. Runs for
+            // EVERY hop (including redirect hops), so a session cookie set by
+            // an intermediate redirect is available to the next hop.
+            if let Some(jar) = jar {
+                if let Ok(url) = reqwest::Url::parse(&current_url) {
+                    for v in response.headers().get_all(reqwest::header::SET_COOKIE) {
+                        if let Ok(s) = v.to_str() {
+                            jar.add_cookie_str(s, &url);
+                        }
+                    }
+                }
+            }
 
             // ── Redirect hop? ──
             // k6 parity: every redirect hop is its own request. When the response
@@ -983,6 +1043,54 @@ impl HttpClient {
     /// Hawk, Digest) is supported in exactly one place.
     pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
         tropel_auth::build_auth_signer(auth)
+    }
+}
+
+/// Per-VU HTTP client: shares the connection-pooled [`HttpClient`] (clones of
+/// a `reqwest::Client` share the underlying pool, which is the point — one
+/// pool per run) but owns its OWN cookie jar, so cookies are isolated per VU
+/// (k6 semantics: each VU has its own jar). The wrapper is the sole cookie
+/// authority — the inner clients are built WITHOUT a built-in store (see
+/// [`HttpClient::build_client`]), so nothing can leak a global jar across VUs.
+///
+/// Not `Clone` (`reqwest::cookie::Jar` is not `Clone`) — construct one per VU
+/// from the shared client inside the VU's spawn closure.
+pub struct VuCookieClient {
+    inner: HttpClient,
+    jar: reqwest::cookie::Jar,
+}
+
+impl VuCookieClient {
+    /// Wrap a shared (connection-pooled) client with a fresh, empty jar.
+    pub fn new(inner: HttpClient) -> Self {
+        Self {
+            inner,
+            // `Jar` derives `Default` (its only constructor in reqwest 0.13).
+            jar: reqwest::cookie::Jar::default(),
+        }
+    }
+
+    /// The shared inner client (pool, TLS, RPS limiter, redirect policy).
+    pub fn inner(&self) -> &HttpClient {
+        &self.inner
+    }
+
+    /// Auth-signer builder (passthrough to the shared client).
+    pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
+        self.inner.get_signer(auth)
+    }
+
+    /// Execute a request through the shared client, applying this VU's cookie
+    /// jar: stored cookies are injected per hop and every `Set-Cookie` header
+    /// on each hop response is stored back into the jar.
+    pub async fn execute(
+        &self,
+        request: &Request,
+        signer: Option<&dyn AuthSigner>,
+    ) -> Result<HttpResponse> {
+        self.inner
+            .execute_with_jar(request, signer, Some(&self.jar))
+            .await
     }
 }
 
@@ -1308,6 +1416,130 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A minimal HTTP server that speaks just enough to exercise the cookie
+    /// jar:
+    /// - `GET /set` → 200 with `Set-Cookie: sid=abc123; Path=/`
+    /// - `GET /echo` → 200 with the request's `Cookie` header as the body
+    ///   (or `none` when absent)
+    ///
+    /// Responses use `Connection: close`, so every request opens a fresh
+    /// connection — no keep-alive bookkeeping in the test.
+    fn spawn_cookie_test_server() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let mut buf = [0u8; 8192];
+                let mut n = 0usize;
+                // Read until the full head ("\r\n\r\n") is in the buffer — a
+                // single read() may return a partial request if the kernel
+                // fragments it, which would drop the Cookie header and make
+                // the /echo assertion flaky.
+                while n < buf.len() {
+                    match std::io::Read::read(&mut stream, &mut buf[n..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            n += read;
+                            if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if n == 0 {
+                    continue;
+                }
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let request_line = head.lines().next().unwrap_or_default();
+                let cookie = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim().to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let (status, body, extra) = if request_line.contains("/set") {
+                    (
+                        "200 OK",
+                        "set".to_string(),
+                        "Set-Cookie: sid=abc123; Path=/\r\n".to_string(),
+                    )
+                } else {
+                    ("200 OK", cookie, String::new())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+            }
+        });
+        (addr, handle)
+    }
+
+    fn get_request(url: &str) -> Request {
+        Request {
+            url: url.to_string(),
+            method: Method::GET,
+            headers: HashMap::new(),
+            query_params: HashMap::new(),
+            body: None,
+            auth: None,
+            certificate: None,
+            follow_redirects: true,
+            timeout: None,
+            response_type: ResponseType::Text,
+        }
+    }
+
+    #[test]
+    fn per_vu_cookie_jar_is_isolated_and_persistent() {
+        // Regression (backlog V2 §2): every VU shared ONE reqwest client with
+        // ONE built-in cookie store, so a cookie set by VU A was sent by VU B.
+        // Each per-VU VuCookieClient (own jar over the shared pool client,
+        // whose built-in store is disabled) must isolate AND persist cookies.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (addr, _server) = spawn_cookie_test_server();
+            let shared = HttpClient::new(&HttpConfig::default()).unwrap();
+            let base = format!("http://{addr}");
+
+            let vu_a = VuCookieClient::new(shared.clone());
+            // VU A plants a cookie...
+            let set = vu_a
+                .execute(&get_request(&format!("{base}/set")), None)
+                .await
+                .unwrap();
+            assert_eq!(set.status_code, 200);
+            assert_eq!(set.cookies.len(), 1);
+            assert_eq!(set.cookies[0].name, "sid");
+            assert_eq!(set.cookies[0].value, "abc123");
+            // ...and its NEXT request carries it (persistence within the VU).
+            let echo_a = vu_a
+                .execute(&get_request(&format!("{base}/echo")), None)
+                .await
+                .unwrap();
+            assert_eq!(echo_a.status_code, 200);
+            assert_eq!(echo_a.body_text().unwrap(), "sid=abc123");
+
+            // VU B shares the same pool client but owns a fresh jar: it must
+            // NOT see VU A's cookie (isolation) — and the shared client's
+            // disabled built-in store must not leak it either.
+            let vu_b = VuCookieClient::new(shared.clone());
+            let echo_b = vu_b
+                .execute(&get_request(&format!("{base}/echo")), None)
+                .await
+                .unwrap();
+            assert_eq!(echo_b.status_code, 200);
+            assert_eq!(echo_b.body_text().unwrap(), "none");
+        });
+    }
 
     #[test]
     fn canonical_header_name_matches_go_mime_form() {

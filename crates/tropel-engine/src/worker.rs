@@ -357,21 +357,35 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_vu_pins_each_vu_to_its_own_thread() {
-        // Two VUs spawned via spawn_vu must land on DIFFERENT OS threads —
-        // the whole point of the 1-VU-per-task design. If they shared a
-        // current-thread runtime, a blocking sleep() in one would freeze the
-        // other.
+        // Two CONCURRENT VUs spawned via spawn_vu must land on DIFFERENT OS
+        // threads — the whole point of the 1-VU-per-task design. If they
+        // shared a current-thread runtime, a blocking sleep() in one would
+        // freeze the other.
         let pool = VUWorkerPool::new(1);
 
+        // Barrier: both VUs must be LIVE simultaneously before either records
+        // its thread name. Without it the test is racy — VU 0's task (a
+        // single thread-name read) can finish before VU 1's spawn_vu acquires
+        // a slot, freeing slot 0 for legitimate reuse (the pool sizes to PEAK
+        // CONCURRENCY), and both VUs report the same worker. Observed on
+        // macOS CI: the pool correctly reused the freed slot, and the test
+        // wrongly asserted they were distinct. Holding both tasks at the
+        // barrier keeps both busy flags set, so the second spawn MUST grow
+        // the pool to a second worker.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let (t0, t1) = tokio::join!(
             async {
-                let h = pool.spawn_vu(0, async {
+                let b = barrier.clone();
+                let h = pool.spawn_vu(0, async move {
+                    b.wait().await;
                     std::thread::current().name().map(|s| s.to_string())
                 });
                 h.await.unwrap()
             },
             async {
-                let h = pool.spawn_vu(1, async {
+                let b = barrier.clone();
+                let h = pool.spawn_vu(1, async move {
+                    b.wait().await;
                     std::thread::current().name().map(|s| s.to_string())
                 });
                 h.await.unwrap()
