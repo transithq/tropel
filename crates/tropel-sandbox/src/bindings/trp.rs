@@ -275,7 +275,7 @@ fn parse_headers(json: &str) -> HashMap<String, String> {
 
 /// Register all `pm.*` bridge functions as global JS functions in a JsContext.
 /// Functions like `__tropel_pm_test`, `__tropel_pm_environment_get`, etc.
-/// are registered so the JS shims in pm-api/pm.js can call them.
+/// are registered so the JS shims in scripting-api/pm.js can call them.
 ///
 /// With rquickjs 0.12+, the following complex types are supported as
 /// Func::from parameter/return types via FromJs/IntoJs: HashMap<String, String>,
@@ -1477,7 +1477,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
 
             // Stock install: pm + trp only — no aliases, no tropel.
@@ -1555,7 +1555,7 @@ mod tests {
             };
             ctx.eval::<(), _>(cfg.render_js_preamble())
                 .expect("config preamble should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
 
             // Custom canonical installed; aliases are true aliases of it.

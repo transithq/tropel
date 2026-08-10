@@ -23,8 +23,8 @@ pub(crate) const SHIM_BUNDLE_VERSION: &str = "0.1.0";
 /// All shim libraries concatenated at COMPILE TIME (concat!) into a single
 /// `&'static str`, byte-identical for every VU and every scenario.
 const JS_SHIM_BUNDLE: &str = concat!(
-    "// ==== shim: pm-api ====\n",
-    include_str!("../../../js/pm-api/pm.js"),
+    "// ==== shim: pm-shim ====\n",
+    include_str!("../../../js/scripting-api/pm.js"),
     "\n",
     "// ==== shim: chai-shim ====\n",
     include_str!("../../../js/chai/chai-shim.js"),
@@ -83,9 +83,10 @@ impl Default for ShimBundle {
     fn default() -> Self {
         Self(vec![
             ShimEntry(
-                "pm-api",
-                std::borrow::Cow::Borrowed(include_str!("../../../js/pm-api/pm.js")),
+                "pm-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/scripting-api/pm.js")),
             ),
+
             ShimEntry(
                 "chai-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/chai/chai-shim.js")),
@@ -101,6 +102,10 @@ impl Default for ShimBundle {
             ShimEntry(
                 "exec-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/exec/exec.js")),
+            ),
+            ShimEntry(
+                "bru-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/scripting-api/bru.js")),
             ),
         ])
     }
@@ -131,7 +136,8 @@ static SHIM_BYTECODE_FAILED: AtomicBool = AtomicBool::new(false);
 static SHIM_BYTECODE_RUN_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Create a JS context for one VU, bootstrap the bundled shim libraries
-/// (pm-api, chai, lodash, crypto, exec), install the native modules and PM
+/// (scripting-api, chai, lodash, crypto, exec), install the native modules and PM
+
 /// bridge functions, and wire a blocking `sleep(seconds)` helper.
 ///
 /// Returns `None` if context creation fails — context-creation failures log
@@ -197,7 +203,7 @@ pub(crate) async fn create_vu_js_context(
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
     }
 
-    let bridge = tropel_sandbox::bindings::pm::PmBridge::new(pm_state.clone(), http_client.clone());
+    let bridge = tropel_sandbox::bindings::trp::PmBridge::new(pm_state.clone(), http_client.clone());
     if let Err(e) = bridge.install(&mut ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }

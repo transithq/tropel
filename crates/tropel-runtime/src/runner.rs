@@ -1116,14 +1116,14 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
-            .eval(include_str!("../../../js/pm-api/pm.js"))
+            .eval(include_str!("../../../js/scripting-api/pm.js"))
             .await
             .expect("pm shim should eval");
         let bridge_client = Arc::new(
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
-        tropel_sandbox::bindings::pm::PmBridge::new(runner.pm_state().clone(), bridge_client)
+        tropel_sandbox::bindings::trp::PmBridge::new(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);
@@ -1220,14 +1220,14 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
-            .eval(include_str!("../../../js/pm-api/pm.js"))
+            .eval(include_str!("../../../js/scripting-api/pm.js"))
             .await
             .expect("pm shim should eval");
         let bridge_client = Arc::new(
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("bridge http client should construct"),
         );
-        tropel_sandbox::bindings::pm::PmBridge::new(runner.pm_state().clone(), bridge_client)
+        tropel_sandbox::bindings::trp::PmBridge::new(runner.pm_state().clone(), bridge_client)
             .install(&mut js_ctx)
             .expect("pm bridge should install");
         runner = runner.with_js_context(js_ctx);

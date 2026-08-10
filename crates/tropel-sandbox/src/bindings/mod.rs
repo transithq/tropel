@@ -5,6 +5,6 @@
 //! `trp.*` (canonical, Postman convention) and any product aliases are peer
 //! views.
 
-pub mod pm;
+pub mod trp;
 
-pub use pm::*;
+pub use trp::*;

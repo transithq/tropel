@@ -3099,7 +3099,7 @@ const K6_BASE_SHIM_BUNDLE: &str = concat!(
 /// concatenated at COMPILE TIME into one bundle (see K6_BASE_SHIM_BUNDLE).
 const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: pm-api ====\n",
-    include_str!("../../../../js/pm-api/pm.js"),
+    include_str!("../../../../js/scripting-api/pm.js"),
     "\n",
     "// ==== shim: sleep-shim ====\n",
     include_str!("../../../../js/k6-shim/sleep-shim.js"),
@@ -3915,7 +3915,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -3972,7 +3972,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -4036,7 +4036,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             // Stub the response bridges with known values.
             ctx.eval::<(), _>(
@@ -4140,7 +4140,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -4207,7 +4207,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
                 .expect("chai shim should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -4383,7 +4383,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -4514,7 +4514,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -4730,7 +4730,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -5051,7 +5051,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
