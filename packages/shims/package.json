@@ -1,0 +1,45 @@
+{
+  "name": "@tropel/shims",
+  "version": "0.1.0",
+  "description": "The tropel JS shim bundle — pm/bru scripting API, chai, lodash, CryptoJS, exec, and the k6 family. The same sources the tropel runtime embeds (ShimBundle::default()), published for embedders.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/bundle.js",
+  "types": "./dist/bundle.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/bundle.d.ts",
+      "default": "./dist/bundle.js"
+    }
+  },
+  "files": [
+    "dist",
+    "shim",
+    "LICENSE-APACHE"
+  ],
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "test": "node smoke.mjs",
+    "pack:dry": "bash scripts/build.sh && npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/transithq/tropel.git",
+    "directory": "packages/shims"
+  },
+  "homepage": "https://github.com/transithq/tropel/tree/main/packages/shims",
+  "keywords": [
+    "postman",
+    "k6",
+    "load-testing",
+    "shims",
+    "tropel"
+  ]
+}

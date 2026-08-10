@@ -1,0 +1,53 @@
+{
+  "name": "@tropel/exec-wasm",
+  "version": "0.1.0",
+  "description": "Browser/Node host for the tropel load-testing runtime compiled to wasm32-wasip1: postcard C ABI driver, WASI preview1 wiring, and the HTTP bridge that answers each request the runtime makes.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "wasm",
+    "LICENSE-APACHE"
+  ],
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "test": "node smoke.mjs",
+    "pack:dry": "bash scripts/build.sh && npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/transithq/tropel.git",
+    "directory": "packages/exec-wasm"
+  },
+  "homepage": "https://github.com/transithq/tropel/tree/main/packages/exec-wasm",
+  "keywords": [
+    "load-testing",
+    "postman",
+    "k6",
+    "wasm",
+    "webassembly",
+    "wasi",
+    "tropel"
+  ],
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "@bjorn3/browser_wasi_shim": "^0.4.2"
+  }
+}

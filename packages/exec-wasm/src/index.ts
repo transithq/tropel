@@ -189,9 +189,14 @@ export async function createExecWasm(options: ExecWasmOptions): Promise<ExecWasm
   };
 
   const { instance } = await WebAssembly.instantiate(
-    options.wasmBytes instanceof Uint8Array
+    // TS 5.9's BufferSource is `ArrayBufferView<ArrayBuffer> | ArrayBuffer`, and
+    // `wasmBytes: ArrayBuffer | Uint8Array` narrows to `Uint8Array<ArrayBufferLike>`
+    // (SharedArrayBuffer allowed) — which fails overload 1 and falls through to
+    // the `Module` overload, typing the result as `Instance`. The cast forces
+    // the buffer-source overload (`WebAssemblyInstantiatedSource`).
+    (options.wasmBytes instanceof Uint8Array
       ? options.wasmBytes
-      : new Uint8Array(options.wasmBytes),
+      : new Uint8Array(options.wasmBytes)) as BufferSource,
     imports
   );
   instanceRef = instance;
