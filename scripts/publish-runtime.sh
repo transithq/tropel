@@ -65,6 +65,14 @@
 # Usage:
 #   bash scripts/publish-runtime.sh             # dry-run the whole sequence
 #   bash scripts/publish-runtime.sh --execute   # actually publish, in order
+#   bash scripts/publish-runtime.sh --resume    # continue a rate-limited
+#                                      # release: probe static.crates.io and
+#                                      # skip any crate whose version is
+#                                      # already live (implies --execute);
+#                                      # 429s are waited out automatically
+#   bash scripts/publish-runtime.sh --no-wait    # don't auto-wait on 429 rate
+#                                      # limits (CI / unattended runs); fail
+#                                      # fast instead of sleeping a window
 #   bash scripts/publish-runtime.sh --skip-name-check  # skip the crates.io
 #                                      # name pre-flight (air-gapped / rate-
 #                                      # limited release machines)
@@ -78,12 +86,16 @@ CRATES=(tropel-variables tropel-js tropel-native tropel-auth tropel-http tropel-
 EXECUTE=0
 SKIP_NAME_CHECK=0
 SKIP_API_CHECK=0
+RESUME=0
+NO_WAIT=0
 for arg in "$@"; do
   case "$arg" in
     --execute) EXECUTE=1 ;;
+    --resume) RESUME=1; EXECUTE=1 ;;
+    --no-wait) NO_WAIT=1 ;;
     --skip-name-check) SKIP_NAME_CHECK=1 ;;
     --skip-api-check) SKIP_API_CHECK=1 ;;
-    *) echo "unknown argument: $arg (expected --execute, --skip-name-check, --skip-api-check)" >&2; exit 2 ;;
+    *) echo "unknown argument: $arg (expected --execute, --resume, --no-wait, --skip-name-check, --skip-api-check)" >&2; exit 2 ;;
   esac
 done
 
@@ -149,9 +161,93 @@ check_name_available() {
   fi
 }
 
+# ── Resume support (--resume) ──────────────────────────────────────────────
+# crates.io limits NEW crate creation (5/window), so a first-time 7-crate
+# release inherently spans several rate-limit windows. --resume makes the
+# re-run a one-command retry: before each publish it probes static.crates.io
+# for the exact version THIS manifest declares and skips any crate already
+# live (the ones that succeeded in an earlier window). HTTP 200 = live
+# (skip); anything else = not live yet, publish it — failing safe toward
+# attempting the publish, since cargo itself rejects a duplicate version.
+crate_is_live() {
+  local name="$1" version status
+  version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "crates/$name/Cargo.toml" | head -1)
+  if [[ -z "$version" ]]; then
+    echo "    ? could not read version from crates/$name/Cargo.toml; assuming not published"
+    return 1
+  fi
+  status=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tropel-release-gate' \
+    "https://static.crates.io/crates/$name/$name-$version.crate" 2>/dev/null || echo 000)
+  if [[ "$status" == "200" ]]; then
+    echo "    ✓ $name $version is already live on crates.io — skipping"
+    return 0
+  fi
+  echo "    · $name $version not on the registry (HTTP $status) — will publish"
+  return 1
+}
+
+# ── Rate-limit auto-wait (429 handling) ────────────────────────────────────
+# crates.io limits new crate creation (5/window). On a 429 cargo prints
+# "try again after <RFC2822 date>". Parse that timestamp, sleep until the
+# window opens, and retry the SAME crate — so a multi-window release
+# completes in one invocation instead of requiring the operator to notice
+# and re-run. --no-wait disables the sleep (CI / unattended runs fail fast
+# and the operator re-runs --resume later).
+parse_retry_after() {
+  # stdin: cargo stderr text; stdout: the RFC2822 retry timestamp or empty.
+  grep -oE '[A-Z][a-z]{2}, [0-9]{1,2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT' | head -1
+}
+
+retry_epoch() {
+  # $1: RFC2822 timestamp like "Mon, 10 Aug 2026 07:11:32 GMT".
+  # GNU date (Linux / Git Bash).
+  if date -d "$1" +%s 2>/dev/null; then
+    return 0
+  fi
+  # BSD date (macOS).
+  date -jf '%a, %d %b %Y %H:%M:%S GMT' "$1" +%s 2>/dev/null || return 1
+}
+
+MAX_RATE_RETRIES=8   # a window is ~10 min; 8 covers any first-release spread
+
+publish_one() {
+  local c="$1" out retry_ts now target wait_sec attempt=0
+  while :; do
+    attempt=$((attempt + 1))
+    if out=$(cargo publish -p "$c" --allow-dirty 2>&1); then
+      echo "$out" | grep -E 'Uploaded|Published' | head -2 || true
+      return 0
+    fi
+    # Surface the failure, but treat a rate limit as resumable.
+    if ! grep -qi '429 Too Many Requests' <<<"$out"; then
+      echo "$out" | grep -E '^error|Caused by' | head -4 || true
+      return 1
+    fi
+    if [[ $NO_WAIT -eq 1 || $attempt -gt $MAX_RATE_RETRIES ]]; then
+      echo "$out" | grep -E '^error|Caused by' | head -4 || true
+      echo "    (429 rate limit — re-run with --resume after the window, or drop --no-wait to auto-wait)"
+      return 1
+    fi
+    retry_ts=$(parse_retry_after <<<"$out" || true)
+    if [[ -z "$retry_ts" ]] || ! now=$(date +%s) || ! target=$(retry_epoch "$retry_ts"); then
+      echo "$out" | grep -E '^error|Caused by' | head -4 || true
+      echo "    (could not parse the 429 retry time — re-run with --resume after the window)"
+      return 1
+    fi
+    wait_sec=$((target - now))
+    [[ $wait_sec -lt 1 ]] && wait_sec=1
+    echo "    ⏳ rate limited (attempt $attempt); retrying $c in ${wait_sec}s (window opens at $retry_ts)"
+    sleep "$wait_sec"
+  done
+}
+
 NAMES_TAKEN=()
-if [[ $SKIP_NAME_CHECK -eq 1 ]]; then
-  echo "── Pre-flight: crates.io name availability (skipped via --skip-name-check) ──"
+if [[ $SKIP_NAME_CHECK -eq 1 || $RESUME -eq 1 ]]; then
+  if [[ $RESUME -eq 1 ]]; then
+    echo "── Pre-flight: crates.io name availability (skipped — --resume expects the names to exist) ──"
+  else
+    echo "── Pre-flight: crates.io name availability (skipped via --skip-name-check) ──"
+  fi
 else
   echo "── Pre-flight: crates.io name availability ──"
   for c in "${CRATES[@]}"; do
@@ -233,16 +329,38 @@ fi
 # flipped manifests (no restore — that is the release intent). Report them so
 # a confused second run can't happen.
 if [[ $EXECUTE -eq 1 ]]; then
-  trap 'echo; echo "⚠️  publish interrupted — publish = true left in:"; for m in "${FLIPPED[@]}"; do echo "    $m"; done; echo "Commit them with the release, or restore to publish = false before retrying."' ERR
+  trap 'echo; echo "⚠️  publish interrupted — publish = true left in:"; for m in "${FLIPPED[@]}"; do echo "    $m"; done; echo "Commit them with the release, or restore to publish = false before retrying. Re-run with --resume to continue past crates already live on crates.io."' ERR
+fi
+
+if [[ $RESUME -eq 1 ]]; then
+  echo "── Resume mode: skipping crates already live on crates.io (implies --execute) ──"
+  if [[ $NO_WAIT -eq 1 ]]; then
+    echo "⚠️  --no-wait: rate limits are NOT waited out — re-run --resume manually after each window."
+  else
+    echo "⚠️  REAL PUBLISH — this run uploads to crates.io and waits out 429 rate limits automatically."
+  fi
+elif [[ $EXECUTE -eq 1 ]]; then
+  if [[ $NO_WAIT -eq 1 ]]; then
+    echo "⚠️  REAL PUBLISH — this run uploads to crates.io; 429 rate limits fail fast (--no-wait)."
+  else
+    echo "⚠️  REAL PUBLISH — this run uploads to crates.io and waits out 429 rate limits automatically."
+  fi
 fi
 
 echo "── Publish order: ${CRATES[*]} ──"
+PUBLISHED_THIS_RUN=()
+SKIPPED_THIS_RUN=()
 for c in "${CRATES[@]}"; do
   echo
   echo "─── $c ───"
+  if [[ $RESUME -eq 1 ]] && crate_is_live "$c"; then
+    SKIPPED_THIS_RUN+=("$c")
+    continue
+  fi
   flip_publish_flag "$c"
   if [[ $EXECUTE -eq 1 ]]; then
-    cargo publish -p "$c" --allow-dirty
+    publish_one "$c"
+    PUBLISHED_THIS_RUN+=("$c")
   else
     cargo publish -p "$c" --dry-run --allow-dirty "${PATCH_ARGS[@]}"
   fi
@@ -255,7 +373,12 @@ fi
 
 if [[ $EXECUTE -eq 1 ]]; then
   echo
-  echo "✅ published: ${CRATES[*]}"
+  if [[ ${#SKIPPED_THIS_RUN[@]} -gt 0 ]]; then
+    echo "✅ done — already live (skipped): ${SKIPPED_THIS_RUN[*]}"
+    echo "   published this run: ${PUBLISHED_THIS_RUN[*]:-none}"
+  else
+    echo "✅ published: ${CRATES[*]}"
+  fi
 else
   echo
   echo "✅ dry-run OK — re-run with --execute to actually publish."
