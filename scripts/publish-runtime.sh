@@ -17,9 +17,10 @@
 #   - tropel-http is NOT in the set (F1, review fix): it was published by
 #     accident because sandbox's `send-request` used `dep:tropel-http`; the
 #     sandbox now routes pm.sendRequest through the SDK `DriverHttpClient`
-#     trait and `publish = false` blocks future publishes. The already-live
-#     0.1.0 stays on the registry until yanked (cargo yank --version 0.1.0
-#     tropel-http), but no new publish step references it.
+#     trait and `publish = false` blocks future publishes. The accidental
+#     0.1.0 has been YANKED on crates.io (cargo yank --version 0.1.0
+#     tropel-http, 2026-08-10), so consumers resolving it get an error instead
+#     of a stale internal crate; no new publish step references it.
 #   - Real publishes happen only after the BACKLOG_V2 Phase 0–2 release gate;
 #     this script defaults to --dry-run so the sequence is exercised, not
 #     executed, until you pass --execute.

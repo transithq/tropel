@@ -28,8 +28,14 @@ extern "C" {
 }
 
 // ── native: test seam ──
+// `pub` (doc(hidden)) not `pub(crate)`: the F3 differential harness lives in
+// `tests/native_vs_wasm.rs` — an INTEGRATION test, which compiles the lib
+// WITHOUT `cfg(test)` and cannot see `pub(crate)` items. The seam only exists
+// on non-wasm targets, so it never ships in the wasm build; tropel-web is
+// `publish = false`, so this is a test-only public surface.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod native_seam {
+#[doc(hidden)]
+pub mod native_seam {
     use std::sync::Mutex;
 
     use tropel_sdk::types::{Request, Response};
@@ -38,14 +44,13 @@ pub(crate) mod native_seam {
     pub type Handler = Box<dyn Fn(&Request) -> Result<Response> + Send + Sync>;
 
     // A Mutex (replaceable) rather than OnceLock: the F3 differential harness
-    // installs its own deterministic handler, and unit-test ordering is not
+    // installs its own deterministic handler, and test ordering is not
     // guaranteed — OnceLock's first-wins semantics would let an unrelated
     // test's handler leak into the harness and silently break the diff.
     static HANDLER: Mutex<Option<Handler>> = Mutex::new(None);
 
     /// Install the handler native tests use instead of the wasm host import.
     /// Replaces any previous handler (last install wins).
-    #[cfg(test)]
     pub fn set_handler(h: Handler) {
         *HANDLER.lock().unwrap() = Some(h);
     }

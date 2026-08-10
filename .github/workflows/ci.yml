@@ -244,13 +244,30 @@ jobs:
       # F3 (TROPEL_MODULARIZATION_REVIEW.md): the REAL differential harness —
       # the same fixture through native tropel-runtime and through the wasm32
       # build, diffing the full outcome (status, headers, variable state,
-      # assertion results, setNextRequest trace). Requires the artifact from
+      # assertion results, setNextRequest trace). An INTEGRATION test
+      # (tests/native_vs_wasm.rs), so it links the lib without cfg(test) —
+      # the native_seam is pub(doc(hidden)) for it. Requires the artifact from
       # the size gate above; TROPEL_REQUIRE_WASM=1 turns a missing artifact
       # into a hard failure rather than the local-dev skip.
       - name: F3 differential harness (native vs wasm32 runtime)
         env:
           TROPEL_REQUIRE_WASM: "1"
-        run: cargo test -p tropel-web --lib native_vs_wasm
+        run: cargo test -p tropel-web --test native_vs_wasm
+
+      # P6 (TROPEL_MODULARIZATION_TODO.md): @tropel/exec-wasm — the npm host
+      # that ships the wasm slice. Build the TS wrapper, copy the artifact
+      # into the package (build.sh), and drive the same F3 fixture through
+      # node:wasi from OUTSIDE Rust — proving the published package works.
+      # TROPEL_REQUIRE_WASM=1 turns a missing artifact into a hard failure
+      # (same gate as the F3 harness).
+      - name: P6 npm smoke (@tropel/exec-wasm)
+        env:
+          TROPEL_REQUIRE_WASM: "1"
+        run: |
+          cd packages/exec-wasm
+          npm install --no-audit --no-fund
+          npm run build
+          node smoke.mjs
 
   smoke:
     name: "e2e smoke (samples: k6, postman, openapi, har)"

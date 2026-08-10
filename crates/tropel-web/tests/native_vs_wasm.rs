@@ -6,8 +6,8 @@
 //! fixture walks through the identical `ScenarioRunner` code compiled two
 //! ways —
 //!
-//!   1. **native** — `crate::run_request`, with a deterministic fixture HTTP
-//!      handler installed on the native seam (`native_seam`), and
+//!   1. **native** — `tropel_web::run_request`, with a deterministic fixture
+//!      HTTP handler installed on the native seam (`native_seam`), and
 //!   2. **wasm32-wasip1** — the `tropel_web.wasm` artifact (built by
 //!      `scripts/wasm-size.sh`) loaded into wasmtime, driven through the
 //!      postcard C ABI (`tropel_alloc` / `tropel_run` / `tropel_free`) with
@@ -34,8 +34,8 @@ use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
 
-use crate::http::native_seam;
-use crate::wire::{RunOutcome, RunRequest};
+use tropel_web::http::native_seam;
+use tropel_web::wire::{RunOutcome, RunRequest};
 
 // ── the fixture ──────────────────────────────────────────────────────────
 
@@ -281,7 +281,7 @@ fn native_outcome_postcard_roundtrip() {
         .enable_all()
         .build()
         .expect("native runtime");
-    let outcome = rt.block_on(crate::run_request(req));
+    let outcome = rt.block_on(tropel_web::run_request(req));
     assert!(outcome.error.is_none(), "run error: {:?}", outcome.error);
     assert!(
         !outcome.iterations.is_empty(),
@@ -369,7 +369,7 @@ fn postcard_bisect_outcome_wire_types() {
             .enable_all()
             .build()
             .expect("native runtime");
-        let outcome = rt.block_on(crate::run_request(req));
+        let outcome = rt.block_on(tropel_web::run_request(req));
         assert!(outcome.error.is_none(), "run error: {:?}", outcome.error);
 
         for (it_i, it) in outcome.iterations.iter().enumerate() {
@@ -473,7 +473,7 @@ fn native_and_wasm_runtime_produce_identical_outcomes() {
         .enable_all()
         .build()
         .expect("native runtime");
-    let native = rt.block_on(crate::run_request(req.clone()));
+    let native = rt.block_on(tropel_web::run_request(req.clone()));
 
     // Wasm leg: the wasm32 build, driven through the C ABI.
     let wasm = wasm_leg(&wasm_path, &req);

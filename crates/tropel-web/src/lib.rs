@@ -11,12 +11,6 @@ pub mod bootstrap;
 pub mod http;
 pub mod wire;
 
-// F3 (TROPEL_MODULARIZATION_REVIEW.md): the real native-vs-wasm32 differential
-// harness. `#[cfg(test)]` — it needs the wasmtime dev-deps and the native
-// HTTP seam, so it never ships in the wasm build.
-#[cfg(test)]
-mod native_vs_wasm;
-
 use std::sync::Arc;
 
 use tropel_runtime::{flatten_execution_items, ScenarioRunner};
