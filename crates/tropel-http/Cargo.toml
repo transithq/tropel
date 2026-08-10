@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
+description = "HTTP protocol implementation for Tropel: reqwest client, connection pooling, redirects, per-VU cookie jar. Auth signers live in tropel-auth."
 
 [dependencies]
 tropel-sdk.workspace = true
