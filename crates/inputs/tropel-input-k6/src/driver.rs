@@ -2763,9 +2763,11 @@ async fn eval_module_export_json(
     // The k6 shim libs (Rate/check/http/…) must be present: options blocks
     // commonly run k6 API at module top level (e.g. `new Rate('errors')`),
     // which threw QuickJS exceptions when the shim was missing.
-    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false))).await.map_err(|e| {
-        TropelError::Other(format!("k6 shim bootstrap failed for options eval: {}", e))
-    })?;
+    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false)))
+        .await
+        .map_err(|e| {
+            TropelError::Other(format!("k6 shim bootstrap failed for options eval: {}", e))
+        })?;
 
     // Minimal globals a k6 script may reference while building its options.
     // `__ENV` carries the job's env vars so options computed from them
@@ -2825,12 +2827,14 @@ async fn eval_module_handle_summary(
         })?;
     // Same k6-shim requirement as the options eval: a script that touches
     // k6 API at module top level must not throw while handleSummary is read.
-    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false))).await.map_err(|e| {
-        TropelError::Other(format!(
-            "k6 shim bootstrap failed for handleSummary eval: {}",
-            e
-        ))
-    })?;
+    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false)))
+        .await
+        .map_err(|e| {
+            TropelError::Other(format!(
+                "k6 shim bootstrap failed for handleSummary eval: {}",
+                e
+            ))
+        })?;
 
     // Minimal globals a k6 script may reference while building its summary.
     // Backlog line 142: numbers, not strings (see options eval above).
@@ -2891,9 +2895,11 @@ async fn eval_module_call_export(
         .map_err(|e| {
             TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
         })?;
-    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false))).await.map_err(|e| {
-        TropelError::Other(format!("k6 shim bootstrap failed for {export} eval: {}", e))
-    })?;
+    bootstrap_js_libs(&mut js_ctx, Arc::new(AtomicBool::new(false)))
+        .await
+        .map_err(|e| {
+            TropelError::Other(format!("k6 shim bootstrap failed for {export} eval: {}", e))
+        })?;
 
     // k6 §4 (backlog line 119): setup()/teardown() may make HTTP calls —
     // register the native HTTP bridges against the scenario's shared client

@@ -665,10 +665,7 @@ impl ScenarioRunner {
                                 tracing::warn!("VU {} test script error: {}", iteration_index, e);
                                 // Backlog line 98: record a failed check so the
                                 // failure is visible and drives a non-zero exit.
-                                record_script_failure(
-                                    &mut result,
-                                    &format!("{}.test", item.name),
-                                );
+                                record_script_failure(&mut result, &format!("{}.test", item.name));
                             }
                         }
                     }
@@ -1174,8 +1171,9 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
-        let mut runner = ScenarioRunner::new(scenario, execution_items, names, client, 0, "fs".into())
-            .with_force_stop_flag(flag.clone());
+        let mut runner =
+            ScenarioRunner::new(scenario, execution_items, names, client, 0, "fs".into())
+                .with_force_stop_flag(flag.clone());
 
         // Control: without force-stop the items run (the dead-URL requests
         // still emit http_reqs/errors samples — k6 parity).

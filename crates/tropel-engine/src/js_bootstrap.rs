@@ -366,9 +366,16 @@ mod tests {
             namespace: "acme".into(),
             aliases: vec!["product".into(), "wire".into()],
         };
-        let mut ctx = create_vu_js_context(7, &pm_state, &client, &ShimBundle::default(), &config, Arc::new(AtomicBool::new(false)))
-            .await
-            .expect("context must be created");
+        let mut ctx = create_vu_js_context(
+            7,
+            &pm_state,
+            &client,
+            &ShimBundle::default(),
+            &config,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("context must be created");
 
         let check = ctx
             .eval(
