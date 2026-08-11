@@ -6101,6 +6101,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_cryptojs_modes_padding_utf16_wordarray_and_missing_algorithms() {
+        // Backlog line 95: ECB/CTR/CFB/OFB silently ran GCM (wrong cipher,
+        // no error); {padding: NoPadding} was ignored (16 bytes → 32);
+        // WordArray.concat corrupted non-4-byte-aligned data ('abc'+'de' →
+        // "abc\0d"); enc.Utf16 was an alias of Utf8; RIPEMD160/SHA224/
+        // HmacSHA384 were undefined.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var key = CryptoJS.lib.WordArray.random(16);
+                var iv = CryptoJS.lib.WordArray.random(16);
+
+                // Unsupported modes must FAIL LOUDLY, not silently run GCM.
+                var ecbThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.ECB, iv: iv }); return 'no'; }
+                    catch (e) { return /ECB/.test(e.message) ? 'ecb' : 'other:' + e.message; }
+                })();
+                var ctrThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.CTR, iv: iv }); return 'no'; }
+                    catch (e) { return /CTR/.test(e.message) ? 'ctr' : 'other:' + e.message; }
+                })();
+                var cfbThrew = (function () {
+                    try { CryptoJS.AES.decrypt(CryptoJS.enc.Hex.parse('00'.repeat(16)), key, { mode: CryptoJS.mode.CFB, iv: iv }); return 'no'; }
+                    catch (e) { return /CFB/.test(e.message) ? 'cfb' : 'other:' + e.message; }
+                })();
+
+                // Unsupported padding must FAIL LOUDLY, not silently pad.
+                var noPadThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.NoPadding, iv: iv }); return 'no'; }
+                    catch (e) { return /NoPadding/.test(e.message) ? 'nopad' : 'other:' + e.message; }
+                })();
+
+                // WordArray.concat must be bit-aligned: 'abc' + 'de' = 'abcde'.
+                var concatStr = CryptoJS.enc.Utf8.stringify(
+                    CryptoJS.enc.Utf8.parse('abc').concat(CryptoJS.enc.Utf8.parse('de'))
+                );
+
+                // Utf16 must be UTF-16BE (not a Utf8 alias) and round-trip.
+                var utf16 = CryptoJS.enc.Utf16.stringify(CryptoJS.enc.Utf16.parse('héllo'));
+                var utf16Hex = CryptoJS.enc.Utf16.parse('hi').toString(CryptoJS.enc.Hex);
+                var utf16beAlias = CryptoJS.enc.Utf16BE === CryptoJS.enc.Utf16;
+
+                // Missing algorithms now defined and matching known vectors.
+                var sha224 = CryptoJS.SHA224('hello').toString();
+                var ripemd160 = CryptoJS.RIPEMD160('hello').toString();
+                var hmac384 = CryptoJS.HmacSHA384('hello', 'key').toString();
+
+                JSON.stringify([
+                    ecbThrew, ctrThrew, cfbThrew, noPadThrew,
+                    concatStr, utf16, utf16Hex, utf16beAlias,
+                    sha224, ripemd160, hmac384
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\"ecb\",\"ctr\",\"cfb\",\"nopad\",\"abcde\",\"héllo\",\"00680069\",true,\"ea09ae9cc6768c50fcee903ed054556e5bfc8347907f12598aa24193\",\"108f07b8382412612c048d07d13f814118445acd\",\"eacbad575c301fa68afb26dae48b25bf5cd42fd08ed28c08c274ce62df7928f01249976cd8aaf1ab0681d3accedc9543\"]",
+            "modes fail loudly, padding fails loudly, concat aligns, Utf16 is BE, missing algorithms defined"
+        );
+    }
+
     fn temp_script_dir(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("tropel-k6-open-{}-{}", tag, std::process::id()));
