@@ -7,27 +7,124 @@ var chai = chai || {};
 
 (function () {
     // Proper JS deep-equal (handles NaN, undefined, key-order)
-    function jsDeepEqual(a, b) {
+    // Backlog line 85: Date/Set/Map/RegExp used to collapse to
+    // Object.keys() = [] — ANY two instances compared equal
+    // (chai.expect(new Set([1])).to.eql(new Set([9])) passed). They now
+    // compare by VALUE (time for Date, source+flags for RegExp, size +
+    // order-insensitive entries for Map/Set). Circular structures no longer
+    // overflow the stack (seen-pair guard: revisiting the exact (a,b) pair
+    // mid-compare is assumed equal).
+    function jsDeepEqual(a, b, seen) {
         if (a === b) return true;
         if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
         if (a === null || b === null || a === undefined || b === undefined) return a === b;
         if (typeof a !== typeof b) return false;
+        // Date: compare by epoch time; two invalid dates compare equal.
+        if (a instanceof Date || b instanceof Date) {
+            if (!(b instanceof Date)) return false;
+            var ta = a.getTime(), tb = b.getTime();
+            return (isNaN(ta) && isNaN(tb)) || ta === tb;
+        }
+        // RegExp: source + flags.
+        if (a instanceof RegExp || b instanceof RegExp) {
+            if (!(b instanceof RegExp)) return false;
+            return a.source === b.source && a.flags === b.flags;
+        }
         if (Array.isArray(a)) {
             if (!Array.isArray(b) || a.length !== b.length) return false;
-            for (var i = 0; i < a.length; i++) {
-                if (!jsDeepEqual(a[i], b[i])) return false;
+            seen = seen || [];
+            for (var s = 0; s < seen.length; s++) {
+                if (seen[s][0] === a && seen[s][1] === b) return true;
             }
+            seen.push([a, b]);
+            for (var i = 0; i < a.length; i++) {
+                if (!jsDeepEqual(a[i], b[i], seen)) {
+                    seen.pop();
+                    return false;
+                }
+            }
+            seen.pop();
             return true;
         }
         if (typeof a === 'object') {
             if (Array.isArray(b) || b === null || b === undefined) return false;
+            // Map: same size, each entry's key+value finds a deep-equal mate
+            // (order-insensitive).
+            if (a instanceof Map || b instanceof Map) {
+                if (!(b instanceof Map) || a.size !== b.size) return false;
+                // Cycle guard: Map nodes can be self-referential; revisiting the
+                // exact (a, b) pair mid-compare is assumed equal.
+                seen = seen || [];
+                for (var s = 0; s < seen.length; s++) {
+                    if (seen[s][0] === a && seen[s][1] === b) return true;
+                }
+                seen.push([a, b]);
+                var aEntries = Array.from(a.entries());
+                var bEntries = Array.from(b.entries());
+                var usedB = [];
+                outer:
+                for (var mi = 0; mi < aEntries.length; mi++) {
+                    for (var mj = 0; mj < bEntries.length; mj++) {
+                        if (usedB[mj]) continue;
+                        if (jsDeepEqual(aEntries[mi][0], bEntries[mj][0], seen) &&
+                            jsDeepEqual(aEntries[mi][1], bEntries[mj][1], seen)) {
+                            usedB[mj] = true;
+                            continue outer;
+                        }
+                    }
+                    seen.pop();
+                    return false;
+                }
+                seen.pop();
+                return true;
+            }
+            // Set: same size, each member finds a deep-equal mate.
+            if (a instanceof Set || b instanceof Set) {
+                if (!(b instanceof Set) || a.size !== b.size) return false;
+                // Cycle guard: Set nodes can be self-referential; revisiting the
+                // exact (a, b) pair mid-compare is assumed equal.
+                seen = seen || [];
+                for (var s = 0; s < seen.length; s++) {
+                    if (seen[s][0] === a && seen[s][1] === b) return true;
+                }
+                seen.push([a, b]);
+                var aMembers = Array.from(a);
+                var bMembers = Array.from(b);
+                var usedS = [];
+                outer2:
+                for (var si = 0; si < aMembers.length; si++) {
+                    for (var sj = 0; sj < bMembers.length; sj++) {
+                        if (usedS[sj]) continue;
+                        if (jsDeepEqual(aMembers[si], bMembers[sj], seen)) {
+                            usedS[sj] = true;
+                            continue outer2;
+                        }
+                    }
+                    seen.pop();
+                    return false;
+                }
+                seen.pop();
+                return true;
+            }
+            // Plain object: key-set comparison with a cycle guard.
+            seen = seen || [];
+            for (var k = 0; k < seen.length; k++) {
+                if (seen[k][0] === a && seen[k][1] === b) return true;
+            }
+            seen.push([a, b]);
             var keysA = Object.keys(a).sort();
             var keysB = Object.keys(b).sort();
-            if (keysA.length !== keysB.length) return false;
-            for (var i = 0; i < keysA.length; i++) {
-                if (keysA[i] !== keysB[i]) return false;
-                if (!jsDeepEqual(a[keysA[i]], b[keysB[i]])) return false;
+            if (keysA.length !== keysB.length) {
+                seen.pop();
+                return false;
             }
+            for (var j = 0; j < keysA.length; j++) {
+                if (keysA[j] !== keysB[j] || !jsDeepEqual(a[keysA[j]], b[keysB[j]], seen)) {
+                    seen.pop();
+                    return false;
+                }
+            }
+            seen.pop();
             return true;
         }
         return a === b;
@@ -40,6 +137,14 @@ var chai = chai || {};
             if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
             if (a === b) return true;
             if (a === null || a === undefined || b === null || b === undefined) return a === b;
+            // Backlog line 85: JSON.stringify collapses Date/Set/Map/RegExp
+            // (Date → ISO string, others → "{}") so typed values must never
+            // go through the string bridge — the JS impl compares them by
+            // value.
+            if (a instanceof Date || a instanceof RegExp || a instanceof Set || a instanceof Map ||
+                b instanceof Date || b instanceof RegExp || b instanceof Set || b instanceof Map) {
+                return jsDeepEqual(a, b);
+            }
             return __tropel_native_deep_equal(JSON.stringify(a), JSON.stringify(b));
         }
         : jsDeepEqual;
