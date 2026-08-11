@@ -77,11 +77,6 @@ async fn run_vu_loop(
     let mut exit_guard = sched.control_spawn_guard();
 
     let mut iteration_index = 0u64;
-    let mut vu_sample_counter: u64 = 0;
-    // Time-based VU gauge cadence: vus/vus_max are ALSO sampled every ~2s
-    // (not only every 100 iterations), so the live progress bar's VU field
-    // is real even on short runs that never reach the iteration threshold.
-    let mut last_vu_gauge = Instant::now();
 
     loop {
         if sched.is_force_stop_requested() || sched.is_stop_requested() {
@@ -114,19 +109,6 @@ async fn run_vu_loop(
             && !sched.try_claim_shared_iteration(shared.total_iterations)
         {
             break;
-        }
-
-        vu_sample_counter += 1;
-        let vu_gauge_due =
-            vu_sample_counter % 100 == 0 || last_vu_gauge.elapsed() >= Duration::from_secs(2);
-        if vu_gauge_due {
-            let active = sched.active_vus().await;
-            let peak = sched.peak_vus();
-            shared
-                .last_active_vus
-                .store(active, std::sync::atomic::Ordering::Relaxed);
-            utils_emit_vus_metrics(&shared.metrics, active, peak, &shared.sc_tags).await;
-            last_vu_gauge = Instant::now();
         }
 
         let iter_start = Instant::now();
@@ -344,6 +326,22 @@ where
     let vu_init_failures = Arc::new(AtomicU32::new(0));
     let script_failures = Arc::new(AtomicU64::new(0));
     let last_active_vus = Arc::new(AtomicU32::new(0));
+
+    // Single scheduler-wide vus/vus_max sampler (backlog line 165): the
+    // gauge used to be sampled by EVERY VU every ~2s (plus every 100
+    // iterations), so 1000 VUs emitted ~1000 duplicate `record_batch` calls
+    // per 2s floor — corrupting the gauge's min/max/avg with ~1000
+    // identical readings. ONE task now samples on a fixed cadence for the
+    // whole run; the guaranteed final sample below still fires at the end.
+    // It also keeps `last_active_vus` fresh so the final sample reflects the
+    // last real concurrency, not 0.
+    let vus_sampler = tokio::spawn(vus_sampler_task(
+        executor.control_handle(),
+        metrics.clone(),
+        last_active_vus.clone(),
+        sc_tags.clone(),
+    ));
+
     let shared = VuRunShared {
         metrics: metrics.clone(),
         sc_tags: sc_tags.clone(),
@@ -376,17 +374,20 @@ where
         );
     }
 
-    // Stop the single abort coordinator — the run has finished, so a
-    // lingering 2s poller would otherwise keep the metrics aggregator alive.
+    // Stop the single abort coordinator and the vus sampler — the run has
+    // finished, so a lingering 2s poller would otherwise keep the metrics
+    // aggregator alive.
     if let Some(monitor) = abort_monitor {
         monitor.abort();
     }
+    vus_sampler.abort();
 
-    // Emit a guaranteed final vus/vus_max sample. The periodic sampler only
-    // fires every 100 iterations per VU, so a short run would otherwise emit
-    // NO vus/vus_max samples and the summary would read vus_max: 0. The
-    // active count uses the LAST KNOWN sampled value (not 0) so the vus
-    // gauge's `last` reflects real concurrency (backlog line 154).
+    // Emit a guaranteed final vus/vus_max sample. The single scheduler-wide
+    // sampler runs on a 2s cadence (backlog line 165), so a run shorter than
+    // 2s would otherwise emit only the t=0 sample and the summary could read
+    // a stale vus: 0. The active count uses the LAST KNOWN sampled value (not
+    // 0) so the vus gauge's `last` reflects real concurrency (backlog line
+    // 154).
     let final_active = last_active_vus.load(std::sync::atomic::Ordering::SeqCst);
     utils_emit_vus_metrics(&metrics, final_active, executor.peak_vus(), &sc_tags).await;
 
@@ -966,6 +967,31 @@ fn merge_scenario_tags(samples: &mut [Sample], tags: &HashMap<String, String>) {
     }
 }
 
+/// The single scheduler-wide vus/vus_max sampler task (backlog line 165).
+/// Samples the gauge on a fixed cadence — ONE emission per floor for the
+/// WHOLE run, instead of every VU emitting one per 2s (1000 VUs → ~1000
+/// duplicate readings per floor, corrupting the gauge's min/max/avg). Runs
+/// until the scenario finishes, then is aborted by `run_vus`; a guaranteed
+/// final sample is emitted separately after the run.
+async fn vus_sampler_task(
+    sched: Arc<VUScheduler>,
+    metrics: Arc<MetricsCollector>,
+    last_active_vus: Arc<AtomicU32>,
+    sc_tags: HashMap<String, String>,
+) {
+    // First tick fires immediately, then every 2s — so a run shorter than
+    // the cadence still gets one sample (plus the final one after the run).
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let active = sched.active_vus().await;
+        let peak = sched.peak_vus();
+        last_active_vus.store(active, std::sync::atomic::Ordering::Relaxed);
+        utils_emit_vus_metrics(&metrics, active, peak, &sc_tags).await;
+    }
+}
+
 async fn utils_emit_vus_metrics(
     metrics: &MetricsCollector,
     active: u32,
@@ -1001,4 +1027,72 @@ async fn utils_emit_vus_metrics(
             },
         ])
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backlog line 165: the vus/vus_max gauge must be sampled by ONE
+    /// scheduler-wide task on a fixed cadence, not by every VU every ~2s —
+    /// 1000 VUs used to emit ~1000 duplicate `record_batch` calls per 2s
+    /// floor, corrupting the gauge's min/max/avg. Run the single sampler for
+    /// ~2.3 real seconds and assert the sample count stays small (t=0 +
+    /// t=2s = ~2) REGARDLESS of the VU count — the old per-VU trigger would
+    /// have produced ~1000. Real time (not paused) so the spawned task and
+    /// the metrics aggregator actually get polled.
+    #[tokio::test]
+    async fn vus_sampler_emits_bounded_cadence_not_per_vu() {
+        let metrics = Arc::new(MetricsCollector::new());
+        // 1000 VUs would have produced ~1000 samples per 2s floor under the
+        // old per-VU trigger; the single sampler must stay at ~2.
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1000,
+            duration: "10s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+        let last_active = Arc::new(AtomicU32::new(0));
+        let tags = HashMap::new();
+        let task = tokio::spawn(vus_sampler_task(
+            sched,
+            metrics.clone(),
+            last_active.clone(),
+            tags,
+        ));
+        // t=0 tick fires immediately, then every 2s — ~2 samples in 2.3s.
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        task.abort();
+        let _ = task.await;
+
+        // Assert on the SAMPLE COUNT (results().count), not total_count —
+        // total_count sums VALUES and the active count is 0 (no VUs spawned),
+        // so the sum is legitimately 0 even when samples were ingested.
+        let results = metrics.results().await;
+        let vus = results
+            .metrics
+            .iter()
+            .find(|m| m.key == "vus")
+            .map(|m| m.count)
+            .unwrap_or(0);
+        assert!((
+            vus >= 1,
+            "sampler must emit the t=0 sample, got {vus}"
+        );
+        assert!(
+            vus <= 4,
+            "vus sampler storm: {vus} samples in 2.3s — must be ~2, not per-VU"
+        );
+        // vus_max rides along in the same record_batch.
+        let vus_max = results
+            .metrics
+            .iter()
+            .find(|m| m.key == "vus_max")
+            .map(|m| m.count)
+            .unwrap_or(0);
+        assert!(
+            vus_max <= 4,
+            "vus_max sampler storm: {vus_max} samples in 2.3s"
+        );
+    }
 }
