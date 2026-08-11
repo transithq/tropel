@@ -181,9 +181,13 @@ struct HostState {
 }
 
 /// Implements the `env.tropel_host_http` import the wasm build declares
-/// (http.rs): read the postcard `Request` from linear memory, answer with the
-/// SAME fixture response, allocate the reply in wasm memory via the module's
-/// own `tropel_alloc`, and return the packed `(ptr << 32) | len`.
+/// (http.rs): read the postcard wire `Request` from linear memory, answer
+/// with the SAME fixture response, allocate the reply in wasm memory via the
+/// module's own `tropel_alloc`, and return the packed `(ptr << 32) | len`.
+///
+/// The wire is http.rs's `WireRequest` (backlog line 44: the body is a JSON
+/// envelope string, and nothing follows it) — decoded through the crate's
+/// own `decode_wire_request` so the harness exercises the REAL wire path.
 fn host_http(mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32) -> i64 {
     let memory = caller
         .get_export("memory")
@@ -193,7 +197,7 @@ fn host_http(mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32) -> i
     memory
         .read(&caller, req_ptr as usize, &mut req_buf)
         .expect("read request");
-    let req: Request = postcard::from_bytes(&req_buf).expect("decode Request");
+    let req = tropel_web::http::decode_wire_request(&req_buf).expect("decode wire Request");
     let resp = fixture_response(&req).expect("fixture response");
     let resp_bytes = postcard::to_stdvec(&resp).expect("encode Response");
 

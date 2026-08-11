@@ -49,22 +49,36 @@ export interface Timings {
   sendingMs: number;
   waitingMs: number;
   receivingMs: number;
+  /** Full request duration — the 8th wire field (postcard is positional;
+   * omitting it makes every Response fail to decode on the wasm side). */
+  totalMs: number;
 }
 
 /**
  * A request the JS host must answer, decoded from the wasm's linear memory
- * across the `env.tropel_host_http` bridge (types.rs Request — v1 decodes
- * the fields a fetch needs; see postcard.ts decodeHttpRequest).
+ * across the `env.tropel_host_http` bridge (http.rs WireRequest — the body
+ * is a JSON envelope string; see postcard.ts decodeHttpRequest).
  */
 export interface HttpRequest {
   url: string;
   method: string;
   headers: Record<string, string>;
   queryParams: Record<string, string>;
-  /** Raw string body (Body::Raw) when present and decodable; else null. */
+  /**
+   * The transport-ready body text: raw text for `raw`, the JSON text for
+   * `json`, a URL-encoded string for `url_encoded`/`form_data` (v1 default),
+   * a `{query, variables}` JSON text for `graphql`. null for `binary`
+   * (bytes are in `bodyBytes`).
+   */
   body: string | null;
-  /** Whether the body was present on the wire (even if undecodable). */
+  /** The wire Body variant (types.rs Body) — lets transports special-case. */
+  bodyMode: "raw" | "json" | "form_data" | "url_encoded" | "binary" | "graphql" | null;
+  /** Whether a body was present on the wire. */
   bodyDecoded: boolean;
+  /** mode `"binary"`: the raw request bytes (body is null then). */
+  bodyBytes?: Uint8Array;
+  /** mode `"form_data"`: the field map (body is the URL-encoded default). */
+  formFields?: Record<string, string>;
 }
 
 /** Response the JS host returns across the bridge (types.rs Response). */

@@ -9,13 +9,93 @@
 //! stands in, so the full run path — runner → client → samples — is
 //! exercised without a browser.
 
+use std::collections::HashMap;
+
 use tropel_sdk::traits::DriverHttpClient;
-use tropel_sdk::types::{Request, Response};
-use tropel_sdk::Result;
+use tropel_sdk::types::{Method, Request, Response, ResponseType};
+#[cfg(target_arch = "wasm32")]
+use tropel_sdk::types::Body;
+use tropel_sdk::{Result, TropelError};
 
 /// The browser slice's HTTP client: every request goes through the host.
 #[derive(Debug, Default)]
 pub struct WebHttpClient;
+
+/// Wire form of `Request` for the `tropel_host_http` bridge.
+///
+/// Backlog line 44 (P0): the body used to cross the wire as `Option<Body>`
+/// in its NATIVE postcard form — `Body::Json` serializes as the raw JSON
+/// value's shape, `FormData`/`UrlEncoded`/`Binary`/`GraphQL` as tagged maps —
+/// so the TS decoder (which must not know every shape) read a map-count
+/// varint as a string length and produced a 1-char garbage body for every
+/// non-`Raw` request (a JSON POST went out as one junk byte). The fix
+/// mirrors the crate's own documented hazard pattern (wire.rs: why `Scenario`
+/// is carried as a JSON string): the body is now a JSON **envelope string**
+/// (`{"mode": ..., ...}`) that the host decodes unambiguously. The fields
+/// after `body` (auth, certificate, follow_redirects, timeout, response_type)
+/// were never read by the v1 host and are dropped from the wire — so the
+/// "nothing follows body" claim in postcard.ts is now literally true.
+///
+/// `pub` (doc(hidden)) not `pub(crate)`: the F3 differential harness
+/// (`tests/native_vs_wasm.rs`, an integration test) decodes the wire with
+/// [`decode_wire_request`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[doc(hidden)]
+pub struct WireRequest {
+    pub url: String,
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    pub query_params: HashMap<String, String>,
+    pub body: Option<String>,
+}
+
+/// Encode `Option<Body>` as the wire's JSON envelope string. Every variant
+/// gets a `mode` tag, so the TS host never has to disambiguate postcard
+/// shapes (strings vs maps vs raw JSON values). Binary bytes ride as a JSON
+/// byte array (no extra dependency; correct, if not compact, on the bridge).
+#[cfg(target_arch = "wasm32")]
+fn body_to_wire(body: &Option<Body>) -> Option<String> {
+    let b = body.as_ref()?;
+    let env = match b {
+        Body::Raw(s) => serde_json::json!({ "mode": "raw", "raw": s }),
+        Body::Json(v) => serde_json::json!({ "mode": "json", "json": v }),
+        Body::FormData(fields) => serde_json::json!({ "mode": "form_data", "fields": fields }),
+        Body::UrlEncoded(fields) => serde_json::json!({ "mode": "url_encoded", "fields": fields }),
+        Body::Binary(data) => serde_json::json!({ "mode": "binary", "data": data }),
+        Body::GraphQL { query, variables } => {
+            serde_json::json!({ "mode": "graphql", "query": query, "variables": variables })
+        }
+    };
+    Some(env.to_string())
+}
+
+/// Decode a wire `Request` (the F3 harness / any native consumer). The wire
+/// carries the request shape the host needs; auth/certificate/timeout/etc.
+/// are not part of the v1 wire, so they default (the native seam and the
+/// wasm run path are the same code, so the harness only needs url/method/
+/// headers/query_params for its deterministic fixture).
+///
+/// WIRE-OF-RECORD: [`WireRequest`] is the layout the host sees — a future
+/// fix that wants auth/timeout/etc. in the browser (backlog line 203, the
+/// P2 "decoder drops Request.auth") must extend `WireRequest` AND the TS
+/// decoder together, not rely on `Request`'s own serde.
+#[doc(hidden)]
+pub fn decode_wire_request(bytes: &[u8]) -> Result<Request> {
+    let wire: WireRequest = postcard::from_bytes(bytes)
+        .map_err(|e| TropelError::Http(format!("decode wire request: {e}")))?;
+    Ok(Request {
+        url: wire.url,
+        method: Method::parse(&wire.method).unwrap_or(Method::GET),
+        headers: wire.headers,
+        query_params: wire.query_params,
+        body: None,
+        auth: None,
+        certificate: None,
+        follow_redirects: true,
+        timeout: None,
+        response_type: ResponseType::Text,
+    })
+}
 
 // ── wasm: the host import ──
 #[cfg(target_arch = "wasm32")]
@@ -69,7 +149,17 @@ pub mod native_seam {
 fn bridge(req: &Request) -> Result<Response> {
     #[cfg(target_arch = "wasm32")]
     {
-        let bytes = postcard::to_stdvec(req)
+        // Backlog line 44 (P0): serialize the WIRE VIEW (body as JSON
+        // envelope string), not the native `Request` — the native form put
+        // `Body`'s ambiguous postcard shapes on the wire.
+        let wire = WireRequest {
+            url: req.url.clone(),
+            method: req.method.to_string(),
+            headers: req.headers.clone(),
+            query_params: req.query_params.clone(),
+            body: body_to_wire(&req.body),
+        };
+        let bytes = postcard::to_stdvec(&wire)
             .map_err(|e| tropel_sdk::TropelError::Http(format!("encode request: {e}")))?;
         let packed = unsafe { tropel_host_http(bytes.as_ptr(), bytes.len()) };
         if packed == 0 {
