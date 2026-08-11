@@ -1394,10 +1394,16 @@ impl VUScheduler {
                     let handle = run_vu(self.shared_clone(), self.alloc_vu_id());
                     handles.push(handle);
                 }
-                // Synchronous bump — the next tick sees this count even if
-                // the new VUs haven't registered in `active_vus` yet, so a
-                // lagging registration can never trigger a double-spawn.
-                self.control_spawned.store(target, Ordering::Release);
+                // Add the DELTA, never an absolute store: a VU that exited
+                // concurrently (its `vu_exited` decrement landed between the
+                // `load` above and here) must not be clobbered — the old
+                // `store(target)` overwrote those decrements, so the pool
+                // permanently undershot its target (backlog line 164).
+                // `fetch_add` keeps every concurrent decrement, and the next
+                // tick's `target > spawned` sees the true shortfall and
+                // re-spawns the straggler.
+                self.control_spawned
+                    .fetch_add(target - spawned, Ordering::AcqRel);
                 tracing::debug!("Externally-controlled: VU pool {} → {}", spawned, target);
             } else if target < spawned {
                 // Shrink: reuse the ramp-down claim mechanism so exactly
@@ -1880,6 +1886,37 @@ mod tests {
         sched2.set_ramp_down_target(0, 1);
         assert!(sched2.try_claim_ramp_down(1).await);
         assert_eq!(sched2.control_spawned.load(Ordering::Acquire), 0);
+    }
+
+    /// Backlog line 164: the reconcile grow path must ADD the delta
+    /// (`fetch_add`) instead of storing the absolute target — an absolute
+    /// store clobbers a concurrent `vu_exited` decrement, so the pool
+    /// permanently undershoots its target and the control loop never
+    /// re-spawns the straggler. This mirrors the grow sequence: load
+    /// `spawned`, spawn, then bump by the delta; a VU exiting mid-grow must
+    /// survive.
+    #[tokio::test]
+    async fn control_grow_adds_delta_not_absolute_store() {
+        let sched = VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        sched.control_spawned.store(4, Ordering::Release);
+
+        // Grow from spawned=4 to target=8, exactly as the reconcile loop
+        // does. Between the load and the bump, one VU exits (its
+        // `vu_exited` decrement lands first).
+        let spawned = 4;
+        let target = 8;
+        sched.vu_exited(); // concurrent exit: 4 → 3
+        sched.control_spawned.fetch_add(target - spawned, Ordering::AcqRel);
+
+        // 3 + 4 = 7 — the decrement survives. An absolute store(8) would
+        // have clobbered it, leaving the pool silently one VU short.
+        assert_eq!(sched.control_spawned.load(Ordering::Acquire), 7);
     }
 
     /// Locked (backlog line 170): a VU exiting for ANY reason (not just a
