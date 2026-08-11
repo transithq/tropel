@@ -742,7 +742,25 @@ pm.request.headers = {
 // Postman's canonical idiom is `pm.request.body.raw = '...'`, which requires
 // a STABLE object whose `raw` accessor is bridge-wired (a getter returning a
 // fresh object each read would silently swallow the mutation).
-var _pmRequestBody = { mode: 'raw' };
+// Backlog line 101: `mode` was a plain module-scope property — a fresh
+// request per iteration re-seeded the raw text but NOT the mode, so
+// `pm.request.body.mode` leaked the previous iteration's value. It is now
+// a live getter backed by __tropel_pm_request_body_mode (falling back to
+// the last-assigned value when the bridge is absent, e.g. test stubs).
+var _pmRequestBody = {};
+var _pmBodyModeFallback = 'raw';
+Object.defineProperty(_pmRequestBody, 'mode', {
+    get: function () {
+        if (typeof __tropel_pm_request_body_mode === 'function') {
+            var m = __tropel_pm_request_body_mode();
+            if (m) return m;
+        }
+        return _pmBodyModeFallback;
+    },
+    set: function (m) { _pmBodyModeFallback = m || 'raw'; },
+    enumerable: true,
+    configurable: true
+});
 Object.defineProperty(_pmRequestBody, 'raw', {
     get: function () {
         if (typeof __tropel_pm_request_body === 'function') {
@@ -780,7 +798,21 @@ Object.defineProperty(pm.request, 'body', {
 // may inspect it in a test script).
 var _pmRequestAuth = null;
 Object.defineProperty(pm.request, 'auth', {
-    get: function () { return _pmRequestAuth; },
+    // Backlog line 101: the getter was a module-scope singleton, so a
+    // request with NO auth (or a different auth) on the next iteration
+    // still read the previous iteration's value. Read LIVE from the current
+    // request's auth via __tropel_pm_request_auth; fall back to the stored
+    // copy only when the bridge is absent (test stubs / browser slice).
+    get: function () {
+        if (typeof __tropel_pm_request_auth === 'function') {
+            var j = __tropel_pm_request_auth();
+            if (j) {
+                try { return JSON.parse(j); } catch (e) { return null; }
+            }
+            return null;
+        }
+        return _pmRequestAuth;
+    },
     set: function (auth) {
         _pmRequestAuth = auth;
         // JSON.stringify(undefined) is not a string — skip the bridge (and
@@ -1107,14 +1139,36 @@ pm.execution = {
     }
 };
 
-// ── pm.info ──
-pm.info = {
+// ── pm.info (live, backlog line 101) ──
+// Was a hardcoded stub (eventName 'test', iteration 0, iterationCount 1,
+// requestName '', requestId ''). Each field is now a getter backed by the
+// __tropel_pm_info bridge, so a test script sees the real iteration,
+// request name, and configured iteration count. Falls back to the old
+// stub values when the bridge is absent (test stubs / browser slice).
+var _pmInfoFallback = {
     eventName: 'test',
     iteration: 0,
     iterationCount: 1,
     requestName: '',
     requestId: ''
 };
+function _pmInfoRead() {
+    if (typeof __tropel_pm_info === 'function') {
+        var raw = __tropel_pm_info();
+        if (raw) {
+            try { return JSON.parse(raw); } catch (e) { /* fall through */ }
+        }
+    }
+    return _pmInfoFallback;
+}
+pm.info = {};
+['eventName', 'iteration', 'iterationCount', 'requestName', 'requestId'].forEach(function (k) {
+    Object.defineProperty(pm.info, k, {
+        get: function () { return _pmInfoRead()[k]; },
+        enumerable: true,
+        configurable: true
+    });
+});
 
 // ── pm.metrics (custom metrics) ──
 pm.metrics = {
