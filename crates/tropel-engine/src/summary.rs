@@ -105,6 +105,7 @@ pub(crate) fn build_summary_data(
             "checksTotal": results.checks_total,
             "checksPassed": results.checks_passed,
             "checksFailed": results.checks_failed,
+            "seriesDropped": results.series_dropped,
         },
     })
 }
