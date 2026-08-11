@@ -271,6 +271,22 @@ struct VuRunShared {
 
 /// Shared VU-run scaffolding used by both the scenario and driver paths:
 /// start-delay, scheduler + control API wiring, abort coordinator, the
+/// RAII guard: requests a graceful stop from the scheduler when dropped, so a
+/// scenario task that unwinds (e.g. a panic inside `pool.spawn_vu`'s ramp
+/// loop) still stops its VUs before the engine computes `results()`. Without
+/// this, `request_stop()` — which lives at the tail of every scheduler
+/// `run_*` — is never reached on the unwind path, and the VUs spawned so far
+/// keep emitting while the engine takes a torn snapshot (backlog line 163).
+/// `request_stop` is level-triggered and idempotent, so the guard is also
+/// harmless on the normal completion path.
+struct StopOnDrop(Arc<VUScheduler>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.request_stop();
+    }
+}
+
 /// `executor.run(...)` fan-out, and the post-run teardown (abort monitor,
 /// final vus/vus_max sample, dropped iterations, bounded drain, control API
 /// shutdown). The only difference between the two callers is the per-VU task
@@ -309,6 +325,11 @@ where
     vu_env.extend(sc_env);
 
     let executor = VUScheduler::new(&exec_cfg);
+    // A panic inside the executor's ramp/spawn path unwinds through
+    // `executor.run(...)` below and skips the scheduler's own `request_stop()`
+    // tail — this guard fires on that unwind path so VUs spawned so far stop
+    // before the engine computes `results()` (backlog line 163).
+    let _stop_on_drop = StopOnDrop(executor.control_handle());
 
     // Runtime control API (k6 /v1/status parity): when the executor is
     // externally-controlled and a control port is configured, serve the
@@ -1001,4 +1022,36 @@ async fn utils_emit_vus_metrics(
             },
         ])
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backlog line 163: `StopOnDrop` must request a graceful stop when
+    /// dropped on ANY exit path — including the unwind path where the
+    /// scheduler's own `request_stop()` tail is skipped. Without it, a
+    /// panicked scenario task orphans its VUs and the engine computes
+    /// `results()` while they still emit (a torn snapshot).
+    #[test]
+    fn stop_on_drop_requests_stop_even_on_drop_without_run() {
+        let executor = VUScheduler::new(&ExecutionConfig::SharedIterations {
+            iterations: 5,
+            max_duration: None,
+            vus: 10,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        assert!(!executor.is_stop_requested());
+        {
+            let _guard = StopOnDrop(executor.control_handle());
+            // Guard alive → no stop requested yet.
+            assert!(!executor.is_stop_requested());
+        }
+        // Dropped (simulating the unwind path) → stop requested.
+        assert!(
+            executor.is_stop_requested(),
+            "StopOnDrop must request stop on drop"
+        );
+    }
 }
