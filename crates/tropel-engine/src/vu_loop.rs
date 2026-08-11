@@ -358,10 +358,18 @@ where
         last_active_vus: last_active_vus.clone(),
     };
 
-    executor
+    // Backlog line 53: `executor.run(...).await.ok()` used to DISCARD the
+    // scheduler's error — a rejected execution config (e.g. a malformed
+    // duration) ran zero VUs and exited 0 with http_reqs: 0. Any executor
+    // rejection is now counted as a VU-init failure so the engine fails the
+    // run loudly instead of reporting a green zero-work run.
+    if let Err(e) = executor
         .run(move |sched, vu_id| run_vu(sched, vu_id, &shared))
         .await
-        .ok();
+    {
+        tracing::error!("Scenario '{}': executor rejected the run: {}", sc_name, e);
+        vu_init_failures.fetch_add(1, Ordering::SeqCst);
+    }
 
     // A VU that failed to START (driver init / client creation) means the
     // requested load was NOT delivered — surfacing the count loudly here (and

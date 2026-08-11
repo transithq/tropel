@@ -556,6 +556,12 @@ async fn run_command(cli: Cli) -> Result<()> {
         cli_iteration_data_empty,
     );
 
+    // Backlog line 53: a malformed duration (e.g. `-d 30x`) used to run a
+    // zero-VU "green" run — the scheduler swallowed the parse error and the
+    // run exited 0 with http_reqs: 0. Validate the execution config up front
+    // so a bad duration fails fast with a clear config error.
+    config.execution.validate()?;
+
     tracing::info!("Execution config: {:?}", config.execution); // Create the engine with extension registry (subprocess + WASM plugins
                                                                 // registered the same way `inspect`/`list` do — one shared builder).
     let registry = build_registry(subprocess_adapter, plugins_dir.as_deref())?;
