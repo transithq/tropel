@@ -834,6 +834,26 @@ fn push_redirect_hops(
     }
 }
 
+/// Backlog line 97: parse a tags JSON object into a [`TagMap`], coercing
+/// non-string values to strings (k6's `check(res, conds, {code: 200})` —
+/// k6 `ToString`s every tag value). The old `from_str::<HashMap<String,
+/// String>>()` failed on `{"code":200}` and silently dropped the ENTIRE
+/// tag map; this lenient parse never fails and never drops the map.
+fn stringify_tag_map_into(j: &str, tags: &mut TagMap) {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(j) {
+        for (k, val) in map {
+            let s = match val {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            tags.insert(k, s);
+        }
+    }
+}
+
 /// Implementation of [`push_http_samples`] with an explicit URL/method so
 /// redirect hops (different URL, same method) reuse the same emitter.
 #[allow(clippy::too_many_arguments)] // redirect-hop variant of push_http_samples (same field set + scenario)
@@ -1828,11 +1848,13 @@ impl K6DriverInstance {
                         let mut tags = TagMap::with_capacity(2);
                         tags.insert("check", name);
                         if let Some(j) = tags_json {
-                            if let Ok(extra) = serde_json::from_str::<HashMap<String, String>>(&j) {
-                                for (k, val) in extra {
-                                    tags.insert(k, val);
-                                }
-                            }
+                            // Backlog line 97: tag values may be non-strings
+                            // (check(r, {...}, {code: 200}) — k6 coerces every
+                            // tag value to a string). from_str::<HashMap<
+                            // String,String>>() failed on {"code":200} and
+                            // dropped the ENTIRE tag map; parse the object
+                            // and stringify each value instead.
+                            stringify_tag_map_into(&j, &mut tags);
                         }
                         v.push(Sample {
                             metric: "checks".into(),
@@ -1862,13 +1884,12 @@ impl K6DriverInstance {
                         if is_time {
                             tropel_metrics::time_metrics::register(&name);
                         }
-                        let tags = if tags_json.is_empty() || tags_json == "{}" {
-                            TagMap::new()
-                        } else {
-                            let parsed: HashMap<String, String> =
-                                serde_json::from_str(&tags_json).unwrap_or_default();
-                            TagMap::from_pairs(parsed)
-                        };
+                        let mut tags = TagMap::new();
+                        if !tags_json.is_empty() && tags_json != "{}" {
+                            // Backlog line 97: same lenient parse as check() —
+                            // metric.add(1, {code: 200}) must not drop the map.
+                            stringify_tag_map_into(&tags_json, &mut tags);
+                        }
                         let sample_type = match metric_type_str.as_str() {
                             "counter" => SampleType::Counter,
                             "gauge" => SampleType::Point,
@@ -6688,6 +6709,55 @@ mod tests {
         inst.run_iteration(&mut ctx)
             .await
             .expect("iteration must succeed with numeric __VU/__ITER");
+    }
+
+    #[tokio::test]
+    async fn test_check_tags_accept_non_string_values() {
+        // Backlog line 97: check(r, {...}, {code: 200}) — a NUMBER tag value
+        // — dropped the ENTIRE tag map (shim JSON.stringify → bridge
+        // from_str::<HashMap<String,String>> failed on {"code":200}, no
+        // warning). k6 coerces tag values to strings, so `code` must survive
+        // as "200" alongside string/bool tags. Exercised through the REAL
+        // bridge (register_script_bridges) and the drained sample sink.
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                check(1, { 'status is 200': function (v) { return v === 1; } },
+                      { code: 200, ok: true, name: 'health' });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+        let checks: Vec<_> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .collect();
+        assert_eq!(checks.len(), 1, "one check sample expected, got {:?}", ctx.samples.iter().map(|s| s.metric.as_ref()).collect::<Vec<_>>());
+        let sample = checks[0];
+        assert_eq!(
+            sample.tags.get("code"),
+            Some("200"),
+            "numeric tag value must survive as a string (k6 coerces)"
+        );
+        assert_eq!(
+            sample.tags.get("ok"),
+            Some("true"),
+            "boolean tag value must survive as a string"
+        );
+        assert_eq!(
+            sample.tags.get("name"),
+            Some("health"),
+            "string tag value must survive"
+        );
+        assert_eq!(
+            sample.tags.get("check"),
+            Some("status is 200"),
+            "the check name must still be stamped"
+        );
     }
 
     // ── k6/crypto + k6/encoding + k6/timers + randomSeed + x509 ──
