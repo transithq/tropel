@@ -1370,6 +1370,20 @@ if (typeof b64decode === 'undefined') { var b64decode = k6B64Decode; }
 var __tropel_timers = {};
 var __tropel_timer_seq = 0;
 
+// Backlog line 99: timers leaked across iterations. __tropel_timers is
+// module-scope and had no per-iteration reset, so a setInterval armed in
+// every iteration accumulated 3 live intervals all firing on every
+// subsequent pump — linear growth in callbacks and retained closures for
+// the VU's life. The driver calls __tropel_reset_timers() at the start of
+// each iteration so only the CURRENT iteration's timers are live: ones
+// armed in iteration N fire at the N boundary pump, then are cleared.
+// NOTE: the id sequence is NOT reset — a user-held timer id from an earlier
+// iteration must never collide with a fresh timer's id (stale clearInterval
+// would kill the wrong timer). Only the live table is cleared.
+function __tropel_reset_timers() {
+    __tropel_timers = {};
+}
+
 function setTimeout(fn, ms) {
     var id = ++__tropel_timer_seq;
     __tropel_timers[id] = { fn: fn, at: Date.now() + (ms || 0), interval: false, ms: ms || 0 };

@@ -1097,6 +1097,22 @@ impl DriverInstance for K6DriverInstance {
             self.register_ws_bridges();
         }
 
+        // Backlog line 99: timer state must not leak across iterations.
+        // __tropel_timers is module-scope in k6-shim.js; without a reset,
+        // a setInterval armed in every iteration accumulates live intervals
+        // that all fire on every subsequent pump (linear callback growth +
+        // retained closures for the VU's life). Reset at the START of each
+        // iteration so only timers armed during THIS iteration stay live —
+        // they fire at this iteration's boundary pump, then are cleared.
+        let _ = self.js_ctx.with_ctx(|rq_ctx| {
+            if let Ok(reset) = rq_ctx
+                .globals()
+                .get::<_, rquickjs::Function>("__tropel_reset_timers")
+            {
+                let _ = reset.call::<_, rquickjs::Value>(());
+            }
+        });
+
         // Sync VuContext state into JS globals (__tropel_vu_id, etc.)
         self.sync_globals(ctx).await?;
 
@@ -6944,6 +6960,49 @@ mod tests {
             inst.run_iteration(&mut ctx)
                 .await
                 .expect("iteration must succeed — the boundary pump fires the timer");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timer_state_resets_each_iteration() {
+        // Backlog line 99: timer state leaked across iterations —
+        // __tropel_timers is module-scope with no per-iteration reset, so a
+        // setInterval armed in EVERY iteration accumulated live intervals
+        // that all fired on every subsequent pump (linear growth in
+        // callbacks and retained closures for the VU's life). The driver now
+        // calls __tropel_reset_timers() at the start of each iteration.
+        //
+        // The script asserts the invariant itself: at the start of
+        // iteration N>1 the timer table must be EMPTY (the previous
+        // iteration's interval was cleared by the reset). Long ms keeps the
+        // interval pending so it never fires and never self-cleans — with
+        // the leak, iteration 2 would start with 1 live interval and throw.
+        let driver = K6Driver;
+        let script = br#"
+            export default function (data) {
+                var n = (globalThis.__calls = (globalThis.__calls || 0) + 1);
+                // Start of iteration N>1: the previous iteration's interval
+                // must have been cleared by the reset - zero live timers.
+                if (n > 1) {
+                    var liveAtStart = Object.keys(__tropel_timers).length;
+                    if (liveAtStart > 0) {
+                        throw new Error('timer leak across iterations: ' + liveAtStart + ' live at start of iter ' + n);
+                    }
+                }
+                setInterval(function () { globalThis.__fired = (globalThis.__fired || 0) + 1; }, 1000000);
+                // After arming, exactly ONE interval is live (the current
+                // iteration's) - never the accumulated set.
+                if (Object.keys(__tropel_timers).length !== 1) {
+                    throw new Error('expected exactly 1 live timer, got ' + Object.keys(__tropel_timers).length);
+                }
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        for _ in 0..3 {
+            inst.run_iteration(&mut ctx)
+                .await
+                .expect("iteration must succeed — timers must not leak across iterations");
         }
     }
 
