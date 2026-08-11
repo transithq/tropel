@@ -1134,6 +1134,33 @@ impl DriverInstance for K6DriverInstance {
             )
             .await;
 
+        // k6/timers (backlog line 131): fire due setTimeout/setInterval
+        // callbacks at the iteration boundary. k6 runs its timers on the VU
+        // event loop; Tropel executes JS synchronously per iteration, so the
+        // closest equivalent is pumping them here — which is exactly what
+        // unblocks the lodash debounce/throttle shims. A throwing callback
+        // is logged (not fatal), matching a best-effort event loop.
+        //
+        // Backlog line 100: the pump must run BEFORE the sample drain. Timer
+        // callbacks record samples (and may test.abort()) through the same
+        // bridge closures; draining first meant a callback's samples landed
+        // after the drain — picked up next iteration, or silently DISCARDED
+        // on the last one, and a timer's abort was delayed or lost.
+        // NOTE: the pump also runs BEFORE the error return below so timers
+        // armed in this iteration still drain even when the iteration itself
+        // threw (strict event-loop behavior — timers are not hostage to a
+        // throw).
+        let _ = self.js_ctx.with_ctx(|rq_ctx| {
+            if let Ok(pump) = rq_ctx
+                .globals()
+                .get::<_, rquickjs::Function>("__tropel_pump_timers")
+            {
+                if let Err(e) = pump.call::<_, rquickjs::Value>(()) {
+                    tracing::warn!("k6 timer callback error: {}", e);
+                }
+            }
+        });
+
         // Drain samples recorded by the native bridge closures during this
         // iteration (http_req_*, checks, custom metrics) into the VuContext
         // for the engine's metrics pipeline. k6 tags EVERY sample with the
@@ -1159,29 +1186,11 @@ impl DriverInstance for K6DriverInstance {
         ctx.samples.extend(bridge_samples);
 
         // Surface test.abort() to the engine so the run stops cleanly.
+        // Runs AFTER the pump (line 100: a timer callback's test.abort()
+        // must reach the engine this iteration, not next).
         if let Some(msg) = std::mem::take(&mut *self.abort_requested.lock().unwrap()) {
             ctx.abort(Some(msg));
         }
-
-        // k6/timers (backlog line 131): fire due setTimeout/setInterval
-        // callbacks at the iteration boundary. k6 runs its timers on the VU
-        // event loop; Tropel executes JS synchronously per iteration, so the
-        // closest equivalent is pumping them here — which is exactly what
-        // unblocks the lodash debounce/throttle shims. A throwing callback
-        // is logged (not fatal), matching a best-effort event loop.
-        // NOTE: the pump runs BEFORE the error return below so timers armed
-        // in this iteration still drain even when the iteration itself threw
-        // (strict event-loop behavior — timers are not hostage to a throw).
-        let _ = self.js_ctx.with_ctx(|rq_ctx| {
-            if let Ok(pump) = rq_ctx
-                .globals()
-                .get::<_, rquickjs::Function>("__tropel_pump_timers")
-            {
-                if let Err(e) = pump.call::<_, rquickjs::Value>(()) {
-                    tracing::warn!("k6 timer callback error: {}", e);
-                }
-            }
-        });
 
         // A rejected/thrown default export must fail the iteration (the
         // engine logs it and bumps the error path), not be swallowed.
@@ -7004,6 +7013,54 @@ mod tests {
                 .await
                 .expect("iteration must succeed — timers must not leak across iterations");
         }
+    }
+
+    #[tokio::test]
+    async fn test_timer_callback_samples_and_abort_survive_final_iteration() {
+        // Backlog line 100: run_iteration drained the sample sink BEFORE
+        // pumping timers, so anything a timer callback recorded landed AFTER
+        // the drain — picked up next iteration, or SILENTLY DISCARDED on the
+        // last one; test.abort() from a timer was delayed or lost. With a
+        // SINGLE iteration (which is the final iteration), a setTimeout(0)
+        // callback that records a check AND calls exec.test.abort() must
+        // have both effects visible after run_iteration returns.
+        let driver = K6Driver;
+        let script = br#"
+            export default function (data) {
+                setTimeout(function () {
+                    check(1, { 'from timer': function (v) { return v === 1; } });
+                    exec.test.abort('stop-from-timer');
+                }, 0);
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+        // The timer callback's check sample must be drained THIS iteration
+        // (the only one — nothing follows to pick it up).
+        let checks: Vec<_> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .collect();
+        assert_eq!(
+            checks.len(),
+            1,
+            "timer-callback check sample must survive the final iteration, got {:?}",
+            ctx.samples.iter().map(|s| s.metric.as_ref()).collect::<Vec<_>>()
+        );
+        // The timer's test.abort() must reach the engine THIS iteration.
+        assert!(
+            ctx.abort_requested,
+            "test.abort() from a timer callback must not be lost"
+        );
+        assert_eq!(
+            ctx.abort_message.as_deref(),
+            Some("stop-from-timer"),
+            "abort message must be the timer's"
+        );
     }
 
     #[tokio::test]
