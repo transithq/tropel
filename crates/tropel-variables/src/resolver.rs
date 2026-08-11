@@ -5,7 +5,10 @@ use std::collections::HashMap;
 /// Variable scope.
 #[derive(Debug, Clone, Default)]
 pub struct VariableScope {
-    /// Iteration data (highest priority).
+    /// Local variables (pm.variables) — HIGHEST priority, Postman's local
+    /// scope (backlog line 137). Script-set values here shadow data/env.
+    pub local: HashMap<String, serde_json::Value>,
+    /// Iteration data.
     pub data: HashMap<String, serde_json::Value>,
     /// Environment variables.
     pub env: HashMap<String, String>,
@@ -124,7 +127,15 @@ impl VariableResolver {
 
     /// Resolve a single variable name against the scope.
     pub fn resolve_variable(&self, var_name: &str, scope: &VariableScope) -> String {
-        // Priority: data > env > collection > globals
+        // Postman scope priority: local (pm.variables) > data > env >
+        // collection > globals.
+
+        // Local variables first — pm.variables is the highest-priority scope
+        // (backlog line 137: set-then-get must be consistent, so a local
+        // value shadows same-named iteration data).
+        if let Some(val) = scope.local.get(var_name) {
+            return value_to_string(val);
+        }
 
         // Check iteration data
         if let Some(val) = scope.data.get(var_name) {
@@ -315,6 +326,7 @@ mod tests {
     fn test_scope_priority() {
         let resolver = VariableResolver::new();
         let scope = VariableScope {
+            local: HashMap::new(),
             data: HashMap::from([("key".into(), serde_json::Value::String("data-value".into()))]),
             env: HashMap::from([("key".into(), "env-value".into())]),
             collection: HashMap::from([(
@@ -330,6 +342,28 @@ mod tests {
         // Data takes priority
         let result = resolver.resolve("{{key}}", &scope);
         assert_eq!(result, "data-value");
+    }
+
+    #[test]
+    fn test_local_variable_highest_priority() {
+        // Backlog line 137: pm.variables is the LOCAL scope — Postman's
+        // highest priority. A local value must shadow iteration data, env,
+        // collection and globals for {{var}} substitution.
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            local: HashMap::from([("key".into(), serde_json::Value::String("local".into()))]),
+            data: HashMap::from([("key".into(), serde_json::Value::String("data".into()))]),
+            env: HashMap::from([("key".into(), "env".into())]),
+            collection: HashMap::from([(
+                "key".into(),
+                serde_json::Value::String("col".into()),
+            )]),
+            globals: HashMap::from([(
+                "key".into(),
+                serde_json::Value::String("global".into()),
+            )]),
+        };
+        assert_eq!(resolver.resolve("{{key}}", &scope), "local");
     }
 
     #[test]
