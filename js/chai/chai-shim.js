@@ -44,6 +44,36 @@ var chai = chai || {};
         }
         : jsDeepEqual;
 
+    // chai's type() name for a value (backlog line 104: a/an were not
+    // callable — they were plain getters returning `this`, so
+    // `expect(x).to.be.a('string')` threw "a is not a function").
+    function chaiTypeName(obj) {
+        if (obj === null) return 'null';
+        if (Array.isArray(obj)) return 'array';
+        var t = typeof obj;
+        if (t === 'object') {
+            if (obj instanceof Date) return 'date';
+            if (obj instanceof RegExp) return 'regexp';
+            if (obj instanceof Error) return 'error';
+            if (typeof Map !== 'undefined' && obj instanceof Map) return 'map';
+            if (typeof Set !== 'undefined' && obj instanceof Set) return 'set';
+            if (typeof WeakMap !== 'undefined' && obj instanceof WeakMap) return 'weakmap';
+            if (typeof WeakSet !== 'undefined' && obj instanceof WeakSet) return 'weakset';
+            if (typeof Promise !== 'undefined' && obj instanceof Promise) return 'promise';
+            return 'object';
+        }
+        return t; // string, number, boolean, function, symbol, bigint, undefined
+    }
+
+    // Shared type check for a/an. `type` may be a chai type name ('string',
+    // 'array', 'object', 'null', ...) or a constructor function (instanceof).
+    function assertTypeMatches(obj, type) {
+        if (typeof type === 'function') {
+            return obj instanceof type;
+        }
+        return chaiTypeName(obj) === type;
+    }
+
     // ── Assertion Constructor ──
     function Assertion(obj, msg, ssfi) {
         this._obj = obj;
@@ -89,12 +119,49 @@ var chai = chai || {};
             },
             enumerable: true
         },
+        // Backlog line 104: a/an are CHAINABLE METHODS in chai — calling
+        // them asserts the type (`expect('x').to.be.a('string')`) and returns
+        // the assertion for chaining; the no-argument form stays a no-op
+        // chain getter. The Proxy (chai.expect) returns a variant that hands
+        // back the proxy so the unknown-name guard stays active afterwards.
         a: {
-            get: function () { return this; },
+            get: function () {
+                var self = this;
+                return function (type) {
+                    if (type !== undefined) {
+                        var negate = !!(self.__flags && self.__flags.negate);
+                        var passed = assertTypeMatches(self._obj, type) !== negate;
+                        if (!passed) {
+                            throw new Error(
+                                (self._msg ? self._msg + ': ' : '') +
+                                'expected ' + JSON.stringify(self._obj) +
+                                (negate ? ' not' : '') + ' to be a ' + (typeof type === 'function' ? type.name || 'constructor' : String(type))
+                            );
+                        }
+                    }
+                    return self;
+                };
+            },
             enumerable: true
         },
         an: {
-            get: function () { return this; },
+            get: function () {
+                var self = this;
+                return function (type) {
+                    if (type !== undefined) {
+                        var negate = !!(self.__flags && self.__flags.negate);
+                        var passed = assertTypeMatches(self._obj, type) !== negate;
+                        if (!passed) {
+                            throw new Error(
+                                (self._msg ? self._msg + ': ' : '') +
+                                'expected ' + JSON.stringify(self._obj) +
+                                (negate ? ' not' : '') + ' to be an ' + (typeof type === 'function' ? type.name || 'constructor' : String(type))
+                            );
+                        }
+                    }
+                    return self;
+                };
+            },
             enumerable: true
         }
     });
@@ -343,6 +410,168 @@ var chai = chai || {};
         return this;
     };
 
+    // ── Backlog line 104: missing assertion METHODS ──
+    // above/below/least/most/contain/instanceof/oneOf/throw were absent —
+    // accessing them hit the Proxy guard and threw "unknown assertion
+    // property", turning a large slice of valid chai red. These mirror
+    // chai's semantics, each returning `this` for chaining.
+
+    // .above(n) / .gt(n) / .greaterThan(n) — obj > n
+    Assertion.prototype.above = function (n) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (this._obj > n) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) +
+                (negate ? ' not' : '') + ' to be above ' + n
+            );
+        }
+        return this;
+    };
+    Assertion.prototype.gt = Assertion.prototype.above;
+    Assertion.prototype.greaterThan = Assertion.prototype.above;
+
+    // .below(n) / .lt(n) / .lessThan(n) — obj < n
+    Assertion.prototype.below = function (n) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (this._obj < n) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) +
+                (negate ? ' not' : '') + ' to be below ' + n
+            );
+        }
+        return this;
+    };
+    Assertion.prototype.lt = Assertion.prototype.below;
+    Assertion.prototype.lessThan = Assertion.prototype.below;
+
+    // .least(n) / .gte(n) — obj >= n (chai: `.at.least(n)`, `at` chains)
+    Assertion.prototype.least = function (n) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (this._obj >= n) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) +
+                (negate ? ' not' : '') + ' to be at least ' + n
+            );
+        }
+        return this;
+    };
+    Assertion.prototype.gte = Assertion.prototype.least;
+
+    // .most(n) / .lte(n) — obj <= n (chai: `.at.most(n)`)
+    Assertion.prototype.most = function (n) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (this._obj <= n) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) +
+                (negate ? ' not' : '') + ' to be at most ' + n
+            );
+        }
+        return this;
+    };
+    Assertion.prototype.lte = Assertion.prototype.most;
+
+    // .contain(value) — alias of .include (chai exposes both)
+    Assertion.prototype.contain = function (value) {
+        return this.include(value);
+    };
+    Assertion.prototype.contains = Assertion.prototype.contain;
+
+    // .instanceof(Ctor) / .instanceOf(Ctor) — instanceof check
+    Assertion.prototype.instanceof = function (Ctor) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (this._obj instanceof Ctor) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) +
+                (negate ? ' not' : '') + ' to be an instance of ' + (Ctor && Ctor.name ? Ctor.name : String(Ctor))
+            );
+        }
+        return this;
+    };
+    Assertion.prototype.instanceOf = Assertion.prototype.instanceof;
+
+    // .oneOf(list) — obj is a member of the list (deep-compare each element)
+    Assertion.prototype.oneOf = function (list) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var found = false;
+        if (Array.isArray(list)) {
+            for (var i = 0; i < list.length; i++) {
+                if (nativeDeepEqual(this._obj, list[i])) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        var passed = found !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) +
+                (negate ? ' not' : '') + ' to be one of ' + JSON.stringify(list)
+            );
+        }
+        return this;
+    };
+
+    // .throw([errorCtorOrMsg][, msgMatch]) — the target must be a function
+    // that throws; optionally checks the thrown error's constructor and/or
+    // message. Mirrors chai's throw/throws (error constructor OR string /
+    // regexp message match).
+    Assertion.prototype.throw = function (errType, errMsg) {
+        var fn = this._obj;
+        if (typeof fn !== 'function') {
+            throw new Error('expected ' + JSON.stringify(this._obj) + ' to be a function');
+        }
+        var negate = !!(this.__flags && this.__flags.negate);
+        var threw = false;
+        var caught = null;
+        try {
+            fn();
+        } catch (e) {
+            threw = true;
+            caught = e;
+        }
+        var passed = threw;
+        if (passed && errType !== undefined && errType !== null) {
+            if (typeof errType === 'function') {
+                passed = caught instanceof errType;
+            } else if (errType instanceof RegExp) {
+                passed = errType.test(String(caught && caught.message));
+            } else {
+                passed = caught && caught.message === String(errType);
+            }
+        }
+        if (passed && errMsg !== undefined) {
+            if (errMsg instanceof RegExp) {
+                passed = errMsg.test(String(caught && caught.message));
+            } else {
+                passed = caught && caught.message === String(errMsg);
+            }
+        }
+        passed = passed !== negate;
+        if (!passed) {
+            var want = 'to throw';
+            if (errType !== undefined && errType !== null) {
+                want += ' ' + (typeof errType === 'function' ? errType.name : String(errType));
+            }
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) + (negate ? ' not' : '') + ' ' + want
+            );
+        }
+        return this;
+    };
+    Assertion.prototype.throws = Assertion.prototype.throw;
+
     // ── chai.expect ──
     // Backlog §1: unimplemented assertion PROPERTIES (e.g. `.to.be.empty`,
     // `.to.exist`, `.NaN`, `.finite`) used to read as `undefined` and the
@@ -352,7 +581,7 @@ var chai = chai || {};
     // silently. Known names resolve normally through the prototype chain.
     chai.expect = function (val, msg) {
         var assertion = new Assertion(val, msg, chai.expect);
-        return new Proxy(assertion, {
+        var proxy = new Proxy(assertion, {
             get: function (target, prop, receiver) {
                 // Symbols (Symbol.toPrimitive etc.) and the standard
                 // inspection/promise interop names must resolve normally — a
@@ -364,12 +593,24 @@ var chai = chai || {};
                 ) {
                     return Reflect.get(target, prop, receiver);
                 }
+                if (prop === 'a' || prop === 'an') {
+                    // Chainable-method variant: the returned function hands
+                    // back THIS proxy so `expect(x).to.be.a('string').bogus`
+                    // still trips the unknown-name guard instead of silently
+                    // returning a raw assertion.
+                    var raw = Reflect.get(target, prop, receiver);
+                    return function (type) {
+                        raw.call(target, type);
+                        return proxy;
+                    };
+                }
                 if (prop in Assertion.prototype || prop in target) {
                     return Reflect.get(target, prop, receiver);
                 }
                 throw new Error("unknown assertion property '" + String(prop) + "'");
             }
         });
+        return proxy;
     };
 
     // .empty
