@@ -270,7 +270,22 @@ fn build_query_params(detail: &RequestDetail, url: &mut String) -> HashMap<Strin
         return HashMap::new();
     }
     if has_duplicate_keys(&pairs) {
-        let qs: Vec<String> = pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        // Backlog line 142: the old fold joined `k=v` RAW — a value like
+        // `a b` or `a&b` produced a query string the server could not parse
+        // back, and it was ASYMMETRIC with the non-duplicate path, where the
+        // HTTP client re-appends `query_params` via reqwest's `query()` and
+        // reqwest form-encodes. Percent-encode both key and value so the
+        // duplicate fold is byte-identical in intent to the reqwest path.
+        let qs: Vec<String> = pairs
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    percent_encoding::utf8_percent_encode(k, NON_ALPHANUMERIC),
+                    percent_encoding::utf8_percent_encode(v, NON_ALPHANUMERIC)
+                )
+            })
+            .collect();
         url.push('?');
         url.push_str(&qs.join("&"));
         HashMap::new()
@@ -278,6 +293,11 @@ fn build_query_params(detail: &RequestDetail, url: &mut String) -> HashMap<Strin
         pairs.into_iter().collect()
     }
 }
+
+/// Percent-encode everything except unreserved ASCII characters
+/// (A–Z a–z 0–9 and `- _ . ~`), matching application/x-www-form-urlencoded
+/// key/value encoding.
+const NON_ALPHANUMERIC: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC;
 
 fn has_duplicate_keys(pairs: &[(String, String)]) -> bool {
     let mut seen = std::collections::HashSet::new();
@@ -1456,6 +1476,42 @@ mod tests {
         let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
         let req = scenario.items[0].request.as_ref().unwrap();
         assert_eq!(req.url, "https://api.example.com/search?tag=a&tag=b");
+        assert!(req.query_params.is_empty());
+    }
+
+    #[test]
+    fn test_query_duplicate_fold_percent_encodes() {
+        // Regression (backlog line 142): the duplicate-key fold joined
+        // `k=v` RAW, so a value containing `&`, `=` or a space produced a
+        // query string the server could not parse — asymmetric with the
+        // non-duplicate path (reqwest form-encodes `query_params`). The fold
+        // must percent-encode both key and value.
+        let json = r#"{
+            "info": {"name": "Q", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Tags",
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": "https://api.example.com/search",
+                        "host": ["api", "example", "com"],
+                        "path": ["search"],
+                        "query": [
+                            {"key": "q", "value": "a b"},
+                            {"key": "q", "value": "x&y=z"}
+                        ]
+                    }
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(
+            req.url,
+            "https://api.example.com/search?q=a%20b&q=x%26y%3Dz",
+            "duplicate-fold values must be percent-encoded"
+        );
         assert!(req.query_params.is_empty());
     }
 
