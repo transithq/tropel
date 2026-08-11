@@ -33,14 +33,29 @@ impl InputAdapter for PostmanInputAdapter {
         // any document may legitimately contain the words "postman" /
         // "collection" in embedded content (e.g. a Google-search capture
         // of getpostman.com pages) and must NOT be mis-detected.
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        //
+        // Backlog line 146: the old probe materialized the ENTIRE document
+        // as a `serde_json::Value` just to read `info.schema`, then `parse`
+        // parsed it a second time — a redundant full parse. This probe only
+        // reads the two fields it needs; serde skips the (potentially huge)
+        // `item` subtree without building it.
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(default)]
+            info: Option<InfoProbe>,
+        }
+        #[derive(serde::Deserialize)]
+        struct InfoProbe {
+            #[serde(default)]
+            schema: Option<String>,
+        }
+        let Ok(probe) = serde_json::from_slice::<Probe>(bytes) else {
             return false;
         };
-        let schema = value
-            .get("info")
-            .and_then(|info| info.get("schema"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
+        let schema = probe
+            .info
+            .and_then(|info| info.schema)
+            .unwrap_or_default();
         schema.contains("getpostman.com") && schema.contains("collection")
     }
 

@@ -49,6 +49,108 @@ pub enum CollectionItem {
     Folder(Box<FolderItem>),
 }
 
+/// Presence-preserving `Option` reader: distinguishes a MISSING key
+/// (`None`) from a key present with `null` (`Some(None)`) from a key with a
+/// real value (`Some(Some(v))`). Keeps `CollectionItem`'s folder-first
+/// discrimination exact — a stray `"request": null` beside `"item": [...]`
+/// and a bare `"request": null` behave exactly as the old key-presence
+/// check did, without materializing the subtree.
+fn de_presence<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct Presence<T>(std::marker::PhantomData<T>);
+    impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for Presence<T> {
+        type Value = Option<Option<T>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a value or null")
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            T::deserialize(d).map(|v| Some(Some(v)))
+        }
+    }
+    deserializer.deserialize_option(Presence(std::marker::PhantomData))
+}
+
+/// `request` field reader for [`ItemUnion`]: distinguishes missing (`None`)
+/// from `null` / malformed (`Some(None)`) from a valid object
+/// (`Some(Some(..))`). A malformed request OBJECT is tolerated here rather
+/// than erroring — folder-first discrimination means a folder carrying a
+/// stray broken `request` key must still parse, while a request-only item
+/// with a bad `request` errors loudly at the discriminator.
+fn de_opt_request<'de, D>(deserializer: D) -> Result<Option<Option<RequestDetail>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct RequestPresence;
+    impl<'de> serde::de::Visitor<'de> for RequestPresence {
+        type Value = Option<Option<RequestDetail>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a request object or null")
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            Ok(Some(RequestDetail::deserialize(d).ok()))
+        }
+    }
+    deserializer.deserialize_option(RequestPresence)
+}
+
+/// Union of [`RequestItem`] and [`FolderItem`] fields, deserialized in a
+/// SINGLE streaming pass. Backlog line 146: the old `CollectionItem`
+/// deserialize first materialized the ENTIRE subtree as a `serde_json::Value`
+/// at every nesting level (O(N·depth) total), then re-parsed the concrete
+/// type from that Value — a second full parse of the same subtree. This
+/// merged struct reads every field exactly once; nested `item` children
+/// recurse through the same single-pass path.
+///
+/// Accepted divergence (kept intentional): `response` (request-only) and
+/// `variable` (folder-only) are still validated eagerly even for an item
+/// classified as the other kind — a folder carrying a stray malformed
+/// `response` key, or a request with a stray malformed `variable` key, fails
+/// the parse where the old per-kind structs ignored unknown keys. Both are
+/// pathological (Postman never mixes them); the `request` field IS lenient
+/// (`de_opt_request`) because real exports put `"request": null` beside
+/// `"item": [...]`.
+#[derive(serde::Deserialize)]
+struct ItemUnion {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    /// `None` = no `item` key (not a folder). `Some(Some(..))` = folder
+    /// children (possibly empty). `Some(None)` = `"item": null`.
+    #[serde(default, deserialize_with = "de_presence")]
+    item: Option<Option<Vec<CollectionItem>>>,
+    #[serde(default)]
+    variable: Vec<Variable>,
+    /// `None` = no `request` key. `Some(Some(..))` = request present and
+    /// valid. `Some(None)` = `"request": null` OR a malformed request
+    /// object — tolerated here so a folder carrying a stray broken `request`
+    /// key still parses (the old `FolderItem::deserialize` ignored unknown
+    /// keys); a request-ONLY item with a bad `request` then errors loudly in
+    /// the discriminator's `Some(None)` arm.
+    #[serde(default, deserialize_with = "de_opt_request")]
+    request: Option<Option<RequestDetail>>,
+    #[serde(default)]
+    response: Vec<ResponseDetail>,
+    #[serde(default)]
+    event: Vec<Event>,
+    #[serde(default)]
+    auth: Option<CollectionAuth>,
+}
+
 impl<'de> Deserialize<'de> for CollectionItem {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -58,28 +160,51 @@ impl<'de> Deserialize<'de> for CollectionItem {
         // carry `request`. Folder-first: a folder that also carries a stray
         // `request` key (some real exports put `"request": null` next to
         // `"item": [...]`) must keep its children rather than being
-        // misclassified as a request. If a request item's sub-fields fail to
-        // parse, this errors loudly instead of silently falling through to
-        // FolderItem (the pre-fix behavior that turned the request into an
-        // empty folder and dropped it).
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let is_folder = value
-            .as_object()
-            .map(|o| o.contains_key("item"))
-            .unwrap_or(false);
-        let is_request = !is_folder
-            && value
-                .as_object()
-                .map(|o| o.contains_key("request"))
-                .unwrap_or(false);
-        if is_request {
-            RequestItem::deserialize(value)
-                .map(CollectionItem::Request)
-                .map_err(serde::de::Error::custom)
-        } else {
-            FolderItem::deserialize(value)
-                .map(|f| CollectionItem::Folder(Box::new(f)))
-                .map_err(serde::de::Error::custom)
+        // misclassified as a request. A malformed request sub-field errors
+        // loudly (backlog line 146) instead of silently falling through to
+        // FolderItem.
+        let u = ItemUnion::deserialize(deserializer)?;
+        // Folder-first: the presence of the `item` key classifies as a
+        // folder, even with a stray `request` key next to it.
+        if let Some(items) = u.item {
+            let children = items.ok_or_else(|| {
+                serde::de::Error::custom("folder item must be an array, got null")
+            })?;
+            return Ok(CollectionItem::Folder(Box::new(FolderItem {
+                id: u.id,
+                name: u.name,
+                item: children,
+                event: u.event,
+                auth: u.auth,
+                variable: u.variable,
+            })));
+        }
+        // No `item` key: a present `request` key classifies as a request.
+        match u.request {
+            Some(Some(request)) => Ok(CollectionItem::Request(RequestItem {
+                id: u.id,
+                name: u.name,
+                request,
+                event: u.event,
+                response: u.response,
+                auth: u.auth,
+            })),
+            // `"request": null` (or a malformed object) without a folder —
+            // same loud error the old RequestItem-from-null path produced.
+            // de_opt_request maps both null and malformed to `Some(None)`.
+            Some(None) => Err(serde::de::Error::custom(
+                "request must be a valid request object",
+            )),
+            // Neither key: the old fallback deserialized FolderItem, which
+            // only requires `name`.
+            None => Ok(CollectionItem::Folder(Box::new(FolderItem {
+                id: u.id,
+                name: u.name,
+                item: vec![],
+                event: u.event,
+                auth: u.auth,
+                variable: u.variable,
+            }))),
         }
     }
 }
@@ -568,6 +693,75 @@ mod tests {
                 assert!(matches!(f.item[0], CollectionItem::Request(_)));
             }
             CollectionItem::Request(_) => panic!("folder misclassified as request"),
+        }
+    }
+
+    #[test]
+    fn folder_first_tolerates_stray_malformed_request_object() {
+        // Folder-first (backlog line 146): a folder that also carries a
+        // stray `request` key — even a MALFORMED one — must still parse as
+        // a folder. The old FolderItem::deserialize ignored unknown keys
+        // entirely; the single-pass ItemUnion must not let a stray broken
+        // request sink the whole collection (de_opt_request tolerates it;
+        // only a request-ONLY item with a bad `request` errors loudly).
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "folder",
+                "request": { "method": 123, "url": { "raw": 42 } },
+                "item": [{ "name": "child", "request": { "method": "GET", "url": "https://x.test/" } }]
+            }]
+        }));
+        assert_eq!(col.item.len(), 1);
+        match &col.item[0] {
+            CollectionItem::Folder(f) => {
+                assert_eq!(f.name, "folder");
+                assert_eq!(f.item.len(), 1, "folder must keep its child");
+                assert!(matches!(f.item[0], CollectionItem::Request(_)));
+            }
+            CollectionItem::Request(_) => panic!("folder misclassified as request"),
+        }
+    }
+
+    #[test]
+    fn deep_nesting_parses_in_single_pass() {
+        // Backlog line 146: parse used to be O(N·depth) — every nesting
+        // level materialized a `serde_json::Value` of its ENTIRE subtree,
+        // then re-parsed the concrete type from it (a second full parse).
+        // The single-pass merged discriminator must handle a deep folder
+        // chain correctly: each level is parsed once, and the deepest
+        // request still comes out.
+        let mut inner = json!({
+            "name": "deep-req",
+            "request": { "method": "GET", "url": "https://x.test/" }
+        });
+        for _ in 0..50 {
+            inner = json!({
+                "name": "folder",
+                "item": [inner]
+            });
+        }
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [inner]
+        }));
+        let mut current = &col.item[0];
+        let mut depth = 0;
+        loop {
+            match current {
+                CollectionItem::Folder(f) => {
+                    assert_eq!(f.item.len(), 1, "depth {} must hold one child", depth);
+                    current = &f.item[0];
+                    depth += 1;
+                }
+                CollectionItem::Request(_) => break,
+            }
+            assert!(depth <= 51, "unbounded nesting: {depth}");
+        }
+        assert_eq!(depth, 50, "all 50 folder levels must survive");
+        match current {
+            CollectionItem::Request(r) => assert_eq!(r.name, "deep-req"),
+            CollectionItem::Folder(_) => panic!("expected the deepest request"),
         }
     }
 

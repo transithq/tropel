@@ -4310,6 +4310,7 @@ name = "tropel-collection"
 version = "0.1.0"
 dependencies = [
  "insta",
+ "percent-encoding",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -4504,6 +4505,7 @@ name = "tropel-input-postman"
 version = "0.1.0"
 dependencies = [
  "inventory",
+ "serde",
  "serde_json",
  "tropel-collection",
  "tropel-sdk",

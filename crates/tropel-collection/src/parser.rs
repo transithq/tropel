@@ -118,6 +118,21 @@ fn convert_items(
                 // outer→inner.
                 let mut events = parent_events.to_vec();
                 events.extend(folder.event.iter().cloned());
+                let children = convert_items(&folder.item, &events, folder_auth);
+                // Backlog line 146: an EMPTY folder (no requests anywhere in
+                // its subtree) must not be emitted as a ScenarioItem.
+                // `flatten_execution_items` treats any leaf carrying scripts
+                // as executable, so a script-bearing empty folder would run
+                // as a pseudo-request that sends NO HTTP call. Postman runs
+                // folder scripts around the folder's requests; with none,
+                // they never run — the folder contributes nothing and is
+                // dropped. (The k6 adapter's script-only leaf is
+                // structurally identical — request: None + scripts + no
+                // items — but MUST still run, so this distinction can only
+                // be made here, at parse time.)
+                if children.is_empty() {
+                    continue;
+                }
                 let scenario_item = ScenarioItem {
                     id: folder.id.clone(),
                     name: folder.name.clone(),
@@ -130,7 +145,7 @@ fn convert_items(
                     prerequest: find_prerequest_script(&folder.event),
                     test: find_test_script(&folder.event),
                     assertions: vec![],
-                    items: convert_items(&folder.item, &events, folder_auth),
+                    items: children,
                 };
                 result.push(scenario_item);
             }
@@ -1021,6 +1036,55 @@ mod tests {
         assert_eq!(pre.len(), 2, "inherited + own script, got: {pre:?}");
         assert!(pre[0].contains("COLL_PRE"), "inherited script first");
         assert!(pre[1].contains("REQ_PRE"), "request's own script second");
+    }
+
+    #[test]
+    fn empty_folder_with_scripts_not_emitted_as_pseudo_request() {
+        // Backlog line 146: an empty folder that only carries scripts must
+        // NOT be emitted as a ScenarioItem. `flatten_execution_items` treats
+        // any leaf with scripts as executable, so a script-bearing empty
+        // folder used to run as a pseudo-request that sends NO HTTP call.
+        // Postman runs folder scripts around the folder's requests; with
+        // none, they never run — so the folder is dropped at parse time.
+        // (A k6 script-only leaf is structurally identical but MUST still
+        // run, so the distinction can only be made here, in the parser.)
+        let json = r#"{
+            "info": {"name": "Empty Folder Scripts", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Folder",
+                "event": [{"listen": "prerequest", "script": {"exec": ["FOLDER_PREREQUEST"], "type": "text/javascript"}}],
+                "item": []
+            }]
+        }"#;
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        assert!(
+            scenario.items.is_empty(),
+            "empty folder with scripts must not be emitted: {:?}",
+            scenario.items
+        );
+    }
+
+    #[test]
+    fn folder_with_only_empty_subfolders_not_emitted() {
+        // Backlog line 146: a folder whose ENTIRE subtree contains no
+        // requests (only nested empty folders) must also be dropped — it
+        // would otherwise become a pseudo-request leaf.
+        let json = r#"{
+            "info": {"name": "Nested Empty", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Outer",
+                "item": [{
+                    "name": "Inner",
+                    "item": []
+                }]
+            }]
+        }"#;
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        assert!(
+            scenario.items.is_empty(),
+            "folder with no requests in subtree must be dropped: {:?}",
+            scenario.items
+        );
     }
 
     #[test]
