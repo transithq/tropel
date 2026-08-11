@@ -196,18 +196,36 @@ fn convert_request(
 
     let query_params = build_query_params(detail, &mut url);
 
-    let body = convert_body(detail.body.as_ref());
+    let mut body = convert_body(detail.body.as_ref());
+
+    // Backlog line 140: Postman prunes the request body for GET/HEAD unless
+    // `protocolProfileBehavior.disableBodyPruning` is set. The HTTP client is
+    // now method-agnostic (it attaches whatever body it is given), so the
+    // GET/HEAD pruning happens HERE — the Postman boundary — instead of in
+    // the transport. DELETE/OPTIONS/TRACE and custom-method bodies are kept.
+    let disable_pruning = detail
+        .protocol_profile_behavior
+        .as_ref()
+        .map(|p| p.disable_body_pruning)
+        .unwrap_or(false);
+    if !disable_pruning && matches!(&method, Method::GET | Method::HEAD) {
+        body = None;
+    }
 
     // Backlog line 138: `options.raw.language` selects the Content-Type for
     // a raw body (Postman: language "json" → `application/json`, etc.). The
     // field was parsed and never read — inject the header when the user has
-    // not already set one (case-insensitively).
-    if let Some(content_type) = raw_content_type(detail.body.as_ref()) {
-        let has_ct = headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("content-type"));
-        if !has_ct {
-            headers.insert("Content-Type".to_string(), content_type);
+    // not already set one (case-insensitively). Skipped when the body was
+    // just pruned for GET/HEAD (line 140) — a Content-Type header must not
+    // survive on a request that no longer carries a body.
+    if body.is_some() {
+        if let Some(content_type) = raw_content_type(detail.body.as_ref()) {
+            let has_ct = headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-type"));
+            if !has_ct {
+                headers.insert("Content-Type".to_string(), content_type);
+            }
         }
     }
 
@@ -1243,6 +1261,65 @@ mod tests {
             Some(AuthConfig::OAuth2 { access_token, .. }) => assert_eq!(access_token, "tok"),
             other => panic!("expected OAuth2 auth, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_get_prunes_body_unless_disable_body_pruning() {
+        // Regression (backlog line 140): bodies were dropped in the HTTP
+        // client for DELETE/OPTIONS/TRACE and custom methods, and Postman's
+        // GET/HEAD body pruning was absent repo-wide. The client is now
+        // method-agnostic; the parser is the Postman boundary: GET/HEAD
+        // prune the body by default, `protocolProfileBehavior
+        // .disableBodyPruning` opts out, and DELETE/OPTIONS/TRACE keep it.
+        let json = r#"{
+            "info": {"name": "Bodies", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "GetPruned",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/a"},
+                    "body": {"mode": "raw", "raw": "should-be-pruned"}
+                }
+            }, {
+                "name": "GetKept",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/b"},
+                    "protocolProfileBehavior": {"disableBodyPruning": true},
+                    "body": {"mode": "raw", "raw": "{\"kept\":true}"}
+                }
+            }, {
+                "name": "DeleteWithBody",
+                "request": {
+                    "method": "DELETE",
+                    "url": {"raw": "https://api.example.com/c"},
+                    "body": {"mode": "raw", "raw": "delete-me"}
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+
+        let pruned = scenario.items[0].request.as_ref().unwrap();
+        assert!(
+            pruned.body.is_none(),
+            "GET body must be pruned by default, got {:?}",
+            pruned.body
+        );
+
+        let kept = scenario.items[1].request.as_ref().unwrap();
+        assert!(
+            matches!(kept.body.as_ref(), Some(Body::Raw(s)) if s == "{\"kept\":true}"),
+            "disableBodyPruning must keep the GET body, got {:?}",
+            kept.body
+        );
+
+        let del = scenario.items[2].request.as_ref().unwrap();
+        assert!(
+            matches!(del.body.as_ref(), Some(Body::Raw(s)) if s == "delete-me"),
+            "DELETE body must be kept, got {:?}",
+            del.body
+        );
     }
 
     #[test]
