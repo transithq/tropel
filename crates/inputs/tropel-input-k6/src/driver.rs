@@ -51,7 +51,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tropel_js::JsContext;
 use tropel_sdk::{
-    AuthConfig, Body, Method, Request, Response, Sample, SampleType, TagMap, Timings,
+    AuthConfig, Body, Cookie, Method, Request, Response, Sample, SampleType, TagMap, Timings,
 };
 use tropel_sdk::{
     Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
@@ -1192,6 +1192,7 @@ fn build_k6_response_object<'js>(
     error: &str,
     error_code: i32,
     response_type: &str,
+    cookies: &[Cookie],
 ) -> rquickjs::Object<'js> {
     let obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 response");
     let _ = obj.set("code", code as i32);
@@ -1205,6 +1206,48 @@ fn build_k6_response_object<'js>(
     }
     let _ = obj.set("headers", headers_obj);
     let _ = obj.set("response_time", response_time_ms);
+    // Backlog line 102: res.cookies was absent (res.cookies['sid'] threw).
+    // k6 shape: { name: [{name, value, domain, path, httpOnly, secure,
+    // maxAge, expires, sameSite}] } — an object keyed by cookie name with
+    // an ARRAY of cookie objects per name.
+    let cookies_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 cookies");
+    for c in cookies {
+        let entry = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 cookie entry");
+        let _ = entry.set("name", c.name.as_str());
+        let _ = entry.set("value", c.value.as_str());
+        if let Some(d) = &c.domain {
+            let _ = entry.set("domain", d.as_str());
+        }
+        if let Some(p) = &c.path {
+            let _ = entry.set("path", p.as_str());
+        }
+        if let Some(v) = c.http_only {
+            let _ = entry.set("httpOnly", v);
+        }
+        if let Some(v) = c.secure {
+            let _ = entry.set("secure", v);
+        }
+        if let Some(e) = &c.expires {
+            let _ = entry.set("expires", e.as_str());
+        }
+        if let Some(s) = &c.same_site {
+            let _ = entry.set("sameSite", s.as_str());
+        }
+        match cookies_obj.get::<_, rquickjs::Value>(c.name.as_str()) {
+            Ok(v) if v.is_array() => {
+                let _ = v.as_array().map(|a| {
+                    let idx = a.len();
+                    let _ = a.set(idx, entry);
+                });
+            }
+            _ => {
+                let arr = rquickjs::Array::new(ctx.clone()).expect("Array::new for k6 cookies");
+                let _ = arr.set(0, entry);
+                let _ = cookies_obj.set(c.name.as_str(), arr);
+            }
+        }
+    }
+    let _ = obj.set("cookies", cookies_obj);
     // Real connection-phase timings (k6 keys + Tropel's extra `dns`).
     if let Some(t) = timings {
         let timings_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 timings");
@@ -1415,6 +1458,7 @@ fn register_http_bridges<'js>(
                         &format!("invalid HTTP method {}", method),
                         1000,
                         &response_type,
+                        &[],
                     );
                 };
                 let req = Request {
@@ -1499,6 +1543,7 @@ fn register_http_bridges<'js>(
                             "",
                             0,
                             &response_type,
+                            &resp.cookies,
                         )
                     }
                     Err(e) => {
@@ -1523,6 +1568,7 @@ fn register_http_bridges<'js>(
                             &err,
                             k6_error_code(&err),
                             &response_type,
+                            &[],
                         )
                     }
                 }
@@ -1741,6 +1787,28 @@ fn register_http_bridges<'js>(
                                 "error": "",
                                 "error_code": 0,
                             });
+                            // Backlog line 102: batch responses carry cookies
+                            // too (k6 shape: name -> [cookie objects]).
+                            let mut cookies_map = serde_json::Map::new();
+                            for c in &resp.cookies {
+                                let entry = serde_json::json!({
+                                    "name": c.name,
+                                    "value": c.value,
+                                    "domain": c.domain,
+                                    "path": c.path,
+                                    "httpOnly": c.http_only,
+                                    "secure": c.secure,
+                                    "expires": c.expires,
+                                    "sameSite": c.same_site,
+                                });
+                                cookies_map
+                                    .entry(c.name.clone())
+                                    .or_insert_with(|| serde_json::json!([]))
+                                    .as_array_mut()
+                                    .map(|a| a.push(entry));
+                            }
+                            resp_json["cookies"] =
+                                serde_json::Value::Object(cookies_map);
                             if let Some(t) = &resp.timings {
                                 resp_json["timings"] = serde_json::json!({
                                     "blocked": t.blocked.as_secs_f64() * 1000.0,
@@ -3891,6 +3959,64 @@ mod tests {
                     .to_lowercase()
                     .contains("\"content-type\":\"multipart/form-data\""),
                 "boundary-less content-type variant leaked into header: {mp_lower}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_k6_response_cookies_request_proto_remote_ip_html() {
+        // Backlog line 102: res.cookies / res.request / proto / remote_ip /
+        // html() were absent — `res.cookies['sid']` threw TypeError. The
+        // shim must surface all five from the native bridge result: cookies
+        // in k6's shape (name -> array of {name,value,...}), the REQUEST
+        // that produced the response (headers/body, not the response's),
+        // best-effort proto/remote_ip, and a jQuery-like html() selection.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body) {
+                    return {
+                        code: 200, status: 200,
+                        body: '<html><body><h1 class="title">Hello</h1><p id="sub">World</p></body></html>',
+                        headers: { 'Content-Type': 'text/html' },
+                        responseTime: 5,
+                        cookies: {
+                            sid: [{ name: 'sid', value: 'abc123', domain: 'example.com', path: '/', httpOnly: true, secure: true }]
+                        }
+                    };
+                };
+            "#,
+            )
+            .expect("stub should eval");
+            ctx.eval::<(), _>(
+                r#"
+                var res = http.get('https://example.com/', { headers: { 'X-Request-Id': 'req-7' } });
+                globalThis.__out = JSON.stringify([
+                    res.cookies.sid ? res.cookies.sid[0].value : null,
+                    res.cookies.sid ? res.cookies.sid[0].httpOnly : null,
+                    res.request.method,
+                    res.request.url,
+                    res.request.headers['X-Request-Id'],
+                    res.proto,
+                    typeof res.remote_ip,
+                    res.html().find('.title').text(),
+                    res.html().find('#sub').text()
+                ]);
+            "#,
+            )
+            .expect("script should eval");
+            let out: String = ctx.eval("__out").expect("read __out");
+            assert_eq!(
+                out,
+                concat!(
+                    "[\"abc123\",true,\"GET\",\"https://example.com/\",",
+                    "\"req-7\",\"HTTP/1.1\",\"string\",\"Hello\",\"World\"]"
+                ),
+                "res.cookies/request/proto/remote_ip/html() mismatch: {out}"
             );
         });
     }
