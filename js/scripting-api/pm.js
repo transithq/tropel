@@ -503,6 +503,67 @@ function addPropAssertions(chain, actual, negated) {
 }
 
 pm.expect = function (actual) {
+    // Negated chain body, shared by both spellings Postman emits
+    // (`not.to.*` and `to.not.*`). Each member THROWS when the positive
+    // holds. Property assertions are installed negated on the chain and its
+    // `be` sub-chain so `to.not.be.true` is guarded too.
+    function buildNegated() {
+        var negated = {
+            eql: function (expected) {
+                if (deepEqual(actual, expected)) {
+                    throw new Error(
+                        'expected ' + shortJson(actual) + ' not to eql ' + shortJson(expected)
+                    );
+                }
+            },
+            equal: function (expected) {
+                if (actual === expected) {
+                    throw new Error(
+                        'expected ' + shortJson(actual) + ' not to equal ' + shortJson(expected)
+                    );
+                }
+            },
+            // Postman emits `to.not.include(...)` for "must not contain".
+            // Mirrored from the positive include (line 88 fixes the positive
+            // path on both chains).
+            include: function (expected) {
+                if (String(actual).indexOf(String(expected)) !== -1) {
+                    throw new Error('expected value not to include ' + shortJson(expected));
+                }
+            },
+            match: function (regex) {
+                if (regex.test(String(actual))) {
+                    throw new Error('expected value not to match ' + regex);
+                }
+            },
+            have: {
+                property: function (prop, value) {
+                    var obj = actual;
+                    var has = obj && (prop in obj);
+                    var passed = has && (value === undefined || obj[prop] === value);
+                    if (passed) {
+                        throw new Error('expected value not to have property ' + prop);
+                    }
+                }
+            },
+            be: {
+                // `pm.expect(x).to.not.be.true` must THROW when the positive
+                // holds (the guard applies here too).
+                an: function (type) {
+                    if (typeOf(actual) === type) {
+                        throw new Error('expected value not to be an ' + type);
+                    }
+                },
+                a: function (type) {
+                    return this.an(type);
+                }
+            }
+        };
+        addPropAssertions(negated, actual, true);
+        addPropAssertions(negated.be, actual, true);
+        return negated;
+    }
+
     var chain = {
         to: {
             // Backlog line 144: chai semantics — .eql is DEEP equality,
@@ -584,49 +645,20 @@ pm.expect = function (actual) {
                 if (!regex.test(String(actual))) {
                     throw new Error('expected value to match ' + regex);
                 }
-            }
+            },
+            // Backlog line 87: Postman snippets emit `to.not.*` — the negated
+            // chain must be reachable from `.to` as well as `.not.to`.
+            not: buildNegated()
         },
         not: {
-            to: {
-                eql: function (expected) {
-                    if (deepEqual(actual, expected)) {
-                        throw new Error(
-                            'expected ' + shortJson(actual) + ' not to eql ' + shortJson(expected)
-                        );
-                    }
-                },
-                equal: function (expected) {
-                    if (actual === expected) {
-                        throw new Error(
-                            'expected ' + shortJson(actual) + ' not to equal ' + shortJson(expected)
-                        );
-                    }
-                },
-                be: {
-                    // Negated property/type assertions:
-                    // `pm.expect(x).not.to.be.true` must THROW when the
-                    // positive holds (the guard applies here too).
-                    an: function (type) {
-                        if (typeOf(actual) === type) {
-                            throw new Error('expected value not to be an ' + type);
-                        }
-                    },
-                    a: function (type) {
-                        return this.an(type);
-                    }
-                }
-            }
+            to: buildNegated()
         }
     };
+
     // Install the property assertions on the chain levels where chai-postman
     // exposes them, then guard the whole chain so ANY unknown name throws.
     addPropAssertions(chain.to, actual);
     addPropAssertions(chain.to.be, actual);
-    // Negated chain: both `not.to.true` and the canonical `not.to.be.true`
-    // must be guarded (the getters live on the `be` object, which is a
-    // SEPARATE literal from `not.to`).
-    addPropAssertions(chain.not.to, actual, true);
-    addPropAssertions(chain.not.to.be, actual, true);
     return guardChain(chain);
 };
 

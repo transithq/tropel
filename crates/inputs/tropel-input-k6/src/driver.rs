@@ -4504,6 +4504,77 @@ mod tests {
     }
 
     #[test]
+    fn test_to_not_chain_matches_not_to() {
+        // Backlog line 87: Postman snippets emit `pm.expect(x).to.not.*`
+        // (negation AFTER .to), but only `.not.to.*` existed — the to.not
+        // spelling read as `unknown assertion property 'not'` and recorded
+        // FAIL while chai.expect handled it fine. Both spellings now share
+        // one negated chain.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                // .to.not.* (Postman's spelling) — pass when values differ.
+                trial('to_not_equal_diff', function () { pm.expect(1).to.not.equal(2); });
+                trial('to_not_equal_same', function () { pm.expect(1).to.not.equal(1); });
+                trial('to_not_eql_diff', function () { pm.expect({ a: 1 }).to.not.eql({ b: 2 }); });
+                trial('to_not_eql_same', function () { pm.expect({ a: 1 }).to.not.eql({ a: 1 }); });
+                trial('to_not_be_true_neg', function () { pm.expect(false).to.not.be.true; });
+                trial('to_not_be_true_pos', function () { pm.expect(true).to.not.be.true; });
+                trial('to_not_be_an_neg', function () { pm.expect('x').to.not.be.an('number'); });
+                trial('to_not_be_an_pos', function () { pm.expect(1).to.not.be.an('number'); });
+                trial('to_not_be_a_neg', function () { pm.expect(1).to.not.be.a('string'); });
+                // Negated include/match/have (Postman's "must not contain").
+                trial('to_not_include_absent', function () { pm.expect('abcdef').to.not.include('zzz'); });
+                trial('to_not_include_present', function () { pm.expect('abcdef').to.not.include('bcd'); });
+                trial('to_not_match_no', function () { pm.expect('abcdef').to.not.match(/zzz/); });
+                trial('to_not_match_yes', function () { pm.expect('abcdef').to.not.match(/bcd/); });
+                trial('to_not_have_prop_absent', function () { pm.expect({ a: 1 }).to.not.have.property('b'); });
+                trial('to_not_have_prop_present', function () { pm.expect({ a: 1 }).to.not.have.property('a'); });
+                // Old spelling must still work.
+                trial('not_to_equal_same', function () { pm.expect(1).not.to.equal(1); });
+                trial('not_to_be_true_pos', function () { pm.expect(true).not.to.be.true; });
+                // Guard still applies on the negated chains.
+                trial('to_not_unknown', function () { pm.expect(1).to.not.bogus; });
+                trial('not_to_unknown', function () { pm.expect(1).not.to.bogus; });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("to_not_equal_diff"), "true", "to.not.equal passes when values differ");
+            assert_eq!(r("to_not_equal_same"), "threw", "to.not.equal throws when values match");
+            assert_eq!(r("to_not_eql_diff"), "true", "to.not.eql passes when values differ");
+            assert_eq!(r("to_not_eql_same"), "threw", "to.not.eql throws when values deep-match");
+            assert_eq!(r("to_not_be_true_neg"), "true", "to.not.be.true passes for false");
+            assert_eq!(r("to_not_be_true_pos"), "threw", "to.not.be.true throws for true");
+            assert_eq!(r("to_not_be_an_neg"), "true", "to.not.be.an passes on wrong type");
+            assert_eq!(r("to_not_be_an_pos"), "threw", "to.not.be.an throws on matching type");
+            assert_eq!(r("to_not_be_a_neg"), "true", "to.not.be.a passes on wrong type");
+            assert_eq!(r("to_not_include_absent"), "true", "to.not.include passes when value absent");
+            assert_eq!(r("to_not_include_present"), "threw", "to.not.include throws when value present");
+            assert_eq!(r("to_not_match_no"), "true", "to.not.match passes when no match");
+            assert_eq!(r("to_not_match_yes"), "threw", "to.not.match throws when matched");
+            assert_eq!(r("to_not_have_prop_absent"), "true", "to.not.have.property passes when absent");
+            assert_eq!(r("to_not_have_prop_present"), "threw", "to.not.have.property throws when present");
+            assert_eq!(r("not_to_equal_same"), "threw", "not.to.equal still throws when values match");
+            assert_eq!(r("not_to_be_true_pos"), "threw", "not.to.be.true still throws for true");
+            assert_eq!(r("to_not_unknown"), "threw", "unknown property on to.not throws");
+            assert_eq!(r("not_to_unknown"), "threw", "unknown property on not.to throws");
+        });
+    }
+
+    #[test]
     fn test_unimplemented_assertion_properties_fail_closed() {
         // Backlog §1 P0: unimplemented assertion PROPERTIES (pm.expect(false)
         // .to.be.true, .to.be.null/.undefined/.ok/.empty, pm.expect(null)
