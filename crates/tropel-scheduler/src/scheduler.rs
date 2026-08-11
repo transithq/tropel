@@ -884,10 +884,12 @@ impl VUScheduler {
         // with "JoinHandle polled after completion" if a completed handle is
         // re-polled. The old code joined here and then joined AGAIN in
         // `await_handles_bounded`, which panicked the scenario task on every
-        // shared-iterations run. After this block the handles are dropped:
-        // drained VUs are already done, and in the max_duration branch the
-        // level-triggered stop flag plus the engine's active_vus drain loop
-        // let any stragglers exit on their own.
+        // shared-iterations run. In the max_duration branch we DO still call
+        // `await_handles_bounded` (after the select releases its borrow), but
+        // it now skips handles the select already polled to completion (via
+        // the non-polling `is_finished()` check) and aborts only the
+        // stragglers, so no handle is ever re-polled.
+        let mut hit_max_dur = false;
         if let Some(max_dur) = max_duration {
             let all_done = futures::future::join_all(handles.iter_mut());
             tokio::pin!(all_done);
@@ -907,11 +909,23 @@ impl VUScheduler {
                     );
                     self.request_stop();
                     self.wait_for_drain(grace).await;
+                    hit_max_dur = true;
                 }
             }
         } else {
             // No cap — join all VU handles directly (single join, no re-poll).
             futures::future::join_all(handles.iter_mut()).await;
+        }
+
+        // Backlog P2 (line 158): the handles used to be dropped here
+        // un-aborted, so a VU that ignored the stop signal kept issuing HTTP
+        // through the entire summary phase — its samples landed after
+        // results() and were lost. The select above may have already polled
+        // some handles to completion (re-polling panics tokio), so
+        // await_handles_bounded skips finished handles and aborts the
+        // stragglers.
+        if hit_max_dur {
+            Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
         }
 
         tracing::info!("Shared iterations finished");
@@ -1255,6 +1269,7 @@ impl VUScheduler {
         // Race the JOIN of all VU handles against the timeout (same startup-race
         // fix as run_shared_iterations — see there). Each JoinHandle is polled
         // exactly once (re-polling a completed handle panics tokio).
+        let mut hit_max_dur = false;
         if let Some(max_dur) = max_duration {
             let all_done = futures::future::join_all(handles.iter_mut());
             tokio::pin!(all_done);
@@ -1274,11 +1289,20 @@ impl VUScheduler {
                     );
                     self.request_stop();
                     self.wait_for_drain(grace).await;
+                    hit_max_dur = true;
                 }
             }
         } else {
             // No cap — join all VU handles directly (single join, no re-poll).
             futures::future::join_all(handles.iter_mut()).await;
+        }
+
+        // Backlog P2 (line 158): same as run_shared_iterations — the handles
+        // used to be dropped un-aborted, letting stragglers issue HTTP through
+        // the summary phase. Abort them now (finished handles are skipped, not
+        // re-polled).
+        if hit_max_dur {
+            Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
         }
 
         tracing::info!("Per-VU iterations finished");
@@ -1436,10 +1460,26 @@ impl VUScheduler {
     /// elapses (the detached tasks are abandoned, matching k6's behaviour of
     /// hard-aborting the run after the grace window).
     async fn await_handles_bounded(handles: &mut [tokio::task::JoinHandle<()>], bound: Duration) {
-        // Inline the join_all into the timeout so its &mut borrows of `handles`
-        // are released when the timeout yields Err — the abort loop below can
-        // then re-borrow immutably.
-        match tokio::time::timeout(bound, futures::future::join_all(handles.iter_mut())).await {
+        // Drop handles the caller's `select!` already polled to completion.
+        // Re-polling a completed JoinHandle panics tokio ("JoinHandle polled
+        // after completion"), and the iteration executors reach us AFTER a
+        // select between join_all and the max_duration timeout — so some
+        // handles may have resolved in that select. `is_finished()` is a
+        // NON-polling check, so filtering here is safe. The survivors are the
+        // stragglers that ignored the stop signal.
+        let mut pending: Vec<&mut tokio::task::JoinHandle<()>> = handles
+            .iter_mut()
+            .filter(|h| !h.is_finished())
+            .collect();
+        if pending.is_empty() {
+            tracing::debug!("All VU handles resolved");
+            return;
+        }
+
+        // Inline the join_all into the timeout so its &mut borrows of
+        // `pending` are released when the timeout yields Err — the abort loop
+        // below can then re-borrow immutably.
+        match tokio::time::timeout(bound, futures::future::join_all(pending.iter_mut())).await {
             Ok(_) => tracing::debug!("All VU handles resolved"),
             Err(_) => {
                 tracing::warn!(
@@ -1451,7 +1491,7 @@ impl VUScheduler {
                 // call) kept issuing HTTP after the run reported finished. Abort
                 // is the backstop; the flag-aware JS interrupt and the
                 // interruptible sleep are the primary mechanism.
-                for handle in handles.iter() {
+                for handle in pending.iter() {
                     handle.abort();
                 }
             }
@@ -1574,6 +1614,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// VU ids are handed to `run_vu` for data-row rotation / worker pinning /
     /// `exec.vu.idInTest`. They must be unique across scenarios (each scenario
@@ -2168,5 +2209,86 @@ mod tests {
         sched.set_ramp_down_target(5, 10);
         assert!(!sched.try_claim_ramp_down(5).await); // at target
         assert!(!sched.try_claim_ramp_down(4).await); // below target
+    }
+
+    /// Backlog §5 P2 (line 158): the max_duration branch of
+    /// `run_shared_iterations` used to DROP the VU handles un-aborted, so a
+    /// VU that outlived the cap kept running (issuing HTTP) through the whole
+    /// summary phase — its samples landed after `results()` and were lost.
+    /// The branch now awaits the stragglers before returning, so by the time
+    /// the run reports done, every VU task has actually ended.
+    #[tokio::test]
+    async fn shared_iterations_waits_for_slow_stragglers_after_max_duration() {
+        let sched = VUScheduler::new(&ExecutionConfig::SharedIterations {
+            iterations: 100_000, // never exhausts — max_duration is the only exit
+            max_duration: Some("30ms".to_string()),
+            vus: 2,
+            graceful_stop: Some("20ms".to_string()),
+            think_time: Default::default(),
+        });
+
+        // A straggler VU: sleeps past the max_duration cap and only then
+        // finishes its (simulated) iteration. Completion is tracked with an
+        // atomic (JoinHandle is not Clone, so the test can't retain the
+        // handles itself) — the counter increments only when the task body
+        // actually runs to completion.
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_c = completed.clone();
+        let run_vu = move |_sched: Arc<VUScheduler>, _id: u32| {
+            let completed = completed_c.clone();
+            tokio::spawn(async move {
+                // Outlive max_duration (30ms) before the iteration ends.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                completed.fetch_add(1, Ordering::Release);
+            })
+        };
+
+        let start = std::time::Instant::now();
+        sched
+            .run_shared_iterations(
+                100_000,
+                Some(Duration::from_millis(30)),
+                Duration::from_millis(20),
+                &run_vu,
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        // Every VU task must have run to completion when the executor returns
+        // — the old code returned at the 30ms cap with the stragglers still
+        // sleeping (their bodies never reached the counter increment).
+        assert_eq!(
+            completed.load(Ordering::Acquire),
+            2,
+            "all VUs must finish before the run returns (handles were dropped un-aborted)"
+        );
+        // The wait is bounded (HANDLE_JOIN_BOUND) and these VUs end on their
+        // own at ~100ms — the run should return promptly, not at the bound.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "straggler wait should be prompt, took {elapsed:?}"
+        );
+    }
+
+    /// Backlog §5 P2 (line 158): `await_handles_bounded` must skip handles a
+    /// caller's select! already polled to completion — re-polling a completed
+    /// JoinHandle panics tokio ("JoinHandle polled after completion"). The
+    /// max_duration branch reaches it after exactly such a select, so the
+    /// filter (via the NON-polling `is_finished()`) is what makes the call
+    /// safe there.
+    #[tokio::test]
+    async fn await_handles_bounded_skips_already_polled_handles() {
+        // Simulate the select! in the iteration executors: poll a handle to
+        // completion once via join_all, leaving it in the vec.
+        let done = tokio::spawn(async {});
+        let mut handles = vec![done];
+        futures::future::join_all(handles.iter_mut()).await;
+
+        // Re-polling `done` would panic tokio. is_finished() skips it, so
+        // this must return cleanly (and promptly — no pending handles).
+        let start = std::time::Instant::now();
+        VUScheduler::await_handles_bounded(&mut handles, Duration::from_millis(10)).await;
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(handles[0].is_finished());
     }
 }
