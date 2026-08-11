@@ -5010,6 +5010,98 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_test_async_body_records_on_settlement() {
+        // Backlog line 84: pm.test(name, asyncFn) always passed — the body's
+        // Promise is never `=== false`, so the check recorded GREEN before the
+        // async body settled; a rejected body ALSO passed. The check must be
+        // recorded at settlement time: rejected async body → FAILED check
+        // (mirrors the sync throw path), resolved body → value !== false.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Bare Context::full has no console global; pm.test's error
+                // paths call console.error, so stub it (real k6/sandbox
+                // contexts install one during bootstrap).
+                globalThis.console = {
+                    error: function () {},
+                    log: function () {},
+                    warn: function () {}
+                };
+                globalThis.__recorded = [];
+                globalThis.__tropel_pm_test = function (name, passed, tagsJson) {
+                    globalThis.__recorded.push({
+                        name: name,
+                        passed: passed,
+                        tags: tagsJson ? JSON.parse(tagsJson) : null
+                    });
+                };
+                globalThis.__run = (async function () {
+                    // Rejected async body (stand-in for a failing pm.expect
+                    // inside an async fn): must record FAILED, not PASS.
+                    await pm.test('async-fail', async function () {
+                        throw new Error('boom');
+                    });
+                    // Body returning a rejected promise: same.
+                    await pm.test('async-reject', function () {
+                        return Promise.reject(new Error('nope'));
+                    });
+                    // Resolved async body: value semantics (true → PASS).
+                    await pm.test('async-pass', async function () { return true; });
+                    // Sync paths unchanged.
+                    pm.test('sync-pass', function () { return true; });
+                    pm.test('sync-fail', function () { throw new Error('sync'); });
+                })();
+            "#,
+            )
+            .expect("async pm.test driver script should eval");
+
+            let run: rquickjs::Promise = ctx
+                .eval("globalThis.__run")
+                .expect("read the async driver promise");
+            run.finish::<()>()
+                .expect("async pm.test bodies must settle (job pump)");
+
+            let by_name = |name: &str| -> (String, bool) {
+                let q = format!(
+                    "(function(){{ var r = __recorded.find(x => x.name === '{}'); return r ? [r.name, r.passed] : null; }})()",
+                    name
+                );
+                // rquickjs 0.12 `eval` takes `Into<Vec<u8>>` — `&String`
+                // doesn't impl it, so eval the `&str`.
+                let v: rquickjs::Value = ctx.eval(q.as_str()).unwrap_or_else(|e| {
+                    panic!("find {}: {}", name, e)
+                });
+                if v.is_null() {
+                    panic!("no recorded check named {}", name);
+                }
+                // `Value::as_array` here returns `Option<&Array>` (not Cow),
+                // so `.clone()` yields an owned Array.
+                let arr = v.as_array().expect("recorded entry array").clone();
+                let n: String = arr.get(0).expect("name");
+                let p: bool = arr.get(1).expect("passed");
+                (n, p)
+            };
+
+            let (n, p) = by_name("async-fail (error)");
+            assert_eq!(n, "async-fail (error)", "rejected async body name");
+            assert!(!p, "rejected async body must record a FAILED check, not PASS");
+            let (_n, p) = by_name("async-reject (error)");
+            assert!(!p, "Promise.reject body must record a FAILED check");
+            let (n, p) = by_name("async-pass");
+            assert_eq!(n, "async-pass");
+            assert!(p, "resolved async body returning true must PASS");
+            let (_n, p) = by_name("sync-pass");
+            assert!(p, "sync true body must still PASS");
+            let (_n, p) = by_name("sync-fail (error)");
+            assert!(!p, "sync throwing body must still FAIL");
+        });
+    }
+
+    #[test]
     fn test_timings_error_binary_and_http_file() {
         // Backlog line 150: the k6 path emitted no sub-timing samples, res.
         // timings.* were 0 except waiting/duration, res.error/error_code did
