@@ -256,16 +256,7 @@ impl AuthSigner for AwsSigV4Auth {
         let canonical_uri = sigv4_canonical_uri(path, &service);
 
         // Canonical query string: sorted by encoded key.
-        let mut pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(k, v)| (enc(k.as_ref()), enc(v.as_ref())))
-            .collect();
-        pairs.sort();
-        let canonical_query = pairs
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
+        let canonical_query = sigv4_canonical_query(url);
 
         // Canonical headers: host + x-amz-* AND every header already present
         // on the request (lowercased, deduped), including ALL values of
@@ -316,8 +307,74 @@ impl AuthSigner for AwsSigV4Auth {
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// Canonical query string for SigV4.
+///
+/// AWS canonicalizes the RAW query bytes: split the raw (still-encoded)
+/// query on `&` and the first `=`, sort by (key, value), rejoin unchanged.
+/// The old `Url::query_pairs()` was the FORM decoder (`+` → space) and then
+/// `enc()` wrote `%20` back — so `?a=b+c` was signed as `a=b%20c` while AWS
+/// computed `a=b+c`, a guaranteed 403 SignatureDoesNotMatch (backlog line
+/// 61). No re-encoding here: the raw bytes ARE the canonical form (the
+/// client already encoded).
+fn sigv4_canonical_query(url: &reqwest::Url) -> String {
+    let mut pairs: Vec<(&str, &str)> = url
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (p, ""),
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// AWS services that expose VIRTUAL-HOSTED endpoints, where the tenant label
+/// (S3 bucket, API Gateway ID, OpenSearch domain, …) precedes the service
+/// label. For these, `host.split('.').next()` returns the TENANT — the
+/// signing service is a later label (examplebucket.s3.amazonaws.com → s3).
+const VIRTUAL_HOSTED_SERVICE_LABELS: &[&str] = &[
+    "s3", "s3-control", "s3-object-lambda", "s3-outposts", "s3express",
+    "execute-api", "es", "aoss", "cloudsearch",
+];
+
 fn default_service(host: &str) -> String {
-    // "s3.us-west-2.amazonaws.com" → "s3"; fall back to the whole host.
+    // Virtual-hosted AWS endpoints put the tenant BEFORE the service label
+    // (examplebucket.s3.amazonaws.com, {api-id}.execute-api.{region}.
+    // amazonaws.com, {domain}.{region}.es.amazonaws.com), so the first DNS
+    // label is NOT the signing service (backlog line 60: the old code derived
+    // `examplebucket` / `abc` / `search-x`, breaking the scope, the signing
+    // key, and is_s3_family → double-encoded S3 path → 403 on everything).
+    // For *.amazonaws.com hosts, scan labels RIGHT-TO-LEFT for a known
+    // virtual-hosted service: the service label sits closest to the
+    // amazonaws suffix, so this is also collision-robust when a tenant
+    // happens to BE a service name (es.s3.amazonaws.com → s3, not es). The
+    // S3 website/fips endpoints (bucket.s3-website-{region}…,
+    // s3-fips…amazonaws.com) still sign as s3. Everything else keeps the
+    // first-label rule (s3.us-west-2.amazonaws.com → s3; non-AWS hosts keep
+    // their first label).
+    let is_aws = host.ends_with(".amazonaws.com")
+        || host.ends_with(".amazonaws.com.cn")
+        || host == "amazonaws.com";
+    if is_aws {
+        for label in host.split('.').rev() {
+            if label == "amazonaws" || label == "com" || label == "cn" {
+                continue;
+            }
+            if VIRTUAL_HOSTED_SERVICE_LABELS.contains(&label) {
+                return label.to_string();
+            }
+            if label.starts_with("s3-website-") || label == "s3-fips" {
+                return "s3".to_string();
+            }
+        }
+    }
     host.split('.').next().unwrap_or(host).to_string()
 }
 
@@ -1295,6 +1352,48 @@ mod tests {
         let mut req = build_request("GET", "http://example.com/", None);
         BearerAuth::new("tok123").sign(&mut req).unwrap();
         assert_eq!(auth_header(&req), "Bearer tok123");
+    }
+
+    #[test]
+    fn sigv4_default_service_derives_virtual_hosted_endpoints() {
+        // Regression (backlog line 60): default_service took the FIRST DNS
+        // label, so virtual-hosted endpoints derived the TENANT as the
+        // signing service (examplebucket / abc / search-x) — wrong scope,
+        // wrong signing key, and for S3 a false is_s3_family → double-encoded
+        // path (403 on every virtual-hosted-S3 and API-Gateway request).
+        assert_eq!(default_service("s3.us-west-2.amazonaws.com"), "s3");
+        assert_eq!(default_service("examplebucket.s3.amazonaws.com"), "s3");
+        assert_eq!(default_service("examplebucket.s3.us-west-2.amazonaws.com"), "s3");
+        assert_eq!(default_service("mybucket.s3-website-us-west-2.amazonaws.com"), "s3");
+        assert_eq!(default_service("s3-fips.us-west-2.amazonaws.com"), "s3");
+        // Collision-robustness: a tenant that IS a service name must not win
+        // over the real (suffix-closest) service label.
+        assert_eq!(default_service("es.s3.amazonaws.com"), "s3");
+        assert_eq!(
+            default_service("abc123.execute-api.us-east-1.amazonaws.com"),
+            "execute-api"
+        );
+        assert_eq!(default_service("search-x.us-east-1.es.amazonaws.com"), "es");
+        // Non-virtual-hosted service: first label IS the service.
+        assert_eq!(default_service("dynamodb.us-east-1.amazonaws.com"), "dynamodb");
+        // Non-AWS host: first label preserved (unchanged behavior).
+        assert_eq!(default_service("api.example.com"), "api");
+    }
+
+    #[test]
+    fn sigv4_canonical_query_preserves_raw_bytes() {
+        // Regression (backlog line 61): query_pairs() form-decodes '+' →
+        // space, then enc() wrote %20 back — AWS canonicalizes the RAW bytes.
+        let url: reqwest::Url = "http://example.com/?a=b+c&z=1&a=b%20c".parse().unwrap();
+        // Sorted by raw (encoded) key then value: '%' (0x25) < '+' (0x2B), so
+        // the a=b%20c pair sorts first; '+' and '%20' survive untouched.
+        assert_eq!(sigv4_canonical_query(&url), "a=b%20c&a=b+c&z=1");
+        // Duplicate keys sort by value; valueless params keep their '='.
+        let url: reqwest::Url = "http://example.com/?flag&a=2&a=1".parse().unwrap();
+        assert_eq!(sigv4_canonical_query(&url), "a=1&a=2&flag=");
+        // No query at all.
+        let url: reqwest::Url = "http://example.com/".parse().unwrap();
+        assert_eq!(sigv4_canonical_query(&url), "");
     }
 
     #[test]
