@@ -325,7 +325,35 @@ function assertStatusClass(classCode, label) {
     }
 }
 
-pm.response.to = {
+// Backlog line 41/42 (P0): the chai-postman SPECIFIC status helpers
+// (notFound/unauthorized/forbidden/badRequest/accepted/rateLimited/teapot)
+// and withBody used to be absent — reading them yielded `undefined` and
+// pm.test recorded GREEN (silent pass) on every response. They are now
+// real getters that THROW on mismatch, exactly like the status classes.
+function assertStatusCode(code, label) {
+    var c = pm.response.code;
+    if (c !== code) {
+        throw new Error('expected response to be ' + label + ' (' + code + '), got ' + c);
+    }
+}
+
+// Backlog line 42 (P0): Postman's own snippets emit `to.be.json;` — a
+// PROPERTY read — but chai-postman's `.json`/`.html`/`.text` are properties
+// here-methods, so the bare read yielded a truthy Function and passed. As a
+// getter, the check runs on the READ (throwing on mismatch), and the
+// returned callable re-runs it for the parenthesized spelling — both
+// `to.be.json` and `to.be.json()` fail loudly on a bad response.
+function bodyAssertion(check, label) {
+    check();
+    // Deliberately NOT guardChain-wrapped: `.json` is terminal in Postman
+    // idioms (never chained after), so a chained read like `.json.foo` is
+    // not a real script — wrapping the callable would add proxy overhead on
+    // every successful assertion for zero practical coverage.
+    var f = function () { check(); };
+    return f;
+}
+
+pm.response.to = guardChain({
     be: {
         get success() { assertStatusClass(2, 'success'); },
         get ok() { assertStatusClass(2, 'ok'); },
@@ -339,23 +367,39 @@ pm.response.to = {
             }
         },
         get info() { assertStatusClass(1, 'info'); },
-        json: function () {
+        get notFound() { assertStatusCode(404, 'notFound'); },
+        get unauthorized() { assertStatusCode(401, 'unauthorized'); },
+        get forbidden() { assertStatusCode(403, 'forbidden'); },
+        get badRequest() { assertStatusCode(400, 'badRequest'); },
+        get accepted() { assertStatusCode(202, 'accepted'); },
+        get rateLimited() { assertStatusCode(429, 'rateLimited'); },
+        get teapot() { assertStatusCode(418, 'teapot'); },
+        get withBody() {
+            if (!pm.response.text()) {
+                throw new Error('expected response to have a body');
+            }
+        },
+        get json() {
             // Postman parity: to.be.json passes when the body parses as JSON.
             // Content-type is informational — a text/plain body that parses
             // still counts (Postman's chai-postman checks the body first).
-            pm.response.json(); // throws on invalid JSON body
+            return bodyAssertion(function () { pm.response.json(); }, 'json');
         },
-        html: function () {
-            var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
-            if (ct.indexOf('html') === -1) {
-                throw new Error('expected response to be HTML, content-type is ' + ct);
-            }
+        get html() {
+            return bodyAssertion(function () {
+                var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
+                if (ct.indexOf('html') === -1) {
+                    throw new Error('expected response to be HTML, content-type is ' + ct);
+                }
+            }, 'html');
         },
-        text: function () {
-            var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
-            if (ct.indexOf('text') === -1 && ct.indexOf('json') === -1 && ct.indexOf('xml') === -1) {
-                throw new Error('expected response to be text, content-type is ' + ct);
-            }
+        get text() {
+            return bodyAssertion(function () {
+                var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
+                if (ct.indexOf('text') === -1 && ct.indexOf('json') === -1 && ct.indexOf('xml') === -1) {
+                    throw new Error('expected response to be text, content-type is ' + ct);
+                }
+            }, 'text');
         }
     },
     have: {
