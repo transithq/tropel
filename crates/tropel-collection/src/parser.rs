@@ -444,7 +444,12 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                 }
                 None
             }
-            _ => b.raw.clone().map(Body::Raw),
+            // Backlog line 144: `mode: "none"` means NO body — but it fell
+            // into the catch-all and sent the stale draft `raw` text (a body
+            // the user last typed before switching the mode dropdown to
+            // None). An unrecognized mode is equally unselectable: only the
+            // explicitly-handled modes above may produce a body.
+            "none" | _ => None,
         },
         None => None,
     }
@@ -1513,6 +1518,36 @@ mod tests {
             "duplicate-fold values must be percent-encoded"
         );
         assert!(req.query_params.is_empty());
+    }
+
+    #[test]
+    fn test_mode_none_does_not_send_stale_draft() {
+        // Regression (backlog line 144): `body.mode: "none"` fell into the
+        // catch-all `_ => b.raw.clone()`, so the LAST-TYPED draft raw text
+        // was sent even though the user had switched the mode dropdown to
+        // None. mode "none" must yield no body.
+        let json = r#"{
+            "info": {"name": "None", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "NoBody",
+                "request": {
+                    "method": "POST",
+                    "url": {"raw": "https://api.example.com/x"},
+                    "body": {
+                        "mode": "none",
+                        "raw": "this is the stale draft that must NOT be sent"
+                    }
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert!(
+            req.body.is_none(),
+            "mode:none must drop the body entirely, got {:?}",
+            req.body
+        );
     }
 
     #[test]
