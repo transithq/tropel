@@ -414,10 +414,18 @@ pub struct CollectionAuth {
 }
 
 /// Auth attribute (key-value pair).
+///
+/// Backlog line 131: the v2.1 schema types `value` as any-type and doesn't
+/// require it — real Postman OAuth1 exports carry booleans
+/// (`addParamsToHeader`) and modern OAuth2 exports carry arrays
+/// (`tokenRequestParams: []`). A required `String` made serde fail the
+/// *whole collection* → zero requests ran. `Value` accepts anything;
+/// `get_auth_attr` stringifies at the point of use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthAttribute {
     pub key: String,
-    pub value: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
     #[serde(rename = "type")]
     pub attr_type: Option<String>,
 }

@@ -535,7 +535,11 @@ fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
 }
 
 fn get_auth_attr(attrs: &[AuthAttribute], key: &str) -> Option<String> {
-    attrs.iter().find(|a| a.key == key).map(|a| a.value.clone())
+    attrs.iter().find(|a| a.key == key).map(|a| match &a.value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    })
 }
 
 /// ALL prerequest scripts in the event chain, outer (collection) → inner
@@ -1183,6 +1187,62 @@ mod tests {
             "unknown explicit auth must NOT inherit collection auth (NoAuth), got {:?}",
             req.auth
         );
+    }
+
+    #[test]
+    fn test_oauth_export_with_non_string_auth_values_parses() {
+        // Regression (backlog line 131): AuthAttribute.value was a required
+        // String, but the v2.1 schema types it any-type and doesn't require
+        // it — real Postman OAuth1 exports carry booleans
+        // (`addParamsToHeader`) and modern OAuth2 exports carry arrays
+        // (`tokenRequestParams: []`). A boolean/array value made serde fail
+        // the *whole collection* → zero requests ran. The whole collection
+        // must parse and the auth must resolve to the string fields.
+        let json = r#"{
+            "info": {"name": "OAuth", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "OAuth1",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/oauth1"},
+                    "auth": {
+                        "type": "oauth1",
+                        "oauth1": [
+                            {"key": "consumerKey", "value": "ck", "type": "string"},
+                            {"key": "addParamsToHeader", "value": true, "type": "boolean"}
+                        ]
+                    }
+                }
+            }, {
+                "name": "OAuth2",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/oauth2"},
+                    "auth": {
+                        "type": "oauth2",
+                        "oauth2": [
+                            {"key": "accessToken", "value": "tok", "type": "string"},
+                            {"key": "tokenRequestParams", "value": [], "type": "array"}
+                        ]
+                    }
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        assert_eq!(scenario.items.len(), 2, "both OAuth requests must parse");
+
+        let oauth1 = scenario.items[0].request.as_ref().unwrap();
+        match oauth1.auth.as_ref() {
+            Some(AuthConfig::OAuth1 { consumer_key, .. }) => assert_eq!(consumer_key, "ck"),
+            other => panic!("expected OAuth1 auth, got {:?}", other),
+        }
+
+        let oauth2 = scenario.items[1].request.as_ref().unwrap();
+        match oauth2.auth.as_ref() {
+            Some(AuthConfig::OAuth2 { access_token, .. }) => assert_eq!(access_token, "tok"),
+            other => panic!("expected OAuth2 auth, got {:?}", other),
+        }
     }
 
     #[test]
