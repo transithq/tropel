@@ -433,41 +433,39 @@ fn get_auth_attr(attrs: &[AuthAttribute], key: &str) -> Option<String> {
 }
 
 /// ALL prerequest scripts in the event chain, outer (collection) → inner
-/// (request), concatenated into one script string. Postman is additive: a
-/// collection, each enclosing folder, and the request itself may each
-/// contribute a prerequest script and EVERY one runs, before the request,
-/// in that order. The old find-first behavior silently dropped outer
-/// scripts the moment a deeper level had its own (P0).
-fn find_prerequest_script(events: &[Event]) -> Option<String> {
-    let scripts: Vec<String> = events
+/// (request), as a LIST — one entry per script, NOT concatenated. Postman is
+/// additive: a collection, each enclosing folder, and the request itself may
+/// each contribute a prerequest script and EVERY one runs, before the
+/// request, in that order. The old find-first behavior silently dropped
+/// outer scripts the moment a deeper level had its own (P0).
+///
+/// Each script stays its own element so the runner compiles it into its own
+/// lexical scope (backlog §4): a `const baseUrl` at collection level and at
+/// request level must NOT collide, a top-level `return` only exits its own
+/// script, and each script caches independently — the old single joined
+/// string (`"\n;\n"`) shared one scope, so a redeclared const killed the
+/// whole chain.
+fn find_prerequest_script(events: &[Event]) -> Vec<String> {
+    events
         .iter()
         .filter(|e| e.listen == "prerequest")
         .filter_map(|e| e.script.as_ref())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
-        .collect();
-    if scripts.is_empty() {
-        None
-    } else {
-        Some(scripts.join("\n;\n"))
-    }
+        .collect()
 }
 
-/// ALL test scripts in the event chain, outer → inner, concatenated into
-/// one script string (see `find_prerequest_script`).
-fn find_test_script(events: &[Event]) -> Option<String> {
-    let scripts: Vec<String> = events
+/// ALL test scripts in the event chain, outer → inner, as a LIST — one
+/// entry per script, NOT concatenated (same per-script lexical-scope
+/// semantics as `find_prerequest_script`).
+fn find_test_script(events: &[Event]) -> Vec<String> {
+    events
         .iter()
         .filter(|e| e.listen == "test")
         .filter_map(|e| e.script.as_ref())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
-        .collect();
-    if scripts.is_empty() {
-        None
-    } else {
-        Some(scripts.join("\n;\n"))
-    }
+        .collect()
 }
 
 #[cfg(test)]
@@ -649,9 +647,9 @@ mod tests {
         let collection = parse_collection_str(json).unwrap();
         let scenario = collection_to_scenario(collection, HashMap::new());
 
-        assert!(scenario.items[0].prerequest.is_some());
-        assert!(scenario.items[0].test.is_some());
-        assert!(scenario.items[0].test.as_ref().unwrap().contains("pm.test"));
+        assert!(!scenario.items[0].prerequest.is_empty());
+        assert!(!scenario.items[0].test.is_empty());
+        assert!(scenario.items[0].test[0].contains("pm.test"));
     }
 
     #[test]
@@ -696,24 +694,20 @@ mod tests {
         assert_eq!(folder.name, "Folder");
         let inner = &folder.items[0];
 
-        // Prerequest: ALL three levels concatenated, outer→inner.
-        let pre = inner
-            .prerequest
-            .as_ref()
-            .expect("leaf must carry prerequest");
-        let c = pre
-            .find("COLLECTION_PREREQUEST")
-            .expect("collection script folded");
-        let f = pre.find("FOLDER_PREREQUEST").expect("folder script folded");
-        let i = pre.find("INNER_PREREQUEST").expect("request script kept");
-        assert!(c < f && f < i, "prerequest must be outer→inner, got: {pre}");
+        // Prerequest: ALL three levels folded as a LIST, outer→inner, each
+        // in its own element (per-script lexical scope, backlog §4).
+        let pre = &inner.prerequest;
+        assert_eq!(pre.len(), 3, "all three levels must fold, got: {pre:?}");
+        assert!(pre[0].contains("COLLECTION_PREREQUEST"));
+        assert!(pre[1].contains("FOLDER_PREREQUEST"));
+        assert!(pre[2].contains("INNER_PREREQUEST"));
 
-        // Test: ALL three levels concatenated, outer→inner.
-        let t = inner.test.as_ref().expect("leaf must carry test");
-        let c = t.find("COLLECTION_TEST").expect("collection test folded");
-        let f = t.find("FOLDER_TEST").expect("folder test folded");
-        let i = t.find("INNER_TEST").expect("request test kept");
-        assert!(c < f && f < i, "test must be outer→inner, got: {t}");
+        // Test: ALL three levels folded, outer→inner.
+        let t = &inner.test;
+        assert_eq!(t.len(), 3, "all three test levels must fold, got: {t:?}");
+        assert!(t[0].contains("COLLECTION_TEST"));
+        assert!(t[1].contains("FOLDER_TEST"));
+        assert!(t[2].contains("INNER_TEST"));
     }
 
     #[test]
@@ -736,18 +730,10 @@ mod tests {
         }"#;
 
         let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
-        let pre = scenario.items[0]
-            .prerequest
-            .as_ref()
-            .expect("leaf must carry prerequest");
-        let c = pre
-            .find("COLL_PRE")
-            .expect("collection script must be inherited");
-        let r = pre.find("REQ_PRE").expect("request script must be present");
-        assert!(
-            c < r,
-            "inherited script must run before the request's own: {pre}"
-        );
+        let pre = &scenario.items[0].prerequest;
+        assert_eq!(pre.len(), 2, "inherited + own script, got: {pre:?}");
+        assert!(pre[0].contains("COLL_PRE"), "inherited script first");
+        assert!(pre[1].contains("REQ_PRE"), "request's own script second");
     }
 
     #[test]
@@ -1105,10 +1091,10 @@ mod tests {
         assert_eq!(req.url, "https://api.example.com/shapes");
         assert_eq!(req.headers.get("X-No-Value").map(String::as_str), Some(""));
         // String-form exec must still surface as a test script.
-        let test = scenario.items[0].test.as_ref().expect("test script parsed");
+        let test = &scenario.items[0].test;
         assert!(
-            test.contains("pm.test"),
-            "string-form exec joined into script"
+            test[0].contains("pm.test"),
+            "string-form exec must surface as a test script"
         );
     }
 

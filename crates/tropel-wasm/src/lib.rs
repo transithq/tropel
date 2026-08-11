@@ -968,8 +968,11 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
             Ok(ScenarioItem {
                 name: wi.name.clone(),
                 request: wi.request.as_ref().map(convert_request).transpose()?,
-                prerequest: wi.prerequest.clone(),
-                test: wi.test.clone(),
+                // The wire format keeps a single Option<string> (backlog §4:
+                // WASM adapters emit one script); ScenarioItem now carries a
+                // LIST so each script runs in its own lexical scope.
+                prerequest: wi.prerequest.clone().map(|s| vec![s]).unwrap_or_default(),
+                test: wi.test.clone().map(|s| vec![s]).unwrap_or_default(),
                 assertions: wi.assertions.clone(),
                 items: Vec::new(),
             })
@@ -992,8 +995,8 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
                 Ok(ScenarioItem {
                     name: wi.name.clone(),
                     request: wi.request.as_ref().map(convert_request).transpose()?,
-                    prerequest: wi.prerequest.clone(),
-                    test: wi.test.clone(),
+                    prerequest: wi.prerequest.clone().map(|s| vec![s]).unwrap_or_default(),
+                    test: wi.test.clone().map(|s| vec![s]).unwrap_or_default(),
                     assertions: wi.assertions.clone(),
                     items: children,
                 })

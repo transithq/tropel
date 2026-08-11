@@ -260,7 +260,9 @@ impl ScenarioRunner {
             // Items without a request (e.g. transpiled TS/ES module scripts) still
             // execute their prerequest and test scripts.
             if item.items.is_empty()
-                && (item.request.is_some() || item.prerequest.is_some() || item.test.is_some())
+                && (item.request.is_some()
+                    || !item.prerequest.is_empty()
+                    || !item.test.is_empty())
             {
                 // Set request info in PM state
                 {
@@ -271,9 +273,17 @@ impl ScenarioRunner {
                     state.current_request_name = item.name.clone();
                 }
 
-                // Run prerequest script
-                if let Some(script) = &item.prerequest {
-                    let source_url = Some(format!("{}.prerequest.js", item.name));
+                // Run prerequest scripts — EACH in its own lexical scope
+                // (backlog §4): Postman compiles every script separately, so
+                // a `const baseUrl` at collection level and at request level
+                // must NOT collide, a top-level `return` only exits its own
+                // script, and each script hits the compiled-function cache
+                // independently (the old single joined string shared one
+                // scope and one cache entry). An error in one script stops
+                // the rest of the chain (Postman behavior) but still counts
+                // as a failure.
+                for (script_idx, script) in item.prerequest.iter().enumerate() {
+                    let source_url = Some(format!("{}.prerequest#{}.js", item.name, script_idx));
                     if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await {
                         if self.force_stop.load(Ordering::Acquire) {
                             // A deliberate force-stop interrupted the eval —
@@ -285,7 +295,10 @@ impl ScenarioRunner {
                                 iteration_index
                             );
                         } else {
-                            tracing::warn!("VU {} prerequest script error: {}", iteration_index, e);
+                            tracing::warn!(
+                                "VU {} prerequest script error: {}",
+                                iteration_index, e
+                            );
                             // Backlog line 98: script failures were swallowed —
                             // no failed check, no metric, exit 0. Record a
                             // failed check so the failure is visible in the
@@ -295,6 +308,7 @@ impl ScenarioRunner {
                                 &format!("{}.prerequest", item.name),
                             );
                         }
+                        break;
                     }
                 }
 
@@ -646,11 +660,15 @@ impl ScenarioRunner {
                     }
                 }
 
-                // Run test script (skipped when pm.execution.skipRequest() ran)
+                // Run test scripts (skipped when pm.execution.skipRequest()
+                // ran) — EACH in its own lexical scope (backlog §4, same as
+                // the prerequest chain).
                 if !skip_item {
-                    if let Some(script) = &item.test {
-                        let source_url = Some(format!("{}.test.js", item.name));
-                        if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await
+                    for (script_idx, script) in item.test.iter().enumerate() {
+                        let source_url =
+                            Some(format!("{}.test#{}.js", item.name, script_idx));
+                        if let Err(e) =
+                            Self::run_script(&mut self.js_ctx, script, source_url).await
                         {
                             if self.force_stop.load(Ordering::Acquire) {
                                 // Deliberate force-stop interrupted the eval —
@@ -665,8 +683,12 @@ impl ScenarioRunner {
                                 tracing::warn!("VU {} test script error: {}", iteration_index, e);
                                 // Backlog line 98: record a failed check so the
                                 // failure is visible and drives a non-zero exit.
-                                record_script_failure(&mut result, &format!("{}.test", item.name));
+                                record_script_failure(
+                                    &mut result,
+                                    &format!("{}.test", item.name),
+                                );
                             }
+                            break;
                         }
                     }
                 }
@@ -785,7 +807,7 @@ pub fn flatten_execution_items(items: &[ScenarioItem]) -> Vec<ScenarioItem> {
     let mut out = Vec::new();
     for item in items {
         if item.items.is_empty() {
-            if item.request.is_some() || item.prerequest.is_some() || item.test.is_some() {
+            if item.request.is_some() || !item.prerequest.is_empty() || !item.test.is_empty() {
                 out.push(item.clone());
             }
         } else {
@@ -903,8 +925,8 @@ mod tests {
                 timeout: None,
                 response_type: ResponseType::None,
             }),
-            prerequest: None,
-            test: None,
+            prerequest: vec![],
+            test: vec![],
             assertions: vec![],
             items: vec![],
         }
@@ -914,8 +936,8 @@ mod tests {
         ScenarioItem {
             name: name.to_string(),
             request: None,
-            prerequest: None,
-            test: None,
+            prerequest: vec![],
+            test: vec![],
             assertions: vec![],
             items,
         }
@@ -996,8 +1018,8 @@ mod tests {
         let inert = ScenarioItem {
             name: "inert".into(),
             request: None,
-            prerequest: None,
-            test: None,
+            prerequest: vec![],
+            test: vec![],
             assertions: vec![],
             items: vec![],
         };
@@ -1137,8 +1159,8 @@ mod tests {
                         timeout: None,
                         response_type: Default::default(),
                     }),
-                    prerequest: None,
-                    test: None,
+                    prerequest: vec![],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 },
@@ -1156,8 +1178,8 @@ mod tests {
                         timeout: None,
                         response_type: Default::default(),
                     }),
-                    prerequest: None,
-                    test: None,
+                    prerequest: vec![],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 },
@@ -1216,16 +1238,16 @@ mod tests {
                 ScenarioItem {
                     name: "self".into(),
                     request: None,
-                    prerequest: Some("postman.setNextRequest('self');".into()),
-                    test: None,
+                    prerequest: vec!["postman.setNextRequest('self');".into()],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 },
                 ScenarioItem {
                     name: "after".into(),
                     request: None,
-                    prerequest: Some("// inert".into()),
-                    test: None,
+                    prerequest: vec!["// inert".into()],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 },
@@ -1311,11 +1333,11 @@ mod tests {
                 vec![ScenarioItem {
                     name: "inner".into(),
                     request: None,
-                    prerequest: Some(
+                    prerequest: vec![
                         "pm.environment.set('token', 'tok-42'); // COLLECTION; FOLDER; REQUEST"
                             .into(),
-                    ),
-                    test: None,
+                    ],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 }],
@@ -1330,11 +1352,7 @@ mod tests {
             "folder must be descended into — the leaf with the folded scripts must execute"
         );
         assert!(
-            execution_items[0]
-                .prerequest
-                .as_deref()
-                .unwrap_or("")
-                .contains("pm.environment.set"),
+            execution_items[0].prerequest.iter().any(|s| s.contains("pm.environment.set")),
             "the folded collection/folder prerequest must ride on the leaf"
         );
         let names: Arc<Vec<String>> =
@@ -1396,6 +1414,95 @@ mod tests {
             resolver.resolve("{{token}}", &scope),
             "tok-42",
             "folded prerequest-set value must resolve in later requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_script_runs_in_its_own_lexical_scope() {
+        // Backlog §4: scripts were joined with "\n;\n" into ONE string that
+        // compiled into a single `(async function ...)` — one lexical scope.
+        // A `const baseUrl` at collection level AND at request level threw
+        // `SyntaxError: Identifier 'baseUrl' has already been declared` and
+        // killed the WHOLE chain (collection token-minting never ran); a
+        // top-level `return` skipped every downstream script. Postman runs
+        // each script as a separate compilation: this pins the runner-level
+        // symptom — a redeclared const must not collide, and a `return` must
+        // only exit its own script.
+        let scenario = Arc::new(Scenario {
+            info: tropel_sdk::scenario::ScenarioInfo {
+                name: "scopes".into(),
+                description: None,
+                schema: None,
+            },
+            // Three separate prerequest scripts on one leaf (the parser now
+            // emits a LIST, one element per level):
+            //   0: collection — declares `const baseUrl`
+            //   1: folder — REDECLARES `const baseUrl` (the old joined
+            //      string would throw here) AND returns early
+            //   2: request — must STILL run (return only exits script 1)
+            items: vec![ScenarioItem {
+                name: "scoped".into(),
+                request: None,
+                prerequest: vec![
+                    "const baseUrl = 'https://api.example.com'; // COLLECTION".into(),
+                    "const baseUrl = 'https://api.example.com/v2'; if (true) { return; } // FOLDER".into(),
+                    "pm.environment.set('token', 'tok-42'); // REQUEST".into(),
+                ],
+                test: vec![],
+                assertions: vec![],
+                items: vec![],
+            }],
+            variables: HashMap::new(),
+            auth: None,
+        });
+        let execution_items = Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
+        let mut runner = ScenarioRunner::new(
+            scenario,
+            execution_items,
+            names,
+            client,
+            0,
+            "scopes".into(),
+        );
+
+        let mut js_ctx = Box::new(
+            JsContext::new(None, None)
+                .await
+                .expect("js context should construct"),
+        );
+        js_ctx
+            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .await
+            .expect("pm shim should eval");
+        let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("bridge http client should construct"),
+        ));
+        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(
+            runner.pm_state().clone(),
+            bridge_client,
+        )
+        .install(&mut js_ctx)
+        .expect("pm bridge should install");
+        runner = runner.with_js_context(js_ctx);
+
+        let env = HashMap::new();
+        let result = runner.run_iteration(0, None, &env).await;
+        assert_eq!(
+            result.script_failures, 0,
+            "redeclared const must not kill the chain; the request script must still run"
+        );
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("token").map(String::as_str),
+            Some("tok-42"),
+            "script 2 must still run after script 1's early return"
         );
     }
 }

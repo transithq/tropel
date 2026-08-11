@@ -90,8 +90,8 @@ fn fixture_run_request() -> RunRequest {
             timeout: None,
             response_type: ResponseType::Text,
         }),
-        prerequest: None,
-        test: test.map(str::to_string),
+        prerequest: vec![],
+        test: test.map(|t| vec![t.to_string()]).unwrap_or_default(),
         assertions: vec![],
         items: vec![],
     };
