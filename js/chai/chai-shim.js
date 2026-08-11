@@ -343,15 +343,17 @@ var chai = chai || {};
         return this;
     };
 
-    // ── chai.expect ──
-    // Backlog §1: unimplemented assertion PROPERTIES (e.g. `.to.be.empty`,
-    // `.to.exist`, `.NaN`, `.finite`) used to read as `undefined` and the
-    // enclosing pm.test/check recorded GREEN — a silent pass. The instance is
-    // wrapped in a Proxy whose `get` trap THROWS on unknown assertion names,
-    // so a typo'd or unimplemented assertion fails instead of passing
-    // silently. Known names resolve normally through the prototype chain.
-    chai.expect = function (val, msg) {
-        var assertion = new Assertion(val, msg, chai.expect);
+    // ── guarded assertion Proxy ──
+    // Backlog §1/§2: unimplemented assertion PROPERTIES (e.g. `.to.be.empty`,
+    // `.to.exist`, `.NaN`, `.finite`, `.sealed`) used to read as `undefined`
+    // and the enclosing pm.test/check recorded GREEN — a silent pass. The
+    // instance is wrapped in a Proxy whose `get` trap THROWS on unknown
+    // assertion names, so a typo'd or unimplemented assertion fails instead
+    // of passing silently. Known names resolve normally through the prototype
+    // chain. Shared by chai.expect and the `.should` getter (backlog §2: the
+    // latter used to return a RAW Assertion, leaving the whole silent-pass
+    // class reachable via `.should`).
+    function guardAssertion(assertion) {
         return new Proxy(assertion, {
             get: function (target, prop, receiver) {
                 // Symbols (Symbol.toPrimitive etc.) and the standard
@@ -370,6 +372,11 @@ var chai = chai || {};
                 throw new Error("unknown assertion property '" + String(prop) + "'");
             }
         });
+    }
+
+    // ── chai.expect ──
+    chai.expect = function (val, msg) {
+        return guardAssertion(new Assertion(val, msg, chai.expect));
     };
 
     // .empty
@@ -543,10 +550,13 @@ var chai = chai || {};
     };
 
     // ── chai.should (minimal) ──
+    // The getter returns the SAME guarded Proxy as chai.expect (backlog §2:
+    // it used to return a raw Assertion, so `({a:1}).should.be.sealed` read
+    // `undefined` and recorded GREEN).
     chai.should = function () {
         Object.defineProperty(Object.prototype, 'should', {
             get: function () {
-                return new Assertion(this);
+                return guardAssertion(new Assertion(this));
             },
             set: function () {},
             configurable: true,
