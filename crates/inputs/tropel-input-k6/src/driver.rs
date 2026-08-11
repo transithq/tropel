@@ -4578,6 +4578,144 @@ mod tests {
     }
 
     #[test]
+    fn test_chai_a_an_and_numeric_contain_instanceof_oneof_throw() {
+        // Backlog line 104: chai a/an were NOT callable (plain getters, so
+        // `expect(x).to.be.a('string')` threw "a is not a function"), and
+        // above/below/least/most/contain/instanceof/oneOf/throw all hit the
+        // unknown-name Proxy guard and threw — a large slice of valid chai
+        // turned red. Each must now work, support negation, chain, and keep
+        // the unknown-name guard active afterwards.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__out = JSON.stringify([
+                    // a/an are callable and assert the type
+                    (function () { try { chai.expect('x').to.be.a('string'); return 'a-ok'; } catch (e) { return 'a-fail'; } })(),
+                    (function () { try { chai.expect([1]).to.be.an('array'); return 'an-ok'; } catch (e) { return 'an-fail'; } })(),
+                    (function () { try { chai.expect(42).to.be.a('number'); return 'num-ok'; } catch (e) { return 'num-fail'; } })(),
+                    (function () { try { chai.expect({}).to.be.an('object'); return 'obj-ok'; } catch (e) { return 'obj-fail'; } })(),
+                    (function () { try { chai.expect(42).to.be.a('string'); return 'passed'; } catch (e) { return 'threw'; } })(),
+                    // negation
+                    (function () { try { chai.expect(42).not.to.be.a('string'); return 'not-ok'; } catch (e) { return 'not-fail'; } })(),
+                    (function () { try { chai.expect(42).not.to.be.a('number'); return 'passed'; } catch (e) { return 'threw'; } })(),
+                    // chaining after a/an (guard must stay active)
+                    (function () { try { chai.expect('x').to.be.a('string').and.to.equal('x'); return 'chain-ok'; } catch (e) { return 'chain-fail'; } })(),
+                    (function () { try { chai.expect('x').to.be.a('string').bogusAssertion; return 'passed'; } catch (e) { return 'threw'; } })(),
+                    // numeric comparisons
+                    (function () { try { chai.expect(10).to.be.above(5); return 'above-ok'; } catch (e) { return 'above-fail'; } })(),
+                    (function () { try { chai.expect(1).to.be.below(5); return 'below-ok'; } catch (e) { return 'below-fail'; } })(),
+                    (function () { try { chai.expect(5).to.be.at.least(5); return 'least-ok'; } catch (e) { return 'least-fail'; } })(),
+                    (function () { try { chai.expect(5).to.be.at.most(5); return 'most-ok'; } catch (e) { return 'most-fail'; } })(),
+                    (function () { try { chai.expect(10).to.be.below(5); return 'passed'; } catch (e) { return 'threw'; } })(),
+                    (function () { try { chai.expect(1).to.be.above(5); return 'passed'; } catch (e) { return 'threw'; } })(),
+                    // contain
+                    (function () { try { chai.expect([1, 2, 3]).to.contain(2); return 'contain-ok'; } catch (e) { return 'contain-fail'; } })(),
+                    (function () { try { chai.expect('hello').to.contain('ell'); return 'str-ok'; } catch (e) { return 'str-fail'; } })(),
+                    (function () { try { chai.expect([1, 2, 3]).to.contain(9); return 'passed'; } catch (e) { return 'threw'; } })(),
+                    // instanceof
+                    (function () { try { chai.expect(new Error('e')).to.be.instanceof(Error); return 'inst-ok'; } catch (e) { return 'inst-fail'; } })(),
+                    (function () { try { chai.expect({}).to.be.instanceof(Error); return 'passed'; } catch (e) { return 'threw'; } })(),
+                    // oneOf
+                    (function () { try { chai.expect('b').to.be.oneOf(['a', 'b', 'c']); return 'one-ok'; } catch (e) { return 'one-fail'; } })(),
+                    (function () { try { chai.expect('z').to.be.oneOf(['a', 'b']); return 'passed'; } catch (e) { return 'threw'; } })(),
+                    // throw
+                    (function () { try { chai.expect(function () { throw new Error('boom'); }).to.throw(); return 'throw-ok'; } catch (e) { return 'throw-fail'; } })(),
+                    (function () { try { chai.expect(function () { throw new TypeError('boom'); }).to.throw(TypeError); return 'type-ok'; } catch (e) { return 'type-fail'; } })(),
+                    (function () { try { chai.expect(function () { throw new Error('boom'); }).to.throw('boom'); return 'msg-ok'; } catch (e) { return 'msg-fail'; } })(),
+                    (function () { try { chai.expect(function () {}).to.throw(); return 'passed'; } catch (e) { return 'threw'; } })(),
+                    (function () { try { chai.expect(function () {}).not.to.throw(); return 'nothrow-ok'; } catch (e) { return 'nothrow-fail'; } })()
+                ]);
+            "#,
+            )
+            .expect("script should eval");
+            let out: String = ctx.eval("__out").expect("read __out");
+            assert_eq!(
+                out,
+                concat!(
+                    "[\"a-ok\",\"an-ok\",\"num-ok\",\"obj-ok\",\"threw\",",
+                    "\"not-ok\",\"threw\",\"chain-ok\",\"threw\",",
+                    "\"above-ok\",\"below-ok\",\"least-ok\",\"most-ok\",",
+                    "\"threw\",\"threw\",\"contain-ok\",\"str-ok\",\"threw\",",
+                    "\"inst-ok\",\"threw\",\"one-ok\",\"threw\",",
+                    "\"throw-ok\",\"type-ok\",\"msg-ok\",\"threw\",\"nothrow-ok\"]"
+                ),
+                "chai a/an/numeric/contain/instanceof/oneOf/throw mismatch: {out}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pm_expect_chain_allocates_once_not_per_read() {
+        // Backlog line 105: pm.expect was ~10x slower than chai.expect
+        // (2511 ms vs 235 ms over 200k assertions) because EVERY call built
+        // a fresh chain literal with 18 Object.defineProperty calls
+        // (addPropAssertions x4) and guardChain wrapped each object-valued
+        // property read in a NEW Proxy. The chain is now a single class with
+        // the surface on AssertChain.prototype. This test pins the
+        // STRUCTURAL property deterministically (no timing flakiness): after
+        // load, running chains must not call Object.defineProperty at all,
+        // and Proxy allocations must be ~1 per expect + ~1 per .not access,
+        // NOT one per chain-property read.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Instrument AFTER load so module-level defineProperty (the
+                // one-time prototype install) is not counted.
+                globalThis.__defCalls = 0;
+                var __realDefine = Object.defineProperty;
+                Object.defineProperty = function () {
+                    globalThis.__defCalls++;
+                    return __realDefine.apply(Object, arguments);
+                };
+                globalThis.__proxyCalls = 0;
+                var __realProxy = Proxy;
+                Proxy = function () {
+                    globalThis.__proxyCalls++;
+                    return new __realProxy(arguments[0], arguments[1]);
+                };
+
+                // Warm-up + behaviour must be unchanged. (above/below etc.
+                // are chai-shim assertions — the pm chain's surface is
+                // eql/equal/include/match/an/a/property/status/header/
+                // jsonBody, and the guard must still throw on anything else.)
+                pm.expect('x').to.be.an('string').and.to.equal('x');
+                pm.expect(5).not.to.be.a('string');
+                pm.expect([1, 2]).to.include(2);
+                try { pm.expect(1).to.be.bogus; } catch (e) { /* guard still throws */ }
+
+                var defBefore = globalThis.__defCalls;
+                var proxyBefore = globalThis.__proxyCalls;
+                for (var i = 0; i < 500; i++) {
+                    pm.expect('x').to.be.an('string').and.to.equal('x');
+                }
+                globalThis.__defDelta = globalThis.__defCalls - defBefore;
+                globalThis.__proxyDelta = globalThis.__proxyCalls - proxyBefore;
+            "#,
+            )
+            .expect("script should eval");
+
+            let def_delta: i64 = ctx.eval("__defDelta").expect("read defDelta");
+            let proxy_delta: i64 = ctx.eval("__proxyDelta").expect("read proxyDelta");
+            assert_eq!(
+                def_delta, 0,
+                "pm.expect must not call Object.defineProperty per call (got {def_delta})"
+            );
+            assert_eq!(
+                proxy_delta, 500,
+                "pm.expect must allocate exactly one Proxy per call, not per read (got {proxy_delta})"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_collection_vars_globals_request_cookies() {
         // Backlog line 145: pm.collectionVariables / pm.globals / pm.request /
         // pm.cookies / pm.expect.fail / pm.test.skip / postman.setNextRequest
