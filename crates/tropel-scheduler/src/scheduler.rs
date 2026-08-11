@@ -257,6 +257,21 @@ impl VUScheduler {
             .store(current_vus.saturating_sub(target), Ordering::Release);
     }
 
+    /// Arm ONE additional ramp-down surplus slot without discarding unclaimed
+    /// ones (backlog line 161 — ramp-down is a cliff, not a ramp).
+    ///
+    /// Stepped arming via [`Self::set_ramp_down_target`] OVERWRITES
+    /// `remaining` on every call, so each step re-arms only its own single
+    /// slot: slots a VU hasn't claimed yet are discarded, and since VUs claim
+    /// only at their loop top (a 2s iteration → one claim opportunity per 2s
+    /// window), a synchronized pool sheds ~1 VU per window and the rest burst
+    /// out at the final re-arm. Incrementing instead of overwriting preserves
+    /// every unclaimed slot, so the pool sheds at the rate the target drops.
+    pub fn arm_ramp_down_step(&self, target: u32) {
+        self.ramp_down_target.store(target, Ordering::Release);
+        self.ramp_down_remaining.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Reset ramp-down state back to "not ramping down".
     /// Called after a ramp-down stage drains fully (all surplus VUs exited)
     /// so a later stage's target/remaining can't spuriously claim. When a
@@ -747,17 +762,21 @@ impl VUScheduler {
                 let step_delay = stage_duration / delta;
                 for step in 1..=delta {
                     // Interpolate the ramp-down target from current_vus down
-                    // to `target`, one unit at a time. Arm EXACTLY ONE surplus
-                    // slot per step (remaining = new_target+1 - new_target = 1)
-                    // so exactly one VU exits per step window — a true linear
-                    // ramp. Re-arming to a GROWING value (current_vus -
+                    // to `target`, one unit at a time. Each step ADDS one
+                    // surplus slot (arm_ramp_down_step INCREMENTS remaining)
+                    // instead of overwriting it — the old set_ramp_down_target
+                    // re-armed only the current step's single slot, discarding
+                    // slots VUs hadn't claimed at their loop top yet, so a
+                    // synchronized pool shed ~1 VU per iteration window and
+                    // the rest burst out at the final re-arm (backlog line
+                    // 161). Re-arming to a GROWING value (current_vus -
                     // new_target = step) would let VUs exit in bursts and
                     // overshoot below the final target.
                     let new_target = current_vus - step;
                     if new_target < target {
                         break;
                     }
-                    self.set_ramp_down_target(new_target, new_target + 1);
+                    self.arm_ramp_down_step(new_target);
                     tracing::debug!(
                         "Ramp-down step: target {new_target} (from {current_vus}, grace: {:?})",
                         grace_rd
@@ -2168,5 +2187,41 @@ mod tests {
         sched.set_ramp_down_target(5, 10);
         assert!(!sched.try_claim_ramp_down(5).await); // at target
         assert!(!sched.try_claim_ramp_down(4).await); // below target
+    }
+
+    /// Backlog §5 P2 (line 161): `set_ramp_down_target` OVERWRITES
+    /// `remaining` on every call, so each stepped re-arm discarded every
+    /// unclaimed slot — a synchronized pool shed ~1 VU per iteration window
+    /// and the rest burst out at the final re-arm. `arm_ramp_down_step`
+    /// INCREMENTS instead: N arms must yield N claimable surplus slots, and
+    /// a claim between two arms must not be discarded by the second arm.
+    #[tokio::test]
+    async fn arm_ramp_down_step_accumulates_slots_across_steps() {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+
+        // Arm 3 steps (100 → 99, 98, 97). Active stays 100, so all qualify.
+        sched.arm_ramp_down_step(99);
+        sched.arm_ramp_down_step(98);
+        sched.arm_ramp_down_step(97);
+
+        // One VU claims mid-way — under the OLD overwrite semantics, the
+        // second arm would have discarded this claim.
+        assert!(sched.try_claim_ramp_down(100).await);
+        // One more arm must ADD a slot, not reset the count.
+        sched.arm_ramp_down_step(96);
+
+        // 3 claims left (4 armed − 1 claimed), then the pool is drained.
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(
+            !sched.try_claim_ramp_down(100).await,
+            "4th claim must fail: exactly 4 slots were armed, 1 already claimed"
+        );
     }
 }
