@@ -4679,7 +4679,11 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__cv_get").unwrap(), "https://api.example.com", "pm.collectionVariables.get");
             assert!(ctx.eval::<bool, _>("__cv_has").unwrap(), "pm.collectionVariables.has");
             assert_eq!(ctx.eval::<String, _>("__cv_obj").unwrap(), r#"{"base":"x","n":3}"#, "toObject must JSON-decode values");
-            assert_eq!(ctx.eval::<String, _>("__cv_set").unwrap(), "k=v", "collectionVariables.set must reach the bridge");
+            assert_eq!(
+                ctx.eval::<String, _>("__cv_set").unwrap(),
+                "k=\"v\"",
+                "collectionVariables.set must reach the bridge JSON-encoded (shim encodes on set)"
+            );
             assert_eq!(ctx.eval::<String, _>("__cv_unset").unwrap(), "k", "collectionVariables.unset must reach the bridge");
             assert_eq!(ctx.eval::<String, _>("__g_get").unwrap(), "global", "pm.globals.get");
             assert!(ctx.eval::<bool, _>("__g_has").unwrap(), "pm.globals.has");
@@ -4798,6 +4802,145 @@ mod tests {
                 ctx.eval::<String, _>("__next_req_null").unwrap(),
                 "null-or-unset",
                 "setNextRequest(null) must not throw (Option<String> bridge param)"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pm_set_get_roundtrip_preserves_type() {
+        // Backlog line 89: setters String()-coerced and getters JSON.parse'd
+        // were NOT inverses — a plain string '1234' set through
+        // pm.environment/globals came back as the NUMBER 1234 (and objects
+        // became "[object Object]"). The shim now JSON-encodes on set; these
+        // bridge stubs mirror the REAL decode-on-set/encode-on-get contract
+        // (crates/tropel-sandbox trp.rs), so the round trip must restore the
+        // exact type: strings stay strings, numbers stay numbers, objects
+        // stay objects.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // decode_json_encoded equivalent: JSON string → plain string,
+                // anything else (number/bool/object) → its JSON text.
+                function decodeEnv(v) {
+                    try { var p = JSON.parse(v); return typeof p === 'string' ? p : v; }
+                    catch (e) { return v; }
+                }
+                // decode_json_value equivalent: parse to a serde-like Value.
+                function decodeVal(v) {
+                    try { return JSON.parse(v); } catch (e) { return v; }
+                }
+
+                var env = {};
+                globalThis.__tropel_pm_environment_set = function (k, v) { env[k] = decodeEnv(v); };
+                globalThis.__tropel_pm_environment_get = function (k) { return k in env ? JSON.stringify(env[k]) : null; };
+
+                var col = {};
+                globalThis.__tropel_pm_collection_vars_set = function (k, v) { col[k] = decodeVal(v); };
+                globalThis.__tropel_pm_collection_vars_get = function (k) { return k in col ? JSON.stringify(col[k]) : null; };
+
+                var gl = {};
+                globalThis.__tropel_pm_globals_set = function (k, v) { gl[k] = decodeVal(v); };
+                globalThis.__tropel_pm_globals_get = function (k) { return k in gl ? JSON.stringify(gl[k]) : null; };
+
+                // env: '1234' string stays the STRING '1234' (never number).
+                pm.environment.set('s', '1234');
+                globalThis.__env_s = pm.environment.get('s');
+                globalThis.__env_s_type = typeof globalThis.__env_s;
+                // env: number 42 round-trips as the STRING '42' (env is strings-only).
+                pm.environment.set('n', 42);
+                globalThis.__env_n = pm.environment.get('n');
+                globalThis.__env_n_type = typeof globalThis.__env_n;
+                // env: object round-trips as its JSON text string.
+                pm.environment.set('o', { a: 1 });
+                globalThis.__env_o = pm.environment.get('o');
+
+                // collection: numeric string stays string, object stays object.
+                pm.collectionVariables.set('s', '42');
+                globalThis.__col_s = pm.collectionVariables.get('s');
+                globalThis.__col_s_type = typeof globalThis.__col_s;
+                pm.collectionVariables.set('o', { b: [1, 2] });
+                globalThis.__col_o = JSON.stringify(pm.collectionVariables.get('o'));
+                globalThis.__col_o_type = typeof pm.collectionVariables.get('o');
+
+                // globals: number stays number, string stays string.
+                pm.globals.set('n', 42);
+                globalThis.__gl_n = pm.globals.get('n');
+                globalThis.__gl_n_type = typeof globalThis.__gl_n;
+                pm.globals.set('s', '1234');
+                globalThis.__gl_s = pm.globals.get('s');
+                globalThis.__gl_s_type = typeof globalThis.__gl_s;
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__env_s").unwrap(),
+                "1234",
+                "env string '1234' must round-trip as the STRING '1234'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_s_type").unwrap(),
+                "string",
+                "numeric-looking env string must not be retyped to a number"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_n").unwrap(),
+                "42",
+                "env number 42 round-trips as the string '42' (env is strings-only)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_n_type").unwrap(),
+                "string",
+                "env values are always strings"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_o").unwrap(),
+                "{\"a\":1}",
+                "env object round-trips as its JSON text string"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_s").unwrap(),
+                "42",
+                "collection string '42' must stay the STRING '42'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_s_type").unwrap(),
+                "string",
+                "collection must not retype numeric-looking strings"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_o").unwrap(),
+                "{\"b\":[1,2]}",
+                "collection object must round-trip as an object"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_o_type").unwrap(),
+                "object",
+                "collection object must stay an object"
+            );
+            assert_eq!(
+                ctx.eval::<f64, _>("__gl_n").unwrap(),
+                42.0,
+                "globals number 42 round-trips as the number 42"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_n_type").unwrap(),
+                "number",
+                "globals numbers stay numbers"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_s").unwrap(),
+                "1234",
+                "globals string '1234' round-trips as the STRING '1234'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_s_type").unwrap(),
+                "string",
+                "globals numeric-looking string must stay a string"
             );
         });
     }
