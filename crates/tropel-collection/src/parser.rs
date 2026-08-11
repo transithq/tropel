@@ -119,6 +119,7 @@ fn convert_items(
                 let mut events = parent_events.to_vec();
                 events.extend(folder.event.iter().cloned());
                 let scenario_item = ScenarioItem {
+                    id: folder.id.clone(),
                     name: folder.name.clone(),
                     request: None,
                     // The folder's own scripts are ALSO folded into every
@@ -159,6 +160,7 @@ fn convert_request_item(
     events.extend(req.event.iter().cloned());
 
     ScenarioItem {
+        id: req.id.clone(),
         name: req.name.clone(),
         request: Some(request),
         prerequest: find_prerequest_script(&events),

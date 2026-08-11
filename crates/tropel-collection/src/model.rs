@@ -144,6 +144,9 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestItem {
+    /// Postman item id — resolves `setNextRequest` BEFORE names (backlog §4).
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub request: RequestDetail,
     #[serde(default)]
@@ -156,6 +159,9 @@ pub struct RequestItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderItem {
+    /// Postman item id — resolves `setNextRequest` BEFORE names (backlog §4).
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub item: Vec<CollectionItem>,
