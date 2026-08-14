@@ -340,8 +340,15 @@ fn sigv4_canonical_query(url: &reqwest::Url) -> String {
 /// label. For these, `host.split('.').next()` returns the TENANT — the
 /// signing service is a later label (examplebucket.s3.amazonaws.com → s3).
 const VIRTUAL_HOSTED_SERVICE_LABELS: &[&str] = &[
-    "s3", "s3-control", "s3-object-lambda", "s3-outposts", "s3express",
-    "execute-api", "es", "aoss", "cloudsearch",
+    "s3",
+    "s3-control",
+    "s3-object-lambda",
+    "s3-outposts",
+    "s3express",
+    "execute-api",
+    "es",
+    "aoss",
+    "cloudsearch",
 ];
 
 fn default_service(host: &str) -> String {
@@ -1363,8 +1370,14 @@ mod tests {
         // path (403 on every virtual-hosted-S3 and API-Gateway request).
         assert_eq!(default_service("s3.us-west-2.amazonaws.com"), "s3");
         assert_eq!(default_service("examplebucket.s3.amazonaws.com"), "s3");
-        assert_eq!(default_service("examplebucket.s3.us-west-2.amazonaws.com"), "s3");
-        assert_eq!(default_service("mybucket.s3-website-us-west-2.amazonaws.com"), "s3");
+        assert_eq!(
+            default_service("examplebucket.s3.us-west-2.amazonaws.com"),
+            "s3"
+        );
+        assert_eq!(
+            default_service("mybucket.s3-website-us-west-2.amazonaws.com"),
+            "s3"
+        );
         assert_eq!(default_service("s3-fips.us-west-2.amazonaws.com"), "s3");
         // Collision-robustness: a tenant that IS a service name must not win
         // over the real (suffix-closest) service label.
@@ -1375,7 +1388,10 @@ mod tests {
         );
         assert_eq!(default_service("search-x.us-east-1.es.amazonaws.com"), "es");
         // Non-virtual-hosted service: first label IS the service.
-        assert_eq!(default_service("dynamodb.us-east-1.amazonaws.com"), "dynamodb");
+        assert_eq!(
+            default_service("dynamodb.us-east-1.amazonaws.com"),
+            "dynamodb"
+        );
         // Non-AWS host: first label preserved (unchanged behavior).
         assert_eq!(default_service("api.example.com"), "api");
     }
