@@ -562,7 +562,9 @@ http.request = function (method, url, body, params) { return k6HTTPRequest(metho
 // by name. The old implementation always returned a keyed object, so the
 // documented batch idiom (`res[0].status`) silently broke.
 http.batch = function (requests) {
-    if (!requests) {
+    // Backlog §3: `http.batch('abc')` used to fall through both branches
+    // (not an array, typeof !== 'object') and return {} silently.
+    if (!requests || typeof requests !== 'object') {
         throw new Error('http.batch requires an array or object of requests');
     }
 
@@ -588,12 +590,37 @@ http.batch = function (requests) {
     var results = isArrayInput ? [] : {};
 
     if (typeof __tropel_k6_http_batch === 'function') {
+        // Backlog §3: two entries with the same `name` collided in the
+        // driver's response map (response_map.insert — the second overwrote
+        // the first and one real response was lost). Dedupe the round-trip
+        // keys BEFORE sending so every response survives; the read loop below
+        // looks up by the SAME deduped key.
+        var finalKeys = [];
+        var usedKeys = {};
+        for (var dki = 0; dki < keys.length; dki++) {
+            var kCandidate = String(keys[dki]);
+            if (usedKeys[kCandidate] !== undefined) {
+                // Keep appending a numeric suffix until the candidate is
+                // free — a single #index retry could still collide when a
+                // user names a request 'dup#2' next to two 'dup' entries.
+                // First retry uses #<index> (matching the original naming),
+                // so the candidate is computed BEFORE the suffix increments.
+                var kBase = kCandidate;
+                var kSuffix = dki;
+                while (usedKeys[kCandidate] !== undefined) {
+                    kCandidate = kBase + '#' + kSuffix;
+                    kSuffix += 1;
+                }
+            }
+            usedKeys[kCandidate] = true;
+            finalKeys.push(kCandidate);
+        }
         var normalized = [];
         for (var ei = 0; ei < entries.length; ei++) {
             var entry = entries[ei];
             var canonical = normalizeK6Request(entry.method, entry.url, entry.body, entry.params);
             normalized.push({
-                key: String(keys[ei]),
+                key: String(finalKeys[ei]),
                 method: canonical.method,
                 url: canonical.url,
                 headers_json: JSON.stringify(canonical.headers),
@@ -615,10 +642,17 @@ http.batch = function (requests) {
         var batchResult = JSON.parse(batchResultJson);
         for (var ei = 0; ei < entries.length; ei++) {
             var entry = entries[ei];
-            var key = String(keys[ei]);
+            var key = String(finalKeys[ei]);
+            // Backlog §3: a missing key used to fabricate {status:0, body:'',
+            // error:''} — and error==='' made `if (res.error)` miss it. The
+            // driver inserts every sent key (incl. error envelopes), so a
+            // missing one is a contract violation — fail loudly.
+            if (!(key in batchResult)) {
+                throw new Error('http.batch: native bridge returned no response for key "' + key + '"');
+            }
             // Wrap each entry as a K6Response so `.json()`, `.status`, `.body`
             // behave like the sequential path (k6 returns Response objects).
-            var raw = batchResult[key] || {};
+            var raw = batchResult[key];
             var headers = raw.headers || {};
             var normalizedHeaders = {};
             if (Array.isArray(headers)) {
@@ -707,12 +741,24 @@ function normalizeBatchEntry(req, defaultKey) {
             key: req.name != null ? req.name : defaultKey,
             method: req.method || 'GET',
             url: req.url || '',
-            body: req.body || null,
+            // Backlog §3: `req.body || null` dropped 0/''/false — only
+            // undefined/null mean "no body".
+            body: req.body !== undefined ? req.body : null,
             params: {
                 headers: req.headers || entryParams.headers || {},
                 tags: req.tags || entryParams.tags || {},
-                timeout: req.timeout || entryParams.timeout || '30s',
-                responseType: entryParams.responseType || req.responseType || 'text'
+                // Backlog §3: object-form entries forced `timeout:'30s'`,
+                // overriding the global HttpConfig.request_timeout. Mirror
+                // the single path — leave it unset so timeoutMs stays 0 and
+                // the driver applies the client-level global.
+                timeout: req.timeout || entryParams.timeout,
+                responseType: entryParams.responseType || req.responseType || 'text',
+                // Backlog §3: object-form entries dropped auth/redirects/
+                // compression/cookies that the single path honors.
+                auth: req.auth !== undefined ? req.auth : entryParams.auth,
+                redirects: req.redirects !== undefined ? req.redirects : entryParams.redirects,
+                compression: req.compression !== undefined ? req.compression : entryParams.compression,
+                cookies: req.cookies !== undefined ? req.cookies : entryParams.cookies
             }
         };
     }
@@ -1369,6 +1415,20 @@ if (typeof b64decode === 'undefined') { var b64decode = k6B64Decode; }
 
 var __tropel_timers = {};
 var __tropel_timer_seq = 0;
+
+// Backlog line 99: timers leaked across iterations. __tropel_timers is
+// module-scope and had no per-iteration reset, so a setInterval armed in
+// every iteration accumulated 3 live intervals all firing on every
+// subsequent pump — linear growth in callbacks and retained closures for
+// the VU's life. The driver calls __tropel_reset_timers() at the start of
+// each iteration so only the CURRENT iteration's timers are live: ones
+// armed in iteration N fire at the N boundary pump, then are cleared.
+// NOTE: the id sequence is NOT reset — a user-held timer id from an earlier
+// iteration must never collide with a fresh timer's id (stale clearInterval
+// would kill the wrong timer). Only the live table is cleared.
+function __tropel_reset_timers() {
+    __tropel_timers = {};
+}
 
 function setTimeout(fn, ms) {
     var id = ++__tropel_timer_seq;
