@@ -754,6 +754,10 @@ impl ScenarioRunner {
             env.insert(k.clone(), v.clone());
         }
         tropel_variables::VariableScope {
+            // pm.variables is the LOCAL scope — Postman's highest priority
+            // (backlog line 137): script-set values must win over data/env
+            // for {{var}} substitution in later requests.
+            local: state.local_vars.clone(),
             data,
             env,
             collection: state.collection_vars.clone(),
@@ -1752,6 +1756,32 @@ mod tests {
             state.environment.get("sawIdx2").map(String::as_str),
             Some("1"),
             "execution continues past the jump target (Postman flow)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pm_variables_local_scope_shadows_iteration_data() {
+        // Backlog line 137: pm.variables.set wrote to COLLECTION scope while
+        // get read data > env > collection — set-then-get disagreed when
+        // iteration data had the same key. pm.variables is Postman's LOCAL
+        // (highest-priority) scope: the set value must win, both for
+        // pm.variables.get and for {{var}} substitution in later requests.
+        let mut runner = runner_with_scripts(vec![
+            script_item("first", "pm.variables.set('token', 'local-tok');"),
+            script_item(
+                "second",
+                "pm.environment.set('saw', pm.variables.get('token'));",
+            ),
+        ])
+        .await;
+        let data: HashMap<String, serde_json::Value> =
+            HashMap::from([("token".into(), serde_json::Value::String("data-tok".into()))]);
+        let _ = runner.run_iteration(0, Some(data), &HashMap::new()).await;
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("saw").map(String::as_str),
+            Some("local-tok"),
+            "pm.variables (local scope) must win over iteration data"
         );
     }
 }
