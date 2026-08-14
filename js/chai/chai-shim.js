@@ -709,7 +709,7 @@ var chai = chai || {};
                     var raw = Reflect.get(target, prop, receiver);
                     return function (type) {
                         raw.call(target, type);
-                        return proxy;
+                        return receiver;
                     };
                 }
                 if (prop in Assertion.prototype || prop in target) {
