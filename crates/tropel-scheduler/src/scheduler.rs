@@ -546,7 +546,7 @@ impl VUScheduler {
                 let grace_rd = graceful_stop_duration(graceful_ramp_down);
                 let grace = graceful_stop_duration(graceful_stop);
                 self.run_ramping(*start_vus, stages, grace_rd, grace, &run_vu)
-                    .await;
+                    .await?;
                 Ok(())
             }
             ExecutionConfig::SharedIterations {
@@ -555,11 +555,13 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                // Default maxDuration to 10 minutes (matching k6 behavior)
-                let max_dur = max_duration
-                    .as_ref()
-                    .and_then(|d| parse_duration(d).ok())
-                    .or(Some(Duration::from_secs(600)));
+                // Default maxDuration to 10 minutes when ABSENT (k6
+                // behavior); a present-but-unparseable value must fail
+                // loudly, not silently become 10 minutes (backlog line 47).
+                let max_dur = match max_duration.as_ref() {
+                    Some(d) => Some(parse_duration(d)?),
+                    None => Some(Duration::from_secs(600)),
+                };
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_shared_iterations(*iterations, max_dur, grace, &run_vu)
@@ -588,11 +590,12 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                // Default maxDuration to 10 minutes (matching k6 behavior)
-                let max_dur = max_duration
-                    .as_ref()
-                    .and_then(|d| parse_duration(d).ok())
-                    .or(Some(Duration::from_secs(600)));
+                // Same class as SharedIterations (backlog line 47): a
+                // present-but-unparseable maxDuration must fail loudly.
+                let max_dur = match max_duration.as_ref() {
+                    Some(d) => Some(parse_duration(d)?),
+                    None => None,
+                };
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_per_vu_iterations(*vus, *iterations, max_dur, grace, &run_vu)
@@ -616,7 +619,7 @@ impl VUScheduler {
                     grace,
                     &run_vu,
                 )
-                .await;
+                .await?;
                 Ok(())
             }
             ExecutionConfig::ExternallyControlled {
@@ -626,7 +629,12 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                let duration = duration.as_ref().and_then(|d| parse_duration(d).ok());
+                // Same class (backlog line 47): a present-but-unparseable
+                // duration must fail loudly, not silently mean "no cap".
+                let duration = match duration.as_ref() {
+                    Some(d) => Some(parse_duration(d)?),
+                    None => None,
+                };
                 let grace = graceful_stop_duration(graceful_stop);
                 self.run_externally_controlled(*vus, *max_vus, duration, grace, &run_vu)
                     .await;
@@ -681,7 +689,8 @@ impl VUScheduler {
         grace_rd: Duration,
         grace: Duration,
         run_vu: &F,
-    ) where
+    ) -> Result<()>
+    where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         tracing::info!("Starting ramping VUs: start={}", start_vus);
@@ -702,7 +711,9 @@ impl VUScheduler {
         // ramp-down gradually lowers the target so VUs exit over the duration
         // instead of as a cliff.
         for stage in stages {
-            let stage_duration = parse_duration(&stage.duration).unwrap_or(Duration::from_secs(10));
+            // Backlog line 47: an unparseable stage duration must fail
+            // loudly, not silently become 10 s (which changed the profile).
+            let stage_duration = parse_duration(&stage.duration)?;
             let target = stage.target;
 
             tracing::info!(
@@ -835,6 +846,7 @@ impl VUScheduler {
         Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
 
         tracing::info!("Ramping VUs finished");
+        Ok(())
     }
 
     /// Run with shared iterations across all VUs.
@@ -1090,20 +1102,20 @@ impl VUScheduler {
         max_vus: u32,
         grace: Duration,
         run_vu: &F,
-    ) where
+    ) -> Result<()>
+    where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
-        // Compute total duration from all stages
+        // Compute total duration from all stages — an unparseable stage
+        // must fail loudly, not be silently skipped (backlog line 47).
         let mut total_duration = Duration::ZERO;
         for stage in stages {
-            if let Ok(d) = parse_duration(&stage.duration) {
-                total_duration += d;
-            }
+            total_duration += parse_duration(&stage.duration)?;
         }
 
         if total_duration == Duration::ZERO {
             tracing::warn!("Ramping arrival rate: total duration is zero, nothing to run");
-            return;
+            return Ok(());
         }
 
         tracing::info!(
@@ -1128,7 +1140,7 @@ impl VUScheduler {
             let mut data = Vec::with_capacity(stages.len());
             let mut prev_target = start_rate;
             for stage in stages {
-                let dur = parse_duration(&stage.duration).unwrap_or(Duration::from_secs(10));
+                let dur = parse_duration(&stage.duration)?;
                 let dur = dur.max(Duration::from_millis(1));
                 let dur_secs = dur.as_secs_f64();
                 data.push((dur_secs, prev_target, stage.target));
@@ -1221,6 +1233,7 @@ impl VUScheduler {
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
         tracing::info!("Ramping arrival rate finished (dropped: {})", dropped_total);
+        Ok(())
     }
 
     /// Run with per-VU iterations — each VU runs exactly N iterations independently.
@@ -1717,7 +1730,8 @@ mod tests {
                         Duration::from_millis(40),
                         &run_vu,
                     )
-                    .await;
+                    .await
+                    .unwrap();
             })
         };
         // Sample for 200ms total (10 x 20ms). The run lasts ~260ms (60+80+120)

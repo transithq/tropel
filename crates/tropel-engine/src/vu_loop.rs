@@ -358,10 +358,31 @@ where
         last_active_vus: last_active_vus.clone(),
     };
 
-    executor
+    // Backlog line 47: a malformed execution config (e.g. `-d 30x`) made
+    // the scheduler's run() return Err, which the old `.ok()` swallowed —
+    // zero VUs ran and the run exited 0 with http_reqs: 0. Surface it as a
+    // VU-init failure so the engine fails the run loudly (same convention
+    // as a panicked scenario task, engine.rs).
+    if let Err(e) = executor
         .run(move |sched, vu_id| run_vu(sched, vu_id, &shared))
         .await
-        .ok();
+    {
+        tracing::error!(
+            "Scenario '{}': scheduler rejected the execution config: {}",
+            sc_name,
+            e
+        );
+        // Don't leave the 2s abort poller keeping the metrics aggregator
+        // alive on the error path — and stop the control API task too
+        // (reviewer fix: it was only aborted in the normal tail).
+        if let Some(monitor) = abort_monitor {
+            monitor.abort();
+        }
+        if let Some(handle) = control_server {
+            handle.abort();
+        }
+        return (1, 0);
+    }
 
     // A VU that failed to START (driver init / client creation) means the
     // requested load was NOT delivered — surfacing the count loudly here (and
