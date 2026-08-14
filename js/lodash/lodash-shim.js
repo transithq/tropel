@@ -52,17 +52,38 @@ var _ = _ || {};
         return array;
     };
 
+    // ── Collection shorthand (backlog line 93) ──
+    // Normalize any lodash predicate shorthand into a predicate function,
+    // mirroring lodash's _.iteratee: string → property-path truthiness
+    // (`_.filter(users,'active')`), array [key,value] → equality
+    // (`_.find(users,['active',true])`), object → matcher
+    // (`_.every(users,{active:true})`), function → itself, undefined/other →
+    // truthiness. String paths resolve through _.get so dotted/bracket paths
+    // (`'a.b'`, `'a[0].b'`) work too.
+    function toPredicate(predicate) {
+        if (typeof predicate === 'function') return predicate;
+        if (typeof predicate === 'string') {
+            return function (x) { return !!_.get(x, predicate); };
+        }
+        if (Array.isArray(predicate)) {
+            return function (x) { return _.get(x, predicate[0]) === predicate[1]; };
+        }
+        if (predicate !== null && typeof predicate === 'object') {
+            return function (x) {
+                for (var k in predicate) {
+                    if (x[k] !== predicate[k]) return false;
+                }
+                return true;
+            };
+        }
+        return function (x) { return !!x; };
+    }
+
     _.findIndex = function (array, predicate, fromIndex) {
+        var pred = toPredicate(predicate);
         fromIndex = fromIndex || 0;
         for (var i = fromIndex; i < array.length; i++) {
-            if (typeof predicate === 'function' && predicate(array[i])) return i;
-            if (typeof predicate === 'object' && predicate !== null) {
-                var match = true;
-                for (var k in predicate) {
-                    if (array[i][k] !== predicate[k]) { match = false; break; }
-                }
-                if (match) return i;
-            }
+            if (pred(array[i], i, array)) return i;
         }
         return -1;
     };
@@ -227,67 +248,40 @@ var _ = _ || {};
     _.forEach = _.each;
 
     _.every = function (collection, predicate) {
-        // Iterate objects by key too, and honor object/matcher predicates
-        // (backlog line 155): `_.every([{active:false}],{active:true})` must
-        // be false — the old truthiness branch returned true.
+        // Iterate objects by key too, and honor string/pair/matcher shorthand
+        // (backlog line 155/93): `_.every([{active:false}],{active:true})`
+        // must be false — the old truthiness branch returned true.
+        var pred = toPredicate(predicate);
         var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
         var len = keys ? keys.length : (collection ? collection.length : 0);
         for (var i = 0; i < len; i++) {
             var item = keys ? collection[keys[i]] : collection[i];
-            if (typeof predicate === 'function') {
-                if (!predicate(item, keys ? keys[i] : i, collection)) return false;
-            } else if (predicate !== null && typeof predicate === 'object') {
-                var match = true;
-                for (var k in predicate) {
-                    if (item[k] !== predicate[k]) { match = false; break; }
-                }
-                if (!match) return false;
-            } else {
-                if (!item) return false;
-            }
+            if (!pred(item, keys ? keys[i] : i, collection)) return false;
         }
         return true;
     };
 
     _.filter = function (collection, predicate) {
-        // Object collections iterate by key (backlog line 155) — the old
-        // `collection.length` loop returned empty for objects.
+        // Object collections iterate by key (backlog line 155); string/pair/
+        // matcher shorthand normalized by toPredicate (backlog line 93).
+        var pred = toPredicate(predicate);
         var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
         var len = keys ? keys.length : (collection ? collection.length : 0);
         var result = [];
         for (var i = 0; i < len; i++) {
             var item = keys ? collection[keys[i]] : collection[i];
-            if (typeof predicate === 'function') {
-                if (predicate(item, keys ? keys[i] : i, collection)) result.push(item);
-            } else if (predicate !== null && typeof predicate === 'object') {
-                var match = true;
-                for (var k in predicate) {
-                    if (item[k] !== predicate[k]) { match = false; break; }
-                }
-                if (match) result.push(item);
-            } else {
-                if (item) result.push(item);
-            }
+            if (pred(item, keys ? keys[i] : i, collection)) result.push(item);
         }
         return result;
     };
 
     _.find = function (collection, predicate) {
+        var pred = toPredicate(predicate);
         var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
         var len = keys ? keys.length : (collection ? collection.length : 0);
         for (var i = 0; i < len; i++) {
             var item = keys ? collection[keys[i]] : collection[i];
-            if (typeof predicate === 'function') {
-                if (predicate(item, keys ? keys[i] : i, collection)) return item;
-            } else if (predicate !== null && typeof predicate === 'object') {
-                var match = true;
-                for (var k in predicate) {
-                    if (item[k] !== predicate[k]) { match = false; break; }
-                }
-                if (match) return item;
-            } else if (predicate === undefined) {
-                if (item) return item;
-            }
+            if (pred(item, keys ? keys[i] : i, collection)) return item;
         }
         return undefined;
     };
@@ -328,7 +322,11 @@ var _ = _ || {};
     };
 
     _.reject = function (collection, predicate) {
-        return _.filter(collection, function (x) { return !predicate(x); });
+        // toPredicate normalizes string/pair/matcher shorthand (line 93) —
+        // the old code called the raw predicate as a function and THREW on
+        // object matchers.
+        var pred = toPredicate(predicate);
+        return _.filter(collection, function (x, i, c) { return !pred(x, i, c); });
     };
 
     _.size = function (collection) {
@@ -338,14 +336,15 @@ var _ = _ || {};
     };
 
     _.some = function (collection, predicate) {
-        if (typeof predicate === 'function') {
-            for (var i = 0; i < collection.length; i++) {
-                if (predicate(collection[i], i, collection)) return true;
-            }
-        } else {
-            for (var i = 0; i < collection.length; i++) {
-                if (collection[i]) return true;
-            }
+        // Object collections iterate by key like filter/find/every; shorthand
+        // normalized by toPredicate (backlog line 93 — the old truthiness
+        // branch returned true for any matcher/string predicate).
+        var pred = toPredicate(predicate);
+        var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
+        var len = keys ? keys.length : (collection ? collection.length : 0);
+        for (var i = 0; i < len; i++) {
+            var item = keys ? collection[keys[i]] : collection[i];
+            if (pred(item, keys ? keys[i] : i, collection)) return true;
         }
         return false;
     };
@@ -470,27 +469,125 @@ var _ = _ || {};
         return deep(value);
     };
 
-    function isEqualDeep(a, b) {
+    // Backlog line 85: Date/Set/Map/RegExp used to collapse to
+    // Object.keys() = [] — ANY two instances compared equal. They now
+    // compare by VALUE (time for Date, source+flags for RegExp, size +
+    // order-insensitive entries for Map/Set). Circular structures no longer
+    // overflow the stack (seen-pair guard: revisiting the exact (a,b) pair
+    // mid-compare is assumed equal).
+    function isEqualDeep(a, b, seen) {
         if (a === b) return true;
         if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
         if (a === null || b === null || a === undefined || b === undefined) return a === b;
         if (typeof a !== typeof b) return false;
+        // Date: compare by epoch time; two invalid dates compare equal.
+        if (a instanceof Date || b instanceof Date) {
+            if (!(b instanceof Date)) return false;
+            var ta = a.getTime(), tb = b.getTime();
+            return (isNaN(ta) && isNaN(tb)) || ta === tb;
+        }
+        // RegExp: source + flags.
+        if (a instanceof RegExp || b instanceof RegExp) {
+            if (!(b instanceof RegExp)) return false;
+            // Canonical toString normalizes flag order (/gi vs /ig equal),
+            // matching lodash's isEqual.
+            return String(a) === String(b);
+        }
         if (Array.isArray(a)) {
             if (!Array.isArray(b) || a.length !== b.length) return false;
-            for (var i = 0; i < a.length; i++) {
-                if (!isEqualDeep(a[i], b[i])) return false;
+            seen = seen || [];
+            for (var s = 0; s < seen.length; s++) {
+                if (seen[s][0] === a && seen[s][1] === b) return true;
             }
+            seen.push([a, b]);
+            for (var i = 0; i < a.length; i++) {
+                if (!isEqualDeep(a[i], b[i], seen)) {
+                    seen.pop();
+                    return false;
+                }
+            }
+            seen.pop();
             return true;
         }
         if (typeof a === 'object') {
             if (Array.isArray(b) || b === null || b === undefined) return false;
+            // Map: same size, each entry's key+value finds a deep-equal mate
+            // (order-insensitive).
+            if (a instanceof Map || b instanceof Map) {
+                if (!(b instanceof Map) || a.size !== b.size) return false;
+                // Cycle guard: Map nodes can be self-referential; revisiting the
+                // exact (a, b) pair mid-compare is assumed equal.
+                seen = seen || [];
+                for (var s = 0; s < seen.length; s++) {
+                    if (seen[s][0] === a && seen[s][1] === b) return true;
+                }
+                seen.push([a, b]);
+                var aEntries = Array.from(a.entries());
+                var bEntries = Array.from(b.entries());
+                var usedB = [];
+                outer:
+                for (var mi = 0; mi < aEntries.length; mi++) {
+                    for (var mj = 0; mj < bEntries.length; mj++) {
+                        if (usedB[mj]) continue;
+                        if (isEqualDeep(aEntries[mi][0], bEntries[mj][0], seen) &&
+                            isEqualDeep(aEntries[mi][1], bEntries[mj][1], seen)) {
+                            usedB[mj] = true;
+                            continue outer;
+                        }
+                    }
+                    seen.pop();
+                    return false;
+                }
+                seen.pop();
+                return true;
+            }
+            // Set: same size, each member finds a deep-equal mate.
+            if (a instanceof Set || b instanceof Set) {
+                if (!(b instanceof Set) || a.size !== b.size) return false;
+                // Cycle guard: Set nodes can be self-referential; revisiting the
+                // exact (a, b) pair mid-compare is assumed equal.
+                seen = seen || [];
+                for (var s = 0; s < seen.length; s++) {
+                    if (seen[s][0] === a && seen[s][1] === b) return true;
+                }
+                seen.push([a, b]);
+                var aMembers = Array.from(a);
+                var bMembers = Array.from(b);
+                var usedS = [];
+                outer2:
+                for (var si = 0; si < aMembers.length; si++) {
+                    for (var sj = 0; sj < bMembers.length; sj++) {
+                        if (usedS[sj]) continue;
+                        if (isEqualDeep(aMembers[si], bMembers[sj], seen)) {
+                            usedS[sj] = true;
+                            continue outer2;
+                        }
+                    }
+                    seen.pop();
+                    return false;
+                }
+                seen.pop();
+                return true;
+            }
+            // Plain object: key-set comparison with a cycle guard.
+            seen = seen || [];
+            for (var k = 0; k < seen.length; k++) {
+                if (seen[k][0] === a && seen[k][1] === b) return true;
+            }
+            seen.push([a, b]);
             var keysA = Object.keys(a).sort();
             var keysB = Object.keys(b).sort();
-            if (keysA.length !== keysB.length) return false;
-            for (var i = 0; i < keysA.length; i++) {
-                if (keysA[i] !== keysB[i]) return false;
-                if (!isEqualDeep(a[keysA[i]], b[keysB[i]])) return false;
+            if (keysA.length !== keysB.length) {
+                seen.pop();
+                return false;
             }
+            for (var j = 0; j < keysA.length; j++) {
+                if (keysA[j] !== keysB[j] || !isEqualDeep(a[keysA[j]], b[keysB[j]], seen)) {
+                    seen.pop();
+                    return false;
+                }
+            }
+            seen.pop();
             return true;
         }
         return a === b;
@@ -502,6 +599,14 @@ var _ = _ || {};
             if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
             if (a === b) return true;
             if (a === null || a === undefined || b === null || b === undefined) return a === b;
+            // Backlog line 85: JSON.stringify collapses Date/Set/Map/RegExp
+            // (Date → ISO string, others → "{}") so typed values must never
+            // go through the string bridge — the JS impl compares them by
+            // value.
+            if (a instanceof Date || a instanceof RegExp || a instanceof Set || a instanceof Map ||
+                b instanceof Date || b instanceof RegExp || b instanceof Set || b instanceof Map) {
+                return isEqualDeep(a, b);
+            }
             return __tropel_native_deep_equal(JSON.stringify(a), JSON.stringify(b));
         }
         return isEqualDeep(a, b);
