@@ -1842,8 +1842,9 @@ mod tests {
             .expect("setup should eval");
 
             // Parse the exact output so assertions are unambiguous.
-            let v: serde_json::Value = serde_json::from_str(&ctx.eval::<String, _>("__out").unwrap())
-                .expect("__out must be JSON");
+            let v: serde_json::Value =
+                serde_json::from_str(&ctx.eval::<String, _>("__out").unwrap())
+                    .expect("__out must be JSON");
             let arr = v.as_array().expect("__out must be an array");
             // auth must be NULL (fresh request has none), NOT the stale
             // 'stale-token' singleton from iteration 1.
@@ -1863,17 +1864,28 @@ mod tests {
                 "pm.request.body.mode must read the live mode, got: {arr:?}"
             );
             // pm.info fields must be live, not the hardcoded stub.
-            assert_eq!(arr[2].as_str(), Some("test"), "eventName live, got: {arr:?}");
+            assert_eq!(
+                arr[2].as_str(),
+                Some("test"),
+                "eventName live, got: {arr:?}"
+            );
             assert_eq!(arr[3], serde_json::json!(4), "iteration live, got: {arr:?}");
-            assert_eq!(arr[4], serde_json::json!(25), "iterationCount live, got: {arr:?}");
-            assert_eq!(arr[5].as_str(), Some("get-user"), "requestName live, got: {arr:?}");
+            assert_eq!(
+                arr[4],
+                serde_json::json!(25),
+                "iterationCount live, got: {arr:?}"
+            );
+            assert_eq!(
+                arr[5].as_str(),
+                Some("get-user"),
+                "requestName live, got: {arr:?}"
+            );
             assert_eq!(arr[6].as_str(), Some("r-9"), "requestId live, got: {arr:?}");
 
             // The setter still forwards to the auth bridge.
             let auth_set: String = ctx.eval("__auth_set").unwrap();
             assert_eq!(
-                auth_set,
-                r#"{"type":"bearer","token":"stale-token"}"#,
+                auth_set, r#"{"type":"bearer","token":"stale-token"}"#,
                 "pm.request.auth setter must still JSON-encode to the bridge"
             );
         });
