@@ -571,10 +571,7 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
     Some(match stat {
         // Percentiles: worst (highest) across matched series, mirroring
         // the tag-scoped path.
-        Some("min") => matched
-            .iter()
-            .map(|m| m.min)
-            .fold(f64::MAX, f64::min),
+        Some("min") => matched.iter().map(|m| m.min).fold(f64::MAX, f64::min),
         Some("max") => matched.iter().map(|m| m.max).fold(0.0_f64, f64::max),
         Some("p50") | Some("median") | Some("med") => {
             matched.iter().map(|m| m.p50).fold(0.0_f64, f64::max)
@@ -706,13 +703,13 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         }),
         "http_req_duration" => metrics.http_req_duration.as_ref().and_then(|d| {
             match stat {
-            Some("avg") => Some(d.mean),
-            Some("min") => Some(d.min),
-            Some("max") => Some(d.max),
-            Some("p50") | Some("median") | Some("med") => Some(d.p50),
-            Some("p90") => Some(d.p90),
-            Some("p95") => Some(d.p95),
-            Some("p99") => Some(d.p99),
+                Some("avg") => Some(d.mean),
+                Some("min") => Some(d.min),
+                Some("max") => Some(d.max),
+                Some("p50") | Some("median") | Some("med") => Some(d.p50),
+                Some("p90") => Some(d.p90),
+                Some("p95") => Some(d.p95),
+                Some("p99") => Some(d.p99),
                 Some("count") => Some(d.count as f64),
                 // k6's `value` stat on a trend = the most recent sample.
                 Some("value") | Some("last") => Some(d.last),

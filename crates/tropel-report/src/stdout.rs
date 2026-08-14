@@ -357,8 +357,22 @@ mod tests {
             checks_passed: 2,
             checks_failed: 0,
             run_duration: Duration::from_secs(10),
-            http_req_duration: Some(trend("http_req_duration", 134.89, 150.0, 268.0, 272.0, 338.0)),
-            iteration_duration: Some(trend("iteration_duration", 294.58, 262.0, 279.0, 321.0, 1_150.0)),
+            http_req_duration: Some(trend(
+                "http_req_duration",
+                134.89,
+                150.0,
+                268.0,
+                272.0,
+                338.0,
+            )),
+            iteration_duration: Some(trend(
+                "iteration_duration",
+                294.58,
+                262.0,
+                279.0,
+                321.0,
+                1_150.0,
+            )),
             summary_trend_stats: vec![],
             effective_thresholds: HashMap::new(),
             ..Default::default()
@@ -450,8 +464,22 @@ mod tests {
     #[test]
     fn render_per_url_breakdown_when_multiple_urls() {
         let mut r = result_with();
-        let mut a = trend("http_req_duration{url=/a}", 100.0, 100.0, 150.0, 160.0, 200.0);
-        let mut b = trend("http_req_duration{url=/b}", 200.0, 200.0, 250.0, 260.0, 300.0);
+        let mut a = trend(
+            "http_req_duration{url=/a}",
+            100.0,
+            100.0,
+            150.0,
+            160.0,
+            200.0,
+        );
+        let mut b = trend(
+            "http_req_duration{url=/b}",
+            200.0,
+            200.0,
+            250.0,
+            260.0,
+            300.0,
+        );
         a.tags = vec![("url".to_string(), "/a".to_string())];
         b.tags = vec![("url".to_string(), "/b".to_string())];
         r.per_url = vec![a, b];
