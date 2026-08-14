@@ -6317,12 +6317,36 @@ mod tests {
             )
             .expect("script should eval");
 
-            assert_eq!(ctx.eval::<String, _>("__p_json").unwrap(), "threw", "bare to.be.json on text/html must THROW (was silent PASS)");
-            assert_eq!(ctx.eval::<String, _>("__p_html").unwrap(), "passed", "to.be.html must pass on text/html");
-            assert_eq!(ctx.eval::<String, _>("__p_json_paren").unwrap(), "threw", "to.be.json() on text/html must throw");
-            assert_eq!(ctx.eval::<String, _>("__p_json_ok").unwrap(), "passed", "bare to.be.json on JSON body must pass");
-            assert_eq!(ctx.eval::<String, _>("__p_json_paren_ok").unwrap(), "passed", "to.be.json() on JSON body must pass");
-            assert_eq!(ctx.eval::<String, _>("__p_html_json").unwrap(), "threw", "to.be.html on JSON body must throw");
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json").unwrap(),
+                "threw",
+                "bare to.be.json on text/html must THROW (was silent PASS)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_html").unwrap(),
+                "passed",
+                "to.be.html must pass on text/html"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_paren").unwrap(),
+                "threw",
+                "to.be.json() on text/html must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_ok").unwrap(),
+                "passed",
+                "bare to.be.json on JSON body must pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_paren_ok").unwrap(),
+                "passed",
+                "to.be.json() on JSON body must pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_html_json").unwrap(),
+                "threw",
+                "to.be.html on JSON body must throw"
+            );
         });
     }
 
