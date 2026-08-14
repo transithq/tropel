@@ -245,10 +245,6 @@ struct VuRunShared {
     /// [`VuIterationOutcome::script_failures`] so a run where scripts keep
     /// throwing exits non-zero instead of reporting success (backlog line 98).
     script_failures: Arc<AtomicU64>,
-    /// Last sampled active VU count (Gauge). The final post-run vus sample
-    /// uses this instead of a hardcoded 0 so short runs still report the
-    /// real last-known concurrency (backlog line 154).
-    last_active_vus: Arc<AtomicU32>,
 }
 
 /// Shared VU-run scaffolding used by both the scenario and driver paths:
@@ -353,7 +349,6 @@ where
         executor_name,
         vu_init_failures: vu_init_failures.clone(),
         script_failures: script_failures.clone(),
-        last_active_vus: last_active_vus.clone(),
     };
 
     executor
