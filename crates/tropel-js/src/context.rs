@@ -345,6 +345,52 @@ impl JsContext {
                         );
                     }),
                 );
+                // Backlog line 98: console.info/debug/trace/dir were missing —
+                // a script calling console.info('x') threw TypeError and
+                // ABORTED the iteration (k6/Node both define all of these).
+                // info ≈ log at info level; debug/trace map to their tracing
+                // levels; dir prints the inspected first arg like Node's
+                // console.dir (reuses the shared stringifier).
+                let _ = console.set(
+                    "info",
+                    Func::from(|ctx, args| {
+                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
+                        tracing::info!(
+                            "[JS console.info] {}",
+                            console_args_to_string(&ctx, &args.0)
+                        );
+                    }),
+                );
+                let _ = console.set(
+                    "debug",
+                    Func::from(|ctx, args| {
+                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
+                        tracing::debug!(
+                            "[JS console.debug] {}",
+                            console_args_to_string(&ctx, &args.0)
+                        );
+                    }),
+                );
+                let _ = console.set(
+                    "trace",
+                    Func::from(|ctx, args| {
+                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
+                        tracing::trace!(
+                            "[JS console.trace] {}",
+                            console_args_to_string(&ctx, &args.0)
+                        );
+                    }),
+                );
+                let _ = console.set(
+                    "dir",
+                    Func::from(|ctx, args| {
+                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
+                        tracing::info!(
+                            "[JS console.dir] {}",
+                            console_args_to_string(&ctx, &args.0)
+                        );
+                    }),
+                );
                 let _ = console.set(
                     "warn",
                     Func::from(|ctx, args| {
@@ -1236,6 +1282,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r, "fine");
+    }
+
+    #[tokio::test]
+    async fn console_info_debug_trace_dir_do_not_throw() {
+        // Backlog line 98: console.info/debug/trace/dir were missing — a
+        // script calling console.info('x') threw TypeError and ABORTED the
+        // iteration (k6/Node define all of them). They must exist, accept
+        // arbitrary args (incl. objects), and never throw.
+        let mut ctx = new_ctx().await;
+        let r = ctx
+            .eval_async(
+                "console.info('a', 1); console.debug({d: 2}); console.trace('t'); console.dir({o: 3}); 'done'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(r, "done");
     }
 
     #[tokio::test]
