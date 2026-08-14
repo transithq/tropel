@@ -30,6 +30,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # crates/tropel-sdk is a git submodule of transithq/tropel-sdk
+          # (see .gitmodules) — cargo-deny/cargo-outdated resolve the whole
+          # workspace, so it needs the submodule populated or manifest
+          # resolution fails with "No such file or directory".
+          submodules: recursive
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
@@ -44,6 +50,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
