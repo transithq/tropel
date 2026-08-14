@@ -659,12 +659,56 @@ fn random_last_name<R: RngExt>(rng: &mut R) -> String {
 /// Colour names for {{$randomColor}} (Postman: faker.commerce.color returns a
 /// colour WORD like "red" / "gold", never a hex string).
 const COLOR_NAMES: &[&str] = &[
-    "red", "green", "blue", "yellow", "purple", "mint green", "teal", "white", "black",
-    "orange", "pink", "grey", "maroon", "violet", "turquoise", "tan", "sky blue", "salmon",
-    "plum", "orchid", "olive", "magenta", "lime", "ivory", "indigo", "gold", "fuchsia",
-    "cyan", "azure", "beige", "brown", "crimson", "lavender", "silver", "wheat", "coral",
-    "navy", "khaki", "aqua", "chocolate", "dark blue", "light green", "peach", "peru",
-    "sienna", "tomato", "violet red", "spring green", "royal blue", "rebecca purple",
+    "red",
+    "green",
+    "blue",
+    "yellow",
+    "purple",
+    "mint green",
+    "teal",
+    "white",
+    "black",
+    "orange",
+    "pink",
+    "grey",
+    "maroon",
+    "violet",
+    "turquoise",
+    "tan",
+    "sky blue",
+    "salmon",
+    "plum",
+    "orchid",
+    "olive",
+    "magenta",
+    "lime",
+    "ivory",
+    "indigo",
+    "gold",
+    "fuchsia",
+    "cyan",
+    "azure",
+    "beige",
+    "brown",
+    "crimson",
+    "lavender",
+    "silver",
+    "wheat",
+    "coral",
+    "navy",
+    "khaki",
+    "aqua",
+    "chocolate",
+    "dark blue",
+    "light green",
+    "peach",
+    "peru",
+    "sienna",
+    "tomato",
+    "violet red",
+    "spring green",
+    "royal blue",
+    "rebecca purple",
 ];
 
 fn random_color<R: RngExt>(rng: &mut R) -> String {
@@ -975,7 +1019,10 @@ mod tests {
                 "randomColor must be a colour word, got {:?}",
                 c
             );
-            assert!(!c.chars().all(|ch| ch.is_ascii_hexdigit()), "no bare hex: {c}");
+            assert!(
+                !c.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "no bare hex: {c}"
+            );
         }
     }
 
@@ -1006,7 +1053,13 @@ mod tests {
         assert_eq!(out2, "user={{$randomUserName}}");
         // A known var in the same string still resolves.
         let mixed = catalog.resolve("u={{$randomUserName}} id={{$randomInt}}");
-        assert!(mixed.contains("id="), "known var resolves beside unknown: {mixed}");
-        assert!(mixed.contains("{{$randomUserName}}"), "unknown stays literal: {mixed}");
+        assert!(
+            mixed.contains("id="),
+            "known var resolves beside unknown: {mixed}"
+        );
+        assert!(
+            mixed.contains("{{$randomUserName}}"),
+            "unknown stays literal: {mixed}"
+        );
     }
 }
