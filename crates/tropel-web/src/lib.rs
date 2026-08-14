@@ -226,6 +226,7 @@ mod tests {
                 schema: None,
             },
             items: vec![ScenarioItem {
+                id: None,
                 name: "ping".into(),
                 request: Some(tropel_sdk::types::Request {
                     url: "https://example.com/ping".into(),
@@ -239,8 +240,8 @@ mod tests {
                     timeout: None,
                     response_type: tropel_sdk::types::ResponseType::Text,
                 }),
-                prerequest: None,
-                test: Some("pm.test('ok', () => pm.expect(true).to.be.true);".into()),
+                prerequest: vec![],
+                test: vec!["pm.test('ok', () => pm.expect(true).to.be.true);".into()],
                 assertions: vec![],
                 items: vec![],
             }],
