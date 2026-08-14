@@ -601,10 +601,11 @@ pub struct K6DriverInstance {
     /// 'static and can't reach the VuContext, so they push into this buffer
     /// and run_iteration() drains it into ctx.samples after each iteration.
     sample_sink: Arc<Mutex<Vec<Sample>>>,
-    /// Per-VU group() stack (backlog line 154). `group(name)` pushes here,
-    /// the matching group_end pops; the http bridges read the top when
-    /// stamping http_req_* samples so metrics recorded inside a group carry
-    /// `group=::name` (k6 parity) instead of the hardcoded `group=http`.
+    /// Per-VU group() stack (backlog line 154). `group(name)` pushes the
+    /// FULL `::a::b` path here (backlog line 63), the matching group_end
+    /// pops; the http/checks bridges read the top when stamping samples so
+    /// metrics recorded inside a group carry `group=::a::b` (k6 parity)
+    /// instead of the innermost raw name or the hardcoded `group=http`.
     group_stack: Arc<Mutex<Vec<String>>>,
     /// Shared exec.* state — the pm.js / k6-shim / exec.js scripts read it
     /// through __tropel_exec_* closures registered lazily; sync_globals()
@@ -1898,6 +1899,7 @@ impl K6DriverInstance {
 
             // check() / pm.test() → checks Rate sample
             let sink_test = sink.clone();
+            let group_test = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
@@ -1905,8 +1907,14 @@ impl K6DriverInstance {
                     move |name: String, passed: bool, tags_json: Option<String>| {
                         let mut v = sink_test.lock().unwrap();
                         let now = tropel_js::clock::monotonic_wall_now();
-                        let mut tags = TagMap::with_capacity(2);
+                        let mut tags = TagMap::with_capacity(3);
                         tags.insert("check", name);
+                        // Backlog line 63: checks carry the current group
+                        // path (k6 parity) — nested group() stamps
+                        // group=::checkout::payment on the checks sample too.
+                        if let Some(g) = group_test.lock().unwrap().last() {
+                            tags.insert("group", g.clone());
+                        }
                         if let Some(j) = tags_json {
                             // Backlog line 97: tag values may be non-strings
                             // (check(r, {...}, {code: 200}) — k6 coerces every
@@ -2016,24 +2024,41 @@ impl K6DriverInstance {
             let _ = globals.set(
                 "__tropel_pm_group_start",
                 Func::from(move |name: String| {
-                    group_start.lock().unwrap().push(name);
+                    // Backlog line 63: push the FULL ::a::b path, not the bare
+                    // leaf — every consumer reads group_stack.last() and k6
+                    // tags nested groups group=::checkout::payment. Two
+                    // same-named leaves under different parents must NOT merge
+                    // into one series.
+                    let mut s = group_start.lock().unwrap();
+                    let full = match s.last() {
+                        Some(parent) => format!("{}::{}", parent, name),
+                        None => format!("::{}", name),
+                    };
+                    s.push(full);
                 }),
             );
             let group_end = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
-                    if let Some(top) = group_end.lock().unwrap().pop() {
-                        // Defensive: the JS shim always calls end with the
-                        // matching name; if a script mismatches, don't lose
-                        // the whole stack — just drop the stale top.
-                        if top != name {
-                            tracing::debug!("k6 group_end mismatch: top={} got={}", top, name);
-                        }
+                    // Backlog line 63: pop the FULL ::a::b path (start pushed
+                    // it) and tag group_duration with it — k6 tags nested
+                    // groups group=::checkout::payment, not the bare leaf.
+                    let full = group_end
+                        .lock()
+                        .unwrap()
+                        .pop()
+                        .unwrap_or_else(|| format!("::{}", name));
+                    // Defensive: compare the LEAF (the stack stores full
+                    // ::a::b paths); a mismatched script drops the stale top
+                    // without losing the whole stack.
+                    let leaf = full.rsplit("::").next().unwrap_or(&full);
+                    if leaf != name {
+                        tracing::debug!("k6 group_end mismatch: top={} got={}", full, name);
                     }
                     let mut v = sink_group.lock().unwrap();
                     let mut tags = TagMap::with_capacity(1);
-                    tags.insert("group", name);
+                    tags.insert("group", full);
                     v.push(Sample {
                         metric: "group_duration".into(),
                         value: duration_ms, // ms — the public unit (k6 semantics)
@@ -5624,6 +5649,99 @@ mod tests {
                 "server close must dispatch once even with a defensive user close(): {close2_events}"
             );
         });
+    }
+
+    /// Backlog line 63: group() tagged samples with the INNERMOST raw name
+    /// (group=payment) instead of the k6 full path (group=::checkout::payment)
+    /// — and checks samples carried NO group tag at all. Nested group()
+    /// must tag checks + group_duration with the full ::a::b path.
+    #[tokio::test]
+    async fn test_nested_group_tags_use_full_path() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    group('payment', function () {
+                        check(true, { 'ok': true });
+                    });
+                });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration with nested groups must succeed");
+
+        // checks sample must carry group=::checkout::payment (was untagged).
+        let check_groups: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        assert_eq!(
+            check_groups,
+            vec!["::checkout::payment".to_string()],
+            "checks must carry the full group path, got: {:?}",
+            check_groups
+        );
+
+        // group_duration samples: one per level, tagged with the full path
+        // (::checkout and ::checkout::payment), not the bare leaf.
+        let mut durations: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "group_duration")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        durations.sort();
+        assert_eq!(
+            durations,
+            vec!["::checkout".to_string(), "::checkout::payment".to_string()],
+            "group_duration must use full ::a::b paths, got: {:?}",
+            durations
+        );
+    }
+
+    /// Backlog line 63: http_req_* samples recorded inside nested groups
+    /// must carry group=::checkout::payment (k6 parity) — the old code
+    /// stamped the innermost raw name, so two same-named leaf groups under
+    /// different parents merged into one series.
+    #[tokio::test]
+    async fn test_http_in_nested_group_carries_full_path() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    group('payment', function () {
+                        http.get('http://example.com/');
+                    });
+                });
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        // Wire the stub HTTP client so the native http bridge registers on
+        // the first iteration (same pattern as test_setup_can_make_http_calls).
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration with http inside nested groups must succeed");
+
+        let groups: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "http_req_duration")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["::checkout::payment".to_string()],
+            "http_req_duration must carry the full group path, got: {:?}",
+            groups
+        );
     }
 
     #[test]
