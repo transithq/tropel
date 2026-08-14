@@ -741,7 +741,6 @@ impl Aggregator {
                 .or_insert_with(|| MetricSet::new(metric_type, hmax))
                 .record(sample.value, &sample.sample_type);
         }
-
     }
 
     /// Record a sample into the SINGLE headline accumulators
