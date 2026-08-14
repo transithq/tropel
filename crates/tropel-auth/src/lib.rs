@@ -255,17 +255,7 @@ impl AuthSigner for AwsSigV4Auth {
         let path = url.path();
         let canonical_uri = sigv4_canonical_uri(path, &service);
 
-        // Canonical query string: sorted by encoded key.
-        let mut pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(k, v)| (enc(k.as_ref()), enc(v.as_ref())))
-            .collect();
-        pairs.sort();
-        let canonical_query = pairs
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
+        let canonical_query = sigv4_canonical_query(url.query().unwrap_or(""));
 
         // Canonical headers: host + x-amz-* AND every header already present
         // on the request (lowercased, deduped), including ALL values of
@@ -374,6 +364,32 @@ fn hex_hmac_sha256(key: &[u8], data: &[u8]) -> String {
 /// RFC 3986 percent-encode (unreserved chars pass through).
 fn enc(s: &str) -> String {
     utf8_percent_encode(s, &UNRESERVED).to_string()
+}
+
+/// Canonical query string for SigV4 (backlog line 55).
+///
+/// AWS canonicalizes the RAW bytes of the query, not the form-decoded
+/// values: a literal `+` is a plus (`%2B`), NOT a space, and an already
+/// percent-encoded byte is re-encoded (`%2B` → `%252B`). The old code used
+/// `url::query_pairs()` — the FORM decoder (`+`→space, percent-decodes) —
+/// then re-encoded, so `?a=b+c` signed as `a=b%20c`. Parse the raw query
+/// (split on `&` and the first `=`), RFC 3986-encode each part, sort by
+/// encoded key; valueless params (`?flag`) become `flag=`.
+fn sigv4_canonical_query(raw_query: &str) -> String {
+    let mut pairs: Vec<(String, String)> = raw_query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (enc(k), enc(v)),
+            None => (enc(pair), String::new()),
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Canonical URI for SigV4.
@@ -1509,6 +1525,60 @@ mod tests {
             "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7",
             "signature must match the AWS-published value (kDate→kRegion→kService→kSigning chain)"
         );
+    }
+
+    /// Backlog line 55: the canonical query signs the RAW bytes, not the
+    /// form-decoded values. `query_pairs()` turned `+` into a space (then
+    /// `enc` wrote `%20`), so `?a=b+c` signed as `a=b%20c` — but AWS treats
+    /// the literal `+` as `%2B`, and an already-encoded byte is re-encoded
+    /// (`%2B` → `%252B`).
+    #[test]
+    fn sigv4_canonical_query_signs_raw_bytes_not_form_decoded() {
+        // Raw `+` is a plus, not a space.
+        assert_eq!(
+            sigv4_canonical_query("a=b+c"),
+            "a=b%2Bc",
+            "raw + canonicalizes to %2B, never %20"
+        );
+        // Already-encoded bytes are re-encoded (raw `%` → `%25`).
+        assert_eq!(
+            sigv4_canonical_query("a=b%2Bc"),
+            "a=b%252Bc",
+            "a pre-encoded + re-encodes its % as %25"
+        );
+        // Sorting by encoded key, valueless params → `key=`.
+        assert_eq!(
+            sigv4_canonical_query("z=1&flag&a=b+c"),
+            "a=b%2Bc&flag=&z=1"
+        );
+        // Empty query → empty canonical query.
+        assert_eq!(sigv4_canonical_query(""), "");
+        // End-to-end: `a=b+c` and `a=b%2Bc` are DIFFERENT wire bytes and
+        // must sign differently (both correctly canonicalized).
+        let sign = |query: &str| {
+            let mut req = build_request(
+                "GET",
+                &format!("https://example.amazonaws.com/?{query}"),
+                None,
+            );
+            AwsSigV4Auth::new(
+                "AKID",
+                "SECRET",
+                Some("us-east-1".into()),
+                Some("example".into()),
+                None,
+            )
+            .sign(&mut req)
+            .unwrap();
+            auth_header(&req)
+        };
+        let plus = sign("a=b+c");
+        let pct = sign("a=b%2Bc");
+        assert_ne!(
+            plus, pct,
+            "raw + and its %2B encoding are different wire bytes"
+        );
+        assert!(plus.contains("Signature="), "signature present: {plus}");
     }
 
     #[test]
