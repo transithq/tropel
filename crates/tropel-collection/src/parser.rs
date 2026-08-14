@@ -121,7 +121,6 @@ fn convert_items(
                 let scenario_item = ScenarioItem {
                     id: folder.id.clone(),
                     name: folder.name.clone(),
-                    id: None,
                     request: None,
                     // The folder's own scripts are ALSO folded into every
                     // descendant leaf below, so they run before/after each
@@ -163,7 +162,6 @@ fn convert_request_item(
     ScenarioItem {
         id: req.id.clone(),
         name: req.name.clone(),
-        id: None,
         request: Some(request),
         prerequest: find_prerequest_script(&events),
         test: find_test_script(&events),

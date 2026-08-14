@@ -355,7 +355,6 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
     let body = entry.request.post_data.map(build_body);
 
     Ok(ScenarioItem {
-        id: None,
         name: item_name,
         id: None,
         request: Some(Request {

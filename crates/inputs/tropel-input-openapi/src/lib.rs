@@ -498,7 +498,6 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             })?;
 
             items.push(ScenarioItem {
-                id: None,
                 name: item_name,
                 id: None,
                 request: Some(Request {
