@@ -12,9 +12,9 @@
 use std::collections::HashMap;
 
 use tropel_sdk::traits::DriverHttpClient;
-use tropel_sdk::types::{Method, Request, Response, ResponseType};
 #[cfg(target_arch = "wasm32")]
 use tropel_sdk::types::Body;
+use tropel_sdk::types::{Method, Request, Response, ResponseType};
 use tropel_sdk::{Result, TropelError};
 
 /// The browser slice's HTTP client: every request goes through the host.
