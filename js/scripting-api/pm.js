@@ -365,7 +365,11 @@ function assertStatusCode(code, label) {
 }
 
 pm.response.to = guardChain({
-    be: {
+    // Backlog line 41: be/have are nested objects, so wrap them in guardChain
+    // explicitly — an unknown assertion name must throw, not silently pass.
+    // (Master's guardChain deliberately does not recurse: the AssertChain hot
+    // path hands back `this`, so recursion would add a proxy per nested read.)
+    be: guardChain({
         get success() { assertStatusClass(2, 'success'); },
         get ok() { assertStatusClass(2, 'ok'); },
         get redirection() { assertStatusClass(3, 'redirection'); },
@@ -388,6 +392,13 @@ pm.response.to = guardChain({
         get withBody() {
             if (!pm.response.text()) {
                 throw new Error('expected response to have a body');
+            }
+        },
+        get withoutBody() {
+            // Backlog line 41: the mirror of withBody — a non-empty body must
+            // FAIL withoutBody instead of silently passing.
+            if (pm.response.text()) {
+                throw new Error('expected response to have no body');
             }
         },
         // Backlog line 42: chai-postman exposes .json/.html/.text as
@@ -421,8 +432,8 @@ pm.response.to = guardChain({
             }
             return function () {};
         }
-    },
-    have: {
+    }),
+    have: guardChain({
         status: function (code) {
             // Backlog line 143: pm.response.code is a VALUE now.
             var actual = pm.response.code;
@@ -456,7 +467,7 @@ pm.response.to = guardChain({
                 throw new Error('expected response JSON body to match');
             }
         }
-    }
+    })
 });
 
 // ── pm.test ──
