@@ -297,7 +297,7 @@ fn build_query_params(detail: &RequestDetail, url: &mut String) -> HashMap<Strin
 /// Percent-encode everything except unreserved ASCII characters
 /// (A–Z a–z 0–9 and `- _ . ~`), matching application/x-www-form-urlencoded
 /// key/value encoding.
-const NON_ALPHANUMERIC: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC;
+const NON_ALPHANUMERIC: &percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC;
 
 fn has_duplicate_keys(pairs: &[(String, String)]) -> bool {
     let mut seen = std::collections::HashSet::new();
@@ -1519,8 +1519,7 @@ mod tests {
         let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
         let req = scenario.items[0].request.as_ref().unwrap();
         assert_eq!(
-            req.url,
-            "https://api.example.com/search?q=a%20b&q=x%26y%3Dz",
+            req.url, "https://api.example.com/search?q=a%20b&q=x%26y%3Dz",
             "duplicate-fold values must be percent-encoded"
         );
         assert!(req.query_params.is_empty());

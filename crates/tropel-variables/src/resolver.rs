@@ -249,7 +249,6 @@ fn json_escape(value: &str) -> String {
     out
 }
 
-
 /// Is the placeholder at `range` inside a JSON string literal? A template
 /// has an ODD number of unescaped `"` before a placeholder that sits inside
 /// a string (each pair of quotes opens+closes a string literal, so an odd
@@ -354,14 +353,8 @@ mod tests {
             local: HashMap::from([("key".into(), serde_json::Value::String("local".into()))]),
             data: HashMap::from([("key".into(), serde_json::Value::String("data".into()))]),
             env: HashMap::from([("key".into(), "env".into())]),
-            collection: HashMap::from([(
-                "key".into(),
-                serde_json::Value::String("col".into()),
-            )]),
-            globals: HashMap::from([(
-                "key".into(),
-                serde_json::Value::String("global".into()),
-            )]),
+            collection: HashMap::from([("key".into(), serde_json::Value::String("col".into()))]),
+            globals: HashMap::from([("key".into(), serde_json::Value::String("global".into()))]),
         };
         assert_eq!(resolver.resolve("{{key}}", &scope), "local");
     }
@@ -564,10 +557,7 @@ mod tests {
             env: HashMap::from([("token".into(), "tok+1 #2".into())]),
             ..Default::default()
         };
-        assert_eq!(
-            resolver.resolve_url("?t={{token}}", &scope2),
-            "?t=tok+1 #2"
-        );
+        assert_eq!(resolver.resolve_url("?t={{token}}", &scope2), "?t=tok+1 #2");
     }
 
     #[test]
@@ -612,10 +602,7 @@ mod tests {
         // full URL keeps its query string instead of `search%3Fa%3D1`.
         let resolver = VariableResolver::new();
         let scope = VariableScope {
-            env: HashMap::from([(
-                "endpoint".into(),
-                "https://api.test/search?a=1".into(),
-            )]),
+            env: HashMap::from([("endpoint".into(), "https://api.test/search?a=1".into())]),
             ..Default::default()
         };
         let result = resolver.resolve_url_deep("{{endpoint}}", &scope, 5);
