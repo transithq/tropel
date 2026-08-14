@@ -490,7 +490,9 @@ var _ = _ || {};
         // RegExp: source + flags.
         if (a instanceof RegExp || b instanceof RegExp) {
             if (!(b instanceof RegExp)) return false;
-            return a.source === b.source && a.flags === b.flags;
+            // Canonical toString normalizes flag order (/gi vs /ig equal),
+            // matching lodash's isEqual.
+            return String(a) === String(b);
         }
         if (Array.isArray(a)) {
             if (!Array.isArray(b) || a.length !== b.length) return false;

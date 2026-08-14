@@ -4427,6 +4427,7 @@ mod tests {
                 trial('pm_date_diff', function () { pm.expect(new Date(1700000000000)).to.eql(new Date(1)); });
                 trial('pm_re_same', function () { pm.expect(/a+b/i).to.eql(/a+b/i); });
                 trial('pm_re_flags', function () { pm.expect(/a+b/i).to.eql(/a+b/g); });
+                trial('pm_re_flag_order', function () { pm.expect(/a+b/gi).to.eql(/a+b/ig); });
                 trial('pm_set_order', function () { pm.expect(new Set([1, 2, 3])).to.eql(new Set([3, 1, 2])); });
                 trial('pm_set_diff', function () { pm.expect(new Set([1, 2])).to.eql(new Set([1, 3])); });
                 trial('pm_map_same', function () { pm.expect(new Map([['a', 1]])).to.eql(new Map([['a', 1]])); });
@@ -4485,6 +4486,7 @@ mod tests {
             assert_eq!(r("pm_date_diff"), "threw", "different Dates must NOT eql");
             assert_eq!(r("pm_re_same"), "true", "same RegExp source+flags must eql");
             assert_eq!(r("pm_re_flags"), "threw", "differing RegExp flags must NOT eql");
+            assert_eq!(r("pm_re_flag_order"), "true", "RegExp flag order is normalized (/gi == /ig)");
             assert_eq!(r("pm_set_order"), "true", "Sets are order-insensitive");
             assert_eq!(r("pm_set_diff"), "threw", "differing Set members must NOT eql");
             assert_eq!(r("pm_map_same"), "true", "Maps with equal entries must eql");

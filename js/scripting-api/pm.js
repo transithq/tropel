@@ -839,10 +839,11 @@ function deepEqual(a, b, seen) {
         var ta = a.getTime(), tb = b.getTime();
         return (isNaN(ta) && isNaN(tb)) || ta === tb;
     }
-    // RegExp: source + flags.
+    // RegExp: canonical toString (normalizes flag order — /gi vs /ig are
+    // the same expression, matching chai's deep-eql).
     if (a instanceof RegExp || b instanceof RegExp) {
         if (!(b instanceof RegExp)) return false;
-        return a.source === b.source && a.flags === b.flags;
+        return String(a) === String(b);
     }
     if (Array.isArray(a)) {
         if (!Array.isArray(b) || a.length !== b.length) return false;
