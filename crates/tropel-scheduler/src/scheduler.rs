@@ -905,10 +905,12 @@ impl VUScheduler {
         // with "JoinHandle polled after completion" if a completed handle is
         // re-polled. The old code joined here and then joined AGAIN in
         // `await_handles_bounded`, which panicked the scenario task on every
-        // shared-iterations run. After this block the handles are dropped:
-        // drained VUs are already done, and in the max_duration branch the
-        // level-triggered stop flag plus the engine's active_vus drain loop
-        // let any stragglers exit on their own.
+        // shared-iterations run. In the max_duration branch we DO still call
+        // `await_handles_bounded` (after the select releases its borrow), but
+        // it now skips handles the select already polled to completion (via
+        // the non-polling `is_finished()` check) and aborts only the
+        // stragglers, so no handle is ever re-polled.
+        let mut hit_max_dur = false;
         if let Some(max_dur) = max_duration {
             let all_done = futures::future::join_all(handles.iter_mut());
             tokio::pin!(all_done);
@@ -926,6 +928,7 @@ impl VUScheduler {
                         "Shared iterations: max_duration ({:?}) reached — requesting stop",
                         max_dur
                     );
+                    hit_max_dur = true;
                     self.request_stop();
                     self.wait_for_drain(grace).await;
                 }
@@ -933,6 +936,17 @@ impl VUScheduler {
         } else {
             // No cap — join all VU handles directly (single join, no re-poll).
             futures::future::join_all(handles.iter_mut()).await;
+        }
+
+        // Backlog P2 (line 158): the handles used to be dropped here
+        // un-aborted, so a VU that ignored the stop signal kept issuing HTTP
+        // through the entire summary phase — its samples landed after
+        // results() and were lost. The select above may have already polled
+        // some handles to completion (re-polling panics tokio), so
+        // await_handles_bounded skips finished handles and aborts the
+        // stragglers.
+        if hit_max_dur {
+            Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
         }
 
         tracing::info!("Shared iterations finished");
@@ -1275,7 +1289,12 @@ impl VUScheduler {
         // max_duration is a CAP, not a mandatory wait.
         // Race the JOIN of all VU handles against the timeout (same startup-race
         // fix as run_shared_iterations — see there). Each JoinHandle is polled
-        // exactly once (re-polling a completed handle panics tokio).
+        // exactly once (re-polling a completed handle panics tokio). In the
+        // max_duration branch we DO still call `await_handles_bounded` (after
+        // the select releases its borrow), which skips handles the select
+        // already polled to completion via the non-polling `is_finished()`
+        // check.
+        let mut hit_max_dur = false;
         if let Some(max_dur) = max_duration {
             let all_done = futures::future::join_all(handles.iter_mut());
             tokio::pin!(all_done);
@@ -1293,6 +1312,7 @@ impl VUScheduler {
                         "Per-VU iterations: max_duration ({:?}) reached — requesting stop",
                         max_dur
                     );
+                    hit_max_dur = true;
                     self.request_stop();
                     self.wait_for_drain(grace).await;
                 }
@@ -1300,6 +1320,14 @@ impl VUScheduler {
         } else {
             // No cap — join all VU handles directly (single join, no re-poll).
             futures::future::join_all(handles.iter_mut()).await;
+        }
+
+        // Backlog P2 (line 158): same as run_shared_iterations — the handles
+        // used to be dropped un-aborted, letting stragglers issue HTTP through
+        // the summary phase. Abort them now (finished handles are skipped, not
+        // re-polled).
+        if hit_max_dur {
+            Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
         }
 
         tracing::info!("Per-VU iterations finished");
@@ -1457,10 +1485,26 @@ impl VUScheduler {
     /// elapses (the detached tasks are abandoned, matching k6's behaviour of
     /// hard-aborting the run after the grace window).
     async fn await_handles_bounded(handles: &mut [tokio::task::JoinHandle<()>], bound: Duration) {
-        // Inline the join_all into the timeout so its &mut borrows of `handles`
-        // are released when the timeout yields Err — the abort loop below can
-        // then re-borrow immutably.
-        match tokio::time::timeout(bound, futures::future::join_all(handles.iter_mut())).await {
+        // Drop handles the caller's `select!` already polled to completion.
+        // Re-polling a completed JoinHandle panics tokio ("JoinHandle polled
+        // after completion"), and the iteration executors reach us AFTER a
+        // select between join_all and the max_duration timeout — so some
+        // handles may have resolved in that select. `is_finished()` is a
+        // NON-polling check, so filtering here is safe. The survivors are the
+        // stragglers that ignored the stop signal.
+        let mut pending: Vec<&mut tokio::task::JoinHandle<()>> = handles
+            .iter_mut()
+            .filter(|h| !h.is_finished())
+            .collect();
+        if pending.is_empty() {
+            tracing::debug!("All VU handles resolved");
+            return;
+        }
+
+        // Inline the join_all into the timeout so its &mut borrows of
+        // `pending` are released when the timeout yields Err — the abort loop
+        // below can then re-borrow immutably.
+        match tokio::time::timeout(bound, futures::future::join_all(pending.iter_mut())).await {
             Ok(_) => tracing::debug!("All VU handles resolved"),
             Err(_) => {
                 tracing::warn!(
@@ -1472,7 +1516,7 @@ impl VUScheduler {
                 // call) kept issuing HTTP after the run reported finished. Abort
                 // is the backstop; the flag-aware JS interrupt and the
                 // interruptible sleep are the primary mechanism.
-                for handle in handles.iter() {
+                for handle in pending.iter() {
                     handle.abort();
                 }
             }
