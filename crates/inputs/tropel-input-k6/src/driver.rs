@@ -4577,6 +4577,72 @@ mod tests {
     }
 
     #[test]
+    fn test_include_uses_chai_value_semantics() {
+        // Backlog line 88: pm.expect(arr).to.include(v) was a SUBSTRING test
+        // (String(arr).indexOf) — [11,22].include(1) passed and
+        // {a:1}.include('object') passed. chai-shim implements it correctly
+        // (array indexOf for arrays, `key in obj` for objects). pm now
+        // mirrors chai: substring for strings, element membership for
+        // arrays, key membership for objects — on BOTH the positive chain
+        // and the negated chain.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                // Arrays: element membership, not substring.
+                trial('pm_arr_include_yes', function () { pm.expect([11, 22]).to.include(22); });
+                trial('pm_arr_include_no', function () { pm.expect([11, 22]).to.include(1); });
+                trial('pm_arr_include_str', function () { pm.expect(['a', 'b']).to.include('b'); });
+                trial('pm_arr_include_str_no', function () { pm.expect(['a', 'b']).to.include('ab'); });
+                // Objects: key membership.
+                trial('pm_obj_include_key', function () { pm.expect({ a: 1 }).to.include('a'); });
+                trial('pm_obj_include_nokey', function () { pm.expect({ a: 1 }).to.include('object'); });
+                // Strings stay substring.
+                trial('pm_str_include_yes', function () { pm.expect('abcdef').to.include('bcd'); });
+                trial('pm_str_include_no', function () { pm.expect('abcdef').to.include('zzz'); });
+                // Negated chain mirrors the same semantics.
+                trial('pm_arr_not_include_yes', function () { pm.expect([11, 22]).to.not.include(1); });
+                trial('pm_arr_not_include_no', function () { pm.expect([11, 22]).to.not.include(22); });
+                // chai parity: both expect()s must agree.
+                trial('chai_arr_include_yes', function () { chai.expect([11, 22]).to.include(22); });
+                trial('chai_arr_include_no', function () { chai.expect([11, 22]).to.include(1); });
+                trial('chai_obj_include_key', function () { chai.expect({ a: 1 }).to.include('a'); });
+                trial('chai_obj_include_nokey', function () { chai.expect({ a: 1 }).to.include('object'); });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("pm_arr_include_yes"), "true", "array include passes for a present element");
+            assert_eq!(r("pm_arr_include_no"), "threw", "array include must NOT match substrings (11.include(1) was the bug)");
+            assert_eq!(r("pm_arr_include_str"), "true", "string-array include passes for a present member");
+            assert_eq!(r("pm_arr_include_str_no"), "threw", "string-array include must not substring-match ('ab' not in ['a','b'])");
+            assert_eq!(r("pm_obj_include_key"), "true", "object include passes for a present key");
+            assert_eq!(r("pm_obj_include_nokey"), "threw", "object include must test keys, not type names ('object' was the bug)");
+            assert_eq!(r("pm_str_include_yes"), "true", "string include still substring-tests");
+            assert_eq!(r("pm_str_include_no"), "threw", "string include throws when absent");
+            assert_eq!(r("pm_arr_not_include_yes"), "true", "negated array include passes for an absent element");
+            assert_eq!(r("pm_arr_not_include_no"), "threw", "negated array include throws for a present element");
+            assert_eq!(r("chai_arr_include_yes"), "true", "chai array include agrees (element present)");
+            assert_eq!(r("chai_arr_include_no"), "threw", "chai array include agrees (substring must not match)");
+            assert_eq!(r("chai_obj_include_key"), "true", "chai object include agrees (key present)");
+            assert_eq!(r("chai_obj_include_nokey"), "threw", "chai object include agrees (key test)");
+        });
+    }
+
+    #[test]
     fn test_unimplemented_assertion_properties_fail_closed() {
         // Backlog §1 P0: unimplemented assertion PROPERTIES (pm.expect(false)
         // .to.be.true, .to.be.null/.undefined/.ok/.empty, pm.expect(null)

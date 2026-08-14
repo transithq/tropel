@@ -524,10 +524,9 @@ pm.expect = function (actual) {
                 }
             },
             // Postman emits `to.not.include(...)` for "must not contain".
-            // Mirrored from the positive include (line 88 fixes the positive
-            // path on both chains).
+            // Same value-based semantics as the positive include (line 88).
             include: function (expected) {
-                if (String(actual).indexOf(String(expected)) !== -1) {
+                if (includesValue(actual, expected)) {
                     throw new Error('expected value not to include ' + shortJson(expected));
                 }
             },
@@ -586,7 +585,7 @@ pm.expect = function (actual) {
                 }
             },
             include: function (expected) {
-                if (String(actual).indexOf(String(expected)) === -1) {
+                if (!includesValue(actual, expected)) {
                     throw new Error('expected value to include ' + shortJson(expected));
                 }
             },
@@ -977,6 +976,17 @@ function deepEqual(a, b, seen) {
         return true;
     }
     return a === b;
+}
+
+// Backlog line 88: chai's .include semantics — substring for strings,
+// element membership (strict indexOf) for arrays, KEY membership for
+// objects. The old String(container).indexOf(...) made [11,22].include(1)
+// and {a:1}.include('object') pass.
+function includesValue(container, value) {
+    if (typeof container === 'string') return container.indexOf(value) !== -1;
+    if (Array.isArray(container)) return container.indexOf(value) !== -1;
+    if (container !== null && typeof container === 'object') return value in container;
+    return false;
 }
 
 // ── pm.iterationData ──
