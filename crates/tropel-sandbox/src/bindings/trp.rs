@@ -30,6 +30,28 @@ fn string_to_json_encoded(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_default()
 }
 
+/// Decode a value the JS shim JSON-encoded on set back to a plain string.
+/// Backlog line 89: set/get must be INVERSES. `pm.environment.set('x',
+/// '1234')` sends `JSON.stringify('1234')` = `'"1234"'`; decoding yields the
+/// plain string `1234`. Non-string JSON (numbers, booleans, objects) is
+/// stored as its JSON text — Postman environment variables are strings-only,
+/// so this is the type-safe representation. Unparseable input (e.g. legacy
+/// seeded plain strings) passes through verbatim.
+fn decode_json_encoded(s: &str) -> String {
+    match serde_json::from_str::<Value>(s) {
+        Ok(Value::String(v)) => v,
+        Ok(other) => other.to_string(),
+        Err(_) => s.to_string(),
+    }
+}
+
+/// Decode a value the JS shim JSON-encoded on set back into a serde_json
+/// Value for the collection/global stores. `'{"a":1}'` → object, `'42'` →
+/// number, `'"42"'` → the string "42"; unparseable input → String(raw).
+fn decode_json_value(s: &str) -> Value {
+    serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))
+}
+
 /// Resolve a variable across ALL scopes with Postman precedence:
 /// iteration data > environment > collection > globals (backlog line 145).
 ///
@@ -338,17 +360,21 @@ impl TrpBridge {
             }
 
             // ── Environment ──
-            // NOTE: environment values are returned RAW (not JSON-encoded) on
-            // purpose — Postman environment variables are always strings, and
-            // the shim's `pm.environment.get` returns them as-is (no
-            // JSON.parse). Do NOT "harmonize" this with variables_get's JSON
-            // encoding, or env vars like "123" would round-trip as numbers.
+            // Backlog line 89: set/get must be INVERSES. The shim JSON-encodes
+            // on set (string '1234' → '"1234"', number 42 → '42') and
+            // JSON-parses on get; these bridges store PLAIN values (decode on
+            // set) and JSON-encode on get, so '1234' survives a round trip as
+            // the STRING '1234' — never the number 1234 — while script-set
+            // values stay plain for {{var}} substitution (which reads the
+            // maps directly).
             let state_clone = state.clone();
             set_global!(
                 "__tropel_pm_environment_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.environment.get(&key).cloned()
+                    st.environment
+                        .get(&key)
+                        .map(|v| string_to_json_encoded(v.as_str()))
                 }),
             );
 
@@ -357,7 +383,7 @@ impl TrpBridge {
                 "__tropel_pm_environment_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.environment.insert(key, value);
+                    st.environment.insert(key, decode_json_encoded(&value));
                 }),
             );
 
@@ -404,8 +430,7 @@ impl TrpBridge {
                 "__tropel_pm_variables_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars
-                        .insert(key, serde_json::Value::String(value));
+                    st.collection_vars.insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -437,7 +462,10 @@ impl TrpBridge {
                 "__tropel_pm_environment_to_object",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
-                    st.environment.clone()
+                    st.environment
+                        .iter()
+                        .map(|(k, v)| (k.clone(), string_to_json_encoded(v)))
+                        .collect()
                 }),
             );
 
@@ -459,8 +487,7 @@ impl TrpBridge {
                 "__tropel_pm_collection_vars_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars
-                        .insert(key, serde_json::Value::String(value));
+                    st.collection_vars.insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -509,7 +536,7 @@ impl TrpBridge {
                 "__tropel_pm_globals_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.globals.insert(key, serde_json::Value::String(value));
+                    st.globals.insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -1364,6 +1391,50 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&variable_value_to_string(&num)).unwrap();
         assert!(parsed.is_number());
+    }
+
+    /// Regression (backlog line 89): setters String()-coerced and getters
+    /// JSON.parse'd were NOT inverses — a plain string '1234' set through
+    /// pm.environment round-tripped as the NUMBER 1234 (and objects became
+    /// "[object Object]"). The shim now JSON-encodes on set; the bridges
+    /// decode-on-set / encode-on-get, so the full cycle (shim encode → bridge
+    /// decode → bridge encode → shim parse) must restore the exact value.
+    #[test]
+    fn test_set_get_json_roundtrip_preserves_type() {
+        // Env bridge: decode on set. JSON string → plain string.
+        assert_eq!(decode_json_encoded("\"1234\""), "1234");
+        // Number/bool/object → stored as JSON text (env is strings-only).
+        assert_eq!(decode_json_encoded("42"), "42");
+        assert_eq!(decode_json_encoded("{\"a\":1}"), "{\"a\":1}");
+        // Unparseable (legacy seeded plain string) → verbatim.
+        assert_eq!(
+            decode_json_encoded("https://api.example.com"),
+            "https://api.example.com"
+        );
+
+        // Full env cycle: set('s','1234') → shim sends '"1234"' → bridge
+        // stores plain '1234' → get bridge returns '"1234"' → shim JSON.parse
+        // → the STRING '1234' (never the number 1234).
+        let stored = decode_json_encoded("\"1234\"");
+        assert_eq!(stored, "1234");
+        let on_get = string_to_json_encoded(&stored);
+        assert_eq!(on_get, "\"1234\"");
+        let parsed: serde_json::Value = serde_json::from_str(&on_get).unwrap();
+        assert!(parsed.is_string());
+        assert_eq!(parsed.as_str().unwrap(), "1234");
+
+        // Collection/global bridge: decode on set to a Value.
+        assert_eq!(decode_json_value("\"42\""), serde_json::json!("42"));
+        assert_eq!(decode_json_value("42"), serde_json::json!(42));
+        assert_eq!(decode_json_value("{\"a\":1}"), serde_json::json!({"a": 1}));
+        assert_eq!(decode_json_value("plain"), serde_json::json!("plain"));
+
+        // Full collection cycle: object set → object out.
+        let obj: Value = decode_json_value("{\"a\":1}");
+        let encoded = variable_value_to_string(&obj);
+        assert_eq!(encoded, "{\"a\":1}");
+        let back: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(back, serde_json::json!({"a": 1}));
     }
 
     /// Regression (backlog line 145): `pm.variables.get` must resolve with
