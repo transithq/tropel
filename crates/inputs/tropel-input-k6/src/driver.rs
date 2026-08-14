@@ -1860,7 +1860,10 @@ impl K6DriverInstance {
                           metric_type_str: String,
                           is_time: bool| {
                         if is_time {
-                            tropel_metrics::time_metrics::register(&name);
+                            tropel_metrics::time_metrics::register(
+                                &name,
+                                tropel_metrics::MetricUnit::Time,
+                            );
                         }
                         let tags = if tags_json.is_empty() || tags_json == "{}" {
                             TagMap::new()
