@@ -736,6 +736,75 @@ impl TrpBridge {
                 }),
             );
 
+            // Live auth READ (backlog line 101): the JS shim kept auth in a
+            // module-scope `_pmRequestAuth` singleton, so a request that had
+            // NO auth (or a DIFFERENT auth) on the next iteration still read
+            // the previous iteration's value. The getter returns the CURRENT
+            // request's auth from state (None when unset) so reads are
+            // always per-request — no cross-iteration leakage.
+            let state_clone = state.clone();
+            set_global!(
+                "__tropel_pm_request_auth",
+                Func::from(move || -> Option<String> {
+                    let st = state_clone.lock().unwrap();
+                    st.request.as_ref().and_then(|r| {
+                        r.auth
+                            .as_ref()
+                            .map(|a| serde_json::to_string(a).unwrap_or_default())
+                    })
+                }),
+            );
+
+            // Live body-mode READ (backlog line 101): the JS shim's
+            // `_pmRequestBody.mode` module-scope value persisted across
+            // iterations (a fresh request per iteration re-seeded the raw
+            // text but not the mode). The getter derives the mode from the
+            // CURRENT request's Body variant, so `pm.request.body.mode`
+            // always describes the actual request — no leakage.
+            let state_clone = state.clone();
+            set_global!(
+                "__tropel_pm_request_body_mode",
+                Func::from(move || -> String {
+                    let st = state_clone.lock().unwrap();
+                    match st.request.as_ref().and_then(|r| r.body.as_ref()) {
+                        Some(Body::Raw(_)) | Some(Body::Json(_)) => "raw".to_string(),
+                        Some(Body::FormData(_)) => "formdata".to_string(),
+                        Some(Body::UrlEncoded(_)) => "urlencoded".to_string(),
+                        Some(Body::Binary(_)) => "file".to_string(),
+                        Some(Body::GraphQL { .. }) => "graphql".to_string(),
+                        None => "raw".to_string(),
+                    }
+                }),
+            );
+
+            // ── pm.info (live, backlog line 101) ──
+            // The shim previously shipped a hardcoded stub (eventName
+            // 'test', iteration 0, iterationCount 1, requestName ''). All
+            // five fields are now read from PmState so a test script sees
+            // the real iteration, the real request name, and the configured
+            // iteration count.
+            let state_clone = state.clone();
+            set_global!(
+                "__tropel_pm_info",
+                Func::from(move || -> String {
+                    let st = state_clone.lock().unwrap();
+                    let request_id = st
+                        .request_names
+                        .iter()
+                        .position(|n| n == &st.current_request_name)
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| st.current_request_name.clone());
+                    serde_json::json!({
+                        "eventName": st.event_name,
+                        "iteration": st.iteration_index,
+                        "iterationCount": st.total_iterations.unwrap_or(1),
+                        "requestName": st.current_request_name,
+                        "requestId": request_id,
+                    })
+                    .to_string()
+                }),
+            );
+
             // ── Test skip (pm.test.skip) ──
             // Backlog line 145: pm.test.skip(name, fn) marks a test skipped
             // WITHOUT running it — a collection using it used to throw
@@ -1712,6 +1781,113 @@ mod tests {
                 )
                 .unwrap();
             assert!(readonly, "acme/product must be non-writable");
+        });
+    }
+
+    /// Regression (backlog line 101): `pm.info` was a hardcoded stub and
+    /// `pm.request.auth` / `pm.request.body.mode` were module-scope
+    /// singletons — a fresh request on the next iteration (no auth, a
+    /// different body) still read the PREVIOUS iteration's values. The shim
+    /// now reads LIVE from the __tropel_pm_* bridges: pm.info fields come
+    /// from __tropel_pm_info, auth from __tropel_pm_request_auth (null when
+    /// the current request has none), and mode from
+    /// __tropel_pm_request_body_mode. Stub bridges simulate the per-
+    /// iteration state change; reads must follow the bridge, not a stale
+    /// JS-side copy.
+    #[test]
+    fn test_pm_info_auth_and_body_mode_read_live_per_iteration() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+
+            // Iteration 1: a prerequest script SETS auth and a body mode.
+            ctx.eval::<(), _>(
+                r#"
+                // Simulate the sandbox bridges. Per-iteration values change
+                // to prove reads are live, not cached.
+                globalThis.__tropel_pm_info = function () {
+                    return JSON.stringify({ eventName: 'test', iteration: 4,
+                        iterationCount: 25, requestName: 'get-user', requestId: 'r-9' });
+                };
+                globalThis.__tropel_pm_request_auth = function () {
+                    // The CURRENT request has no auth.
+                    return null;
+                };
+                globalThis.__tropel_pm_request_body_mode = function () {
+                    // The CURRENT request's body is urlencoded.
+                    return 'urlencoded';
+                };
+                globalThis.__tropel_pm_request_auth_set = function (j) {
+                    globalThis.__auth_set = j;
+                };
+
+                // Iteration 1: prerequest writes auth + a body mode.
+                pm.request.auth = { type: 'bearer', token: 'stale-token' };
+                pm.request.body = { mode: 'raw', raw: 'x' };
+
+                // Iteration 2: a fresh request with NO auth and a urlencoded
+                // body. Reads must come from the live bridges.
+                var authNow = pm.request.auth;
+                var modeNow = pm.request.body.mode;
+                var info = pm.info;
+                globalThis.__out = JSON.stringify([
+                    authNow, modeNow,
+                    info.eventName, info.iteration, info.iterationCount,
+                    info.requestName, info.requestId
+                ]);
+                "#,
+            )
+            .expect("setup should eval");
+
+            // Parse the exact output so assertions are unambiguous.
+            let v: serde_json::Value =
+                serde_json::from_str(&ctx.eval::<String, _>("__out").unwrap())
+                    .expect("__out must be JSON");
+            let arr = v.as_array().expect("__out must be an array");
+            // auth must be NULL (fresh request has none), NOT the stale
+            // 'stale-token' singleton from iteration 1.
+            assert!(
+                arr[0].is_null(),
+                "pm.request.auth must read the live (absent) auth, got: {arr:?}"
+            );
+            assert!(
+                arr[0].as_str().is_none(),
+                "pm.request.auth must not leak the previous iteration's auth, got: {arr:?}"
+            );
+            // body.mode must follow the live bridge, not the 'raw' written
+            // by iteration 1's body setter.
+            assert_eq!(
+                arr[1].as_str(),
+                Some("urlencoded"),
+                "pm.request.body.mode must read the live mode, got: {arr:?}"
+            );
+            // pm.info fields must be live, not the hardcoded stub.
+            assert_eq!(
+                arr[2].as_str(),
+                Some("test"),
+                "eventName live, got: {arr:?}"
+            );
+            assert_eq!(arr[3], serde_json::json!(4), "iteration live, got: {arr:?}");
+            assert_eq!(
+                arr[4],
+                serde_json::json!(25),
+                "iterationCount live, got: {arr:?}"
+            );
+            assert_eq!(
+                arr[5].as_str(),
+                Some("get-user"),
+                "requestName live, got: {arr:?}"
+            );
+            assert_eq!(arr[6].as_str(), Some("r-9"), "requestId live, got: {arr:?}");
+
+            // The setter still forwards to the auth bridge.
+            let auth_set: String = ctx.eval("__auth_set").unwrap();
+            assert_eq!(
+                auth_set, r#"{"type":"bearer","token":"stale-token"}"#,
+                "pm.request.auth setter must still JSON-encode to the bridge"
+            );
         });
     }
 }
