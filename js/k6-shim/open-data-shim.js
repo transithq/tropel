@@ -37,7 +37,12 @@ function open(path, mode) {
         return result;
     }
     // Binary mode: the native side returns base64; decode into an ArrayBuffer.
-    var binary = base64ToBytes(result);
+    // NOTE: this helper is deliberately private-named (openDataBase64ToBytes)
+    // and NOT `base64ToBytes` — the shims are concatenated into ONE shared
+    // scope (K6_NATIVE_SHIM_BUNDLE), and a duplicate top-level
+    // `base64ToBytes` here would shadow the k6-shim's Uint8Array version,
+    // breaking http()/file callers that rely on `.buffer` (k6-shim.js:99,644).
+    var binary = openDataBase64ToBytes(result);
     var buf = new ArrayBuffer(binary.length);
     var view = new Uint8Array(buf);
     for (var i = 0; i < binary.length; i++) {
@@ -214,8 +219,8 @@ Object.defineProperty(SharedArrayView.prototype, Symbol.iterator, {
     configurable: true
 });
 
-// ── Base64 helper for open(path, 'b') ──
-function base64ToBytes(b64) {
+// ── Base64 helper for open(path, 'b') (private; see caller note above) ──
+function openDataBase64ToBytes(b64) {
     var CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
     var bytes = [];
     var i;
