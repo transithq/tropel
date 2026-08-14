@@ -414,10 +414,17 @@ pub struct CollectionAuth {
 }
 
 /// Auth attribute (key-value pair).
+///
+/// Real Postman OAuth1/OAuth2 exports carry non-string values — booleans
+/// (`"addParamsToHeader": true`, `"usePkce": true`) and arrays
+/// (`"tokenRequestParams": [...]`). A bare `String` failed the WHOLE
+/// collection parse on such exports (P0, backlog §4), so values stay
+/// structured JSON here and are stringified on read (`get_auth_attr`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthAttribute {
     pub key: String,
-    pub value: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
     #[serde(rename = "type")]
     pub attr_type: Option<String>,
 }

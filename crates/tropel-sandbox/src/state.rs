@@ -70,6 +70,14 @@ pub struct PmState {
     pub iteration_index: u64,
     /// Name of the currently executing request/item.
     pub current_request_name: String,
+    /// Which script is running right now — "prerequest" or "test". Backs
+    /// `pm.info.eventName` (backlog line 101: it was a hardcoded "test"
+    /// stub). Set by the runner before each script executes.
+    pub event_name: String,
+    /// Total iterations configured for this scenario, when known. Backs
+    /// `pm.info.iterationCount` (backlog line 101). `None` for
+    /// duration-based runs where no fixed count exists.
+    pub total_iterations: Option<u64>,
     // ── Test abort ──
     /// When true, the engine should abort the entire test run.
     /// Set by test.abort() from scripts.
@@ -116,6 +124,8 @@ impl PmState {
             global_iterations: None,
             iteration_index: 0,
             current_request_name: String::new(),
+            event_name: "test".to_string(),
+            total_iterations: None,
             abort_requested: false,
             abort_message: None,
         }
