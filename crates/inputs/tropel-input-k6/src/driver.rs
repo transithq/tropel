@@ -62,6 +62,12 @@ use tropel_sdk::{Result, TropelError};
 // K6Driver — the stateless factory
 // ══════════════════════════════════════════════════════════════════
 
+/// Per-VU QuickJS heap cap (bytes), set in init() via
+/// `JsContext::new_with_force_stop`. A server-controlled response body larger
+/// than this must degrade to an error response, NOT `.expect()`-panic across
+/// the QuickJS FFI boundary (backlog line 46 P0).
+const K6_VU_HEAP_BYTES: usize = 10 * 1024 * 1024;
+
 pub struct K6Driver;
 
 #[async_trait]
@@ -72,9 +78,14 @@ impl Driver for K6Driver {
 
     fn detect(&self, bytes: &[u8]) -> bool {
         if let Ok(text) = std::str::from_utf8(bytes) {
-            // Reject Postman collections (handled by the Postman adapter)
-            let looks_like_collection = text.contains("postman") || text.contains("\"item\"");
-            if looks_like_collection {
+            // Reject ACTUAL Postman collections (handled by the Postman
+            // adapter) using the SAME STRUCTURAL check the Postman adapter
+            // uses — a JSON doc whose top-level info.schema points at the
+            // getpostman.com collection schema. Substring matching is
+            // forbidden (backlog line 61): a k6 script hitting k6's own
+            // documented postman-echo.com endpoint legitimately contains
+            // the word "postman" and was rejected.
+            if crate::is_postman_collection(text) {
                 return false;
             }
             let has_export_default = text.contains("export default");
@@ -119,7 +130,7 @@ impl Driver for K6Driver {
         // interrupt handler keeps polling the instance-local `force_stop`.
         let sched_link: Arc<OnceLock<Arc<AtomicBool>>> = Arc::new(OnceLock::new());
         let mut js_ctx = JsContext::new_with_force_stop(
-            Some(10 * 1024 * 1024),
+            Some(K6_VU_HEAP_BYTES),
             Some(Duration::from_secs(10)),
             force_stop.clone(),
         )
@@ -595,10 +606,11 @@ pub struct K6DriverInstance {
     /// 'static and can't reach the VuContext, so they push into this buffer
     /// and run_iteration() drains it into ctx.samples after each iteration.
     sample_sink: Arc<Mutex<Vec<Sample>>>,
-    /// Per-VU group() stack (backlog line 154). `group(name)` pushes here,
-    /// the matching group_end pops; the http bridges read the top when
-    /// stamping http_req_* samples so metrics recorded inside a group carry
-    /// `group=::name` (k6 parity) instead of the hardcoded `group=http`.
+    /// Per-VU group() stack (backlog line 154). `group(name)` pushes the
+    /// FULL `::a::b` path here (backlog line 63), the matching group_end
+    /// pops; the http/checks bridges read the top when stamping samples so
+    /// metrics recorded inside a group carry `group=::a::b` (k6 parity)
+    /// instead of the innermost raw name or the hardcoded `group=http`.
     group_stack: Arc<Mutex<Vec<String>>>,
     /// Shared exec.* state — the pm.js / k6-shim / exec.js scripts read it
     /// through __tropel_exec_* closures registered lazily; sync_globals()
@@ -772,6 +784,25 @@ fn http_tags_for(
     tags
 }
 
+/// Tiny status-0 error envelope used when a response allocation fails
+/// (backlog line 46 P0): mirrors the invalid-method path so the script sees
+/// a FAILED response (checks fail, http_req_failed counts) instead of a
+/// cross-FFI panic from `.expect()` on a body larger than the per-VU heap
+/// cap. Returns `None` only when the heap has no headroom at all — the
+/// caller then propagates a JS exception (never a panic).
+fn k6_error_envelope<'js>(ctx: &rquickjs::Ctx<'js>, msg: &str) -> Option<rquickjs::Object<'js>> {
+    let e = rquickjs::Object::new(ctx.clone()).ok()?;
+    let _ = e.set("code", 0_i32);
+    let _ = e.set("status", 0_i32);
+    let _ = e.set("status_text", msg);
+    let _ = e.set("error", msg);
+    let _ = e.set("error_code", 1000_i32);
+    let _ = e.set("headers", rquickjs::Object::new(ctx.clone()).ok()?);
+    let _ = e.set("body", "");
+    let _ = e.set("response_time", 0.0_f64);
+    Some(e)
+}
+
 /// Record the standard `http_req_*` samples for a completed request.
 ///
 /// Mirrors the declarative runner's tag set and k6's default success
@@ -831,6 +862,26 @@ fn push_redirect_hops(
             extra_tags,
             group,
         );
+    }
+}
+
+/// Backlog line 97: parse a tags JSON object into a [`TagMap`], coercing
+/// non-string values to strings (k6's `check(res, conds, {code: 200})` —
+/// k6 `ToString`s every tag value). The old `from_str::<HashMap<String,
+/// String>>()` failed on `{"code":200}` and silently dropped the ENTIRE
+/// tag map; this lenient parse never fails and never drops the map.
+fn stringify_tag_map_into(j: &str, tags: &mut TagMap) {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(j) {
+        for (k, val) in map {
+            let s = match val {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            tags.insert(k, s);
+        }
     }
 }
 
@@ -1192,14 +1243,21 @@ fn build_k6_response_object<'js>(
     error: &str,
     error_code: i32,
     response_type: &str,
-) -> rquickjs::Object<'js> {
-    let obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 response");
+) -> rquickjs::Result<rquickjs::Object<'js>> {
+    // Backlog line 46 (P0): allocation failures must NOT `.expect()`-panic
+    // across the QuickJS FFI boundary — a server-controlled binary body can
+    // exceed the per-VU heap cap. Small envelope allocations use `?` (the
+    // rquickjs Func converts Err into a script-thrown exception); the body
+    // ArrayBuffer pre-checks the cap and degrades to the status-0 error
+    // response (same shape as the invalid-method path) while the heap still
+    // has headroom.
+    let obj = rquickjs::Object::new(ctx.clone())?;
     let _ = obj.set("code", code as i32);
     let _ = obj.set("status", code as i32);
     let _ = obj.set("status_text", status_text);
     let _ = obj.set("error", error);
     let _ = obj.set("error_code", error_code);
-    let headers_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 headers");
+    let headers_obj = rquickjs::Object::new(ctx.clone())?;
     for (k, v) in headers {
         let _ = headers_obj.set(k.as_str(), v.as_str());
     }
@@ -1207,7 +1265,7 @@ fn build_k6_response_object<'js>(
     let _ = obj.set("response_time", response_time_ms);
     // Real connection-phase timings (k6 keys + Tropel's extra `dns`).
     if let Some(t) = timings {
-        let timings_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 timings");
+        let timings_obj = rquickjs::Object::new(ctx.clone())?;
         let _ = timings_obj.set("blocked", t.blocked.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("dns", t.dns.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("connecting", t.connecting.as_secs_f64() * 1000.0);
@@ -1220,14 +1278,42 @@ fn build_k6_response_object<'js>(
     }
     // `responseType: "binary"` → native ArrayBuffer body (raw bytes survive);
     // otherwise UTF-8 text. `none` (k6) sends an empty body.
+    // NOTE (metrics-vs-script divergence): the caller has ALREADY pushed the
+    // real http_req_* samples (the request completed on the wire) before this
+    // object is built, so degrading to a status-0 envelope here is a JS
+    // REPRESENTATION fallback only — the metrics keep the true status, and
+    // the envelope is the script-visible failure signal. Do NOT "fix" this
+    // by also pushing failure samples (double-counted failures).
     if response_type.eq_ignore_ascii_case("binary") {
-        let ab =
-            rquickjs::ArrayBuffer::new(ctx.clone(), body).expect("ArrayBuffer for k6 binary body");
-        let _ = obj.set("body", ab);
+        // A body at/over the WHOLE heap cap is guaranteed OOM — degrade to
+        // the status-0 envelope BEFORE attempting the allocation, so it can
+        // be built while headroom still exists. In-between sizes try the
+        // ArrayBuffer and fall back to the envelope on failure.
+        if body.len() >= K6_VU_HEAP_BYTES {
+            return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap") {
+                Some(e) => Ok(e),
+                None => Err(rquickjs::Error::Exception),
+            };
+        }
+        match rquickjs::ArrayBuffer::new(ctx.clone(), body) {
+            Ok(ab) => {
+                let _ = obj.set("body", ab);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "k6 binary body allocation failed (heap cap) — status-0 error response"
+                );
+                return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap")
+                {
+                    Some(e) => Ok(e),
+                    None => Err(rquickjs::Error::Exception),
+                };
+            }
+        }
     } else {
         let _ = obj.set("body", String::from_utf8_lossy(&body).into_owned());
     }
-    obj
+    Ok(obj)
 }
 
 impl K6DriverInstance {
@@ -1311,7 +1397,7 @@ fn register_http_bridges<'js>(
                   body: String,
                   response_type: String,
                   extras_json: String|
-                  -> rquickjs::Object<'js> {
+                  -> rquickjs::Result<rquickjs::Object<'js>> {
                 // Backlog line 140: the shim packs per-request
                 // params.timeout/tags/auth/redirects/compression into
                 // ONE JSON string (the bridge closure is arity-capped
@@ -1818,6 +1904,7 @@ impl K6DriverInstance {
 
             // check() / pm.test() → checks Rate sample
             let sink_test = sink.clone();
+            let group_test = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
@@ -1825,14 +1912,22 @@ impl K6DriverInstance {
                     move |name: String, passed: bool, tags_json: Option<String>| {
                         let mut v = sink_test.lock().unwrap();
                         let now = tropel_js::clock::monotonic_wall_now();
-                        let mut tags = TagMap::with_capacity(2);
+                        let mut tags = TagMap::with_capacity(3);
                         tags.insert("check", name);
+                        // Backlog line 63: checks carry the current group
+                        // path (k6 parity) — nested group() stamps
+                        // group=::checkout::payment on the checks sample too.
+                        if let Some(g) = group_test.lock().unwrap().last() {
+                            tags.insert("group", g.clone());
+                        }
                         if let Some(j) = tags_json {
-                            if let Ok(extra) = serde_json::from_str::<HashMap<String, String>>(&j) {
-                                for (k, val) in extra {
-                                    tags.insert(k, val);
-                                }
-                            }
+                            // Backlog line 97: tag values may be non-strings
+                            // (check(r, {...}, {code: 200}) — k6 coerces every
+                            // tag value to a string). from_str::<HashMap<
+                            // String,String>>() failed on {"code":200} and
+                            // dropped the ENTIRE tag map; parse the object
+                            // and stringify each value instead.
+                            stringify_tag_map_into(&j, &mut tags);
                         }
                         v.push(Sample {
                             metric: "checks".into(),
@@ -1860,15 +1955,17 @@ impl K6DriverInstance {
                           metric_type_str: String,
                           is_time: bool| {
                         if is_time {
-                            tropel_metrics::time_metrics::register(&name);
+                            tropel_metrics::time_metrics::register(
+                                &name,
+                                tropel_metrics::MetricUnit::Time,
+                            );
                         }
-                        let tags = if tags_json.is_empty() || tags_json == "{}" {
-                            TagMap::new()
-                        } else {
-                            let parsed: HashMap<String, String> =
-                                serde_json::from_str(&tags_json).unwrap_or_default();
-                            TagMap::from_pairs(parsed)
-                        };
+                        let mut tags = TagMap::new();
+                        if !tags_json.is_empty() && tags_json != "{}" {
+                            // Backlog line 97: same lenient parse as check() —
+                            // metric.add(1, {code: 200}) must not drop the map.
+                            stringify_tag_map_into(&tags_json, &mut tags);
+                        }
                         let sample_type = match metric_type_str.as_str() {
                             "counter" => SampleType::Counter,
                             "gauge" => SampleType::Point,
@@ -1935,24 +2032,41 @@ impl K6DriverInstance {
             let _ = globals.set(
                 "__tropel_pm_group_start",
                 Func::from(move |name: String| {
-                    group_start.lock().unwrap().push(name);
+                    // Backlog line 63: push the FULL ::a::b path, not the bare
+                    // leaf — every consumer reads group_stack.last() and k6
+                    // tags nested groups group=::checkout::payment. Two
+                    // same-named leaves under different parents must NOT merge
+                    // into one series.
+                    let mut s = group_start.lock().unwrap();
+                    let full = match s.last() {
+                        Some(parent) => format!("{}::{}", parent, name),
+                        None => format!("::{}", name),
+                    };
+                    s.push(full);
                 }),
             );
             let group_end = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
-                    if let Some(top) = group_end.lock().unwrap().pop() {
-                        // Defensive: the JS shim always calls end with the
-                        // matching name; if a script mismatches, don't lose
-                        // the whole stack — just drop the stale top.
-                        if top != name {
-                            tracing::debug!("k6 group_end mismatch: top={} got={}", top, name);
-                        }
+                    // Backlog line 63: pop the FULL ::a::b path (start pushed
+                    // it) and tag group_duration with it — k6 tags nested
+                    // groups group=::checkout::payment, not the bare leaf.
+                    let full = group_end
+                        .lock()
+                        .unwrap()
+                        .pop()
+                        .unwrap_or_else(|| format!("::{}", name));
+                    // Defensive: compare the LEAF (the stack stores full
+                    // ::a::b paths); a mismatched script drops the stale top
+                    // without losing the whole stack.
+                    let leaf = full.rsplit("::").next().unwrap_or(&full);
+                    if leaf != name {
+                        tracing::debug!("k6 group_end mismatch: top={} got={}", full, name);
                     }
                     let mut v = sink_group.lock().unwrap();
                     let mut tags = TagMap::with_capacity(1);
-                    tags.insert("group", name);
+                    tags.insert("group", full);
                     v.push(Sample {
                         metric: "group_duration".into(),
                         value: duration_ms, // ms — the public unit (k6 semantics)
@@ -4030,9 +4144,16 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__captured = [];
+                // Echo stub: the new missing-key guard throws on a bare '{}'
+                // — return a response for every key the shim sends.
                 globalThis.__tropel_k6_http_batch = function (requestsJson) {
-                    globalThis.__captured.push(JSON.parse(requestsJson));
-                    return '{}';
+                    var reqs = JSON.parse(requestsJson);
+                    var out = {};
+                    for (var ri = 0; ri < reqs.length; ri++) {
+                        out[reqs[ri].key] = { status: 200, code: 200, body: 'ok', headers: {}, timings: {} };
+                    }
+                    globalThis.__captured.push(reqs);
+                    return JSON.stringify(out);
                 };
                 http.batch([
                     ['GET', 'https://example.com/1', null, {
@@ -4073,6 +4194,116 @@ mod tests {
             assert!(
                 entries.contains("\"auth_json\":\"null\""),
                 "batch auth not null when absent: {entries}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_http_batch_object_form_params_duplicate_keys_and_loud_failures() {
+        // Backlog §3: the batch path missed every single-request fix.
+        // - object-form entries dropped auth/redirects/compression/cookies
+        // - object-form forced timeout '30s' (overriding the global)
+        // - duplicate `name` keys collided (one real response lost)
+        // - http.batch('abc') returned {} silently
+        // - body: req.body || null dropped 0/''/false
+        // - a missing native key fabricated a silent status-0 response
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                // Echo stub: return a response for EVERY key the shim sends —
+                // the new missing-key guard throws otherwise (that guard is
+                // what the separate '{}' stub below exercises).
+                globalThis.__tropel_k6_http_batch = function (requestsJson) {
+                    var reqs = JSON.parse(requestsJson);
+                    var out = {};
+                    for (var ri = 0; ri < reqs.length; ri++) {
+                        out[reqs[ri].key] = { status: 200, code: 200, body: 'ok', headers: {}, timings: {} };
+                    }
+                    globalThis.__captured.push(reqs);
+                    return JSON.stringify(out);
+                };
+                // Object-form entry: every per-request param must survive;
+                // falsy body 0 must NOT become null; no forced '30s'.
+                http.batch([{
+                    url: 'https://example.com/o1',
+                    method: 'POST',
+                    body: 0,
+                    params: {
+                        auth: { username: 'u', password: 'p' },
+                        redirects: 0,
+                        compression: 'gzip',
+                        cookies: { sid: 's1' },
+                    },
+                }]);
+                // Duplicate names: BOTH object-form with the same name so the
+                // keys actually collide in the batch caller; the round-trip
+                // keys must be deduped so both responses survive the map.
+                http.batch([
+                    { url: 'https://example.com/d1', name: 'dup' },
+                    { url: 'https://example.com/d2', name: 'dup' },
+                ]);
+                // http.batch('abc') must throw, not return an object silently.
+                var threwAbc = false;
+                try { http.batch('abc'); } catch (e) { threwAbc = true; }
+                // A missing native key must throw, not fabricate status-0 —
+                // this needs a bare '{}' stub (the echo stub never misses).
+                var threwMissing = false;
+                globalThis.__tropel_k6_http_batch = function () { return '{}'; };
+                try { http.batch([['GET', 'https://example.com/m']]); } catch (e) { threwMissing = true; }
+                globalThis.__threwAbc = threwAbc;
+                globalThis.__threwMissing = threwMissing;
+            "#,
+            )
+            .expect("script should eval");
+
+            // First call: object-form params all present + falsy body kept.
+            let first: String = ctx
+                .eval("JSON.stringify(__captured[0])")
+                .expect("read first batch call");
+            assert!(
+                first.contains("\"auth_json\":\"{\\\"type\\\":\\\"basic\\\""),
+                "object-form auth dropped: {first}"
+            );
+            assert!(first.contains("\"redirects\":0"), "object-form redirects dropped: {first}");
+            assert!(
+                first.contains("\"compression\":\"gzip\""),
+                "object-form compression dropped: {first}"
+            );
+            // cookies are merged into the Cookie header by normalizeK6Request.
+            assert!(
+                first.contains("sid=s1"),
+                "object-form cookies not merged into Cookie header: {first}"
+            );
+            assert!(
+                first.contains("\"body\":\"0\""),
+                "falsy body 0 dropped to null: {first}"
+            );
+            assert!(
+                first.contains("\"timeout_ms\":0"),
+                "object-form forced a timeout instead of leaving it 0: {first}"
+            );
+
+            // Second call: duplicate names deduped to distinct keys.
+            let second: String = ctx
+                .eval("JSON.stringify(__captured[1].map(function(e){return e.key;}))")
+                .expect("read second batch call keys");
+            assert_eq!(
+                second, "[\"dup\",\"dup#1\"]",
+                "duplicate batch names must be deduped: {second}"
+            );
+
+            assert!(
+                ctx.eval::<bool, _>("__threwAbc").expect("read threwAbc"),
+                "http.batch('abc') must throw, not return an object silently"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__threwMissing").expect("read threwMissing"),
+                "missing native key must throw, not fabricate status-0"
             );
         });
     }
@@ -5545,6 +5776,99 @@ mod tests {
         });
     }
 
+    /// Backlog line 63: group() tagged samples with the INNERMOST raw name
+    /// (group=payment) instead of the k6 full path (group=::checkout::payment)
+    /// — and checks samples carried NO group tag at all. Nested group()
+    /// must tag checks + group_duration with the full ::a::b path.
+    #[tokio::test]
+    async fn test_nested_group_tags_use_full_path() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    group('payment', function () {
+                        check(true, { 'ok': true });
+                    });
+                });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration with nested groups must succeed");
+
+        // checks sample must carry group=::checkout::payment (was untagged).
+        let check_groups: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        assert_eq!(
+            check_groups,
+            vec!["::checkout::payment".to_string()],
+            "checks must carry the full group path, got: {:?}",
+            check_groups
+        );
+
+        // group_duration samples: one per level, tagged with the full path
+        // (::checkout and ::checkout::payment), not the bare leaf.
+        let mut durations: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "group_duration")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        durations.sort();
+        assert_eq!(
+            durations,
+            vec!["::checkout".to_string(), "::checkout::payment".to_string()],
+            "group_duration must use full ::a::b paths, got: {:?}",
+            durations
+        );
+    }
+
+    /// Backlog line 63: http_req_* samples recorded inside nested groups
+    /// must carry group=::checkout::payment (k6 parity) — the old code
+    /// stamped the innermost raw name, so two same-named leaf groups under
+    /// different parents merged into one series.
+    #[tokio::test]
+    async fn test_http_in_nested_group_carries_full_path() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    group('payment', function () {
+                        http.get('http://example.com/');
+                    });
+                });
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        // Wire the stub HTTP client so the native http bridge registers on
+        // the first iteration (same pattern as test_setup_can_make_http_calls).
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration with http inside nested groups must succeed");
+
+        let groups: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "http_req_duration")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["::checkout::payment".to_string()],
+            "http_req_duration must carry the full group path, got: {:?}",
+            groups
+        );
+    }
+
     #[test]
     fn test_check_throws_on_nonsense_and_forwards_tags() {
         // Backlog line 149: check() accepted nonsense as success —
@@ -6186,6 +6510,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_lodash_string_and_property_shorthand() {
+        // Backlog line 93: string shorthand (`'active'`) and pair shorthand
+        // (`['active',true]`) were broken across filter/find/every/some/
+        // findIndex, and `_.reject(coll,{matcher})` THREW (raw predicate
+        // called as a function). All must normalize through toPredicate.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var users = [
+                    { name: 'a', active: true },
+                    { name: 'b', active: false },
+                    { name: 'c', active: true },
+                ];
+                JSON.stringify([
+                    // String shorthand: filter by property truthiness.
+                    _.filter(users, 'active').map(function (u) { return u.name; }),
+                    // find returns the FIRST active user.
+                    _.find(users, 'active').name,
+                    // findIndex returns the index of the first active user.
+                    _.findIndex(users, 'active'),
+                    // every/some honor the string shorthand.
+                    _.every(users, 'active'),
+                    _.some(users, 'active'),
+                    // Pair shorthand: [key, value] equality.
+                    _.filter(users, ['active', true]).length,
+                    // reject with an object matcher must not throw.
+                    _.reject(users, { active: false }).map(function (u) { return u.name; }),
+                    // some with an object matcher.
+                    _.some(users, { active: true }),
+                    // Dotted path shorthand via _.get.
+                    _.filter([{ a: { b: 1 } }, { a: { b: 0 } }], 'a.b').length,
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "[[\"a\",\"c\"],\"a\",0,false,true,2,[\"a\",\"c\"],true,1]",
+            "string/pair/matcher shorthand across the collection family"
+        );
+    }
+
+    #[tokio::test]
     async fn test_lodash_set_blocks_proto_pollution() {
         // Backlog line 155: `_.set({}, '__proto__.polluted', 1)` polluted
         // the per-VU context for the whole run.
@@ -6532,6 +6900,71 @@ mod tests {
         assert_eq!(
             out, "[true,\"phrase msg\"]",
             "passphrase encrypt/decrypt round-trips"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_modes_padding_utf16_wordarray_and_missing_algorithms() {
+        // Backlog line 95: ECB/CTR/CFB/OFB silently ran GCM (wrong cipher,
+        // no error); {padding: NoPadding} was ignored (16 bytes → 32);
+        // WordArray.concat corrupted non-4-byte-aligned data ('abc'+'de' →
+        // "abc\0d"); enc.Utf16 was an alias of Utf8; RIPEMD160/SHA224/
+        // HmacSHA384 were undefined.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var key = CryptoJS.lib.WordArray.random(16);
+                var iv = CryptoJS.lib.WordArray.random(16);
+
+                // Unsupported modes must FAIL LOUDLY, not silently run GCM.
+                var ecbThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.ECB, iv: iv }); return 'no'; }
+                    catch (e) { return /ECB/.test(e.message) ? 'ecb' : 'other:' + e.message; }
+                })();
+                var ctrThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.CTR, iv: iv }); return 'no'; }
+                    catch (e) { return /CTR/.test(e.message) ? 'ctr' : 'other:' + e.message; }
+                })();
+                var cfbThrew = (function () {
+                    try { CryptoJS.AES.decrypt(CryptoJS.enc.Hex.parse('00'.repeat(16)), key, { mode: CryptoJS.mode.CFB, iv: iv }); return 'no'; }
+                    catch (e) { return /CFB/.test(e.message) ? 'cfb' : 'other:' + e.message; }
+                })();
+
+                // Unsupported padding must FAIL LOUDLY, not silently pad.
+                var noPadThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.NoPadding, iv: iv }); return 'no'; }
+                    catch (e) { return /NoPadding/.test(e.message) ? 'nopad' : 'other:' + e.message; }
+                })();
+
+                // WordArray.concat must be bit-aligned: 'abc' + 'de' = 'abcde'.
+                var concatStr = CryptoJS.enc.Utf8.stringify(
+                    CryptoJS.enc.Utf8.parse('abc').concat(CryptoJS.enc.Utf8.parse('de'))
+                );
+
+                // Utf16 must be UTF-16BE (not a Utf8 alias) and round-trip.
+                var utf16 = CryptoJS.enc.Utf16.stringify(CryptoJS.enc.Utf16.parse('héllo'));
+                var utf16Hex = CryptoJS.enc.Utf16.parse('hi').toString(CryptoJS.enc.Hex);
+                var utf16beAlias = CryptoJS.enc.Utf16BE === CryptoJS.enc.Utf16;
+
+                // Missing algorithms now defined and matching known vectors.
+                var sha224 = CryptoJS.SHA224('hello').toString();
+                var ripemd160 = CryptoJS.RIPEMD160('hello').toString();
+                var hmac384 = CryptoJS.HmacSHA384('hello', 'key').toString();
+
+                JSON.stringify([
+                    ecbThrew, ctrThrew, cfbThrew, noPadThrew,
+                    concatStr, utf16, utf16Hex, utf16beAlias,
+                    sha224, ripemd160, hmac384
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\"ecb\",\"ctr\",\"cfb\",\"nopad\",\"abcde\",\"héllo\",\"00680069\",true,\"ea09ae9cc6768c50fcee903ed054556e5bfc8347907f12598aa24193\",\"108f07b8382412612c048d07d13f814118445acd\",\"eacbad575c301fa68afb26dae48b25bf5cd42fd08ed28c08c274ce62df7928f01249976cd8aaf1ab0681d3accedc9543\"]",
+            "modes fail loudly, padding fails loudly, concat aligns, Utf16 is BE, missing algorithms defined"
         );
     }
 
@@ -7057,6 +7490,63 @@ mod tests {
         inst.run_iteration(&mut ctx)
             .await
             .expect("iteration must succeed with numeric __VU/__ITER");
+    }
+
+    #[tokio::test]
+    async fn test_check_tags_accept_non_string_values() {
+        // Backlog line 97: check(r, {...}, {code: 200}) — a NUMBER tag value
+        // — dropped the ENTIRE tag map (shim JSON.stringify → bridge
+        // from_str::<HashMap<String,String>> failed on {"code":200}, no
+        // warning). k6 coerces tag values to strings, so `code` must survive
+        // as "200" alongside string/bool tags. Exercised through the REAL
+        // bridge (register_script_bridges) and the drained sample sink.
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                check(1, { 'status is 200': function (v) { return v === 1; } },
+                      { code: 200, ok: true, name: 'health' });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+        let checks: Vec<_> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .collect();
+        assert_eq!(
+            checks.len(),
+            1,
+            "one check sample expected, got {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
+        let sample = checks[0];
+        assert_eq!(
+            sample.tags.get("code"),
+            Some("200"),
+            "numeric tag value must survive as a string (k6 coerces)"
+        );
+        assert_eq!(
+            sample.tags.get("ok"),
+            Some("true"),
+            "boolean tag value must survive as a string"
+        );
+        assert_eq!(
+            sample.tags.get("name"),
+            Some("health"),
+            "string tag value must survive"
+        );
+        assert_eq!(
+            sample.tags.get("check"),
+            Some("status is 200"),
+            "the check name must still be stamped"
+        );
     }
 
     // ── k6/crypto + k6/encoding + k6/timers + randomSeed + x509 ──

@@ -501,8 +501,9 @@ fn build_threshold(
     }
 }
 
-/// Translate a k6 threshold expression (`p(95)<500`, `avg<200`, `rate<0.01`)
-/// into Tropel's `metric.stat op value` form (e.g. `http_req_duration.p95 < 500`).
+/// Translate a k6 threshold expression (`p(95)<500`, `avg<200`, `rate<0.01`,
+/// `value>10`) into Tropel's `metric.stat op value` form (e.g.
+/// `http_req_duration.p95 < 500`).
 ///
 /// k6 expresses the metric via the map key; Tropel's evaluator wants a fully
 /// qualified reference. Since backlog §0, ALL durations are stored in
@@ -512,15 +513,42 @@ fn build_threshold(
 /// This is what makes `--threshold 'http_req_duration.p95 < 500'` on the CLI
 /// agree with an identical k6-script threshold. Expressions that already
 /// carry a metric name (or use syntax we don't recognize) are passed through
-/// unchanged — compound expressions (`&&`/`||`) are logged loudly because
-/// the evaluator cannot parse them and would otherwise report them as
-/// silently passing.
+/// unchanged. Backlog line 121: `value` (k6's Gauge stat) and compound
+/// `&&`/`||` expressions are translated too — the evaluator has supported
+/// both since line 154, but the translator couldn't produce them, so a valid
+/// k6 threshold aborted the whole run at startup via `validate_thresholds`.
 fn translate_k6_expression(metric: &str, expr: &str) -> String {
+    // Backlog line 121: compound AND/OR. `&&` binds tighter than `||` — split
+    // on `||` first, translate every clause, and rejoin with the original
+    // operators so the evaluator's compound parser (thresholds.rs) sees a
+    // fully qualified clause per split. The old code passed compounds through
+    // RAW, which `validate_thresholds` (line 154) then rejected as malformed
+    // → `TropelError::Config` before a VU started.
+    if expr.contains("&&") || expr.contains("||") {
+        let out = expr
+            .split("||")
+            .map(|group| {
+                group
+                    .split("&&")
+                    .map(|clause| translate_k6_clause(metric, clause))
+                    .collect::<Vec<_>>()
+                    .join(" && ")
+            })
+            .collect::<Vec<_>>()
+            .join(" || ");
+        return out;
+    }
+    translate_k6_clause(metric, expr)
+}
+
+/// Translate a single (non-compound) k6 threshold clause.
+fn translate_k6_clause(metric: &str, expr: &str) -> String {
     // k6's real median stat is `med` (not `median`). Accepting `median` meant
     // `med<400` fell through to the evaluator as a 1-token expression and
-    // silently passed (fail-open gate).
+    // silently passed (fail-open gate). `value` is k6's Gauge stat (backlog
+    // line 121) and maps onto the evaluator's `.value`.
     let re = Regex::new(
-        r"^\s*(p\(\d+(?:\.\d+)?\)|avg|med|min|max|count|sum|rate)\s*(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$",
+        r"^\s*(p\(\d+(?:\.\d+)?\)|avg|med|min|max|count|sum|rate|value)\s*(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$",
     )
     .expect("threshold translation regex is valid");
     if let Some(caps) = re.captures(expr) {
@@ -548,18 +576,11 @@ fn translate_k6_expression(metric: &str, expr: &str) -> String {
             // second dot in parse_metric_ref and yield stat "9".
             s if s.starts_with("p(") => format!(".{s}"),
             "med" | "median" => ".p50".to_string(),
-            // avg / min / max / count / sum / rate map 1:1 onto evaluator stats
+            // avg / min / max / count / sum / rate / value map 1:1 onto
+            // evaluator stats
             other => format!(".{other}"),
         };
         return format!("{metric}{suffix} {op} {val_str}");
-    }
-    if expr.contains("&&") || expr.contains("||") {
-        tracing::warn!(
-            "k6 threshold '{}' uses compound expression '{}' which Tropel cannot \
-             evaluate — it will always report PASS",
-            metric,
-            expr.trim()
-        );
     }
     expr.trim().to_string()
 }
@@ -877,6 +898,72 @@ mod tests {
         assert_eq!(
             translate_k6_expression("http_req_duration", "p(10)<300"),
             "http_req_duration.p(10) < 300"
+        );
+    }
+
+    #[test]
+    fn test_threshold_gauge_value_stat_translated() {
+        // Backlog line 121: k6's `value` (the only Gauge stat) was missing
+        // from the translator regex, so `vus: ['value>10']` fell through raw
+        // and validate_thresholds aborted the run at startup.
+        let expr = translate_k6_expression("vus", "value>10");
+        assert_eq!(expr, "vus.value > 10");
+    }
+
+    #[test]
+    fn test_threshold_compound_and_or_translated() {
+        // Backlog line 121: compounds were passed through raw (with a "cannot
+        // evaluate" warning), so validate_thresholds saw 1-token clauses and
+        // aborted the run — despite the evaluator supporting &&/|| since line
+        // 154. Every clause must be translated and rejoined.
+        assert_eq!(
+            translate_k6_expression("http_req_duration", "p(95)<500 && p(99)<1000"),
+            "http_req_duration.p(95) < 500 && http_req_duration.p(99) < 1000"
+        );
+        assert_eq!(
+            translate_k6_expression("http_req_duration", "avg<200 || p(95)<500"),
+            "http_req_duration.avg < 200 || http_req_duration.p(95) < 500"
+        );
+        // Mixed precedence: && binds tighter than ||, and the rejoin must
+        // preserve the grouping.
+        assert_eq!(
+            translate_k6_expression("http_req_duration", "p(95)<500 && avg<200 || count>1000"),
+            "http_req_duration.p(95) < 500 && http_req_duration.avg < 200 \
+             || http_req_duration.count > 1000"
+        );
+        // A compound whose clauses are already fully qualified passes through.
+        assert_eq!(
+            translate_k6_expression(
+                "http_req_duration",
+                "http_req_duration.p95 < 500 && http_reqs.count > 100"
+            ),
+            "http_req_duration.p95 < 500 && http_reqs.count > 100"
+        );
+    }
+
+    #[test]
+    fn test_threshold_compound_value_mixed() {
+        // value (Gauge) combined with a percentile — both translations in one.
+        assert_eq!(
+            translate_k6_expression("vus", "value>10 && value<100"),
+            "vus.value > 10 && vus.value < 100"
+        );
+    }
+
+    #[test]
+    fn test_threshold_tag_filter_passes_through() {
+        // k6 tag-filtered clauses ({status:200}) don't match the translation
+        // regex — they must pass through UNCHANGED, never mangled by the
+        // &&/|| split (tag filters contain neither operator). Pre-existing
+        // passthrough behavior, pinned so the compound dispatcher can't
+        // corrupt it.
+        assert_eq!(
+            translate_k6_expression("http_req_duration", "{status:200}<500"),
+            "{status:200}<500"
+        );
+        assert_eq!(
+            translate_k6_expression("http_req_duration", "p(95)<500 || {status:500}<100"),
+            "http_req_duration.p(95) < 500 || {status:500}<100"
         );
     }
 

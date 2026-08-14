@@ -52,17 +52,38 @@ var _ = _ || {};
         return array;
     };
 
+    // ── Collection shorthand (backlog line 93) ──
+    // Normalize any lodash predicate shorthand into a predicate function,
+    // mirroring lodash's _.iteratee: string → property-path truthiness
+    // (`_.filter(users,'active')`), array [key,value] → equality
+    // (`_.find(users,['active',true])`), object → matcher
+    // (`_.every(users,{active:true})`), function → itself, undefined/other →
+    // truthiness. String paths resolve through _.get so dotted/bracket paths
+    // (`'a.b'`, `'a[0].b'`) work too.
+    function toPredicate(predicate) {
+        if (typeof predicate === 'function') return predicate;
+        if (typeof predicate === 'string') {
+            return function (x) { return !!_.get(x, predicate); };
+        }
+        if (Array.isArray(predicate)) {
+            return function (x) { return _.get(x, predicate[0]) === predicate[1]; };
+        }
+        if (predicate !== null && typeof predicate === 'object') {
+            return function (x) {
+                for (var k in predicate) {
+                    if (x[k] !== predicate[k]) return false;
+                }
+                return true;
+            };
+        }
+        return function (x) { return !!x; };
+    }
+
     _.findIndex = function (array, predicate, fromIndex) {
+        var pred = toPredicate(predicate);
         fromIndex = fromIndex || 0;
         for (var i = fromIndex; i < array.length; i++) {
-            if (typeof predicate === 'function' && predicate(array[i])) return i;
-            if (typeof predicate === 'object' && predicate !== null) {
-                var match = true;
-                for (var k in predicate) {
-                    if (array[i][k] !== predicate[k]) { match = false; break; }
-                }
-                if (match) return i;
-            }
+            if (pred(array[i], i, array)) return i;
         }
         return -1;
     };
@@ -227,67 +248,40 @@ var _ = _ || {};
     _.forEach = _.each;
 
     _.every = function (collection, predicate) {
-        // Iterate objects by key too, and honor object/matcher predicates
-        // (backlog line 155): `_.every([{active:false}],{active:true})` must
-        // be false — the old truthiness branch returned true.
+        // Iterate objects by key too, and honor string/pair/matcher shorthand
+        // (backlog line 155/93): `_.every([{active:false}],{active:true})`
+        // must be false — the old truthiness branch returned true.
+        var pred = toPredicate(predicate);
         var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
         var len = keys ? keys.length : (collection ? collection.length : 0);
         for (var i = 0; i < len; i++) {
             var item = keys ? collection[keys[i]] : collection[i];
-            if (typeof predicate === 'function') {
-                if (!predicate(item, keys ? keys[i] : i, collection)) return false;
-            } else if (predicate !== null && typeof predicate === 'object') {
-                var match = true;
-                for (var k in predicate) {
-                    if (item[k] !== predicate[k]) { match = false; break; }
-                }
-                if (!match) return false;
-            } else {
-                if (!item) return false;
-            }
+            if (!pred(item, keys ? keys[i] : i, collection)) return false;
         }
         return true;
     };
 
     _.filter = function (collection, predicate) {
-        // Object collections iterate by key (backlog line 155) — the old
-        // `collection.length` loop returned empty for objects.
+        // Object collections iterate by key (backlog line 155); string/pair/
+        // matcher shorthand normalized by toPredicate (backlog line 93).
+        var pred = toPredicate(predicate);
         var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
         var len = keys ? keys.length : (collection ? collection.length : 0);
         var result = [];
         for (var i = 0; i < len; i++) {
             var item = keys ? collection[keys[i]] : collection[i];
-            if (typeof predicate === 'function') {
-                if (predicate(item, keys ? keys[i] : i, collection)) result.push(item);
-            } else if (predicate !== null && typeof predicate === 'object') {
-                var match = true;
-                for (var k in predicate) {
-                    if (item[k] !== predicate[k]) { match = false; break; }
-                }
-                if (match) result.push(item);
-            } else {
-                if (item) result.push(item);
-            }
+            if (pred(item, keys ? keys[i] : i, collection)) result.push(item);
         }
         return result;
     };
 
     _.find = function (collection, predicate) {
+        var pred = toPredicate(predicate);
         var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
         var len = keys ? keys.length : (collection ? collection.length : 0);
         for (var i = 0; i < len; i++) {
             var item = keys ? collection[keys[i]] : collection[i];
-            if (typeof predicate === 'function') {
-                if (predicate(item, keys ? keys[i] : i, collection)) return item;
-            } else if (predicate !== null && typeof predicate === 'object') {
-                var match = true;
-                for (var k in predicate) {
-                    if (item[k] !== predicate[k]) { match = false; break; }
-                }
-                if (match) return item;
-            } else if (predicate === undefined) {
-                if (item) return item;
-            }
+            if (pred(item, keys ? keys[i] : i, collection)) return item;
         }
         return undefined;
     };
@@ -328,7 +322,11 @@ var _ = _ || {};
     };
 
     _.reject = function (collection, predicate) {
-        return _.filter(collection, function (x) { return !predicate(x); });
+        // toPredicate normalizes string/pair/matcher shorthand (line 93) —
+        // the old code called the raw predicate as a function and THREW on
+        // object matchers.
+        var pred = toPredicate(predicate);
+        return _.filter(collection, function (x, i, c) { return !pred(x, i, c); });
     };
 
     _.size = function (collection) {
@@ -338,14 +336,15 @@ var _ = _ || {};
     };
 
     _.some = function (collection, predicate) {
-        if (typeof predicate === 'function') {
-            for (var i = 0; i < collection.length; i++) {
-                if (predicate(collection[i], i, collection)) return true;
-            }
-        } else {
-            for (var i = 0; i < collection.length; i++) {
-                if (collection[i]) return true;
-            }
+        // Object collections iterate by key like filter/find/every; shorthand
+        // normalized by toPredicate (backlog line 93 — the old truthiness
+        // branch returned true for any matcher/string predicate).
+        var pred = toPredicate(predicate);
+        var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
+        var len = keys ? keys.length : (collection ? collection.length : 0);
+        for (var i = 0; i < len; i++) {
+            var item = keys ? collection[keys[i]] : collection[i];
+            if (pred(item, keys ? keys[i] : i, collection)) return true;
         }
         return false;
     };
