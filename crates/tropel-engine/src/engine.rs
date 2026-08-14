@@ -435,6 +435,20 @@ impl Engine {
             })
             .collect();
 
+        // Apply summary presentation config (trend stats + effective
+        // thresholds) to the collector BEFORE the VU loop starts. The 2 s
+        // abort coordinator polls `results()` mid-run (backlog line 59a);
+        // when the config only arrived after the loop, `retain_histograms`
+        // was false for EVERY mid-run `abortOnFail` evaluation, so a
+        // non-tracked `p(75)` fell back to the nearest tracked bucket (p90)
+        // and healthy runs were aborted. Setting it here means the exact
+        // histograms are retained for the whole run.
+        let summary_trend_stats =
+            declared_trend_stats.unwrap_or_else(tropel_metrics::collector::k6_default_trend_stats);
+        metrics
+            .set_summary_config(summary_trend_stats, thresholds.clone())
+            .await;
+
         tracing::info!(
             "Starting Tropel load test: {} scenario(s)",
             scenario_configs.len()
@@ -588,14 +602,6 @@ impl Engine {
         for handle in output_handles {
             let _ = handle.await;
         }
-
-        // Apply summary presentation config (trend stats + effective
-        // thresholds) to the collector so reporters see them.
-        let summary_trend_stats =
-            declared_trend_stats.unwrap_or_else(tropel_metrics::collector::k6_default_trend_stats);
-        metrics
-            .set_summary_config(summary_trend_stats, thresholds.clone())
-            .await;
 
         // Raw snapshot (build_results now clones the summary config into
         // every result, so ordering no longer matters — captured here only
