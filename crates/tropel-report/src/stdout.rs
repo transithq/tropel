@@ -18,8 +18,11 @@ impl StdoutReporter {
     /// name-heuristic `/1000` is gone — values are already in the public unit.
     fn render_trend(out: &mut String, line: &str, m: &MetricSummary, stats: &[String]) {
         let base = m.key.split('{').next().unwrap_or(&m.key);
-        let is_time = crate::json_stream::is_time_metric(base);
-        let unit = if is_time { "ms" } else { "" };
+        let unit = match crate::json_stream::metric_unit(base) {
+            tropel_metrics::MetricUnit::Time => "ms",
+            tropel_metrics::MetricUnit::Data => "B",
+            tropel_metrics::MetricUnit::Default => "",
+        };
 
         let mut parts: Vec<String> = Vec::new();
         for stat in stats {
