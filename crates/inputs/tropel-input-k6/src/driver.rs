@@ -4144,9 +4144,16 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__captured = [];
+                // Echo stub: the new missing-key guard throws on a bare '{}'
+                // — return a response for every key the shim sends.
                 globalThis.__tropel_k6_http_batch = function (requestsJson) {
-                    globalThis.__captured.push(JSON.parse(requestsJson));
-                    return '{}';
+                    var reqs = JSON.parse(requestsJson);
+                    var out = {};
+                    for (var ri = 0; ri < reqs.length; ri++) {
+                        out[reqs[ri].key] = { status: 200, code: 200, body: 'ok', headers: {}, timings: {} };
+                    }
+                    globalThis.__captured.push(reqs);
+                    return JSON.stringify(out);
                 };
                 http.batch([
                     ['GET', 'https://example.com/1', null, {
@@ -4187,6 +4194,116 @@ mod tests {
             assert!(
                 entries.contains("\"auth_json\":\"null\""),
                 "batch auth not null when absent: {entries}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_http_batch_object_form_params_duplicate_keys_and_loud_failures() {
+        // Backlog §3: the batch path missed every single-request fix.
+        // - object-form entries dropped auth/redirects/compression/cookies
+        // - object-form forced timeout '30s' (overriding the global)
+        // - duplicate `name` keys collided (one real response lost)
+        // - http.batch('abc') returned {} silently
+        // - body: req.body || null dropped 0/''/false
+        // - a missing native key fabricated a silent status-0 response
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                // Echo stub: return a response for EVERY key the shim sends —
+                // the new missing-key guard throws otherwise (that guard is
+                // what the separate '{}' stub below exercises).
+                globalThis.__tropel_k6_http_batch = function (requestsJson) {
+                    var reqs = JSON.parse(requestsJson);
+                    var out = {};
+                    for (var ri = 0; ri < reqs.length; ri++) {
+                        out[reqs[ri].key] = { status: 200, code: 200, body: 'ok', headers: {}, timings: {} };
+                    }
+                    globalThis.__captured.push(reqs);
+                    return JSON.stringify(out);
+                };
+                // Object-form entry: every per-request param must survive;
+                // falsy body 0 must NOT become null; no forced '30s'.
+                http.batch([{
+                    url: 'https://example.com/o1',
+                    method: 'POST',
+                    body: 0,
+                    params: {
+                        auth: { username: 'u', password: 'p' },
+                        redirects: 0,
+                        compression: 'gzip',
+                        cookies: { sid: 's1' },
+                    },
+                }]);
+                // Duplicate names: BOTH object-form with the same name so the
+                // keys actually collide in the batch caller; the round-trip
+                // keys must be deduped so both responses survive the map.
+                http.batch([
+                    { url: 'https://example.com/d1', name: 'dup' },
+                    { url: 'https://example.com/d2', name: 'dup' },
+                ]);
+                // http.batch('abc') must throw, not return an object silently.
+                var threwAbc = false;
+                try { http.batch('abc'); } catch (e) { threwAbc = true; }
+                // A missing native key must throw, not fabricate status-0 —
+                // this needs a bare '{}' stub (the echo stub never misses).
+                var threwMissing = false;
+                globalThis.__tropel_k6_http_batch = function () { return '{}'; };
+                try { http.batch([['GET', 'https://example.com/m']]); } catch (e) { threwMissing = true; }
+                globalThis.__threwAbc = threwAbc;
+                globalThis.__threwMissing = threwMissing;
+            "#,
+            )
+            .expect("script should eval");
+
+            // First call: object-form params all present + falsy body kept.
+            let first: String = ctx
+                .eval("JSON.stringify(__captured[0])")
+                .expect("read first batch call");
+            assert!(
+                first.contains("\"auth_json\":\"{\\\"type\\\":\\\"basic\\\""),
+                "object-form auth dropped: {first}"
+            );
+            assert!(first.contains("\"redirects\":0"), "object-form redirects dropped: {first}");
+            assert!(
+                first.contains("\"compression\":\"gzip\""),
+                "object-form compression dropped: {first}"
+            );
+            // cookies are merged into the Cookie header by normalizeK6Request.
+            assert!(
+                first.contains("sid=s1"),
+                "object-form cookies not merged into Cookie header: {first}"
+            );
+            assert!(
+                first.contains("\"body\":\"0\""),
+                "falsy body 0 dropped to null: {first}"
+            );
+            assert!(
+                first.contains("\"timeout_ms\":0"),
+                "object-form forced a timeout instead of leaving it 0: {first}"
+            );
+
+            // Second call: duplicate names deduped to distinct keys.
+            let second: String = ctx
+                .eval("JSON.stringify(__captured[1].map(function(e){return e.key;}))")
+                .expect("read second batch call keys");
+            assert_eq!(
+                second, "[\"dup\",\"dup#1\"]",
+                "duplicate batch names must be deduped: {second}"
+            );
+
+            assert!(
+                ctx.eval::<bool, _>("__threwAbc").expect("read threwAbc"),
+                "http.batch('abc') must throw, not return an object silently"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__threwMissing").expect("read threwMissing"),
+                "missing native key must throw, not fabricate status-0"
             );
         });
     }
