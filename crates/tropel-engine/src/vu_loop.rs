@@ -603,13 +603,19 @@ pub(crate) async fn run_scenario_vus(
                 // The scenario runner and the PM bridge both consume HTTP
                 // through the SDK `DriverHttpClient` trait (F1 review fix),
                 // so wrap the concrete client in the engine's trait impl.
-                let http_client_handle: Arc<dyn DriverHttpClient> =
-                    Arc::new(DriverHttpClientImpl {
-                        client: VuCookieClient::new(http_client_vu.as_ref().clone()),
-                    });
+                // Backlog line 159: ONE jar per VU — the bridge client must
+                // share the runner's jar, or a prerequest `pm.sendRequest`
+                // → `/login` → `Set-Cookie` would land in the bridge jar and
+                // every collection request would go out with no session (401
+                // for the whole run).
+                let vu_client = VuCookieClient::new(http_client_vu.as_ref().clone());
+                // Derive the bridge BEFORE moving vu_client into the runner
+                // (clone_with_shared_jar reuses the same jar Arc).
                 let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-                    client: VuCookieClient::new(http_client_vu.as_ref().clone()),
+                    client: vu_client.clone_with_shared_jar(),
                 });
+                let http_client_handle: Arc<dyn DriverHttpClient> =
+                    Arc::new(DriverHttpClientImpl { client: vu_client });
                 let mut runner = ScenarioRunner::new(
                     scenario,
                     flattened_vu,
@@ -934,7 +940,14 @@ fn spawn_abort_coordinator(
             }
             let elapsed = test_start.elapsed();
             if elapsed > Duration::from_secs(1) {
-                let results = metrics.results().await;
+                let mut results = metrics.results().await;
+                // Backlog line 45: `results()` stamps run_duration as ZERO —
+                // the engine writes the real elapsed only AFTER the run, so
+                // mid-run counter `rate`/`avg` thresholds divided by 0 and
+                // evaluated to 0.0, and abortOnFail killed healthy runs at
+                // the first check (~2s). Stamp the same wall-clock elapsed
+                // the engine uses post-run so mid-run rates are real.
+                results.run_duration = elapsed;
                 // k6 `tainted`: ANY failed threshold (abortOnFail or not)
                 // marks the run so the control API status doc reports
                 // `tainted: true` (backlog line 154).

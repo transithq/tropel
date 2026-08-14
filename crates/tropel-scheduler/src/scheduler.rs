@@ -257,6 +257,21 @@ impl VUScheduler {
             .store(current_vus.saturating_sub(target), Ordering::Release);
     }
 
+    /// Arm ONE additional ramp-down surplus slot without discarding unclaimed
+    /// ones (backlog line 161 — ramp-down is a cliff, not a ramp).
+    ///
+    /// Stepped arming via [`Self::set_ramp_down_target`] OVERWRITES
+    /// `remaining` on every call, so each step re-arms only its own single
+    /// slot: slots a VU hasn't claimed yet are discarded, and since VUs claim
+    /// only at their loop top (a 2s iteration → one claim opportunity per 2s
+    /// window), a synchronized pool sheds ~1 VU per window and the rest burst
+    /// out at the final re-arm. Incrementing instead of overwriting preserves
+    /// every unclaimed slot, so the pool sheds at the rate the target drops.
+    pub fn arm_ramp_down_step(&self, target: u32) {
+        self.ramp_down_target.store(target, Ordering::Release);
+        self.ramp_down_remaining.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Reset ramp-down state back to "not ramping down".
     /// Called after a ramp-down stage drains fully (all surplus VUs exited)
     /// so a later stage's target/remaining can't spuriously claim. When a
@@ -729,13 +744,27 @@ impl VUScheduler {
                 // clears ramp-down first for exactly this hazard.
                 self.clear_ramp_down();
                 let delta = target - current_vus;
-                let step_delay = stage_duration / delta;
-                for _ in 0..delta {
+                // k6 precomputes an ABSOLUTE-offset step table (PARITY_K6
+                // §2.1, backlog line 160): each step's deadline is computed
+                // fresh from the FULL stage duration (`stage_duration * step /
+                // delta`), so integer division can't truncate a running total
+                // and relative sleeps can't accumulate drift. A deadline
+                // already in the past (a ramp finer than tokio's ~1ms timer
+                // floor, e.g. 10 000 VUs over 1 s = 100µs steps) fires
+                // immediately — steps batch into the same timer tick instead
+                // of stretching to ~10 s of 1ms sleeps.
+                let stage_start = time::Instant::now();
+                let stage_nanos = stage_duration.as_nanos();
+                for step in 1..=delta {
+                    // u128 intermediate: `Duration * u32` can overflow u64
+                    // nanos for pathological stages (100M VUs over an hour).
+                    let offset =
+                        Duration::from_nanos((stage_nanos * step as u128 / delta as u128) as u64);
+                    time::sleep_until(stage_start + offset).await;
                     let vu_id = self.alloc_vu_id();
                     let handle = run_vu(self.shared_clone(), vu_id);
                     handles.push(handle);
                     current_vus += 1;
-                    time::sleep(step_delay).await;
                 }
             } else if target < current_vus {
                 // ── Linear ramp-down: lower the target gradually across the
@@ -744,25 +773,36 @@ impl VUScheduler {
                 //    claims a surplus slot via try_claim_ramp_down at its next
                 //    iteration start.
                 let delta = current_vus - target;
-                let step_delay = stage_duration / delta;
+                // Same absolute-offset step table as ramp-up (PARITY_K6
+                // §2.1, backlog line 160): arm each surplus slot at its
+                // absolute deadline, so drift and truncation can't accumulate.
+                let stage_start = time::Instant::now();
+                let stage_nanos = stage_duration.as_nanos();
                 for step in 1..=delta {
                     // Interpolate the ramp-down target from current_vus down
-                    // to `target`, one unit at a time. Arm EXACTLY ONE surplus
-                    // slot per step (remaining = new_target+1 - new_target = 1)
-                    // so exactly one VU exits per step window — a true linear
-                    // ramp. Re-arming to a GROWING value (current_vus -
+                    // to `target`, one unit at a time. Each step ADDS one
+                    // surplus slot (arm_ramp_down_step INCREMENTS remaining)
+                    // instead of overwriting it — the old set_ramp_down_target
+                    // re-armed only the current step's single slot, discarding
+                    // slots VUs hadn't claimed at their loop top yet, so a
+                    // synchronized pool shed ~1 VU per iteration window and
+                    // the rest burst out at the final re-arm (backlog line
+                    // 161). Re-arming to a GROWING value (current_vus -
                     // new_target = step) would let VUs exit in bursts and
                     // overshoot below the final target.
                     let new_target = current_vus - step;
                     if new_target < target {
                         break;
                     }
-                    self.set_ramp_down_target(new_target, new_target + 1);
+                    // u128 intermediate — see ramp-up above.
+                    let offset =
+                        Duration::from_nanos((stage_nanos * step as u128 / delta as u128) as u64);
+                    time::sleep_until(stage_start + offset).await;
+                    self.arm_ramp_down_step(new_target);
                     tracing::debug!(
                         "Ramp-down step: target {new_target} (from {current_vus}, grace: {:?})",
                         grace_rd
                     );
-                    time::sleep(step_delay).await;
                 }
                 // Re-arm the final surplus from the REAL active count, not
                 // the stage-START `current_vus`. The stepped phase above arms
@@ -1394,10 +1434,16 @@ impl VUScheduler {
                     let handle = run_vu(self.shared_clone(), self.alloc_vu_id());
                     handles.push(handle);
                 }
-                // Synchronous bump — the next tick sees this count even if
-                // the new VUs haven't registered in `active_vus` yet, so a
-                // lagging registration can never trigger a double-spawn.
-                self.control_spawned.store(target, Ordering::Release);
+                // Add the DELTA, never an absolute store: a VU that exited
+                // concurrently (its `vu_exited` decrement landed between the
+                // `load` above and here) must not be clobbered — the old
+                // `store(target)` overwrote those decrements, so the pool
+                // permanently undershot its target (backlog line 164).
+                // `fetch_add` keeps every concurrent decrement, and the next
+                // tick's `target > spawned` sees the true shortfall and
+                // re-spawns the straggler.
+                self.control_spawned
+                    .fetch_add(target - spawned, Ordering::AcqRel);
                 tracing::debug!("Externally-controlled: VU pool {} → {}", spawned, target);
             } else if target < spawned {
                 // Shrink: reuse the ramp-down claim mechanism so exactly
@@ -1882,6 +1928,39 @@ mod tests {
         assert_eq!(sched2.control_spawned.load(Ordering::Acquire), 0);
     }
 
+    /// Backlog line 164: the reconcile grow path must ADD the delta
+    /// (`fetch_add`) instead of storing the absolute target — an absolute
+    /// store clobbers a concurrent `vu_exited` decrement, so the pool
+    /// permanently undershoots its target and the control loop never
+    /// re-spawns the straggler. This mirrors the grow sequence: load
+    /// `spawned`, spawn, then bump by the delta; a VU exiting mid-grow must
+    /// survive.
+    #[tokio::test]
+    async fn control_grow_adds_delta_not_absolute_store() {
+        let sched = VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        sched.control_spawned.store(4, Ordering::Release);
+
+        // Grow from spawned=4 to target=8, exactly as the reconcile loop
+        // does. Between the load and the bump, one VU exits (its
+        // `vu_exited` decrement lands first).
+        let spawned = 4;
+        let target = 8;
+        sched.vu_exited(); // concurrent exit: 4 → 3
+        sched
+            .control_spawned
+            .fetch_add(target - spawned, Ordering::AcqRel);
+
+        // 3 + 4 = 7 — the decrement survives. An absolute store(8) would
+        // have clobbered it, leaving the pool silently one VU short.
+        assert_eq!(sched.control_spawned.load(Ordering::Acquire), 7);
+    }
+
     /// Locked (backlog line 170): a VU exiting for ANY reason (not just a
     /// ramp-down claim) must decrement the logical externally-controlled
     /// pool, or `target > spawned` stays permanently false and the control
@@ -2168,5 +2247,89 @@ mod tests {
         sched.set_ramp_down_target(5, 10);
         assert!(!sched.try_claim_ramp_down(5).await); // at target
         assert!(!sched.try_claim_ramp_down(4).await); // below target
+    }
+
+    /// Backlog §5 P2 (line 161): `set_ramp_down_target` OVERWRITES
+    /// `remaining` on every call, so each stepped re-arm discarded every
+    /// unclaimed slot — a synchronized pool shed ~1 VU per iteration window
+    /// and the rest burst out at the final re-arm. `arm_ramp_down_step`
+    /// INCREMENTS instead: N arms must yield N claimable surplus slots, and
+    /// a claim between two arms must not be discarded by the second arm.
+    #[tokio::test]
+    async fn arm_ramp_down_step_accumulates_slots_across_steps() {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+
+        // Arm 3 steps (100 → 99, 98, 97). Active stays 100, so all qualify.
+        sched.arm_ramp_down_step(99);
+        sched.arm_ramp_down_step(98);
+        sched.arm_ramp_down_step(97);
+
+        // One VU claims mid-way — under the OLD overwrite semantics, the
+        // second arm would have discarded this claim.
+        assert!(sched.try_claim_ramp_down(100).await);
+        // One more arm must ADD a slot, not reset the count.
+        sched.arm_ramp_down_step(96);
+
+        // 3 claims left (4 armed − 1 claimed), then the pool is drained.
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(
+            !sched.try_claim_ramp_down(100).await,
+            "4th claim must fail: exactly 4 slots were armed, 1 already claimed"
+        );
+    }
+
+    /// Backlog §5 P2 (line 160): the ramp loop used act-then-sleep with a
+    /// per-step `stage_duration / delta` `Duration` division — a fine ramp
+    /// (more steps than the stage has milliseconds) truncated every step and
+    /// stretched against tokio's ~1ms timer floor (N steps → ~N ms, not the
+    /// stage duration). The absolute-offset step table sleeps to
+    /// `stage_start + stage_duration * step / delta`, so a ramp whose steps
+    /// are finer than the timer floor batches into timer ticks and completes
+    /// in ≈ the stage duration.
+    #[tokio::test]
+    async fn fine_grained_ramp_up_completes_in_stage_duration() {
+        use tropel_core::config::Stage;
+        let stages = vec![Stage {
+            duration: "30ms".to_string(),
+            target: 100,
+        }];
+        let sched = VUScheduler::new(&ExecutionConfig::RampingVus {
+            stages: stages.clone(),
+            start_vus: 1,
+            graceful_ramp_down: Some("10ms".to_string()),
+            graceful_stop: Some("10ms".to_string()),
+            think_time: Default::default(),
+        });
+
+        // Mock VUs: spawn and finish immediately (no lease, no loop).
+        let run_vu = |_sched: Arc<VUScheduler>, _id: u32| tokio::spawn(async {});
+
+        let start = std::time::Instant::now();
+        sched
+            .run_ramping(
+                1,
+                &stages,
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                &run_vu,
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        // 99 steps over 30ms = ~300µs per step, finer than tokio's ~1ms
+        // floor. The old act-then-sleep loop slept ~1ms per step → ~99ms;
+        // the absolute-offset table completes in ≈ the 30ms stage (a small
+        // buffer for the final join).
+        assert!(
+            elapsed < Duration::from_millis(60),
+            "fine ramp must complete in ≈ stage duration, not step-count × 1ms timer floor (took {elapsed:?})"
+        );
     }
 }

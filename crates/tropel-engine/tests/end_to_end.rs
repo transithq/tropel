@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tropel_core::config::{
@@ -111,6 +112,58 @@ async fn start_echo_server(
         }
     });
     (addr, peak_out)
+}
+
+/// Echo server with a LATENCY TAIL: every 6th request sleeps ~500ms while
+/// the rest answer in ~10ms. Builds a distribution where the exact p75 is
+/// fast (~10ms) but the tracked p90 bucket lands in the slow tail (~500ms) —
+/// the setup that discriminates exact-percentile evaluation (backlog line
+/// 59a) from the p90 fallback: `p75 < 100` passes exactly, but would abort
+/// a healthy run if p75 silently became p90.
+async fn start_echo_server_with_latency_tail() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let req_no = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let req_no = req_no.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let mut head = Vec::new();
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let n = req_no.fetch_add(1, Ordering::SeqCst);
+                    if n % 6 == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    let body = r#"{"ok":true}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
 }
 
 /// Server that records the `Authorization` header value it sees on each
@@ -415,6 +468,160 @@ async fn prerequest_pm_request_header_reaches_the_wire() -> Result<()> {
         "all checks passed, got {} failed of {} total",
         result.metrics.checks_failed,
         result.metrics.checks_total
+    );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Regression (backlog line 59a): `set_summary_config` used to fire AFTER
+/// all scenarios completed, so the abort coordinator's mid-run `results()`
+/// evaluations had `retain_histograms = false`. A NON-tracked percentile
+/// (here `p(75)`) then fell back to the nearest tracked bucket (p90). With
+/// the latency-tail server, exact p75 ≈ 10ms but p90 ≈ 500ms, so a healthy
+/// run under `p(75) < 100` with abortOnFail must run its FULL duration —
+/// the old code aborted it at the first ~2s check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_tracked_percentile_threshold_completes_healthy_run() -> Result<()> {
+    let srv = start_echo_server_with_latency_tail().await;
+    let coll = write_collection(&format!("http://{srv}"), "p75-tail");
+
+    let mut thresholds = HashMap::new();
+    thresholds.insert(
+        "http_req_duration".to_string(),
+        ThresholdConfig {
+            expression: "http_req_duration.p(75) < 100".to_string(),
+            abort_on_fail: true,
+            delay_abort_eval: None,
+        },
+    );
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 2,
+            // 6s guarantees the abort coordinator's first ~2s check fires
+            // mid-run; a correct run then still completes the full 6s.
+            duration: "6s".to_string(),
+            graceful_stop: Some("2s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds,
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let start = std::time::Instant::now();
+    let result = engine.run(&config).await?;
+    let elapsed = start.elapsed();
+    let m = &result.metrics;
+
+    // THE regression: the run must NOT abort mid-run. A correct run takes
+    // ~6s; an abort at the first ~2s check (p75 fell back to p90 ~= 500ms
+    // > 100) finishes around 2-3s. The >= 5s bound discriminates: a
+    // completed run is always >= 6s wall-clock, while an aborted run (2s
+    // abort + in-flight drain, bounded by the 2s graceful stop) stays below
+    // it — worst case ~4-4.5s, which is why the bound is 5s and not tighter.
+    assert!(
+        elapsed >= std::time::Duration::from_secs(5),
+        "healthy p(75) run must complete its full duration; aborted after {elapsed:?}"
+    );
+
+    // Sanity: the tail actually produced samples, and the slow-tail
+    // distribution is really in place (NON-VACUOUS guard). With 1/6 requests
+    // ~500ms and the rest ~10ms, the tracked p95 lands in the slow region
+    // (~500ms) while p75 stays fast. If the latency-tail server silently
+    // broke (all-fast), this fails loudly instead of passing vacuously — the
+    // old code would also have completed an all-fast run. (p95 is the u64
+    // tracked bucket in ms on this branch.)
+    assert!(m.http_reqs > 0, "requests fired, got {}", m.http_reqs);
+    if let Some(hd) = &m.http_req_duration {
+        assert!(
+            hd.p95 >= 200,
+            "latency tail must be present: p95 = {}, want >= 200ms",
+            hd.p95
+        );
+    }
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog line 45: the mid-run abort coordinator fed thresholds a
+/// `MetricsResult` whose `run_duration` was ZERO (the collector's `results()`
+/// only gets the real elapsed stamped AFTER the run by the engine), so
+/// counter `rate`/`avg` thresholds divided by 0 and evaluated to 0.0 — and
+/// abortOnFail killed healthy runs at the coordinator's first ~2s check.
+/// A 1-VU 3s run against the echo server with `http_reqs.rate > 0` +
+/// abortOnFail must run to completion: run_duration must exceed the ~2s
+/// window where the old code aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn midrun_rate_threshold_with_abort_on_fail_does_not_kill_healthy_run() -> Result<()> {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (srv, _peak) = start_echo_server(seen.clone()).await;
+    let coll = write_collection(&format!("http://{srv}"), "rate-abort");
+
+    // The canonical k6 throughput gate: requests per second must be REAL.
+    let mut thresholds = HashMap::new();
+    thresholds.insert(
+        "http_reqs".to_string(),
+        ThresholdConfig {
+            expression: "http_reqs.rate > 0".to_string(),
+            abort_on_fail: true,
+            delay_abort_eval: None,
+        },
+    );
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "3s".to_string(),
+            graceful_stop: Some("2s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds,
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+    let m = &result.metrics;
+
+    // The run must NOT have been cut at the ~2s first check: a healthy 3s
+    // run leaves run_duration ≈ 3s, an abort at t≈2s leaves ≈ 2s. The 2.8s
+    // bar leaves headroom against a late first check on a loaded CI (the
+    // coordinator ticker uses MissedTickBehavior::Delay, and `results()` is
+    // a full aggregate rebuild) without any red risk on the fixed path.
+    assert!(
+        m.run_duration >= Duration::from_secs(2) + Duration::from_millis(800),
+        "run survived the mid-run abort check (run_duration={:?}, expected >= 2.8s)",
+        m.run_duration
+    );
+    assert!(m.http_reqs > 0, "requests were made");
+
+    // The threshold itself evaluates to a PASS post-run (rate = reqs/elapsed).
+    let threshold_results = evaluate_thresholds(&result.effective_thresholds, m);
+    let t = threshold_results
+        .iter()
+        .find(|t| t.name == "http_reqs")
+        .expect("threshold evaluated");
+    assert!(
+        t.passed,
+        "threshold '{}' passed (actual={})",
+        t.expression, t.actual
     );
 
     let _ = std::fs::remove_file(&coll);

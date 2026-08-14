@@ -22,6 +22,25 @@ use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 /// Input adapter for k6-style JS/TS test scripts.
 pub struct K6ScriptAdapter;
 
+/// Is this text an ACTUAL Postman collection? Structural check mirroring the
+/// Postman adapter's detect(): a JSON document whose top-level `info.schema`
+/// points at the getpostman.com collection schema. Substring matching is
+/// forbidden (backlog line 61) — a k6 script hitting k6's own documented
+/// postman-echo.com endpoint legitimately contains "postman". Shared by both
+/// detect() copies in this crate so they can never drift; the Postman
+/// adapter's detect() is the canonical third copy (cross-crate).
+pub(crate) fn is_postman_collection(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let schema = value
+        .get("info")
+        .and_then(|info| info.get("schema"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    schema.contains("getpostman.com") && schema.contains("collection")
+}
+
 impl InputAdapter for K6ScriptAdapter {
     fn id(&self) -> &str {
         "k6"
@@ -35,9 +54,14 @@ impl InputAdapter for K6ScriptAdapter {
             // - Common test patterns like `http.get`, `check`, `group`
             //
             // We're lenient here — just check for JS/TS source characteristics
-            // that wouldn't be a Postman collection or HAR file.
-            let looks_like_collection = text.contains("postman") || text.contains("\"item\"");
-            if looks_like_collection {
+            // that wouldn't be a Postman collection or HAR file. Reject ACTUAL
+            // Postman collections (handled by the Postman adapter) using the
+            // SAME STRUCTURAL check that adapter uses — a JSON doc whose
+            // top-level info.schema points at getpostman.com. Substring
+            // matching is forbidden (backlog line 61): a k6 script hitting
+            // k6's own documented postman-echo.com endpoint legitimately
+            // contains "postman" and was rejected.
+            if is_postman_collection(text) {
                 return false;
             }
 
@@ -102,9 +126,10 @@ fn build_scenario_from_source(js_code: &str, name: &str) -> Result<Scenario> {
         },
         items: vec![ScenarioItem {
             name: name.to_string(),
+            id: None,
             request: None,
-            prerequest: None,
-            test: Some(wrapped_code),
+            prerequest: vec![],
+            test: vec![wrapped_code],
             assertions: vec![],
             items: vec![],
         }],
@@ -151,5 +176,53 @@ mod tests {
         let adapter = K6ScriptAdapter;
         let data = br#"http.get("https://example.com");"#;
         assert!(adapter.detect(data));
+    }
+
+    #[test]
+    fn test_detect_k6_script_hitting_postman_echo() {
+        // THE regression (backlog line 61): the OLD detect() rejected any
+        // text containing the substring "postman". k6's own documented
+        // example hits postman-echo.com, so a perfectly valid k6 script
+        // failed detection and fell through to the wrong adapter.
+        let adapter = K6ScriptAdapter;
+        let data = br#"import http from "k6/http";
+export default function () {
+  http.get("https://postman-echo.com/get");
+}"#;
+        assert!(
+            adapter.detect(data),
+            "k6 script hitting postman-echo.com must be detected as k6"
+        );
+    }
+
+    #[test]
+    fn test_detect_k6_script_with_item_word() {
+        // Same class: the OLD code also rejected any text containing
+        // `"item"` — a k6 script iterating an `items` array / object with
+        // a quoted "item" key was rejected. Structural collection detection
+        // must not false-positive on ordinary JS.
+        let adapter = K6ScriptAdapter;
+        let data = br#"import http from "k6/http";
+export default function () {
+  const items = [{ "item": "a" }, { "item": "b" }];
+  for (const it of items) { http.get("https://example.com/" + it.item); }
+}"#;
+        assert!(
+            adapter.detect(data),
+            "k6 script containing a quoted 'item' key must still be detected"
+        );
+    }
+
+    #[test]
+    fn test_detect_real_postman_collection_still_rejected() {
+        // Sanity: the structural check must still reject a REAL Postman
+        // collection (info.schema → getpostman.com) so it routes to the
+        // Postman adapter, never the k6 one.
+        let adapter = K6ScriptAdapter;
+        let data = br#"{"info":{"name":"Test","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"item":[]}"#;
+        assert!(
+            !adapter.detect(data),
+            "a real Postman collection must not be detected as k6"
+        );
     }
 }
