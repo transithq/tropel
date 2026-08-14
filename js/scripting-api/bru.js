@@ -192,9 +192,17 @@
         }
         return null;
     };
-    // Bruno's res.getStatus() returns the status TEXT (e.g. "OK"), not the
-    // numeric code — that's bru.getResStatus(). Use the status-text bridge.
+    // Bruno's res.getStatus() returns the numeric status CODE; res.getStatusText()
+    // returns the text (e.g. "OK"). TROPEL_PARITY_BRUNO.md §0: the old
+    // implementation returned the text from getStatus() (a silent failure for
+    // the canonical `expect(res.getStatus()).to.equal(200)` idiom).
     res.getStatus = function () {
+        if (typeof __tropel_pm_response_code === 'function') {
+            return __tropel_pm_response_code();
+        }
+        return 0;
+    };
+    res.getStatusText = function () {
         if (typeof __tropel_pm_response_status === 'function') {
             return __tropel_pm_response_status();
         }

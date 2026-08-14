@@ -4335,6 +4335,72 @@ mod tests {
     }
 
     #[test]
+    fn test_bru_res_get_status_returns_code_and_status_text() {
+        // TROPEL_PARITY_BRUNO.md §0: res.getStatus() returned the status TEXT
+        // ("OK") while Bruno's docs say it returns the numeric code — the
+        // canonical `expect(res.getStatus()).to.equal(200)` idiom silently
+        // failed. res.getStatusText() is the member that returns the text, and
+        // it didn't exist.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
+                globalThis.__status_code = res.getStatus();
+                globalThis.__status_text = res.getStatusText();
+                globalThis.__status_code_type = typeof res.getStatus();
+                globalThis.__eql_ok = String((function () {
+                    try { return res.getStatus() === 200; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                // Non-200 trial: proves the bridge value is actually read
+                // (a hardcoded 200 constant could not distinguish itself).
+                globalThis.__tropel_pm_response_code = function () { return 404; };
+                globalThis.__tropel_pm_response_status = function () { return 'Not Found'; };
+                globalThis.__status_404 = res.getStatus();
+                globalThis.__status_404_text = res.getStatusText();
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<i64, _>("__status_code").unwrap(),
+                200,
+                "res.getStatus() must return the numeric code (was the text 'OK')"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_code_type").unwrap(),
+                "number",
+                "res.getStatus() must be a number, not a string"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_text").unwrap(),
+                "OK",
+                "res.getStatusText() must return the status text"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__eql_ok").unwrap(),
+                "true",
+                "res.getStatus() === 200 must hold (the canonical Bruno assertion)"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__status_404").unwrap(),
+                404,
+                "res.getStatus() must reflect a non-200 bridge value (404), proving the bridge is read"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_404_text").unwrap(),
+                "Not Found",
+                "res.getStatusText() must reflect the 404 status text"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_expect_eql_is_deep_equal() {
         // Backlog line 144: pm.expect(...).to.eql() was strict === while
         // .equal() delegated to eql — inverted vs chai. Deep-equal means a
