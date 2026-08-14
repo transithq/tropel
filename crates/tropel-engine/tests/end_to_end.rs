@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tropel_core::config::{
@@ -547,6 +548,81 @@ async fn non_tracked_percentile_threshold_completes_healthy_run() -> Result<()> 
             hd.p95
         );
     }
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog line 45: the mid-run abort coordinator fed thresholds a
+/// `MetricsResult` whose `run_duration` was ZERO (the collector's `results()`
+/// only gets the real elapsed stamped AFTER the run by the engine), so
+/// counter `rate`/`avg` thresholds divided by 0 and evaluated to 0.0 — and
+/// abortOnFail killed healthy runs at the coordinator's first ~2s check.
+/// A 1-VU 3s run against the echo server with `http_reqs.rate > 0` +
+/// abortOnFail must run to completion: run_duration must exceed the ~2s
+/// window where the old code aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn midrun_rate_threshold_with_abort_on_fail_does_not_kill_healthy_run() -> Result<()> {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (srv, _peak) = start_echo_server(seen.clone()).await;
+    let coll = write_collection(&format!("http://{srv}"), "rate-abort");
+
+    // The canonical k6 throughput gate: requests per second must be REAL.
+    let mut thresholds = HashMap::new();
+    thresholds.insert(
+        "http_reqs".to_string(),
+        ThresholdConfig {
+            expression: "http_reqs.rate > 0".to_string(),
+            abort_on_fail: true,
+            delay_abort_eval: None,
+        },
+    );
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "3s".to_string(),
+            graceful_stop: Some("2s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds,
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+    let m = &result.metrics;
+
+    // The run must NOT have been cut at the ~2s first check: a healthy 3s
+    // run leaves run_duration ≈ 3s, an abort at t≈2s leaves ≈ 2s. The 2.8s
+    // bar leaves headroom against a late first check on a loaded CI (the
+    // coordinator ticker uses MissedTickBehavior::Delay, and `results()` is
+    // a full aggregate rebuild) without any red risk on the fixed path.
+    assert!(
+        m.run_duration >= Duration::from_secs(2) + Duration::from_millis(800),
+        "run survived the mid-run abort check (run_duration={:?}, expected >= 2.8s)",
+        m.run_duration
+    );
+    assert!(m.http_reqs > 0, "requests were made");
+
+    // The threshold itself evaluates to a PASS post-run (rate = reqs/elapsed).
+    let threshold_results = evaluate_thresholds(&result.effective_thresholds, m);
+    let t = threshold_results
+        .iter()
+        .find(|t| t.name == "http_reqs")
+        .expect("threshold evaluated");
+    assert!(
+        t.passed,
+        "threshold '{}' passed (actual={})",
+        t.expression, t.actual
+    );
 
     let _ = std::fs::remove_file(&coll);
     Ok(())
