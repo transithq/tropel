@@ -604,13 +604,19 @@ pub(crate) async fn run_scenario_vus(
                 // The scenario runner and the PM bridge both consume HTTP
                 // through the SDK `DriverHttpClient` trait (F1 review fix),
                 // so wrap the concrete client in the engine's trait impl.
-                let http_client_handle: Arc<dyn DriverHttpClient> =
-                    Arc::new(DriverHttpClientImpl {
-                        client: VuCookieClient::new(http_client_vu.as_ref().clone()),
-                    });
+                // Backlog line 159: ONE jar per VU — the bridge client must
+                // share the runner's jar, or a prerequest `pm.sendRequest`
+                // → `/login` → `Set-Cookie` would land in the bridge jar and
+                // every collection request would go out with no session (401
+                // for the whole run).
+                let vu_client = VuCookieClient::new(http_client_vu.as_ref().clone());
+                // Derive the bridge BEFORE moving vu_client into the runner
+                // (clone_with_shared_jar reuses the same jar Arc).
                 let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-                    client: VuCookieClient::new(http_client_vu.as_ref().clone()),
+                    client: vu_client.clone_with_shared_jar(),
                 });
+                let http_client_handle: Arc<dyn DriverHttpClient> =
+                    Arc::new(DriverHttpClientImpl { client: vu_client });
                 let mut runner = ScenarioRunner::new(
                     scenario,
                     flattened_vu,

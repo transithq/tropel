@@ -63,6 +63,14 @@ impl NativeModule for CryptoModule {
                 Func::from(|data: Vec<u8>| -> Vec<u8> { ripemd160(&data) }),
             );
 
+            // CryptoJS.SHA224 is the SHA-2 224-bit variant (sha2::Sha224),
+            // NOT the truncated SHA-512/224 that k6's crypto module exposes.
+            // Backlog line 95: CryptoJS.SHA224 was undefined.
+            let _ = globals.set(
+                "__tropel_native_sha224",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { sha224(&data) }),
+            );
+
             // k6/crypto one-shots (backlog line 126): sha512_224 / sha512_256
             // (sha2 crate truncations) and md4 were missing — k6's crypto
             // module exports all nine one-shot hashes, and CryptoJS-shaped
@@ -183,6 +191,15 @@ impl NativeModule for CryptoModule {
 pub fn sha256(data: &[u8]) -> Vec<u8> {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+/// Compute SHA-224 hash — the SHA-2 224-bit variant used by CryptoJS.SHA224
+/// (distinct from the truncated SHA-512/224 k6 exposes).
+pub fn sha224(data: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha224::new();
     hasher.update(data);
     hasher.finalize().to_vec()
 }
