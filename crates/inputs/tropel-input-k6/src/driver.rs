@@ -4923,6 +4923,62 @@ mod tests {
         });
     }
 
+    /// Backlog line 74: pm.test(name, asyncFn) ALWAYS passed — the shim
+    /// recorded `result !== false` synchronously, and a Promise is never
+    /// false, so an async body whose pm.expect failed (and a body returning
+    /// Promise.reject) both recorded PASS. The check must now be deferred
+    /// until the promise settles: the driver's job pump (inside
+    /// run_script_cached) fires the .then handlers, which record the REAL
+    /// pass/fail into the sink before run_iteration drains it.
+    #[tokio::test]
+    async fn test_pm_test_async_body_records_real_result() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                pm.test('async failing expect', async function () {
+                    pm.expect(1).to.equal(2);
+                });
+                pm.test('async rejecting', async function () {
+                    return Promise.reject(new Error('boom'));
+                });
+                pm.test('async passing', async function () {
+                    await Promise.resolve();
+                    pm.expect(1).to.equal(1);
+                });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration with async pm.test bodies must succeed");
+
+        let checks: Vec<(String, f64)> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .filter_map(|s| {
+                let name = s.tags.get("check").map(|c| c.to_string()).unwrap_or_default();
+                Some((name, s.value))
+            })
+            .collect();
+        assert!(
+            checks.iter().any(|(n, v)| n == "async failing expect" && *v == 0.0),
+            "failing async expect must record FAIL, got: {:?}",
+            checks
+        );
+        assert!(
+            checks.iter().any(|(n, v)| n == "async rejecting" && *v == 0.0),
+            "Promise.reject body must record FAIL, got: {:?}",
+            checks
+        );
+        assert!(
+            checks.iter().any(|(n, v)| n == "async passing" && *v == 1.0),
+            "passing async body must record PASS, got: {:?}",
+            checks
+        );
+    }
+
     #[test]
     fn test_check_throws_on_nonsense_and_forwards_tags() {
         // Backlog line 149: check() accepted nonsense as success —

@@ -399,6 +399,28 @@ pm.response.to = {
 pm.test = function (name, fn) {
     try {
         var result = fn();
+        // Backlog line 74: an ASYNC body returns a Promise, and `result !==
+        // false` is ALWAYS true for a Promise — so every async pm.test
+        // recorded PASS even when the body's pm.expect failed or the promise
+        // rejected. Defer the check instead: attach .then handlers; the
+        // driver's job pump (run after each iteration eval) settles the
+        // promise and records the REAL pass/fail.
+        if (result && typeof result.then === 'function') {
+            result.then(
+                function () {
+                    if (typeof __tropel_pm_test === 'function') {
+                        __tropel_pm_test(name, true, '');
+                    }
+                },
+                function (err) {
+                    if (typeof __tropel_pm_test === 'function') {
+                        __tropel_pm_test(name, false, '');
+                    }
+                    console.error(__ns + '.test error:', err);
+                }
+            );
+            return result;
+        }
         var passed = result !== false;
         if (typeof __tropel_pm_test === 'function') {
             // 3rd arg (tags) always passed — rquickjs enforces arity, so a
