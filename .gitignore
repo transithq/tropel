@@ -83,3 +83,7 @@ benches/**/results/
 # ── CI / temporary ────────────────────────────────────────────
 tmp/
 temp/
+
+# ── Backlog docs — local only, never tracked (avoids CI churn) ─
+/TROPEL_BACKLOG_V2.md
+/TROPEL_BACKLOG_V2_X.md
