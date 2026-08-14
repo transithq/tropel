@@ -8173,4 +8173,37 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             )
         );
     }
+
+    /// Backlog line 51: open-data-shim used to redefine `base64ToBytes` (a
+    /// plain-Array variant) and load LAST in K6_NATIVE_SHIM_BUNDLE, so the
+    /// k6-shim `Uint8Array` variant that binary response paths call with
+    /// `.buffer` was clobbered — http.batch binary entries got
+    /// `new Uint8Array(undefined)` → length 0, silently. Eval the shims in
+    /// the exact production order and assert the k6 variant survives (the
+    /// old standalone test evaled k6-shim alone and passed while production
+    /// was broken).
+    #[test]
+    fn test_k6_shim_bundle_base64_collision_keeps_arraybuffer_view() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let bundle = format!(
+                "{}\n{}\n",
+                include_str!("../../../../js/k6-shim/k6-shim.js"),
+                include_str!("../../../../js/k6-shim/open-data-shim.js")
+            );
+            ctx.eval::<(), _>(bundle.as_str())
+                .expect("shims in production order must eval");
+            let is_ab: bool = ctx
+                .eval(
+                    "var b = base64ToBytes('aGk='); \
+                     b instanceof Uint8Array && new Uint8Array(b.buffer).length === 3",
+                )
+                .expect("base64ToBytes must eval");
+            assert!(
+                is_ab,
+                "base64ToBytes must be k6-shim's Uint8Array variant in the production bundle order"
+            );
+        });
+    }
 }
