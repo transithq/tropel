@@ -4401,6 +4401,98 @@ mod tests {
     }
 
     #[test]
+    fn test_bru_runtime_vars_route_through_variables_store() {
+        // TROPEL_PARITY_BRUNO.md §2: bru.getVar/setVar used to map to the
+        // COLLECTION vars bridges — but Bruno's getVar/setVar are RUNTIME-scope
+        // (in-memory, per collection run). The mis-scoping silently broke the
+        // core request-chaining idiom (setVar in one request, getVar in the
+        // next). The shim now routes through __tropel_pm_variables_* (the same
+        // fall-through store pm.variables uses), and the family
+        // hasVar/deleteVar/getAllVars/deleteAllVars is exposed.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Route-spy: the VARIABLES bridge must be the one called.
+                var __vars_calls = [];
+                globalThis.__tropel_pm_variables_get = function (key) {
+                    __vars_calls.push('get:' + key);
+                    if (key === 'userId') return '42';
+                    if (key === 'token') return '"abc"';
+                    return null;
+                };
+                globalThis.__tropel_pm_variables_set = function (key, value) {
+                    __vars_calls.push('set:' + key + '=' + value);
+                };
+                globalThis.__tropel_pm_variables_unset = function (key) {
+                    __vars_calls.push('unset:' + key);
+                };
+                // The COLLECTION bridge must NOT be touched.
+                globalThis.__tropel_pm_collection_vars_get = function () {
+                    throw new Error('getVar must not read collection vars');
+                };
+                globalThis.__tropel_pm_collection_vars_set = function () {
+                    throw new Error('setVar must not write collection vars');
+                };
+                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                    return { userId: '42', token: '"abc"', flag: 'true' };
+                };
+                var v1 = bru.getVar('userId');
+                bru.setVar('userId', 42);
+                var h1 = bru.hasVar('userId');
+                var h2 = bru.hasVar('missing');
+                bru.deleteVar('token');
+                var all = bru.getAllVars();
+                bru.deleteAllVars();
+                globalThis.__v1 = v1;
+                globalThis.__v1_type = typeof v1;
+                globalThis.__h1 = String(h1);
+                globalThis.__h2 = String(h2);
+                globalThis.__all_keys = Object.keys(all).sort().join(',');
+                globalThis.__all_userId = all.userId;
+                globalThis.__calls = __vars_calls.join('|');
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__v1_type").unwrap(),
+                "number",
+                "bru.getVar must JSON.parse the bridge value (42 → number, not '42' string)"
+            );
+            assert_eq!(ctx.eval::<i64, _>("__v1").unwrap(), 42);
+            assert_eq!(
+                ctx.eval::<String, _>("__h1").unwrap(),
+                "true",
+                "bru.hasVar must be true for an existing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h2").unwrap(),
+                "false",
+                "bru.hasVar must be false for a missing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__all_keys").unwrap(),
+                "flag,token,userId",
+                "bru.getAllVars must return all runtime vars (JSON-parsed)"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__all_userId").unwrap(),
+                42,
+                "bru.getAllVars must include the runtime var set via setVar as a JSON-parsed NUMBER (request-chaining reads it back)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__calls").unwrap(),
+                "get:userId|set:userId=42|get:userId|get:missing|unset:token|unset:userId|unset:token|unset:flag",
+                "getVar/setVar must hit the variables bridges (not collection), hasVar one lookup each, and deleteAllVars must unset every key"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_expect_eql_is_deep_equal() {
         // Backlog line 144: pm.expect(...).to.eql() was strict === while
         // .equal() delegated to eql — inverted vs chai. Deep-equal means a

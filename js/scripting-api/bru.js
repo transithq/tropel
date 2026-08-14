@@ -29,19 +29,63 @@
         }
     };
 
-    // Collection variables (Bruno's bru.getVar/setVar at collection scope)
+    // Runtime variables — Bruno's bru.getVar/setVar are RUNTIME-scope
+    // (in-memory, per collection run), NOT collection scope. TROPEL_PARITY_BRUNO.md
+    // §2: they used to map to the collection_vars bridges, so a runtime var set
+    // by one request could not be read by the next (the core request-chaining
+    // idiom silently broke). They now route through the pm.variables store
+    // (__tropel_pm_variables_*, the same fall-through lookup pm.variables uses).
     bru.getVar = function (key) {
-        if (typeof __tropel_pm_collection_vars_get === 'function') {
-            var raw = __tropel_pm_collection_vars_get(key);
+        if (typeof __tropel_pm_variables_get === 'function') {
+            var raw = __tropel_pm_variables_get(key);
             if (raw === null || raw === undefined) return undefined;
             try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return undefined;
     };
     bru.setVar = function (key, value) {
-        if (typeof __tropel_pm_collection_vars_set === 'function') {
-            __tropel_pm_collection_vars_set(key, value === undefined ? '' : String(value));
+        if (typeof __tropel_pm_variables_set === 'function') {
+            __tropel_pm_variables_set(key, value === undefined ? '' : String(value));
         }
+    };
+    bru.hasVar = function (key) {
+        // Single bridge round-trip: getVar returns undefined on a miss.
+        var v = bru.getVar(key);
+        return v !== undefined;
+    };
+    bru.deleteVar = function (key) {
+        if (typeof __tropel_pm_variables_unset === 'function') {
+            __tropel_pm_variables_unset(key);
+        }
+    };
+    // NOTE (deleteAllVars cascade): getAllVars reads the store that the
+    // runtime vars currently alias onto, and deleteVar → variables_unset
+    // removes from collection_vars + environment + globals — so on a key
+    // collision this also clears an env/global var of the same name. Bounded
+    // by the documented §2 aliasing caveat; a scoped runtime-only unset needs
+    // a bridge change (TROPEL_PARITY_BRUNO.md §7).
+    bru.deleteAllVars = function () {
+        var all = bru.getAllVars();
+        for (var k in all) {
+            if (Object.prototype.hasOwnProperty.call(all, k)) bru.deleteVar(k);
+        }
+    };
+    // getAllVars: the runtime store currently aliases onto collection_vars at
+    // the Rust state level (documented in TROPEL_PARITY_BRUNO.md §2), so the
+    // to_object bridge of that store is the honest view of "all runtime vars".
+    bru.getAllVars = function () {
+        if (typeof __tropel_pm_collection_vars_to_object === 'function') {
+            var map = __tropel_pm_collection_vars_to_object() || {};
+            var out = {};
+            for (var k in map) {
+                if (Object.prototype.hasOwnProperty.call(map, k)) {
+                    var raw = map[k];
+                    try { out[k] = JSON.parse(raw); } catch (e) { out[k] = raw; }
+                }
+            }
+            return out;
+        }
+        return {};
     };
 
     // Request body
