@@ -12,17 +12,27 @@ function __tropel_build_binding(namespace) {
     var __ns = namespace || 'pm';
 
 // ── pm.environment ──
+// Backlog line 89: set/get must be INVERSES. The old setter String()-coerced
+// (pm.response.json() → "[object Object]" stored) and the getter returned raw
+// — an object set once could never come back. Values are now JSON-encoded on
+// set (strings stay strings: '1234' is stored as '"1234"', never retyped to
+// the number 1234) and JSON.parsed on get with a raw fallback. The runner's
+// build_scope decodes the same encoding for {{var}} substitution.
 pm.environment = {
     get: function (key) {
-        // Delegates to native environment_get
         if (typeof __tropel_pm_environment_get === 'function') {
-            return __tropel_pm_environment_get(key);
+            var raw = __tropel_pm_environment_get(key);
+            if (raw === null || raw === undefined) return null;
+            try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return null;
     },
     set: function (key, value) {
         if (typeof __tropel_pm_environment_set === 'function') {
-            __tropel_pm_environment_set(key, String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_environment_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -45,7 +55,14 @@ pm.environment = {
     },
     toObject: function () {
         if (typeof __tropel_pm_environment_to_object === 'function') {
-            return __tropel_pm_environment_to_object() || {};
+            var map = __tropel_pm_environment_to_object() || {};
+            var out = {};
+            for (var k in map) {
+                if (map.hasOwnProperty(k)) {
+                    try { out[k] = JSON.parse(map[k]); } catch (e) { out[k] = map[k]; }
+                }
+            }
+            return out;
         }
         return {};
     },
@@ -69,7 +86,10 @@ pm.collectionVariables = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_collection_vars_set === 'function') {
-            __tropel_pm_collection_vars_set(key, value === undefined ? '' : String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_collection_vars_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -114,7 +134,10 @@ pm.globals = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_globals_set === 'function') {
-            __tropel_pm_globals_set(key, value === undefined ? '' : String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_globals_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -162,10 +185,14 @@ pm.variables = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_variables_set === 'function') {
-            // Backlog line 146: every other store coerces String(value);
-            // variables.set passed the RAW value, so a number like 42 hit
-            // the bridge's strict String param and threw TypeError.
-            __tropel_pm_variables_set(key, value === undefined ? '' : String(value));
+            // Backlog line 89/146: JSON-encode so set/get are inverses (an
+            // object set once comes back as an object; '1234' stays the
+            // string '1234'). Line 146: never pass the RAW value into the
+            // strict String bridge param.
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_variables_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -542,6 +569,66 @@ function addPropAssertions(chain, actual, negated) {
 }
 
 pm.expect = function (actual) {
+    // Negated chain body, shared by both spellings Postman emits
+    // (`not.to.*` and `to.not.*`). Each member THROWS when the positive
+    // holds. Property assertions are installed negated on the chain and its
+    // `be` sub-chain so `to.not.be.true` is guarded too.
+    function buildNegated() {
+        var negated = {
+            eql: function (expected) {
+                if (deepEqual(actual, expected)) {
+                    throw new Error(
+                        'expected ' + shortJson(actual) + ' not to eql ' + shortJson(expected)
+                    );
+                }
+            },
+            equal: function (expected) {
+                if (actual === expected) {
+                    throw new Error(
+                        'expected ' + shortJson(actual) + ' not to equal ' + shortJson(expected)
+                    );
+                }
+            },
+            // Postman emits `to.not.include(...)` for "must not contain".
+            // Same value-based semantics as the positive include (line 88).
+            include: function (expected) {
+                if (includesValue(actual, expected)) {
+                    throw new Error('expected value not to include ' + shortJson(expected));
+                }
+            },
+            match: function (regex) {
+                if (regex.test(String(actual))) {
+                    throw new Error('expected value not to match ' + regex);
+                }
+            },
+            have: {
+                property: function (prop, value) {
+                    var obj = actual;
+                    var has = obj && (prop in obj);
+                    var passed = has && (value === undefined || obj[prop] === value);
+                    if (passed) {
+                        throw new Error('expected value not to have property ' + prop);
+                    }
+                }
+            },
+            be: {
+                // `pm.expect(x).to.not.be.true` must THROW when the positive
+                // holds (the guard applies here too).
+                an: function (type) {
+                    if (typeOf(actual) === type) {
+                        throw new Error('expected value not to be an ' + type);
+                    }
+                },
+                a: function (type) {
+                    return this.an(type);
+                }
+            }
+        };
+        addPropAssertions(negated, actual, true);
+        addPropAssertions(negated.be, actual, true);
+        return negated;
+    }
+
     var chain = {
         to: {
             // Backlog line 144: chai semantics — .eql is DEEP equality,
@@ -564,7 +651,7 @@ pm.expect = function (actual) {
                 }
             },
             include: function (expected) {
-                if (String(actual).indexOf(String(expected)) === -1) {
+                if (!includesValue(actual, expected)) {
                     throw new Error('expected value to include ' + shortJson(expected));
                 }
             },
@@ -623,49 +710,20 @@ pm.expect = function (actual) {
                 if (!regex.test(String(actual))) {
                     throw new Error('expected value to match ' + regex);
                 }
-            }
+            },
+            // Backlog line 87: Postman snippets emit `to.not.*` — the negated
+            // chain must be reachable from `.to` as well as `.not.to`.
+            not: buildNegated()
         },
         not: {
-            to: {
-                eql: function (expected) {
-                    if (deepEqual(actual, expected)) {
-                        throw new Error(
-                            'expected ' + shortJson(actual) + ' not to eql ' + shortJson(expected)
-                        );
-                    }
-                },
-                equal: function (expected) {
-                    if (actual === expected) {
-                        throw new Error(
-                            'expected ' + shortJson(actual) + ' not to equal ' + shortJson(expected)
-                        );
-                    }
-                },
-                be: {
-                    // Negated property/type assertions:
-                    // `pm.expect(x).not.to.be.true` must THROW when the
-                    // positive holds (the guard applies here too).
-                    an: function (type) {
-                        if (typeOf(actual) === type) {
-                            throw new Error('expected value not to be an ' + type);
-                        }
-                    },
-                    a: function (type) {
-                        return this.an(type);
-                    }
-                }
-            }
+            to: buildNegated()
         }
     };
+
     // Install the property assertions on the chain levels where chai-postman
     // exposes them, then guard the whole chain so ANY unknown name throws.
     addPropAssertions(chain.to, actual);
     addPropAssertions(chain.to.be, actual);
-    // Negated chain: both `not.to.true` and the canonical `not.to.be.true`
-    // must be guarded (the getters live on the `be` object, which is a
-    // SEPARATE literal from `not.to`).
-    addPropAssertions(chain.not.to, actual, true);
-    addPropAssertions(chain.not.to.be, actual, true);
     return guardChain(chain);
 };
 
@@ -860,30 +918,141 @@ function shortJson(v) {
 // key order, nested arrays/objects. Mirrors the jsDeepEqual in
 // js/chai/chai-shim.js — the backlog fix for .eql must not depend on chai
 // being loaded first (pm.js is bundled standalone).
-function deepEqual(a, b) {
+//
+// Backlog line 85: Date/Set/Map/RegExp used to collapse to Object.keys()
+// = [] — ANY two instances compared equal (pm.expect(new Date(1))
+// .to.eql(new Date(999999)) passed). They now compare by VALUE (time for
+// Date, source+flags for RegExp, size + order-insensitive entries for
+// Map/Set). Circular structures no longer overflow the stack (a seen-pair
+// guard: revisiting the exact (a,b) pair mid-compare is assumed equal).
+function deepEqual(a, b, seen) {
     if (a === b) return true;
     if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
     if (a === null || b === null || a === undefined || b === undefined) return a === b;
     if (typeof a !== typeof b) return false;
+    // Date: compare by epoch time; two invalid dates compare equal.
+    if (a instanceof Date || b instanceof Date) {
+        if (!(b instanceof Date)) return false;
+        var ta = a.getTime(), tb = b.getTime();
+        return (isNaN(ta) && isNaN(tb)) || ta === tb;
+    }
+    // RegExp: canonical toString (normalizes flag order — /gi vs /ig are
+    // the same expression, matching chai's deep-eql).
+    if (a instanceof RegExp || b instanceof RegExp) {
+        if (!(b instanceof RegExp)) return false;
+        return String(a) === String(b);
+    }
     if (Array.isArray(a)) {
         if (!Array.isArray(b) || a.length !== b.length) return false;
-        for (var i = 0; i < a.length; i++) {
-            if (!deepEqual(a[i], b[i])) return false;
+        seen = seen || [];
+        for (var s = 0; s < seen.length; s++) {
+            if (seen[s][0] === a && seen[s][1] === b) return true;
         }
+        seen.push([a, b]);
+        for (var i = 0; i < a.length; i++) {
+            if (!deepEqual(a[i], b[i], seen)) {
+                seen.pop();
+                return false;
+            }
+        }
+        seen.pop();
         return true;
     }
     if (typeof a === 'object') {
         if (Array.isArray(b) || b === null || b === undefined) return false;
+        // Map: same size, each entry's key+value finds a deep-equal mate
+        // (order-insensitive).
+        if (a instanceof Map || b instanceof Map) {
+            if (!(b instanceof Map) || a.size !== b.size) return false;
+            // Cycle guard: Map nodes can be self-referential (a Map whose value
+            // is itself); revisiting the exact (a, b) pair mid-compare is
+            // assumed equal.
+            seen = seen || [];
+            for (var s = 0; s < seen.length; s++) {
+                if (seen[s][0] === a && seen[s][1] === b) return true;
+            }
+            seen.push([a, b]);
+            var aEntries = Array.from(a.entries());
+            var bEntries = Array.from(b.entries());
+            var usedB = [];
+            outer:
+            for (var mi = 0; mi < aEntries.length; mi++) {
+                for (var mj = 0; mj < bEntries.length; mj++) {
+                    if (usedB[mj]) continue;
+                    if (deepEqual(aEntries[mi][0], bEntries[mj][0], seen) &&
+                        deepEqual(aEntries[mi][1], bEntries[mj][1], seen)) {
+                        usedB[mj] = true;
+                        continue outer;
+                    }
+                }
+                seen.pop();
+                return false;
+            }
+            seen.pop();
+            return true;
+        }
+        // Set: same size, each member finds a deep-equal mate.
+        if (a instanceof Set || b instanceof Set) {
+            if (!(b instanceof Set) || a.size !== b.size) return false;
+            // Cycle guard: Set nodes can be self-referential (a Set containing
+            // itself); revisiting the exact (a, b) pair mid-compare is assumed
+            // equal.
+            seen = seen || [];
+            for (var s = 0; s < seen.length; s++) {
+                if (seen[s][0] === a && seen[s][1] === b) return true;
+            }
+            seen.push([a, b]);
+            var aMembers = Array.from(a);
+            var bMembers = Array.from(b);
+            var usedS = [];
+            outer2:
+            for (var si = 0; si < aMembers.length; si++) {
+                for (var sj = 0; sj < bMembers.length; sj++) {
+                    if (usedS[sj]) continue;
+                    if (deepEqual(aMembers[si], bMembers[sj], seen)) {
+                        usedS[sj] = true;
+                        continue outer2;
+                    }
+                }
+                seen.pop();
+                return false;
+            }
+            seen.pop();
+            return true;
+        }
+        // Plain object: key-set comparison with a cycle guard.
+        seen = seen || [];
+        for (var k = 0; k < seen.length; k++) {
+            if (seen[k][0] === a && seen[k][1] === b) return true;
+        }
+        seen.push([a, b]);
         var keysA = Object.keys(a).sort();
         var keysB = Object.keys(b).sort();
-        if (keysA.length !== keysB.length) return false;
-        for (var j = 0; j < keysA.length; j++) {
-            if (keysA[j] !== keysB[j]) return false;
-            if (!deepEqual(a[keysA[j]], b[keysB[j]])) return false;
+        if (keysA.length !== keysB.length) {
+            seen.pop();
+            return false;
         }
+        for (var j = 0; j < keysA.length; j++) {
+            if (keysA[j] !== keysB[j] || !deepEqual(a[keysA[j]], b[keysB[j]], seen)) {
+                seen.pop();
+                return false;
+            }
+        }
+        seen.pop();
         return true;
     }
     return a === b;
+}
+
+// Backlog line 88: chai's .include semantics — substring for strings,
+// element membership (strict indexOf) for arrays, KEY membership for
+// objects. The old String(container).indexOf(...) made [11,22].include(1)
+// and {a:1}.include('object') pass.
+function includesValue(container, value) {
+    if (typeof container === 'string') return container.indexOf(value) !== -1;
+    if (Array.isArray(container)) return container.indexOf(value) !== -1;
+    if (container !== null && typeof container === 'object') return value in container;
+    return false;
 }
 
 // ── pm.iterationData ──
