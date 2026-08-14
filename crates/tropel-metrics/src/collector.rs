@@ -850,16 +850,8 @@ impl Aggregator {
                     count: set.count as u64,
                     sum: set.sum,
                     mean: set.mean(),
-                    min: if set.min == f64::MAX {
-                        0.0
-                    } else {
-                        set.min
-                    },
-                    max: if set.max == f64::MIN {
-                        0.0
-                    } else {
-                        set.max
-                    },
+                    min: if set.min == f64::MAX { 0.0 } else { set.min },
+                    max: if set.max == f64::MIN { 0.0 } else { set.max },
                     p50: 0.0,
                     p90: 0.0,
                     p95: 0.0,
