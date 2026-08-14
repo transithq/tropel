@@ -923,6 +923,7 @@ mod tests {
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
             name: name.to_string(),
+            id: None,
             request: Some(tropel_sdk::types::Request {
                 url: format!("http://example.com/{name}"),
                 method: Method::GET,
@@ -945,6 +946,7 @@ mod tests {
     fn folder(name: &str, items: Vec<ScenarioItem>) -> ScenarioItem {
         ScenarioItem {
             name: name.to_string(),
+            id: None,
             request: None,
             prerequest: vec![],
             test: vec![],
@@ -1027,6 +1029,7 @@ mod tests {
         // not appear in the run order.
         let inert = ScenarioItem {
             name: "inert".into(),
+            id: None,
             request: None,
             prerequest: vec![],
             test: vec![],
@@ -1157,6 +1160,7 @@ mod tests {
             items: vec![
                 ScenarioItem {
                     name: "item-a".into(),
+                    id: None,
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/a".into(),
                         method: Method::GET,
@@ -1176,6 +1180,7 @@ mod tests {
                 },
                 ScenarioItem {
                     name: "item-b".into(),
+                    id: None,
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/b".into(),
                         method: Method::GET,
@@ -1247,6 +1252,7 @@ mod tests {
             items: vec![
                 ScenarioItem {
                     name: "self".into(),
+                    id: None,
                     request: None,
                     prerequest: vec!["postman.setNextRequest('self');".into()],
                     test: vec![],
@@ -1255,6 +1261,7 @@ mod tests {
                 },
                 ScenarioItem {
                     name: "after".into(),
+                    id: None,
                     request: None,
                     prerequest: vec!["// inert".into()],
                     test: vec![],
@@ -1342,6 +1349,7 @@ mod tests {
                 "Folder",
                 vec![ScenarioItem {
                     name: "inner".into(),
+                    id: None,
                     request: None,
                     prerequest: vec![
                         "pm.environment.set('token', 'tok-42'); // COLLECTION; FOLDER; REQUEST"
@@ -1455,6 +1463,7 @@ mod tests {
             //   2: request — must STILL run (return only exits script 1)
             items: vec![ScenarioItem {
                 name: "scoped".into(),
+                id: None,
                 request: None,
                 prerequest: vec![
                     "const baseUrl = 'https://api.example.com'; // COLLECTION".into(),

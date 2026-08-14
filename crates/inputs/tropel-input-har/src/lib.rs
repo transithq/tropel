@@ -356,6 +356,7 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
 
     Ok(ScenarioItem {
         name: item_name,
+        id: None,
         request: Some(Request {
             url,
             method,

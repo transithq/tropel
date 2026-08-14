@@ -78,6 +78,7 @@ fn fixture_response(req: &Request) -> Result<Response> {
 fn fixture_run_request() -> RunRequest {
     let item = |name: &str, url: &str, test: Option<&str>, body: Option<Body>| ScenarioItem {
         name: name.into(),
+        id: None,
         request: Some(Request {
             url: url.into(),
             method: Method::GET,

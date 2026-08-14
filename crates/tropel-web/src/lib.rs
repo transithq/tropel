@@ -227,6 +227,7 @@ mod tests {
             },
             items: vec![ScenarioItem {
                 name: "ping".into(),
+                id: None,
                 request: Some(tropel_sdk::types::Request {
                     url: "https://example.com/ping".into(),
                     method: Method::GET,

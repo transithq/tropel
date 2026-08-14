@@ -967,6 +967,7 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
         .map(|wi| -> Result<ScenarioItem> {
             Ok(ScenarioItem {
                 name: wi.name.clone(),
+                id: None,
                 request: wi.request.as_ref().map(convert_request).transpose()?,
                 // The wire format keeps a single Option<string> (backlog §4:
                 // WASM adapters emit one script); ScenarioItem now carries a
@@ -994,6 +995,7 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
                 let children = build_item_tree(&wi.items)?;
                 Ok(ScenarioItem {
                     name: wi.name.clone(),
+                    id: None,
                     request: wi.request.as_ref().map(convert_request).transpose()?,
                     prerequest: wi.prerequest.clone().map(|s| vec![s]).unwrap_or_default(),
                     test: wi.test.clone().map(|s| vec![s]).unwrap_or_default(),

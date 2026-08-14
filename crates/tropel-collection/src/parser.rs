@@ -120,6 +120,7 @@ fn convert_items(
                 events.extend(folder.event.iter().cloned());
                 let scenario_item = ScenarioItem {
                     name: folder.name.clone(),
+                    id: None,
                     request: None,
                     // The folder's own scripts are ALSO folded into every
                     // descendant leaf below, so they run before/after each
@@ -160,6 +161,7 @@ fn convert_request_item(
 
     ScenarioItem {
         name: req.name.clone(),
+        id: None,
         request: Some(request),
         prerequest: find_prerequest_script(&events),
         test: find_test_script(&events),

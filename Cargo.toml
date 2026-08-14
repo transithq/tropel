@@ -222,7 +222,7 @@ tropel-scheduler = { path = "crates/tropel-scheduler", version = "0.1.0" }
 tropel-metrics = { path = "crates/tropel-metrics" }
 tropel-report = { path = "crates/tropel-report" }
 tropel-ext = { path = "crates/tropel-ext", version = "0.1.0" }
-tropel-sdk = { path = "crates/tropel-sdk", version = "0.2.0" }
+tropel-sdk = { path = "crates/tropel-sdk", version = "0.3.0" }
 tropel-engine = { path = "crates/tropel-engine" }
 tropel-build = { path = "crates/tropel-build" }
 tropel-input-postman = { path = "crates/inputs/tropel-input-postman" }

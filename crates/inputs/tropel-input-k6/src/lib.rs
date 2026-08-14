@@ -126,6 +126,7 @@ fn build_scenario_from_source(js_code: &str, name: &str) -> Result<Scenario> {
         },
         items: vec![ScenarioItem {
             name: name.to_string(),
+            id: None,
             request: None,
             prerequest: vec![],
             test: vec![wrapped_code],
