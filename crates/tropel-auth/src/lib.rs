@@ -317,8 +317,73 @@ impl AuthSigner for AwsSigV4Auth {
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn default_service(host: &str) -> String {
-    // "s3.us-west-2.amazonaws.com" → "s3"; fall back to the whole host.
-    host.split('.').next().unwrap_or(host).to_string()
+    // AWS service detection (backlog line 54): the old "first DNS label"
+    // heuristic returned the bucket or API name (`examplebucket`, `abc`,
+    // `search-x`) instead of the service (`s3`, `execute-api`, `es`) — a 403
+    // on every virtual-hosted-S3 and API-Gateway request, breaking scope,
+    // the signing key, and is_s3_family (double-encoded S3 paths). AWS
+    // convention: strip the amazonaws.com partition suffix, strip a trailing
+    // region label (and any `dualstack` marker), and take the last remaining
+    // label.
+    let lower = host.to_ascii_lowercase();
+    let labels: Vec<&str> = lower.split('.').collect();
+    if !matches!(
+        labels.as_slice(),
+        [.., "amazonaws", "com"] | [.., "amazonaws", "com", "cn"]
+    ) {
+        // Not an AWS endpoint — no service to detect; keep the old
+        // first-label fallback (e.g. a local sigv4 target).
+        return labels.first().copied().unwrap_or(host).to_string();
+    }
+    // Strip the `.amazonaws.com` (or `.amazonaws.com.cn`) partition suffix.
+    let end = labels.len() - if labels.last() == Some(&"cn") { 3 } else { 2 };
+    let mut service_labels = &labels[..end];
+    // Strip a trailing region label (e.g. `us-east-1`, `eu-west-2`,
+    // `us-gov-west-1`).
+    if let [.., last] = service_labels {
+        if is_aws_region(last) {
+            service_labels = &service_labels[..service_labels.len() - 1];
+        }
+    }
+    // Dualstack endpoints put `dualstack` between service and region
+    // (`s3.dualstack.us-west-2.amazonaws.com`); the signing service is still
+    // `s3`, so drop the marker before taking the last label.
+    if service_labels.last() == Some(&"dualstack") {
+        service_labels = &service_labels[..service_labels.len() - 1];
+    }
+    if let Some(service) = service_labels.last() {
+        if !service.is_empty() {
+            return (*service).to_string();
+        }
+    }
+    host.to_string()
+}
+
+/// True for labels shaped like AWS region names (`us-east-1`, `eu-west-2`,
+/// `ap-southeast-1`, `us-gov-west-1`, `cn-north-1`, `mx-central-1`): a
+/// 2-letter partition prefix, one or more alphabetic location parts, and a
+/// single-digit numeric suffix. Matched structurally rather than by
+/// enumeration so regions AWS adds later are recognized without maintenance.
+/// Used to strip the region from a service hostname before taking the service
+/// label (backlog line 54).
+fn is_aws_region(label: &str) -> bool {
+    let parts: Vec<&str> = label.split('-').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    let first = parts[0];
+    if first.len() != 2 || !first.chars().all(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    let middle = &parts[1..parts.len() - 1];
+    if middle
+        .iter()
+        .any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_lowercase()))
+    {
+        return false;
+    }
+    let last = parts[parts.len() - 1];
+    last.len() == 1 && last.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 /// `host[:port]` — omit the port when it is the scheme default. IPv6 hosts
@@ -2107,5 +2172,45 @@ mod tests {
             .unwrap();
         assert!(h3.contains("nonce=\"nonce-b\""));
         assert!(h3.contains("nc=00000001"), "rotated nonce resets nc: {h3}");
+    }
+
+    /// Backlog line 54: the old `default_service` took the FIRST DNS label,
+    /// so virtual-hosted S3 (`examplebucket.s3.amazonaws.com` →
+    /// "examplebucket") and API Gateway (`abc.execute-api.us-east-1…` →
+    /// "abc") hosts produced the wrong SigV4 service — breaking scope, the
+    /// signing key, and `is_s3_family` (double-encoded S3 paths) → 403 on
+    /// every such request.
+    #[test]
+    fn default_service_derives_aws_service_not_first_dns_label() {
+        let cases = [
+            ("examplebucket.s3.amazonaws.com", "s3"),
+            ("examplebucket.s3.us-west-2.amazonaws.com", "s3"),
+            ("s3.amazonaws.com", "s3"),
+            ("s3.us-west-2.amazonaws.com", "s3"),
+            ("s3.us-gov-west-1.amazonaws.com", "s3"),
+            ("s3.cn-north-1.amazonaws.com.cn", "s3"),
+            ("s3.dualstack.us-west-2.amazonaws.com", "s3"),
+            ("examplebucket.s3.dualstack.us-west-2.amazonaws.com", "s3"),
+            // Regions added after any enumeration could ever list them:
+            // the structural region match must recognize them.
+            ("s3.mx-central-1.amazonaws.com", "s3"),
+            ("s3.ap-southeast-5.amazonaws.com", "s3"),
+            ("abc.execute-api.us-east-1.amazonaws.com", "execute-api"),
+            ("search-x.us-east-1.es.amazonaws.com", "es"),
+            ("s3-control.us-west-2.amazonaws.com", "s3-control"),
+            ("lambda.us-east-1.amazonaws.com", "lambda"),
+            ("route53.amazonaws.com", "route53"),
+            // Non-AWS endpoints keep the old first-label fallback.
+            ("non-aws.example.com", "non-aws"),
+        ];
+        for (host, want) in cases {
+            assert_eq!(default_service(host), want, "default_service({host})");
+        }
+        // is_s3_family must now be true for virtual-hosted S3 (fixes the
+        // double-encoded path breakage) and false for execute-api.
+        assert!(is_s3_family(&default_service("examplebucket.s3.amazonaws.com")));
+        assert!(!is_s3_family(&default_service(
+            "abc.execute-api.us-east-1.amazonaws.com"
+        )));
     }
 }
