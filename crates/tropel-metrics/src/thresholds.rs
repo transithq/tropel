@@ -902,7 +902,11 @@ mod tests {
 
         // Unscoped: merged population p95 ≈ 10 ms → threshold passes.
         let result = evaluate_single_threshold("http_req_waiting.p95 < 100", &metrics);
-        assert!(result.0, "merged p95 (~10 ms) must pass < 100, got {}", result.1);
+        assert!(
+            result.0,
+            "merged p95 (~10 ms) must pass < 100, got {}",
+            result.1
+        );
         assert!(
             result.1 < 100.0,
             "actual {} must be the merged p95, not the 2000 ms worst series",
@@ -943,8 +947,7 @@ mod tests {
             ..make_metrics()
         };
 
-        let result =
-            evaluate_single_threshold("http_req_waiting{status=200}.p95 < 50", &metrics);
+        let result = evaluate_single_threshold("http_req_waiting{status=200}.p95 < 50", &metrics);
         assert!(
             result.0,
             "merged p95 (~10 ms) must pass < 50, got {} — the old max-fold gave 100 ms",
@@ -954,7 +957,11 @@ mod tests {
         // A more selective scope must still isolate its own population.
         let only_b =
             evaluate_single_threshold("http_req_waiting{status=200,url=/b}.p95 < 50", &metrics);
-        assert!(!only_b.0, "url=/b alone is ~100 ms and must fail, got {}", only_b.1);
+        assert!(
+            !only_b.0,
+            "url=/b alone is ~100 ms and must fail, got {}",
+            only_b.1
+        );
     }
 
     #[test]
@@ -962,8 +969,13 @@ mod tests {
         // No retained histograms (pre-config window / synthetic summaries):
         // the fallback keeps the old worst-of behavior so a missing histogram
         // can never false-PASS a threshold.
-        let mut m1 = trend_series_with_hist("http_req_waiting{url=/a}", vec![("url", "/a")], &[(10, 10)]);
-        let mut m2 = trend_series_with_hist("http_req_waiting{url=/b}", vec![("url", "/b")], &[(2000, 10)]);
+        let mut m1 =
+            trend_series_with_hist("http_req_waiting{url=/a}", vec![("url", "/a")], &[(10, 10)]);
+        let mut m2 = trend_series_with_hist(
+            "http_req_waiting{url=/b}",
+            vec![("url", "/b")],
+            &[(2000, 10)],
+        );
         m1.histogram = None;
         m2.histogram = None;
         let metrics = MetricsResult {
