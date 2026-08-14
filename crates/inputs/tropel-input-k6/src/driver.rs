@@ -5904,22 +5904,32 @@ mod tests {
             .iter()
             .filter(|s| s.metric == "checks")
             .filter_map(|s| {
-                let name = s.tags.get("check").map(|c| c.to_string()).unwrap_or_default();
+                let name = s
+                    .tags
+                    .get("check")
+                    .map(|c| c.to_string())
+                    .unwrap_or_default();
                 Some((name, s.value))
             })
             .collect();
         assert!(
-            checks.iter().any(|(n, v)| n == "async failing expect" && *v == 0.0),
+            checks
+                .iter()
+                .any(|(n, v)| n == "async failing expect" && *v == 0.0),
             "failing async expect must record FAIL, got: {:?}",
             checks
         );
         assert!(
-            checks.iter().any(|(n, v)| n == "async rejecting" && *v == 0.0),
+            checks
+                .iter()
+                .any(|(n, v)| n == "async rejecting" && *v == 0.0),
             "Promise.reject body must record FAIL, got: {:?}",
             checks
         );
         assert!(
-            checks.iter().any(|(n, v)| n == "async passing" && *v == 1.0),
+            checks
+                .iter()
+                .any(|(n, v)| n == "async passing" && *v == 1.0),
             "passing async body must record PASS, got: {:?}",
             checks
         );
