@@ -644,7 +644,11 @@ mod tests {
         // Force the construction-time build to fail → zero-worker pool.
         FAIL_NEXT_WORKER_BUILD.with(|f| f.set(true));
         let pool = VUWorkerPool::new(1);
-        assert_eq!(pool.worker_count(), 0, "forced build failure must yield an empty pool");
+        assert_eq!(
+            pool.worker_count(),
+            0,
+            "forced build failure must yield an empty pool"
+        );
         // Re-arm the hook so the spawn-time growth call ALSO fails — the
         // swap-once flag was already consumed by construction, and without
         // re-arming, spawn would grow the pool (Slot::Grown) instead of
