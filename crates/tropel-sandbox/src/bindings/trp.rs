@@ -966,38 +966,63 @@ impl TrpBridge {
             );
 
             // ── Flow Control ──
-            // setNextRequest accepts either a numeric index (legacy) or a
-            // request name. If the argument parses as usize, use it as an
-            // index directly. Otherwise, look up the name in request_names
-            // (populated from scenario items by the runner).
+            // setNextRequest resolution order (backlog §4):
+            //   1. null / empty / "null"  → END the iteration (the runner
+            //      breaks when the pending index is out of range; usize::MAX
+            //      is the sentinel for "stop walking this iteration"). The
+            //      old code treated null as a NO-OP, so a collection whose
+            //      last item jumped to an earlier one never consumed the
+            //      jump, leaked it into the next iteration, and ran one
+            //      request forever.
+            //   2. item ID  → Postman resolves ids FIRST (the v2.1 schema
+            //      keys items by id; name is the fallback).
+            //   3. item NAME → LAST match wins (Postman is last-wins on
+            //      duplicate names; the old first-wins position() jumped the
+            //      wrong item).
+            //   4. numeric index (legacy, LAST) — only when no id/name
+            //      matches, so a request literally named "2" is resolved by
+            //      name, not hijacked by the numeric parse.
+            //   5. anything else → END the iteration (Postman: an unknown
+            //      name stops the flow rather than silently continuing).
+            // Sentinel: an out-of-range jump target means "end the current
+            // iteration" — the runner breaks on any target >= item_count.
+            const END_ITERATION: usize = usize::MAX;
             let state_clone = state.clone();
             set_global!(
                 "__tropel_pm_set_next_request",
                 Func::from(move |request_id: Option<String>| {
                     let mut st = state_clone.lock().unwrap();
 
-                    // skipRequest passes null — clear any pending jump.
-                    // Backlog line 146: the old `request_id: String` param
-                    // threw on JS null; Option<String> accepts it as None.
                     let Some(request_id) = request_id else {
-                        st.next_request = None;
+                        st.next_request = Some(END_ITERATION);
                         return;
                     };
                     if request_id == "null" || request_id.is_empty() {
-                        st.next_request = None;
+                        st.next_request = Some(END_ITERATION);
                         return;
                     }
 
-                    // Try numeric index first (backward compat)
+                    // 1. Item id first (Postman resolves ids before names).
+                    if let Some(pos) = st.request_ids.iter().position(|i| i == &request_id) {
+                        st.next_request = Some(pos);
+                        return;
+                    }
+
+                    // 2. Name — last-wins on duplicates (Postman).
+                    if let Some(pos) = st.request_names.iter().rposition(|n| n == &request_id) {
+                        st.next_request = Some(pos);
+                        return;
+                    }
+
+                    // 3. Legacy numeric index — only after id/name miss, so a
+                    //    request named "2" is not hijacked by the parse.
                     if let Ok(index) = request_id.parse::<usize>() {
                         st.next_request = Some(index);
                         return;
                     }
 
-                    // Look up by name in the request list
-                    if let Some(pos) = st.request_names.iter().position(|n| n == &request_id) {
-                        st.next_request = Some(pos);
-                    }
+                    // 4. Unknown → end the iteration (Postman semantics).
+                    st.next_request = Some(usize::MAX);
                 }),
             );
 

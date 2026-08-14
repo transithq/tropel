@@ -119,6 +119,7 @@ fn convert_items(
                 let mut events = parent_events.to_vec();
                 events.extend(folder.event.iter().cloned());
                 let scenario_item = ScenarioItem {
+                    id: folder.id.clone(),
                     name: folder.name.clone(),
                     id: None,
                     request: None,
@@ -160,6 +161,7 @@ fn convert_request_item(
     events.extend(req.event.iter().cloned());
 
     ScenarioItem {
+        id: req.id.clone(),
         name: req.name.clone(),
         id: None,
         request: Some(request),

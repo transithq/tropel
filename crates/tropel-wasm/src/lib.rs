@@ -886,6 +886,8 @@ struct WasmScenario {
 
 #[derive(serde::Deserialize)]
 struct WasmItem {
+    #[serde(default)]
+    id: Option<String>,
     name: String,
     #[serde(default)]
     request: Option<WasmRequest>,
@@ -966,6 +968,7 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
         .iter()
         .map(|wi| -> Result<ScenarioItem> {
             Ok(ScenarioItem {
+                id: wi.id.clone(),
                 name: wi.name.clone(),
                 id: None,
                 request: wi.request.as_ref().map(convert_request).transpose()?,
@@ -994,6 +997,7 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
             .map(|wi| -> Result<ScenarioItem> {
                 let children = build_item_tree(&wi.items)?;
                 Ok(ScenarioItem {
+                    id: wi.id.clone(),
                     name: wi.name.clone(),
                     id: None,
                     request: wi.request.as_ref().map(convert_request).transpose()?,

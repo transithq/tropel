@@ -374,6 +374,7 @@ impl InputAdapter for SubprocessAdapter {
                     .map(|v| {
                         serde_json::from_value(v.clone()).unwrap_or_else(|_| {
                             tropel_sdk::ScenarioItem {
+                                id: None,
                                 name: "Imported item".to_string(),
                                 id: None,
                                 request: None,

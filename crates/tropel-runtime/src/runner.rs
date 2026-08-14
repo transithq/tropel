@@ -103,6 +103,15 @@ impl ScenarioRunner {
         {
             let mut state = pm_state.lock().unwrap();
             state.set_request_names(execution_names);
+            // Postman item ids for setNextRequest id-first resolution
+            // (backlog §4): derived from the SAME flattened execution list,
+            // one entry per item, empty string when an item has no id.
+            state.set_request_ids(Arc::new(
+                execution_items
+                    .iter()
+                    .map(|i| i.id.clone().unwrap_or_default())
+                    .collect(),
+            ));
             state.vu_id = vu_id;
             state.scenario_name = scenario_name.clone();
             // Seed collection variables from the scenario (the Postman
@@ -210,6 +219,13 @@ impl ScenarioRunner {
             let mut state = self.pm_state.lock().unwrap();
             state.set_iteration_data(data_row.clone());
             state.iteration_index = iteration_index;
+            // Backlog §4: a setNextRequest jump set by the LAST item of the
+            // previous iteration was never consumed (the loop already exited)
+            // and leaked into this iteration — iteration 2 started
+            // mid-collection, re-armed the jump, and every subsequent
+            // iteration ran exactly one request. Jumps are per-iteration in
+            // Postman; clear any stale pending jump at iteration start.
+            state.next_request = None;
         }
 
         // Walk through the flattened execution list (folders descended).
@@ -922,6 +938,7 @@ mod tests {
 
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
+            id: None,
             name: name.to_string(),
             id: None,
             request: Some(tropel_sdk::types::Request {
@@ -945,6 +962,7 @@ mod tests {
 
     fn folder(name: &str, items: Vec<ScenarioItem>) -> ScenarioItem {
         ScenarioItem {
+            id: None,
             name: name.to_string(),
             id: None,
             request: None,
@@ -1028,6 +1046,7 @@ mod tests {
         // A leaf with no request and no scripts is not executable; it must
         // not appear in the run order.
         let inert = ScenarioItem {
+            id: None,
             name: "inert".into(),
             id: None,
             request: None,
@@ -1159,6 +1178,7 @@ mod tests {
             auth: None,
             items: vec![
                 ScenarioItem {
+                    id: None,
                     name: "item-a".into(),
                     id: None,
                     request: Some(tropel_sdk::types::Request {
@@ -1179,6 +1199,7 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
+                    id: None,
                     name: "item-b".into(),
                     id: None,
                     request: Some(tropel_sdk::types::Request {
@@ -1251,6 +1272,7 @@ mod tests {
             // forever. Both items are script-only — no network traffic.
             items: vec![
                 ScenarioItem {
+                    id: None,
                     name: "self".into(),
                     id: None,
                     request: None,
@@ -1260,6 +1282,7 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
+                    id: None,
                     name: "after".into(),
                     id: None,
                     request: None,
@@ -1348,6 +1371,7 @@ mod tests {
             items: vec![folder(
                 "Folder",
                 vec![ScenarioItem {
+                    id: None,
                     name: "inner".into(),
                     id: None,
                     request: None,
@@ -1462,6 +1486,7 @@ mod tests {
             //      string would throw here) AND returns early
             //   2: request — must STILL run (return only exits script 1)
             items: vec![ScenarioItem {
+                id: None,
                 name: "scoped".into(),
                 id: None,
                 request: None,
@@ -1520,6 +1545,222 @@ mod tests {
             state.environment.get("token").map(String::as_str),
             Some("tok-42"),
             "script 2 must still run after script 1's early return"
+        );
+    }
+
+    /// Wire a runner over the given items with a REAL JS context (pm shim +
+    /// bridge) so setNextRequest tests exercise the full flow-control path.
+    async fn runner_with_scripts(items: Vec<ScenarioItem>) -> ScenarioRunner {
+        let scenario = Arc::new(Scenario {
+            info: tropel_sdk::scenario::ScenarioInfo {
+                name: "jumps".into(),
+                description: None,
+                schema: None,
+            },
+            items,
+            variables: HashMap::new(),
+            auth: None,
+        });
+        let execution_items = Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
+        let runner =
+            ScenarioRunner::new(scenario, execution_items, names, client, 0, "jumps".into());
+        let mut js_ctx = Box::new(
+            JsContext::new(None, None)
+                .await
+                .expect("js context should construct"),
+        );
+        js_ctx
+            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .await
+            .expect("pm shim should eval");
+        let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("bridge http client should construct"),
+        ));
+        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(
+            runner.pm_state().clone(),
+            bridge_client,
+        )
+        .install(&mut js_ctx)
+        .expect("pm bridge should install");
+        runner.with_js_context(js_ctx)
+    }
+
+    fn script_item(name: &str, script: &str) -> ScenarioItem {
+        ScenarioItem {
+            id: None,
+            name: name.into(),
+            request: None,
+            prerequest: vec![script.into()],
+            test: vec![],
+            assertions: vec![],
+            items: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn set_next_request_null_ends_the_iteration() {
+        // Backlog §4: setNextRequest(null) was a NO-OP — the runner kept
+        // walking the collection. Postman semantics: null ends the current
+        // ITERATION (nothing after the jump runs).
+        let mut runner = runner_with_scripts(vec![
+            script_item(
+                "first",
+                "pm.environment.set('saw0', '1'); postman.setNextRequest(null);",
+            ),
+            script_item("second", "pm.environment.set('saw1', '1');"),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(state.environment.get("saw0").map(String::as_str), Some("1"));
+        assert!(
+            !state.environment.contains_key("saw1"),
+            "setNextRequest(null) must end the iteration — item 1 must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_unknown_name_ends_the_iteration() {
+        // Backlog §4: an unknown request name was a silent no-op (runner kept
+        // walking). Postman stops the flow — the iteration ends.
+        let mut runner = runner_with_scripts(vec![
+            script_item(
+                "first",
+                "pm.environment.set('saw0', '1'); postman.setNextRequest('no-such-item');",
+            ),
+            script_item("second", "pm.environment.set('saw1', '1');"),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(state.environment.get("saw0").map(String::as_str), Some("1"));
+        assert!(
+            !state.environment.contains_key("saw1"),
+            "unknown setNextRequest target must end the iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_jump_does_not_leak_into_next_iteration() {
+        // Backlog §4: a jump set by the LAST item was never consumed within
+        // the iteration (the loop had already exited), leaked into iteration
+        // 2, and re-armed — every subsequent iteration started mid-collection
+        // and ran exactly one request. Jumps are per-iteration in Postman;
+        // iteration 2 must start at item 0 again.
+        let mut runner = runner_with_scripts(vec![
+            script_item("a", "pm.environment.set('sawA', '1');"),
+            script_item("b", "pm.environment.set('sawB', '1');"),
+            script_item("c", "postman.setNextRequest('b');"),
+        ])
+        .await;
+        let _ = runner.run_iteration(0, None, &HashMap::new()).await;
+        // Iteration 2: the stale jump to 'b' must be cleared — item A runs.
+        let result = runner.run_iteration(1, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("sawA").map(String::as_str),
+            Some("1"),
+            "iteration 2 must start at the first item — the previous jump leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_duplicate_name_is_last_wins() {
+        // Backlog §4: the old first-wins position() jumped to the FIRST item
+        // with a duplicate name. Postman is last-wins.
+        let mut runner = runner_with_scripts(vec![
+            script_item("start", "postman.setNextRequest('dup');"),
+            script_item("dup", "pm.environment.set('saw1', '1');"),
+            script_item("dup", "pm.environment.set('saw2', '1');"),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert!(
+            state.environment.contains_key("saw2"),
+            "the LAST duplicate must win (saw2 set)"
+        );
+        assert!(
+            !state.environment.contains_key("saw1"),
+            "the FIRST duplicate must NOT run (saw1 unset)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_resolves_id_before_name() {
+        // Backlog §4: Postman resolves item ids FIRST — a request id shadows
+        // a same-named item. The named item sits BEFORE the id-carrying item:
+        // if the name won, the jump would land on it first (and the id item
+        // would still run after); if the id wins, execution jumps PAST the
+        // named item directly to the id item (Postman continues from the
+        // target to the end of the collection, so ordering isolates the win).
+        let mut runner = runner_with_scripts(vec![
+            script_item("start", "postman.setNextRequest('t1');"),
+            script_item("t1", "pm.environment.set('sawName', '1');"),
+            ScenarioItem {
+                id: Some("t1".into()),
+                name: "by-id".into(),
+                request: None,
+                prerequest: vec!["pm.environment.set('sawId', '1');".into()],
+                test: vec![],
+                assertions: vec![],
+                items: vec![],
+            },
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("sawId").map(String::as_str),
+            Some("1"),
+            "item id must win over the same-named item"
+        );
+        assert!(
+            !state.environment.contains_key("sawName"),
+            "the same-named item must NOT run (id resolved first)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_numeric_like_name_is_not_hijacked() {
+        // Backlog §4: a request literally named "2" was hijacked by the
+        // numeric-index parse (jumped to INDEX 2). The name lookup must
+        // precede the legacy numeric fallback. (Postman continues from the
+        // jump target to the end, so the later "third" item still runs — the
+        // discriminator is that the item NAMED '2' runs at all.)
+        let mut runner = runner_with_scripts(vec![
+            script_item("start", "postman.setNextRequest('2');"),
+            script_item("2", "pm.environment.set('sawName2', '1');"),
+            script_item("third", "pm.environment.set('sawIdx2', '1');"),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("sawName2").map(String::as_str),
+            Some("1"),
+            "a request named '2' must resolve by NAME, not index"
+        );
+        // Under the old numeric-first parse, '2' jumped to INDEX 2 ("third")
+        // and the item named "2" never ran — sawIdx2 would be set and
+        // sawName2 absent. The name lookup winning is what this pins.
+        assert_eq!(
+            state.environment.get("sawIdx2").map(String::as_str),
+            Some("1"),
+            "execution continues past the jump target (Postman flow)"
         );
     }
 }
