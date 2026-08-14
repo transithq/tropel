@@ -4493,8 +4493,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn test_bru_collection_vars_family() {
         // TROPEL_PARITY_BRUNO.md §2: Bruno exposes the collection scope via
         // getCollectionVar/setCollectionVar/hasCollectionVar/delete* — the
@@ -4569,7 +4567,6 @@ mod tests {
             );
         });
     }
-
 
     #[test]
     fn test_pm_expect_eql_is_deep_equal() {
