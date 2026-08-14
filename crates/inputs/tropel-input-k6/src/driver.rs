@@ -4404,7 +4404,10 @@ mod tests {
         // .to.exist, and chai .empty/.exist/.NaN/.finite) used to read as
         // `undefined` and pm.test recorded GREEN — a silent pass. The Proxy
         // guard now THROWS on unknown assertion names, and the common
-        // property getters are implemented for real.
+        // property getters are implemented for real. Backlog line 73: the
+        // `.should` getter must go through the SAME guard — previously it
+        // returned a raw Assertion, so `({a:1}).should.be.sealed` read as
+        // undefined and passed silently.
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
@@ -4490,6 +4493,33 @@ mod tests {
                     try { chai.expect(false).to.be.true; return 'passed'; }
                     catch (e) { return 'threw'; }
                 })());
+                // ── chai.should (backlog line 73) ──
+                chai.should();
+                globalThis.__should_sealed_fail = String((function () {
+                    // VERIFIED bug: ({a:1}).should.be.sealed returned
+                    // undefined (raw Assertion, no Proxy) — must now throw.
+                    try { ({ a: 1 }).should.be.sealed; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_true_ok = String((function () {
+                    // Implemented getter must still WORK through the guard.
+                    try { (true).should.be.true; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_false_true_fail = String((function () {
+                    try { (false).should.be.true; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_unknown_prop = String((function () {
+                    try { (1).should.be.bogusShouldProp; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_method_chain_ok = String((function () {
+                    // Method-chain positive: `equal` reads this._obj through
+                    // the Proxy receiver — must still resolve.
+                    try { (5).should.equal(5); return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
             "#,
             )
             .expect("script should eval");
@@ -4573,6 +4603,32 @@ mod tests {
                 ctx.eval::<String, _>("__chai_true_fail").unwrap(),
                 "threw",
                 "chai false.to.be.true must throw"
+            );
+            // ── chai.should (backlog line 73) ──
+            assert_eq!(
+                ctx.eval::<String, _>("__should_sealed_fail").unwrap(),
+                "threw",
+                "should.be.sealed must throw (was silent undefined)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_true_ok").unwrap(),
+                "ok",
+                "(true).should.be.true must still pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_false_true_fail").unwrap(),
+                "threw",
+                "(false).should.be.true must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_unknown_prop").unwrap(),
+                "threw",
+                "should unknown assertion prop must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_method_chain_ok").unwrap(),
+                "ok",
+                "(5).should.equal(5) method chain must pass through the guard"
             );
         });
     }

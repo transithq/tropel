@@ -70,7 +70,7 @@
 - [x] **`pm.expect(...)` unimplemented properties** — FIXED (`pm.js:446-503` `addPropAssertions` + `guardChain` Proxy). ✅VERIFIED all 14 probes record correctly.
 - [x] **chai prototype `empty`/`exist`/`NaN`/`finite`** — FIXED (`chai-shim.js:376-444` + guard Proxy).
 - [x] **`assert.throws` swallowing its own error** — FIXED (`chai-shim.js:511-535`, raised after the try/catch).
-- [ ] **P1 · `chai.should()` is unguarded** — returns a raw `Assertion`, not the Proxy. ✅VERIFIED `({a:1}).should.be.sealed` → `undefined`, no throw. The whole silent-pass class is still reachable via `.should`.
+- [x] **P1 · `chai.should()` is unguarded** — returns a raw `Assertion`, not the Proxy. ✅VERIFIED `({a:1}).should.be.sealed` → `undefined`, no throw. The whole silent-pass class is still reachable via `.should`.
 - [ ] **P1 · `pm.test(name, asyncFn)` always passes.** `pm.js:401` (`result !== false`). ✅VERIFIED: an async body whose `pm.expect` fails, and a body returning `Promise.reject`, **both record PASS**. The rejection surfaces separately — the check is already green.
 - [ ] **P1 · `.eql` passes regardless of value for Date/Set/Map/RegExp.** All **three** deep-equal impls (`pm.js:824`, `chai-shim.js:10`, `lodash-shim.js:473`) reduce non-plain objects to `Object.keys()` = `[]`. ✅VERIFIED `pm.expect(new Date(1)).to.eql(new Date(999999))` → PASS; `chai.expect(new Set([1])).to.eql(new Set([9]))` → PASS. Circular structures blow the stack.
 - [ ] **P1 · `.to.not.*` throws** (only `.not.to.*` exists) — ✅VERIFIED recorded as **FAIL**. This is the order Postman snippets emit. `chai.expect` handles it fine, so the two `expect`s disagree.

@@ -343,15 +343,18 @@ var chai = chai || {};
         return this;
     };
 
-    // ── chai.expect ──
+    // ── guarded assertion ──
     // Backlog §1: unimplemented assertion PROPERTIES (e.g. `.to.be.empty`,
     // `.to.exist`, `.NaN`, `.finite`) used to read as `undefined` and the
     // enclosing pm.test/check recorded GREEN — a silent pass. The instance is
     // wrapped in a Proxy whose `get` trap THROWS on unknown assertion names,
     // so a typo'd or unimplemented assertion fails instead of passing
     // silently. Known names resolve normally through the prototype chain.
-    chai.expect = function (val, msg) {
-        var assertion = new Assertion(val, msg, chai.expect);
+    // Backlog line 73: EVERY entry point must go through this guard —
+    // chai.expect AND the Object.prototype.should getter — otherwise the
+    // whole silent-pass class stays reachable via `.should`.
+    function guardedAssertion(val, msg, ssfi) {
+        var assertion = new Assertion(val, msg, ssfi);
         return new Proxy(assertion, {
             get: function (target, prop, receiver) {
                 // Symbols (Symbol.toPrimitive etc.) and the standard
@@ -370,6 +373,10 @@ var chai = chai || {};
                 throw new Error("unknown assertion property '" + String(prop) + "'");
             }
         });
+    }
+
+    chai.expect = function (val, msg) {
+        return guardedAssertion(val, msg, chai.expect);
     };
 
     // .empty
@@ -543,10 +550,14 @@ var chai = chai || {};
     };
 
     // ── chai.should (minimal) ──
+    // Backlog line 73: the `should` getter previously returned a RAW
+    // Assertion — `.should.be.sealed` read as undefined and passed silently.
+    // Route it through the same guarded Proxy as chai.expect so unknown or
+    // unimplemented assertion names THROW.
     chai.should = function () {
         Object.defineProperty(Object.prototype, 'should', {
             get: function () {
-                return new Assertion(this);
+                return guardedAssertion(this, undefined, chai.should);
             },
             set: function () {},
             configurable: true,
