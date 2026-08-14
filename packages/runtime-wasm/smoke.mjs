@@ -74,6 +74,9 @@ const exec = await createExecWasm({
         sendingMs: 0,
         waitingMs: 5,
         receivingMs: 5,
+        // Backlog line 43: total is the EIGHTH Timings field — its absence
+        // previously broke the round-trip with DeserializeUnexpectedEnd.
+        totalMs: 5,
       },
       // One cookie exercises the Option-heavy Cookie wire layout (name/value
       // plain strings, domain/secure/httpOnly as Options) round-trip.
