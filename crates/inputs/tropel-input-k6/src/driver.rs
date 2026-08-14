@@ -6245,8 +6245,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out,
-            "[[\"a\",\"c\"],\"a\",0,false,true,2,[\"a\",\"c\"],true,1]",
+            out, "[[\"a\",\"c\"],\"a\",0,false,true,2,[\"a\",\"c\"],true,1]",
             "string/pair/matcher shorthand across the collection family"
         );
     }
@@ -7215,7 +7214,15 @@ mod tests {
             .iter()
             .filter(|s| s.metric == "checks")
             .collect();
-        assert_eq!(checks.len(), 1, "one check sample expected, got {:?}", ctx.samples.iter().map(|s| s.metric.as_ref()).collect::<Vec<_>>());
+        assert_eq!(
+            checks.len(),
+            1,
+            "one check sample expected, got {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
         let sample = checks[0];
         assert_eq!(
             sample.tags.get("code"),
