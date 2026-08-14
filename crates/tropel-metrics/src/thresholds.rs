@@ -1,6 +1,7 @@
 use crate::collector::{
     parse_percentile, percentile_value, MetricSummary, MetricType, MetricsResult,
 };
+use crate::histogram::LatencyHistogram;
 use std::collections::HashMap;
 use std::time::Duration;
 use tropel_core::config::ThresholdConfig;
@@ -525,21 +526,16 @@ fn get_tag_scoped_metric_value(
             // Return the MAXIMUM max across all matches
             matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max)
         }
-        Some("p50") | Some("median") | Some("med") => {
-            matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
-        }
-        Some("p90") => matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max),
-        Some("p95") => matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max),
-        Some("p99") => matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max),
+        Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
+        Some("p90") => merged_percentile(&matched, 90.0),
+        Some("p95") => merged_percentile(&matched, 95.0),
+        Some("p99") => merged_percentile(&matched, 99.0),
         // Any other pNN / p(NN) percentile — exact from the retained
-        // histogram of each matching series; worst (highest) wins across
-        // matches (consistent with the tracked buckets above).
+        // histogram of each matching series; merged-population when all
+        // retained, worst (highest) fallback otherwise.
         Some(s) if parse_percentile(s).is_some() => {
             let pct = parse_percentile(s).expect("guarded");
-            matched
-                .iter()
-                .map(|m| percentile_value(m, pct))
-                .fold(0.0_f64, f64::max)
+            merged_percentile(&matched, pct)
         }
         Some("count") => matched.iter().map(|m| m.count as f64).sum(),
         Some("rate") => {
@@ -586,6 +582,34 @@ fn counter_rate(metrics: &MetricsResult, matched: &[&MetricSummary]) -> f64 {
 /// `login_errors` / `login_duration`.
 /// Returns `None` when no series match, so callers can fall back to a
 /// top-level field or 0.0.
+/// Compute a percentile over the MERGED population of every matching series
+/// (k6 semantics: an unscoped or tag-scoped threshold like `http_req_waiting.p95`
+/// is the p95 of ALL samples across the matching series, not the worst
+/// sub-series). When every matched Trend retains its exact histogram, merge
+/// them losslessly and read the percentile from the merged distribution;
+/// otherwise (pre-config window / synthetic summaries with no retained
+/// histograms) fall back to the worst (highest) value across matches — the
+/// old fold behavior.
+fn merged_percentile(matched: &[&MetricSummary], pct: f64) -> f64 {
+    let all_retained = !matched.is_empty()
+        && matched
+            .iter()
+            .all(|m| m.metric_type == MetricType::Trend && m.histogram.is_some());
+    if all_retained {
+        let mut merged = LatencyHistogram::new();
+        for m in matched {
+            if let Some(h) = &m.histogram {
+                merged.merge(h);
+            }
+        }
+        return merged.percentile(pct) as f64;
+    }
+    matched
+        .iter()
+        .map(|m| percentile_value(m, pct))
+        .fold(0.0_f64, f64::max)
+}
+
 fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
     let matched: Vec<&MetricSummary> = metrics
         .metrics
@@ -607,25 +631,20 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         return None;
     }
     Some(match stat {
-        // Percentiles: worst (highest) across matched series, mirroring
-        // the tag-scoped path.
+        // Percentiles: merged-population (k6 semantics) when the exact
+        // per-series histograms are retained; worst (highest) fallback.
         Some("min") => matched
             .iter()
             .map(|m| m.min as f64)
             .fold(f64::MAX, f64::min),
         Some("max") => matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max),
-        Some("p50") | Some("median") | Some("med") => {
-            matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
-        }
-        Some("p90") => matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max),
-        Some("p95") => matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max),
-        Some("p99") => matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max),
+        Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
+        Some("p90") => merged_percentile(&matched, 90.0),
+        Some("p95") => merged_percentile(&matched, 95.0),
+        Some("p99") => merged_percentile(&matched, 99.0),
         Some(s) if parse_percentile(s).is_some() => {
             let pct = parse_percentile(s).expect("guarded");
-            matched
-                .iter()
-                .map(|m| percentile_value(m, pct))
-                .fold(0.0_f64, f64::max)
+            merged_percentile(&matched, pct)
         }
         // Rate = total sum / total count across ALL series (k6 merges tagged
         // sub-series for the unscoped metric).
@@ -837,6 +856,173 @@ mod tests {
         assert!(!result.0, "p95 1200 should NOT be < 1000");
         assert_eq!(result.1, 1200.0);
         assert_eq!(result.2, 1000.0);
+    }
+
+    // ── merged-population percentiles (backlog line 58) ──
+
+    /// Build a Trend series carrying an exact retained histogram: `pairs` of
+    /// (ms value, count) recorded into a fresh LatencyHistogram.
+    fn trend_series_with_hist(
+        name: &str,
+        tags: Vec<(&str, &str)>,
+        pairs: &[(u64, usize)],
+    ) -> MetricSummary {
+        let mut h = LatencyHistogram::new();
+        for (ms, n) in pairs {
+            for _ in 0..*n {
+                h.record_ms(*ms);
+            }
+        }
+        let stats = h.stats();
+        MetricSummary {
+            key: name.to_string(),
+            tags: tags
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            metric_type: MetricType::Trend,
+            count: stats.count,
+            sum: pairs.iter().map(|(ms, n)| (*ms as f64) * (*n as f64)).sum(),
+            mean: stats.mean,
+            min: stats.min,
+            max: stats.max,
+            p50: stats.p50,
+            p90: stats.p90,
+            p95: stats.p95,
+            p99: stats.p99,
+            last: 0.0,
+            rate: 0.0,
+            histogram: Some(h),
+        }
+    }
+
+    #[test]
+    fn unscoped_percentile_is_merged_population_not_worst_series() {
+        // Two http_req_waiting series: a fast majority (1000 × 10 ms) and a
+        // slow minority (10 × 2000 ms). k6's unscoped p95 is the p95 of the
+        // MERGED population (~10 ms — the fast majority dominates), NOT the
+        // worst sub-series (2000 ms). The old fold(f64::max) reported 2000 ms.
+        let metrics = MetricsResult {
+            http_reqs: 0,
+            errors: 0,
+            checks_total: 0,
+            checks_passed: 0,
+            checks_failed: 0,
+            http_req_duration: None,
+            iteration_duration: None,
+            data_received: 0.0,
+            data_sent: 0.0,
+            dropped_iterations: 0,
+            http_req_failed: 0.0,
+            iterations: 0,
+            vus_max: 0,
+            run_duration: Duration::from_secs(10),
+            metrics: vec![
+                trend_series_with_hist(
+                    "http_req_waiting{url=/fast}",
+                    vec![("url", "/fast")],
+                    &[(10, 1000)],
+                ),
+                trend_series_with_hist(
+                    "http_req_waiting{url=/slow}",
+                    vec![("url", "/slow")],
+                    &[(2000, 10)],
+                ),
+            ],
+            per_url: vec![],
+            per_group: vec![],
+            summary_trend_stats: vec![],
+            effective_thresholds: HashMap::new(),
+        };
+
+        // Unscoped: merged population p95 ≈ 10 ms → threshold passes.
+        let result = evaluate_single_threshold("http_req_waiting.p95 < 100", &metrics);
+        assert!(
+            result.0,
+            "merged p95 (~10 ms) must pass < 100, got {}",
+            result.1
+        );
+        assert!(
+            result.1 < 100.0,
+            "actual {} must be the merged p95, not the 2000 ms worst series",
+            result.1
+        );
+
+        // Sanity: tag-scoped to the SLOW series alone must still fail closed
+        // to its own 2000 ms — merging must not leak across scopes.
+        let slow = evaluate_single_threshold("http_req_waiting{url=/slow}.p95 < 100", &metrics);
+        assert!(
+            !slow.0,
+            "slow series alone must stay at ~2000 ms and fail, got {}",
+            slow.1
+        );
+    }
+
+    #[test]
+    fn tag_scoped_percentile_merges_matching_population() {
+        // Two series both matching {status=200} (distinct urls): 1000 × 10 ms
+        // and 20 × 100 ms (the fast majority is 98% of the merged population,
+        // so the merged p95 index 969 lands in the fast region → ~10 ms). k6
+        // evaluates `{status=200}` over the MERGED population of every
+        // matching series — p95 ≈ 10 ms, not the worst (100 ms). Tag-scoped
+        // was *always* max-folded before this fix.
+        let metrics = MetricsResult {
+            metrics: vec![
+                trend_series_with_hist(
+                    "http_req_waiting{status=200,url=/a}",
+                    vec![("status", "200"), ("url", "/a")],
+                    &[(10, 1000)],
+                ),
+                trend_series_with_hist(
+                    "http_req_waiting{status=200,url=/b}",
+                    vec![("status", "200"), ("url", "/b")],
+                    &[(100, 20)],
+                ),
+            ],
+            ..make_metrics()
+        };
+
+        let result = evaluate_single_threshold("http_req_waiting{status=200}.p95 < 50", &metrics);
+        assert!(
+            result.0,
+            "merged p95 (~10 ms) must pass < 50, got {} — the old max-fold gave 100 ms",
+            result.1
+        );
+
+        // A more selective scope must still isolate its own population.
+        let only_b =
+            evaluate_single_threshold("http_req_waiting{status=200,url=/b}.p95 < 50", &metrics);
+        assert!(
+            !only_b.0,
+            "url=/b alone is ~100 ms and must fail, got {}",
+            only_b.1
+        );
+    }
+
+    #[test]
+    fn merged_percentile_falls_back_to_worst_without_histograms() {
+        // No retained histograms (pre-config window / synthetic summaries):
+        // the fallback keeps the old worst-of behavior so a missing histogram
+        // can never false-PASS a threshold.
+        let mut m1 =
+            trend_series_with_hist("http_req_waiting{url=/a}", vec![("url", "/a")], &[(10, 10)]);
+        let mut m2 = trend_series_with_hist(
+            "http_req_waiting{url=/b}",
+            vec![("url", "/b")],
+            &[(2000, 10)],
+        );
+        m1.histogram = None;
+        m2.histogram = None;
+        let metrics = MetricsResult {
+            metrics: vec![m1, m2],
+            ..make_metrics()
+        };
+        let result = evaluate_single_threshold("http_req_waiting.p95 < 500", &metrics);
+        assert!(
+            !result.0,
+            "no histograms → worst-of fallback (2000 ms) must fail < 500, got {}",
+            result.1
+        );
     }
 
     // ── compound && / || (backlog line 154) ──
