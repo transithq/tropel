@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_sdk::types::{Cookie, Method, Request, Response, ResponseType, Sample, Timings};
+use tropel_sdk::types::{Body, Cookie, Method, Request, Response, ResponseType, Sample, Timings};
 use tropel_sdk::Result;
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
@@ -76,14 +76,14 @@ fn fixture_response(req: &Request) -> Result<Response> {
 /// carried across the jump, a header assertion, and status assertions — every
 /// axis F3 names (status, headers, variable state, assertion results, trace).
 fn fixture_run_request() -> RunRequest {
-    let item = |name: &str, url: &str, test: Option<&str>| ScenarioItem {
+    let item = |name: &str, url: &str, test: Option<&str>, body: Option<Body>| ScenarioItem {
         name: name.into(),
         request: Some(Request {
             url: url.into(),
             method: Method::GET,
             headers: HashMap::new(),
             query_params: HashMap::new(),
-            body: None,
+            body,
             auth: None,
             certificate: None,
             follow_redirects: true,
@@ -103,6 +103,11 @@ fn fixture_run_request() -> RunRequest {
             schema: None,
         },
         items: vec![
+            // Backlog line 44: the FIRST item carries a JSON body so the
+            // wasm leg actually crosses a non-Raw Body over the tropel_host_http
+            // bridge. Under the old postcard wire this decode failed (or the
+            // TS host sent a one-byte junk body); the fixture pins the JSON
+            // round-trip on BOTH legs.
             item(
                 "first",
                 "https://fixture.test/first",
@@ -112,6 +117,7 @@ fn fixture_run_request() -> RunRequest {
                      pm.test('header content-type', () => pm.expect(pm.response.headers.get('content-type')).to.eql('application/json'));\
                      pm.execution.setNextRequest('second');",
                 ),
+                Some(Body::Json(serde_json::json!({ "ok": true }))),
             ),
             item(
                 "second",
@@ -120,6 +126,7 @@ fn fixture_run_request() -> RunRequest {
                     "pm.test('carried variable', () => pm.expect(pm.variables.get('carried')).to.eql('yes'));\
                      pm.test('second status', () => pm.expect(pm.response.code).to.eql(200));",
                 ),
+                None,
             ),
         ],
         variables: HashMap::new(),
@@ -181,9 +188,14 @@ struct HostState {
 }
 
 /// Implements the `env.tropel_host_http` import the wasm build declares
-/// (http.rs): read the postcard `Request` from linear memory, answer with the
-/// SAME fixture response, allocate the reply in wasm memory via the module's
-/// own `tropel_alloc`, and return the packed `(ptr << 32) | len`.
+/// (http.rs): read the JSON-encoded `Request` from linear memory, answer with
+/// the SAME fixture response, allocate the reply in wasm memory via the
+/// module's own `tropel_alloc`, and return the packed `(ptr << 32) | len`.
+///
+/// Backlog line 44: the bridge carries `Request` as JSON, not postcard — the
+/// SDK's `Body`/`AuthConfig` serde is JSON-oriented (deserialize_any /
+/// internally-tagged) and postcard refuses it, so a postcard decode failed
+/// on every non-Raw body. This host decodes the same bytes the JS host does.
 fn host_http(mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32) -> i64 {
     let memory = caller
         .get_export("memory")
@@ -193,7 +205,7 @@ fn host_http(mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32) -> i
     memory
         .read(&caller, req_ptr as usize, &mut req_buf)
         .expect("read request");
-    let req: Request = postcard::from_bytes(&req_buf).expect("decode Request");
+    let req: Request = serde_json::from_slice(&req_buf).expect("decode Request");
     let resp = fixture_response(&req).expect("fixture response");
     let resp_bytes = postcard::to_stdvec(&resp).expect("encode Response");
 
