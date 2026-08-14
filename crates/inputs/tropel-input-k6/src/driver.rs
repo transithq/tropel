@@ -62,6 +62,12 @@ use tropel_sdk::{Result, TropelError};
 // K6Driver — the stateless factory
 // ══════════════════════════════════════════════════════════════════
 
+/// Per-VU QuickJS heap cap (bytes), set in init() via
+/// `JsContext::new_with_force_stop`. A server-controlled response body larger
+/// than this must degrade to an error response, NOT `.expect()`-panic across
+/// the QuickJS FFI boundary (backlog line 46 P0).
+const K6_VU_HEAP_BYTES: usize = 10 * 1024 * 1024;
+
 pub struct K6Driver;
 
 #[async_trait]
@@ -119,7 +125,7 @@ impl Driver for K6Driver {
         // interrupt handler keeps polling the instance-local `force_stop`.
         let sched_link: Arc<OnceLock<Arc<AtomicBool>>> = Arc::new(OnceLock::new());
         let mut js_ctx = JsContext::new_with_force_stop(
-            Some(10 * 1024 * 1024),
+            Some(K6_VU_HEAP_BYTES),
             Some(Duration::from_secs(10)),
             force_stop.clone(),
         )
@@ -772,6 +778,25 @@ fn http_tags_for(
     tags
 }
 
+/// Tiny status-0 error envelope used when a response allocation fails
+/// (backlog line 46 P0): mirrors the invalid-method path so the script sees
+/// a FAILED response (checks fail, http_req_failed counts) instead of a
+/// cross-FFI panic from `.expect()` on a body larger than the per-VU heap
+/// cap. Returns `None` only when the heap has no headroom at all — the
+/// caller then propagates a JS exception (never a panic).
+fn k6_error_envelope<'js>(ctx: &rquickjs::Ctx<'js>, msg: &str) -> Option<rquickjs::Object<'js>> {
+    let e = rquickjs::Object::new(ctx.clone()).ok()?;
+    let _ = e.set("code", 0_i32);
+    let _ = e.set("status", 0_i32);
+    let _ = e.set("status_text", msg);
+    let _ = e.set("error", msg);
+    let _ = e.set("error_code", 1000_i32);
+    let _ = e.set("headers", rquickjs::Object::new(ctx.clone()).ok()?);
+    let _ = e.set("body", "");
+    let _ = e.set("response_time", 0.0_f64);
+    Some(e)
+}
+
 /// Record the standard `http_req_*` samples for a completed request.
 ///
 /// Mirrors the declarative runner's tag set and k6's default success
@@ -1192,14 +1217,21 @@ fn build_k6_response_object<'js>(
     error: &str,
     error_code: i32,
     response_type: &str,
-) -> rquickjs::Object<'js> {
-    let obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 response");
+) -> rquickjs::Result<rquickjs::Object<'js>> {
+    // Backlog line 46 (P0): allocation failures must NOT `.expect()`-panic
+    // across the QuickJS FFI boundary — a server-controlled binary body can
+    // exceed the per-VU heap cap. Small envelope allocations use `?` (the
+    // rquickjs Func converts Err into a script-thrown exception); the body
+    // ArrayBuffer pre-checks the cap and degrades to the status-0 error
+    // response (same shape as the invalid-method path) while the heap still
+    // has headroom.
+    let obj = rquickjs::Object::new(ctx.clone())?;
     let _ = obj.set("code", code as i32);
     let _ = obj.set("status", code as i32);
     let _ = obj.set("status_text", status_text);
     let _ = obj.set("error", error);
     let _ = obj.set("error_code", error_code);
-    let headers_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 headers");
+    let headers_obj = rquickjs::Object::new(ctx.clone())?;
     for (k, v) in headers {
         let _ = headers_obj.set(k.as_str(), v.as_str());
     }
@@ -1207,7 +1239,7 @@ fn build_k6_response_object<'js>(
     let _ = obj.set("response_time", response_time_ms);
     // Real connection-phase timings (k6 keys + Tropel's extra `dns`).
     if let Some(t) = timings {
-        let timings_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 timings");
+        let timings_obj = rquickjs::Object::new(ctx.clone())?;
         let _ = timings_obj.set("blocked", t.blocked.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("dns", t.dns.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("connecting", t.connecting.as_secs_f64() * 1000.0);
@@ -1220,14 +1252,42 @@ fn build_k6_response_object<'js>(
     }
     // `responseType: "binary"` → native ArrayBuffer body (raw bytes survive);
     // otherwise UTF-8 text. `none` (k6) sends an empty body.
+    // NOTE (metrics-vs-script divergence): the caller has ALREADY pushed the
+    // real http_req_* samples (the request completed on the wire) before this
+    // object is built, so degrading to a status-0 envelope here is a JS
+    // REPRESENTATION fallback only — the metrics keep the true status, and
+    // the envelope is the script-visible failure signal. Do NOT "fix" this
+    // by also pushing failure samples (double-counted failures).
     if response_type.eq_ignore_ascii_case("binary") {
-        let ab =
-            rquickjs::ArrayBuffer::new(ctx.clone(), body).expect("ArrayBuffer for k6 binary body");
-        let _ = obj.set("body", ab);
+        // A body at/over the WHOLE heap cap is guaranteed OOM — degrade to
+        // the status-0 envelope BEFORE attempting the allocation, so it can
+        // be built while headroom still exists. In-between sizes try the
+        // ArrayBuffer and fall back to the envelope on failure.
+        if body.len() >= K6_VU_HEAP_BYTES {
+            return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap") {
+                Some(e) => Ok(e),
+                None => Err(rquickjs::Error::Exception),
+            };
+        }
+        match rquickjs::ArrayBuffer::new(ctx.clone(), body) {
+            Ok(ab) => {
+                let _ = obj.set("body", ab);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "k6 binary body allocation failed (heap cap) — status-0 error response"
+                );
+                return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap")
+                {
+                    Some(e) => Ok(e),
+                    None => Err(rquickjs::Error::Exception),
+                };
+            }
+        }
     } else {
         let _ = obj.set("body", String::from_utf8_lossy(&body).into_owned());
     }
-    obj
+    Ok(obj)
 }
 
 impl K6DriverInstance {
@@ -1311,7 +1371,7 @@ fn register_http_bridges<'js>(
                   body: String,
                   response_type: String,
                   extras_json: String|
-                  -> rquickjs::Object<'js> {
+                  -> rquickjs::Result<rquickjs::Object<'js>> {
                 // Backlog line 140: the shim packs per-request
                 // params.timeout/tags/auth/redirects/compression into
                 // ONE JSON string (the bridge closure is arity-capped
