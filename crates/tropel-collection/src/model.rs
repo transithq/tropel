@@ -266,7 +266,9 @@ where
     }
     Ok(match Option::<CodeForm>::deserialize(deserializer)? {
         Some(CodeForm::Any(v)) => match &v {
-            serde_json::Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(0),
+            serde_json::Value::Number(n) => {
+                n.as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(0)
+            }
             serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
             _ => 0,
         },
@@ -746,15 +748,10 @@ mod tests {
         }));
         let mut current = &col.item[0];
         let mut depth = 0;
-        loop {
-            match current {
-                CollectionItem::Folder(f) => {
-                    assert_eq!(f.item.len(), 1, "depth {} must hold one child", depth);
-                    current = &f.item[0];
-                    depth += 1;
-                }
-                CollectionItem::Request(_) => break,
-            }
+        while let CollectionItem::Folder(f) = current {
+            assert_eq!(f.item.len(), 1, "depth {} must hold one child", depth);
+            current = &f.item[0];
+            depth += 1;
             assert!(depth <= 51, "unbounded nesting: {depth}");
         }
         assert_eq!(depth, 50, "all 50 folder levels must survive");
@@ -917,9 +914,15 @@ mod tests {
         }));
         if let CollectionItem::Request(r) = &col.item[0] {
             assert_eq!(r.response[0].code, 200, "string-form code must parse");
-            assert_eq!(r.response[1].code, 0, "out-of-range numeric code must degrade to 0");
+            assert_eq!(
+                r.response[1].code, 0,
+                "out-of-range numeric code must degrade to 0"
+            );
             assert_eq!(r.response[1].response_time.as_deref(), Some("7"));
-            assert_eq!(r.response[0].content_type.as_deref(), Some("application/json"));
+            assert_eq!(
+                r.response[0].content_type.as_deref(),
+                Some("application/json")
+            );
             assert_eq!(r.response[0].response_time.as_deref(), Some("42"));
             assert_eq!(r.response[0].cookie.len(), 2);
             // First cookie: no key, numeric value, camelCase httpOnly.
@@ -931,10 +934,7 @@ mod tests {
             assert_eq!(r.response[0].cookie[0].http_only, Some(true));
             // Second cookie: object value + camelCase sameSite.
             assert_eq!(r.response[0].cookie[1].key.as_deref(), Some("sid"));
-            assert_eq!(
-                r.response[0].cookie[1].same_site.as_deref(),
-                Some("Strict")
-            );
+            assert_eq!(r.response[0].cookie[1].same_site.as_deref(), Some("Strict"));
         } else {
             panic!("expected request");
         }

@@ -1541,7 +1541,14 @@ mod tests {
         let globals = HashMap::from([("k".to_string(), Value::String("from-globals".into()))]);
 
         // Full shadow chain: data wins.
-        let got = variables_lookup("k", &HashMap::new(), Some(&data), &env, &collection, &globals);
+        let got = variables_lookup(
+            "k",
+            &HashMap::new(),
+            Some(&data),
+            &env,
+            &collection,
+            &globals,
+        );
         assert_eq!(
             got.as_deref(),
             Some("\"from-data\""),
@@ -1557,7 +1564,14 @@ mod tests {
         );
 
         // No data, no env: collection wins.
-        let got = variables_lookup("k", &HashMap::new(), None, &HashMap::new(), &collection, &globals);
+        let got = variables_lookup(
+            "k",
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            &collection,
+            &globals,
+        );
         assert_eq!(
             got.as_deref(),
             Some("\"from-collection\""),
@@ -1565,7 +1579,14 @@ mod tests {
         );
 
         // Only globals.
-        let got = variables_lookup("k", &HashMap::new(), None, &HashMap::new(), &HashMap::new(), &globals);
+        let got = variables_lookup(
+            "k",
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &globals,
+        );
         assert_eq!(
             got.as_deref(),
             Some("\"from-globals\""),
@@ -1573,7 +1594,14 @@ mod tests {
         );
 
         // No scope has it.
-        let got = variables_lookup("missing", &HashMap::new(), Some(&data), &env, &collection, &globals);
+        let got = variables_lookup(
+            "missing",
+            &HashMap::new(),
+            Some(&data),
+            &env,
+            &collection,
+            &globals,
+        );
         assert_eq!(got, None, "unknown key resolves to None");
     }
 
@@ -1647,7 +1675,8 @@ mod tests {
         );
 
         // Empty body stays None.
-        let (_, _, body) = resolve_send_request("u", "{}", "", &HashMap::new(), &env, &collection, &globals);
+        let (_, _, body) =
+            resolve_send_request("u", "{}", "", &HashMap::new(), &env, &collection, &globals);
         assert!(body.is_none(), "empty body must stay None");
     }
 

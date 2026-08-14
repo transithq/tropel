@@ -52,10 +52,7 @@ impl InputAdapter for PostmanInputAdapter {
         let Ok(probe) = serde_json::from_slice::<Probe>(bytes) else {
             return false;
         };
-        let schema = probe
-            .info
-            .and_then(|info| info.schema)
-            .unwrap_or_default();
+        let schema = probe.info.and_then(|info| info.schema).unwrap_or_default();
         schema.contains("getpostman.com") && schema.contains("collection")
     }
 
