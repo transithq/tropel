@@ -22,6 +22,11 @@ pub(crate) fn build_summary_data(
 ) -> serde_json::Value {
     let mut metrics = Map::new();
     for m in &results.metrics {
+        // k6's `contains` reflects the metric's declared unit (Time/Data/
+        // Default) — delegated to tropel-metrics `unit_of` (single source of
+        // truth shared with json-stream/stdout, backlog line 32).
+        let base = m.key.split('{').next().unwrap_or(&m.key);
+        let contains = tropel_metrics::time_metrics::unit_of(base).as_str();
         let (typ, contains, values) = match m.metric_type {
             MetricType::Counter => {
                 // k6 handleSummary Counter values: `count` (accumulated) +
@@ -34,33 +39,25 @@ pub(crate) fn build_summary_data(
                 };
                 (
                     "counter",
-                    "default",
+                    contains,
                     json!({ "count": m.count, "rate": rate }),
                 )
             }
             MetricType::Gauge => (
                 "gauge",
-                "default",
+                contains,
                 json!({ "value": m.last, "min": m.min, "max": m.max, "avg": m.mean }),
             ),
             MetricType::Rate => (
                 "rate",
-                "default",
+                contains,
                 json!({ "rate": m.rate, "count": m.count }),
             ),
             MetricType::Trend => {
                 // Values are already in ms end-to-end (backlog §0); k6's
-                // `contains` is `"time"` only for duration metrics — a custom
-                // byte-count Trend must NOT be labelled time (the old code
-                // hardcoded "time" for every Trend). The classification
-                // delegates to tropel-metrics (single source of truth shared
-                // with json-stream/stdout) so outputs never disagree.
-                let base = m.key.split('{').next().unwrap_or(&m.key);
-                let contains = if tropel_metrics::time_metrics::is_time_metric(base) {
-                    "time"
-                } else {
-                    "default"
-                };
+                // `contains` reflects the metric's declared unit (Time/Data/
+                // Default) — a custom byte-count Trend is NOT labelled time
+                // (the old code hardcoded "time" for every Trend).
                 (
                     "trend",
                     contains,
