@@ -62,6 +62,12 @@ use tropel_sdk::{Result, TropelError};
 // K6Driver — the stateless factory
 // ══════════════════════════════════════════════════════════════════
 
+/// Per-VU QuickJS heap cap (bytes), set in init() via
+/// `JsContext::new_with_force_stop`. A server-controlled response body larger
+/// than this must degrade to an error response, NOT `.expect()`-panic across
+/// the QuickJS FFI boundary (backlog line 46 P0).
+const K6_VU_HEAP_BYTES: usize = 10 * 1024 * 1024;
+
 pub struct K6Driver;
 
 #[async_trait]
@@ -72,9 +78,14 @@ impl Driver for K6Driver {
 
     fn detect(&self, bytes: &[u8]) -> bool {
         if let Ok(text) = std::str::from_utf8(bytes) {
-            // Reject Postman collections (handled by the Postman adapter)
-            let looks_like_collection = text.contains("postman") || text.contains("\"item\"");
-            if looks_like_collection {
+            // Reject ACTUAL Postman collections (handled by the Postman
+            // adapter) using the SAME STRUCTURAL check the Postman adapter
+            // uses — a JSON doc whose top-level info.schema points at the
+            // getpostman.com collection schema. Substring matching is
+            // forbidden (backlog line 61): a k6 script hitting k6's own
+            // documented postman-echo.com endpoint legitimately contains
+            // the word "postman" and was rejected.
+            if crate::is_postman_collection(text) {
                 return false;
             }
             let has_export_default = text.contains("export default");
@@ -119,7 +130,7 @@ impl Driver for K6Driver {
         // interrupt handler keeps polling the instance-local `force_stop`.
         let sched_link: Arc<OnceLock<Arc<AtomicBool>>> = Arc::new(OnceLock::new());
         let mut js_ctx = JsContext::new_with_force_stop(
-            Some(10 * 1024 * 1024),
+            Some(K6_VU_HEAP_BYTES),
             Some(Duration::from_secs(10)),
             force_stop.clone(),
         )
@@ -595,10 +606,11 @@ pub struct K6DriverInstance {
     /// 'static and can't reach the VuContext, so they push into this buffer
     /// and run_iteration() drains it into ctx.samples after each iteration.
     sample_sink: Arc<Mutex<Vec<Sample>>>,
-    /// Per-VU group() stack (backlog line 154). `group(name)` pushes here,
-    /// the matching group_end pops; the http bridges read the top when
-    /// stamping http_req_* samples so metrics recorded inside a group carry
-    /// `group=::name` (k6 parity) instead of the hardcoded `group=http`.
+    /// Per-VU group() stack (backlog line 154). `group(name)` pushes the
+    /// FULL `::a::b` path here (backlog line 63), the matching group_end
+    /// pops; the http/checks bridges read the top when stamping samples so
+    /// metrics recorded inside a group carry `group=::a::b` (k6 parity)
+    /// instead of the innermost raw name or the hardcoded `group=http`.
     group_stack: Arc<Mutex<Vec<String>>>,
     /// Shared exec.* state — the pm.js / k6-shim / exec.js scripts read it
     /// through __tropel_exec_* closures registered lazily; sync_globals()
@@ -772,6 +784,25 @@ fn http_tags_for(
     tags
 }
 
+/// Tiny status-0 error envelope used when a response allocation fails
+/// (backlog line 46 P0): mirrors the invalid-method path so the script sees
+/// a FAILED response (checks fail, http_req_failed counts) instead of a
+/// cross-FFI panic from `.expect()` on a body larger than the per-VU heap
+/// cap. Returns `None` only when the heap has no headroom at all — the
+/// caller then propagates a JS exception (never a panic).
+fn k6_error_envelope<'js>(ctx: &rquickjs::Ctx<'js>, msg: &str) -> Option<rquickjs::Object<'js>> {
+    let e = rquickjs::Object::new(ctx.clone()).ok()?;
+    let _ = e.set("code", 0_i32);
+    let _ = e.set("status", 0_i32);
+    let _ = e.set("status_text", msg);
+    let _ = e.set("error", msg);
+    let _ = e.set("error_code", 1000_i32);
+    let _ = e.set("headers", rquickjs::Object::new(ctx.clone()).ok()?);
+    let _ = e.set("body", "");
+    let _ = e.set("response_time", 0.0_f64);
+    Some(e)
+}
+
 /// Record the standard `http_req_*` samples for a completed request.
 ///
 /// Mirrors the declarative runner's tag set and k6's default success
@@ -831,6 +862,26 @@ fn push_redirect_hops(
             extra_tags,
             group,
         );
+    }
+}
+
+/// Backlog line 97: parse a tags JSON object into a [`TagMap`], coercing
+/// non-string values to strings (k6's `check(res, conds, {code: 200})` —
+/// k6 `ToString`s every tag value). The old `from_str::<HashMap<String,
+/// String>>()` failed on `{"code":200}` and silently dropped the ENTIRE
+/// tag map; this lenient parse never fails and never drops the map.
+fn stringify_tag_map_into(j: &str, tags: &mut TagMap) {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(j) {
+        for (k, val) in map {
+            let s = match val {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            tags.insert(k, s);
+        }
     }
 }
 
@@ -1077,6 +1128,22 @@ impl DriverInstance for K6DriverInstance {
             self.register_ws_bridges();
         }
 
+        // Backlog line 99: timer state must not leak across iterations.
+        // __tropel_timers is module-scope in k6-shim.js; without a reset,
+        // a setInterval armed in every iteration accumulates live intervals
+        // that all fire on every subsequent pump (linear callback growth +
+        // retained closures for the VU's life). Reset at the START of each
+        // iteration so only timers armed during THIS iteration stay live —
+        // they fire at this iteration's boundary pump, then are cleared.
+        let _ = self.js_ctx.with_ctx(|rq_ctx| {
+            if let Ok(reset) = rq_ctx
+                .globals()
+                .get::<_, rquickjs::Function>("__tropel_reset_timers")
+            {
+                let _ = reset.call::<_, rquickjs::Value>(());
+            }
+        });
+
         // Sync VuContext state into JS globals (__tropel_vu_id, etc.)
         self.sync_globals(ctx).await?;
 
@@ -1097,6 +1164,33 @@ impl DriverInstance for K6DriverInstance {
                 Some("k6-iteration.js".to_string()),
             )
             .await;
+
+        // k6/timers (backlog line 131): fire due setTimeout/setInterval
+        // callbacks at the iteration boundary. k6 runs its timers on the VU
+        // event loop; Tropel executes JS synchronously per iteration, so the
+        // closest equivalent is pumping them here — which is exactly what
+        // unblocks the lodash debounce/throttle shims. A throwing callback
+        // is logged (not fatal), matching a best-effort event loop.
+        //
+        // Backlog line 100: the pump must run BEFORE the sample drain. Timer
+        // callbacks record samples (and may test.abort()) through the same
+        // bridge closures; draining first meant a callback's samples landed
+        // after the drain — picked up next iteration, or silently DISCARDED
+        // on the last one, and a timer's abort was delayed or lost.
+        // NOTE: the pump also runs BEFORE the error return below so timers
+        // armed in this iteration still drain even when the iteration itself
+        // threw (strict event-loop behavior — timers are not hostage to a
+        // throw).
+        let _ = self.js_ctx.with_ctx(|rq_ctx| {
+            if let Ok(pump) = rq_ctx
+                .globals()
+                .get::<_, rquickjs::Function>("__tropel_pump_timers")
+            {
+                if let Err(e) = pump.call::<_, rquickjs::Value>(()) {
+                    tracing::warn!("k6 timer callback error: {}", e);
+                }
+            }
+        });
 
         // Drain samples recorded by the native bridge closures during this
         // iteration (http_req_*, checks, custom metrics) into the VuContext
@@ -1123,29 +1217,11 @@ impl DriverInstance for K6DriverInstance {
         ctx.samples.extend(bridge_samples);
 
         // Surface test.abort() to the engine so the run stops cleanly.
+        // Runs AFTER the pump (line 100: a timer callback's test.abort()
+        // must reach the engine this iteration, not next).
         if let Some(msg) = std::mem::take(&mut *self.abort_requested.lock().unwrap()) {
             ctx.abort(Some(msg));
         }
-
-        // k6/timers (backlog line 131): fire due setTimeout/setInterval
-        // callbacks at the iteration boundary. k6 runs its timers on the VU
-        // event loop; Tropel executes JS synchronously per iteration, so the
-        // closest equivalent is pumping them here — which is exactly what
-        // unblocks the lodash debounce/throttle shims. A throwing callback
-        // is logged (not fatal), matching a best-effort event loop.
-        // NOTE: the pump runs BEFORE the error return below so timers armed
-        // in this iteration still drain even when the iteration itself threw
-        // (strict event-loop behavior — timers are not hostage to a throw).
-        let _ = self.js_ctx.with_ctx(|rq_ctx| {
-            if let Ok(pump) = rq_ctx
-                .globals()
-                .get::<_, rquickjs::Function>("__tropel_pump_timers")
-            {
-                if let Err(e) = pump.call::<_, rquickjs::Value>(()) {
-                    tracing::warn!("k6 timer callback error: {}", e);
-                }
-            }
-        });
 
         // A rejected/thrown default export must fail the iteration (the
         // engine logs it and bumps the error path), not be swallowed.
@@ -1192,14 +1268,21 @@ fn build_k6_response_object<'js>(
     error: &str,
     error_code: i32,
     response_type: &str,
-) -> rquickjs::Object<'js> {
-    let obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 response");
+) -> rquickjs::Result<rquickjs::Object<'js>> {
+    // Backlog line 46 (P0): allocation failures must NOT `.expect()`-panic
+    // across the QuickJS FFI boundary — a server-controlled binary body can
+    // exceed the per-VU heap cap. Small envelope allocations use `?` (the
+    // rquickjs Func converts Err into a script-thrown exception); the body
+    // ArrayBuffer pre-checks the cap and degrades to the status-0 error
+    // response (same shape as the invalid-method path) while the heap still
+    // has headroom.
+    let obj = rquickjs::Object::new(ctx.clone())?;
     let _ = obj.set("code", code as i32);
     let _ = obj.set("status", code as i32);
     let _ = obj.set("status_text", status_text);
     let _ = obj.set("error", error);
     let _ = obj.set("error_code", error_code);
-    let headers_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 headers");
+    let headers_obj = rquickjs::Object::new(ctx.clone())?;
     for (k, v) in headers {
         let _ = headers_obj.set(k.as_str(), v.as_str());
     }
@@ -1207,7 +1290,7 @@ fn build_k6_response_object<'js>(
     let _ = obj.set("response_time", response_time_ms);
     // Real connection-phase timings (k6 keys + Tropel's extra `dns`).
     if let Some(t) = timings {
-        let timings_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 timings");
+        let timings_obj = rquickjs::Object::new(ctx.clone())?;
         let _ = timings_obj.set("blocked", t.blocked.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("dns", t.dns.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("connecting", t.connecting.as_secs_f64() * 1000.0);
@@ -1220,14 +1303,42 @@ fn build_k6_response_object<'js>(
     }
     // `responseType: "binary"` → native ArrayBuffer body (raw bytes survive);
     // otherwise UTF-8 text. `none` (k6) sends an empty body.
+    // NOTE (metrics-vs-script divergence): the caller has ALREADY pushed the
+    // real http_req_* samples (the request completed on the wire) before this
+    // object is built, so degrading to a status-0 envelope here is a JS
+    // REPRESENTATION fallback only — the metrics keep the true status, and
+    // the envelope is the script-visible failure signal. Do NOT "fix" this
+    // by also pushing failure samples (double-counted failures).
     if response_type.eq_ignore_ascii_case("binary") {
-        let ab =
-            rquickjs::ArrayBuffer::new(ctx.clone(), body).expect("ArrayBuffer for k6 binary body");
-        let _ = obj.set("body", ab);
+        // A body at/over the WHOLE heap cap is guaranteed OOM — degrade to
+        // the status-0 envelope BEFORE attempting the allocation, so it can
+        // be built while headroom still exists. In-between sizes try the
+        // ArrayBuffer and fall back to the envelope on failure.
+        if body.len() >= K6_VU_HEAP_BYTES {
+            return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap") {
+                Some(e) => Ok(e),
+                None => Err(rquickjs::Error::Exception),
+            };
+        }
+        match rquickjs::ArrayBuffer::new(ctx.clone(), body) {
+            Ok(ab) => {
+                let _ = obj.set("body", ab);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "k6 binary body allocation failed (heap cap) — status-0 error response"
+                );
+                return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap")
+                {
+                    Some(e) => Ok(e),
+                    None => Err(rquickjs::Error::Exception),
+                };
+            }
+        }
     } else {
         let _ = obj.set("body", String::from_utf8_lossy(&body).into_owned());
     }
-    obj
+    Ok(obj)
 }
 
 impl K6DriverInstance {
@@ -1311,7 +1422,7 @@ fn register_http_bridges<'js>(
                   body: String,
                   response_type: String,
                   extras_json: String|
-                  -> rquickjs::Object<'js> {
+                  -> rquickjs::Result<rquickjs::Object<'js>> {
                 // Backlog line 140: the shim packs per-request
                 // params.timeout/tags/auth/redirects/compression into
                 // ONE JSON string (the bridge closure is arity-capped
@@ -1818,6 +1929,7 @@ impl K6DriverInstance {
 
             // check() / pm.test() → checks Rate sample
             let sink_test = sink.clone();
+            let group_test = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
@@ -1825,14 +1937,22 @@ impl K6DriverInstance {
                     move |name: String, passed: bool, tags_json: Option<String>| {
                         let mut v = sink_test.lock().unwrap();
                         let now = tropel_js::clock::monotonic_wall_now();
-                        let mut tags = TagMap::with_capacity(2);
+                        let mut tags = TagMap::with_capacity(3);
                         tags.insert("check", name);
+                        // Backlog line 63: checks carry the current group
+                        // path (k6 parity) — nested group() stamps
+                        // group=::checkout::payment on the checks sample too.
+                        if let Some(g) = group_test.lock().unwrap().last() {
+                            tags.insert("group", g.clone());
+                        }
                         if let Some(j) = tags_json {
-                            if let Ok(extra) = serde_json::from_str::<HashMap<String, String>>(&j) {
-                                for (k, val) in extra {
-                                    tags.insert(k, val);
-                                }
-                            }
+                            // Backlog line 97: tag values may be non-strings
+                            // (check(r, {...}, {code: 200}) — k6 coerces every
+                            // tag value to a string). from_str::<HashMap<
+                            // String,String>>() failed on {"code":200} and
+                            // dropped the ENTIRE tag map; parse the object
+                            // and stringify each value instead.
+                            stringify_tag_map_into(&j, &mut tags);
                         }
                         v.push(Sample {
                             metric: "checks".into(),
@@ -1860,15 +1980,17 @@ impl K6DriverInstance {
                           metric_type_str: String,
                           is_time: bool| {
                         if is_time {
-                            tropel_metrics::time_metrics::register(&name);
+                            tropel_metrics::time_metrics::register(
+                                &name,
+                                tropel_metrics::MetricUnit::Time,
+                            );
                         }
-                        let tags = if tags_json.is_empty() || tags_json == "{}" {
-                            TagMap::new()
-                        } else {
-                            let parsed: HashMap<String, String> =
-                                serde_json::from_str(&tags_json).unwrap_or_default();
-                            TagMap::from_pairs(parsed)
-                        };
+                        let mut tags = TagMap::new();
+                        if !tags_json.is_empty() && tags_json != "{}" {
+                            // Backlog line 97: same lenient parse as check() —
+                            // metric.add(1, {code: 200}) must not drop the map.
+                            stringify_tag_map_into(&tags_json, &mut tags);
+                        }
                         let sample_type = match metric_type_str.as_str() {
                             "counter" => SampleType::Counter,
                             "gauge" => SampleType::Point,
@@ -1935,24 +2057,41 @@ impl K6DriverInstance {
             let _ = globals.set(
                 "__tropel_pm_group_start",
                 Func::from(move |name: String| {
-                    group_start.lock().unwrap().push(name);
+                    // Backlog line 63: push the FULL ::a::b path, not the bare
+                    // leaf — every consumer reads group_stack.last() and k6
+                    // tags nested groups group=::checkout::payment. Two
+                    // same-named leaves under different parents must NOT merge
+                    // into one series.
+                    let mut s = group_start.lock().unwrap();
+                    let full = match s.last() {
+                        Some(parent) => format!("{}::{}", parent, name),
+                        None => format!("::{}", name),
+                    };
+                    s.push(full);
                 }),
             );
             let group_end = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
-                    if let Some(top) = group_end.lock().unwrap().pop() {
-                        // Defensive: the JS shim always calls end with the
-                        // matching name; if a script mismatches, don't lose
-                        // the whole stack — just drop the stale top.
-                        if top != name {
-                            tracing::debug!("k6 group_end mismatch: top={} got={}", top, name);
-                        }
+                    // Backlog line 63: pop the FULL ::a::b path (start pushed
+                    // it) and tag group_duration with it — k6 tags nested
+                    // groups group=::checkout::payment, not the bare leaf.
+                    let full = group_end
+                        .lock()
+                        .unwrap()
+                        .pop()
+                        .unwrap_or_else(|| format!("::{}", name));
+                    // Defensive: compare the LEAF (the stack stores full
+                    // ::a::b paths); a mismatched script drops the stale top
+                    // without losing the whole stack.
+                    let leaf = full.rsplit("::").next().unwrap_or(&full);
+                    if leaf != name {
+                        tracing::debug!("k6 group_end mismatch: top={} got={}", full, name);
                     }
                     let mut v = sink_group.lock().unwrap();
                     let mut tags = TagMap::with_capacity(1);
-                    tags.insert("group", name);
+                    tags.insert("group", full);
                     v.push(Sample {
                         metric: "group_duration".into(),
                         value: duration_ms, // ms — the public unit (k6 semantics)
@@ -4030,9 +4169,16 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__captured = [];
+                // Echo stub: the new missing-key guard throws on a bare '{}'
+                // — return a response for every key the shim sends.
                 globalThis.__tropel_k6_http_batch = function (requestsJson) {
-                    globalThis.__captured.push(JSON.parse(requestsJson));
-                    return '{}';
+                    var reqs = JSON.parse(requestsJson);
+                    var out = {};
+                    for (var ri = 0; ri < reqs.length; ri++) {
+                        out[reqs[ri].key] = { status: 200, code: 200, body: 'ok', headers: {}, timings: {} };
+                    }
+                    globalThis.__captured.push(reqs);
+                    return JSON.stringify(out);
                 };
                 http.batch([
                     ['GET', 'https://example.com/1', null, {
@@ -4073,6 +4219,116 @@ mod tests {
             assert!(
                 entries.contains("\"auth_json\":\"null\""),
                 "batch auth not null when absent: {entries}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_http_batch_object_form_params_duplicate_keys_and_loud_failures() {
+        // Backlog §3: the batch path missed every single-request fix.
+        // - object-form entries dropped auth/redirects/compression/cookies
+        // - object-form forced timeout '30s' (overriding the global)
+        // - duplicate `name` keys collided (one real response lost)
+        // - http.batch('abc') returned {} silently
+        // - body: req.body || null dropped 0/''/false
+        // - a missing native key fabricated a silent status-0 response
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                // Echo stub: return a response for EVERY key the shim sends —
+                // the new missing-key guard throws otherwise (that guard is
+                // what the separate '{}' stub below exercises).
+                globalThis.__tropel_k6_http_batch = function (requestsJson) {
+                    var reqs = JSON.parse(requestsJson);
+                    var out = {};
+                    for (var ri = 0; ri < reqs.length; ri++) {
+                        out[reqs[ri].key] = { status: 200, code: 200, body: 'ok', headers: {}, timings: {} };
+                    }
+                    globalThis.__captured.push(reqs);
+                    return JSON.stringify(out);
+                };
+                // Object-form entry: every per-request param must survive;
+                // falsy body 0 must NOT become null; no forced '30s'.
+                http.batch([{
+                    url: 'https://example.com/o1',
+                    method: 'POST',
+                    body: 0,
+                    params: {
+                        auth: { username: 'u', password: 'p' },
+                        redirects: 0,
+                        compression: 'gzip',
+                        cookies: { sid: 's1' },
+                    },
+                }]);
+                // Duplicate names: BOTH object-form with the same name so the
+                // keys actually collide in the batch caller; the round-trip
+                // keys must be deduped so both responses survive the map.
+                http.batch([
+                    { url: 'https://example.com/d1', name: 'dup' },
+                    { url: 'https://example.com/d2', name: 'dup' },
+                ]);
+                // http.batch('abc') must throw, not return an object silently.
+                var threwAbc = false;
+                try { http.batch('abc'); } catch (e) { threwAbc = true; }
+                // A missing native key must throw, not fabricate status-0 —
+                // this needs a bare '{}' stub (the echo stub never misses).
+                var threwMissing = false;
+                globalThis.__tropel_k6_http_batch = function () { return '{}'; };
+                try { http.batch([['GET', 'https://example.com/m']]); } catch (e) { threwMissing = true; }
+                globalThis.__threwAbc = threwAbc;
+                globalThis.__threwMissing = threwMissing;
+            "#,
+            )
+            .expect("script should eval");
+
+            // First call: object-form params all present + falsy body kept.
+            let first: String = ctx
+                .eval("JSON.stringify(__captured[0])")
+                .expect("read first batch call");
+            assert!(
+                first.contains("\"auth_json\":\"{\\\"type\\\":\\\"basic\\\""),
+                "object-form auth dropped: {first}"
+            );
+            assert!(first.contains("\"redirects\":0"), "object-form redirects dropped: {first}");
+            assert!(
+                first.contains("\"compression\":\"gzip\""),
+                "object-form compression dropped: {first}"
+            );
+            // cookies are merged into the Cookie header by normalizeK6Request.
+            assert!(
+                first.contains("sid=s1"),
+                "object-form cookies not merged into Cookie header: {first}"
+            );
+            assert!(
+                first.contains("\"body\":\"0\""),
+                "falsy body 0 dropped to null: {first}"
+            );
+            assert!(
+                first.contains("\"timeout_ms\":0"),
+                "object-form forced a timeout instead of leaving it 0: {first}"
+            );
+
+            // Second call: duplicate names deduped to distinct keys.
+            let second: String = ctx
+                .eval("JSON.stringify(__captured[1].map(function(e){return e.key;}))")
+                .expect("read second batch call keys");
+            assert_eq!(
+                second, "[\"dup\",\"dup#1\"]",
+                "duplicate batch names must be deduped: {second}"
+            );
+
+            assert!(
+                ctx.eval::<bool, _>("__threwAbc").expect("read threwAbc"),
+                "http.batch('abc') must throw, not return an object silently"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__threwMissing").expect("read threwMissing"),
+                "missing native key must throw, not fabricate status-0"
             );
         });
     }
@@ -4335,6 +4591,240 @@ mod tests {
     }
 
     #[test]
+    fn test_bru_res_get_status_returns_code_and_status_text() {
+        // TROPEL_PARITY_BRUNO.md §0: res.getStatus() returned the status TEXT
+        // ("OK") while Bruno's docs say it returns the numeric code — the
+        // canonical `expect(res.getStatus()).to.equal(200)` idiom silently
+        // failed. res.getStatusText() is the member that returns the text, and
+        // it didn't exist.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
+                globalThis.__status_code = res.getStatus();
+                globalThis.__status_text = res.getStatusText();
+                globalThis.__status_code_type = typeof res.getStatus();
+                globalThis.__eql_ok = String((function () {
+                    try { return res.getStatus() === 200; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                // Non-200 trial: proves the bridge value is actually read
+                // (a hardcoded 200 constant could not distinguish itself).
+                globalThis.__tropel_pm_response_code = function () { return 404; };
+                globalThis.__tropel_pm_response_status = function () { return 'Not Found'; };
+                globalThis.__status_404 = res.getStatus();
+                globalThis.__status_404_text = res.getStatusText();
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<i64, _>("__status_code").unwrap(),
+                200,
+                "res.getStatus() must return the numeric code (was the text 'OK')"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_code_type").unwrap(),
+                "number",
+                "res.getStatus() must be a number, not a string"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_text").unwrap(),
+                "OK",
+                "res.getStatusText() must return the status text"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__eql_ok").unwrap(),
+                "true",
+                "res.getStatus() === 200 must hold (the canonical Bruno assertion)"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__status_404").unwrap(),
+                404,
+                "res.getStatus() must reflect a non-200 bridge value (404), proving the bridge is read"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_404_text").unwrap(),
+                "Not Found",
+                "res.getStatusText() must reflect the 404 status text"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bru_runtime_vars_route_through_variables_store() {
+        // TROPEL_PARITY_BRUNO.md §2: bru.getVar/setVar used to map to the
+        // COLLECTION vars bridges — but Bruno's getVar/setVar are RUNTIME-scope
+        // (in-memory, per collection run). The mis-scoping silently broke the
+        // core request-chaining idiom (setVar in one request, getVar in the
+        // next). The shim now routes through __tropel_pm_variables_* (the same
+        // fall-through store pm.variables uses), and the family
+        // hasVar/deleteVar/getAllVars/deleteAllVars is exposed.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Route-spy: the VARIABLES bridge must be the one called.
+                var __vars_calls = [];
+                globalThis.__tropel_pm_variables_get = function (key) {
+                    __vars_calls.push('get:' + key);
+                    if (key === 'userId') return '42';
+                    if (key === 'token') return '"abc"';
+                    return null;
+                };
+                globalThis.__tropel_pm_variables_set = function (key, value) {
+                    __vars_calls.push('set:' + key + '=' + value);
+                };
+                globalThis.__tropel_pm_variables_unset = function (key) {
+                    __vars_calls.push('unset:' + key);
+                };
+                // The COLLECTION bridge must NOT be touched.
+                globalThis.__tropel_pm_collection_vars_get = function () {
+                    throw new Error('getVar must not read collection vars');
+                };
+                globalThis.__tropel_pm_collection_vars_set = function () {
+                    throw new Error('setVar must not write collection vars');
+                };
+                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                    return { userId: '42', token: '"abc"', flag: 'true' };
+                };
+                var v1 = bru.getVar('userId');
+                bru.setVar('userId', 42);
+                var h1 = bru.hasVar('userId');
+                var h2 = bru.hasVar('missing');
+                bru.deleteVar('token');
+                var all = bru.getAllVars();
+                bru.deleteAllVars();
+                globalThis.__v1 = v1;
+                globalThis.__v1_type = typeof v1;
+                globalThis.__h1 = String(h1);
+                globalThis.__h2 = String(h2);
+                globalThis.__all_keys = Object.keys(all).sort().join(',');
+                globalThis.__all_userId = all.userId;
+                globalThis.__calls = __vars_calls.join('|');
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__v1_type").unwrap(),
+                "number",
+                "bru.getVar must JSON.parse the bridge value (42 → number, not '42' string)"
+            );
+            assert_eq!(ctx.eval::<i64, _>("__v1").unwrap(), 42);
+            assert_eq!(
+                ctx.eval::<String, _>("__h1").unwrap(),
+                "true",
+                "bru.hasVar must be true for an existing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h2").unwrap(),
+                "false",
+                "bru.hasVar must be false for a missing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__all_keys").unwrap(),
+                "flag,token,userId",
+                "bru.getAllVars must return all runtime vars (JSON-parsed)"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__all_userId").unwrap(),
+                42,
+                "bru.getAllVars must include the runtime var set via setVar as a JSON-parsed NUMBER (request-chaining reads it back)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__calls").unwrap(),
+                "get:userId|set:userId=42|get:userId|get:missing|unset:token|unset:userId|unset:token|unset:flag",
+                "getVar/setVar must hit the variables bridges (not collection), hasVar one lookup each, and deleteAllVars must unset every key"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bru_collection_vars_family() {
+        // TROPEL_PARITY_BRUNO.md §2: Bruno exposes the collection scope via
+        // getCollectionVar/setCollectionVar/hasCollectionVar/delete* — the
+        // shim only had getVar/setVar (aliased to collection). The explicit
+        // family now maps to the __tropel_pm_collection_vars_* bridges.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                var __store = { baseUrl: '"https://api.example.com"', retries: '3' };
+                globalThis.__tropel_pm_collection_vars_get = function (key) {
+                    return Object.prototype.hasOwnProperty.call(__store, key) ? __store[key] : null;
+                };
+                globalThis.__tropel_pm_collection_vars_set = function (key, value) {
+                    __store[key] = value;
+                };
+                globalThis.__tropel_pm_collection_vars_has = function (key) {
+                    return Object.prototype.hasOwnProperty.call(__store, key);
+                };
+                globalThis.__tropel_pm_collection_vars_unset = function (key) {
+                    delete __store[key];
+                };
+                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                    var out = {};
+                    for (var k in __store) out[k] = __store[k];
+                    return out;
+                };
+                var b1 = bru.getCollectionVar('baseUrl');
+                bru.setCollectionVar('token', '"abc"');
+                var h1 = bru.hasCollectionVar('baseUrl');
+                var h2 = bru.hasCollectionVar('missing');
+                bru.deleteCollectionVar('retries');
+                var after = JSON.stringify(__store);
+                bru.deleteAllCollectionVars();
+                var after_all = JSON.stringify(__store);
+                globalThis.__b1_type = typeof b1;
+                globalThis.__h1 = String(h1);
+                globalThis.__h2 = String(h2);
+                globalThis.__after = after;
+                globalThis.__after_all = after_all;
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__b1_type").unwrap(),
+                "string",
+                "bru.getCollectionVar must JSON.parse the bridge value (\"https://…\" is a string, not an object)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h1").unwrap(),
+                "true",
+                "bru.hasCollectionVar must be true for an existing collection var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h2").unwrap(),
+                "false",
+                "bru.hasCollectionVar must be false for a missing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__after").unwrap(),
+                "{\"baseUrl\":\"\\\"https://api.example.com\\\"\",\"token\":\"\\\"abc\\\"\"}",
+                "setCollectionVar must add, deleteCollectionVar must remove (the stub store keeps JSON-encoded values, hence the escaped quotes)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__after_all").unwrap(),
+                "{}",
+                "bru.deleteAllCollectionVars must clear every collection var"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_expect_eql_is_deep_equal() {
         // Backlog line 144: pm.expect(...).to.eql() was strict === while
         // .equal() delegated to eql — inverted vs chai. Deep-equal means a
@@ -4398,13 +4888,261 @@ mod tests {
     }
 
     #[test]
+    fn test_eql_typed_and_circular_values_compare_by_value() {
+        // Backlog line 85: Date/Set/Map/RegExp collapsed to Object.keys() = []
+        // so ANY two instances compared equal (pm.expect(new Date(1))
+        // .to.eql(new Date(2)) passed). They now compare by value; circular
+        // structures no longer overflow the stack. The same fix landed in all
+        // three deep-equal implementations (pm.js deepEqual, chai-shim
+        // jsDeepEqual, lodash-shim isEqualDeep) — this test locks all three.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/lodash/lodash-shim.js"))
+                .expect("lodash shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                trial('pm_date_same', function () { pm.expect(new Date(1700000000000)).to.eql(new Date(1700000000000)); });
+                trial('pm_date_diff', function () { pm.expect(new Date(1700000000000)).to.eql(new Date(1)); });
+                trial('pm_re_same', function () { pm.expect(/a+b/i).to.eql(/a+b/i); });
+                trial('pm_re_flags', function () { pm.expect(/a+b/i).to.eql(/a+b/g); });
+                trial('pm_re_flag_order', function () { pm.expect(/a+b/gi).to.eql(/a+b/ig); });
+                trial('pm_set_order', function () { pm.expect(new Set([1, 2, 3])).to.eql(new Set([3, 1, 2])); });
+                trial('pm_set_diff', function () { pm.expect(new Set([1, 2])).to.eql(new Set([1, 3])); });
+                trial('pm_map_same', function () { pm.expect(new Map([['a', 1]])).to.eql(new Map([['a', 1]])); });
+                trial('pm_map_diff', function () { pm.expect(new Map([['a', 1]])).to.eql(new Map([['a', 2]])); });
+                trial('pm_cycle_same', function () {
+                    var a = { x: 1 }; a.self = a;
+                    var b = { x: 1 }; b.self = b;
+                    pm.expect(a).to.eql(b);
+                });
+                trial('pm_cycle_diff', function () {
+                    var a = { x: 1 }; a.self = a;
+                    var b = { x: 1 }; b.self = {};
+                    pm.expect(a).to.eql(b);
+                });
+                trial('chai_set_same', function () { chai.expect(new Set([1])).to.eql(new Set([1])); });
+                trial('chai_set_diff', function () { chai.expect(new Set([1])).to.eql(new Set([9])); });
+                trial('lodash_date_same', function () {
+                    if (!_.isEqual(new Date(1700000000000), new Date(1700000000000))) throw new Error('not equal');
+                });
+                trial('lodash_date_diff', function () {
+                    if (_.isEqual(new Date(1), new Date(2))) throw new Error('equal');
+                });
+                trial('lodash_cycle', function () {
+                    var a = { x: 1 }; a.self = a;
+                    if (!_.isEqual(a, a)) throw new Error('not equal');
+                });
+                trial('pm_map_self', function () {
+                    var m = new Map(); m.set('self', m);
+                    var m2 = new Map(); m2.set('self', m2);
+                    pm.expect(m).to.eql(m2);
+                });
+                trial('pm_map_self_diff', function () {
+                    var m = new Map(); m.set('self', m);
+                    var m2 = new Map(); m2.set('self', {});
+                    pm.expect(m).to.eql(m2);
+                });
+                trial('pm_set_self', function () {
+                    var s = new Set(); s.add(s);
+                    var s2 = new Set(); s2.add(s2);
+                    pm.expect(s).to.eql(s2);
+                });
+                trial('pm_map_key_diff', function () {
+                    // Same-size self-referential Maps with different keys: must
+                    // exercise the guarded mate-matching failure pop (not the
+                    // instanceof type-check short-circuit).
+                    var m = new Map(); m.set('a', m);
+                    var m2 = new Map(); m2.set('b', m2);
+                    pm.expect(m).to.eql(m2);
+                });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("pm_date_same"), "true", "equal Dates must eql");
+            assert_eq!(r("pm_date_diff"), "threw", "different Dates must NOT eql");
+            assert_eq!(r("pm_re_same"), "true", "same RegExp source+flags must eql");
+            assert_eq!(r("pm_re_flags"), "threw", "differing RegExp flags must NOT eql");
+            assert_eq!(r("pm_re_flag_order"), "true", "RegExp flag order is normalized (/gi == /ig)");
+            assert_eq!(r("pm_set_order"), "true", "Sets are order-insensitive");
+            assert_eq!(r("pm_set_diff"), "threw", "differing Set members must NOT eql");
+            assert_eq!(r("pm_map_same"), "true", "Maps with equal entries must eql");
+            assert_eq!(r("pm_map_diff"), "threw", "differing Map values must NOT eql");
+            assert_eq!(r("pm_cycle_same"), "true", "circular equal structures must eql");
+            assert_eq!(r("pm_cycle_diff"), "threw", "circular differing structures must throw, not overflow");
+            assert_eq!(r("chai_set_same"), "true", "chai: equal Sets must eql");
+            assert_eq!(r("chai_set_diff"), "threw", "chai: differing Sets must NOT eql");
+            assert_eq!(r("lodash_date_same"), "true", "lodash: equal Dates are isEqual");
+            assert_eq!(r("lodash_date_diff"), "true", "lodash: differing Dates are not isEqual");
+            assert_eq!(r("lodash_cycle"), "true", "lodash: circular self-equality must not overflow");
+            assert_eq!(r("pm_map_self"), "true", "self-referential Maps must eql without stack overflow");
+            assert_eq!(r("pm_map_self_diff"), "threw", "differing self-referential Map values must NOT eql");
+            assert_eq!(r("pm_set_self"), "true", "self-referential Sets must eql without stack overflow");
+            assert_eq!(r("pm_map_key_diff"), "threw", "same-size self-referential Maps with different keys must NOT eql");
+        });
+    }
+
+    #[test]
+    fn test_to_not_chain_matches_not_to() {
+        // Backlog line 87: Postman snippets emit `pm.expect(x).to.not.*`
+        // (negation AFTER .to), but only `.not.to.*` existed — the to.not
+        // spelling read as `unknown assertion property 'not'` and recorded
+        // FAIL while chai.expect handled it fine. Both spellings now share
+        // one negated chain.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                // .to.not.* (Postman's spelling) — pass when values differ.
+                trial('to_not_equal_diff', function () { pm.expect(1).to.not.equal(2); });
+                trial('to_not_equal_same', function () { pm.expect(1).to.not.equal(1); });
+                trial('to_not_eql_diff', function () { pm.expect({ a: 1 }).to.not.eql({ b: 2 }); });
+                trial('to_not_eql_same', function () { pm.expect({ a: 1 }).to.not.eql({ a: 1 }); });
+                trial('to_not_be_true_neg', function () { pm.expect(false).to.not.be.true; });
+                trial('to_not_be_true_pos', function () { pm.expect(true).to.not.be.true; });
+                trial('to_not_be_an_neg', function () { pm.expect('x').to.not.be.an('number'); });
+                trial('to_not_be_an_pos', function () { pm.expect(1).to.not.be.an('number'); });
+                trial('to_not_be_a_neg', function () { pm.expect(1).to.not.be.a('string'); });
+                // Negated include/match/have (Postman's "must not contain").
+                trial('to_not_include_absent', function () { pm.expect('abcdef').to.not.include('zzz'); });
+                trial('to_not_include_present', function () { pm.expect('abcdef').to.not.include('bcd'); });
+                trial('to_not_match_no', function () { pm.expect('abcdef').to.not.match(/zzz/); });
+                trial('to_not_match_yes', function () { pm.expect('abcdef').to.not.match(/bcd/); });
+                trial('to_not_have_prop_absent', function () { pm.expect({ a: 1 }).to.not.have.property('b'); });
+                trial('to_not_have_prop_present', function () { pm.expect({ a: 1 }).to.not.have.property('a'); });
+                // Old spelling must still work.
+                trial('not_to_equal_same', function () { pm.expect(1).not.to.equal(1); });
+                trial('not_to_be_true_pos', function () { pm.expect(true).not.to.be.true; });
+                // Guard still applies on the negated chains.
+                trial('to_not_unknown', function () { pm.expect(1).to.not.bogus; });
+                trial('not_to_unknown', function () { pm.expect(1).not.to.bogus; });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("to_not_equal_diff"), "true", "to.not.equal passes when values differ");
+            assert_eq!(r("to_not_equal_same"), "threw", "to.not.equal throws when values match");
+            assert_eq!(r("to_not_eql_diff"), "true", "to.not.eql passes when values differ");
+            assert_eq!(r("to_not_eql_same"), "threw", "to.not.eql throws when values deep-match");
+            assert_eq!(r("to_not_be_true_neg"), "true", "to.not.be.true passes for false");
+            assert_eq!(r("to_not_be_true_pos"), "threw", "to.not.be.true throws for true");
+            assert_eq!(r("to_not_be_an_neg"), "true", "to.not.be.an passes on wrong type");
+            assert_eq!(r("to_not_be_an_pos"), "threw", "to.not.be.an throws on matching type");
+            assert_eq!(r("to_not_be_a_neg"), "true", "to.not.be.a passes on wrong type");
+            assert_eq!(r("to_not_include_absent"), "true", "to.not.include passes when value absent");
+            assert_eq!(r("to_not_include_present"), "threw", "to.not.include throws when value present");
+            assert_eq!(r("to_not_match_no"), "true", "to.not.match passes when no match");
+            assert_eq!(r("to_not_match_yes"), "threw", "to.not.match throws when matched");
+            assert_eq!(r("to_not_have_prop_absent"), "true", "to.not.have.property passes when absent");
+            assert_eq!(r("to_not_have_prop_present"), "threw", "to.not.have.property throws when present");
+            assert_eq!(r("not_to_equal_same"), "threw", "not.to.equal still throws when values match");
+            assert_eq!(r("not_to_be_true_pos"), "threw", "not.to.be.true still throws for true");
+            assert_eq!(r("to_not_unknown"), "threw", "unknown property on to.not throws");
+            assert_eq!(r("not_to_unknown"), "threw", "unknown property on not.to throws");
+        });
+    }
+
+    #[test]
+    fn test_include_uses_chai_value_semantics() {
+        // Backlog line 88: pm.expect(arr).to.include(v) was a SUBSTRING test
+        // (String(arr).indexOf) — [11,22].include(1) passed and
+        // {a:1}.include('object') passed. chai-shim implements it correctly
+        // (array indexOf for arrays, `key in obj` for objects). pm now
+        // mirrors chai: substring for strings, element membership for
+        // arrays, key membership for objects — on BOTH the positive chain
+        // and the negated chain.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                // Arrays: element membership, not substring.
+                trial('pm_arr_include_yes', function () { pm.expect([11, 22]).to.include(22); });
+                trial('pm_arr_include_no', function () { pm.expect([11, 22]).to.include(1); });
+                trial('pm_arr_include_str', function () { pm.expect(['a', 'b']).to.include('b'); });
+                trial('pm_arr_include_str_no', function () { pm.expect(['a', 'b']).to.include('ab'); });
+                // Objects: key membership.
+                trial('pm_obj_include_key', function () { pm.expect({ a: 1 }).to.include('a'); });
+                trial('pm_obj_include_nokey', function () { pm.expect({ a: 1 }).to.include('object'); });
+                // Strings stay substring.
+                trial('pm_str_include_yes', function () { pm.expect('abcdef').to.include('bcd'); });
+                trial('pm_str_include_no', function () { pm.expect('abcdef').to.include('zzz'); });
+                // Negated chain mirrors the same semantics.
+                trial('pm_arr_not_include_yes', function () { pm.expect([11, 22]).to.not.include(1); });
+                trial('pm_arr_not_include_no', function () { pm.expect([11, 22]).to.not.include(22); });
+                // chai parity: both expect()s must agree.
+                trial('chai_arr_include_yes', function () { chai.expect([11, 22]).to.include(22); });
+                trial('chai_arr_include_no', function () { chai.expect([11, 22]).to.include(1); });
+                trial('chai_obj_include_key', function () { chai.expect({ a: 1 }).to.include('a'); });
+                trial('chai_obj_include_nokey', function () { chai.expect({ a: 1 }).to.include('object'); });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("pm_arr_include_yes"), "true", "array include passes for a present element");
+            assert_eq!(r("pm_arr_include_no"), "threw", "array include must NOT match substrings (11.include(1) was the bug)");
+            assert_eq!(r("pm_arr_include_str"), "true", "string-array include passes for a present member");
+            assert_eq!(r("pm_arr_include_str_no"), "threw", "string-array include must not substring-match ('ab' not in ['a','b'])");
+            assert_eq!(r("pm_obj_include_key"), "true", "object include passes for a present key");
+            assert_eq!(r("pm_obj_include_nokey"), "threw", "object include must test keys, not type names ('object' was the bug)");
+            assert_eq!(r("pm_str_include_yes"), "true", "string include still substring-tests");
+            assert_eq!(r("pm_str_include_no"), "threw", "string include throws when absent");
+            assert_eq!(r("pm_arr_not_include_yes"), "true", "negated array include passes for an absent element");
+            assert_eq!(r("pm_arr_not_include_no"), "threw", "negated array include throws for a present element");
+            assert_eq!(r("chai_arr_include_yes"), "true", "chai array include agrees (element present)");
+            assert_eq!(r("chai_arr_include_no"), "threw", "chai array include agrees (substring must not match)");
+            assert_eq!(r("chai_obj_include_key"), "true", "chai object include agrees (key present)");
+            assert_eq!(r("chai_obj_include_nokey"), "threw", "chai object include agrees (key test)");
+        });
+    }
+
+    #[test]
     fn test_unimplemented_assertion_properties_fail_closed() {
         // Backlog §1 P0: unimplemented assertion PROPERTIES (pm.expect(false)
         // .to.be.true, .to.be.null/.undefined/.ok/.empty, pm.expect(null)
         // .to.exist, and chai .empty/.exist/.NaN/.finite) used to read as
         // `undefined` and pm.test recorded GREEN — a silent pass. The Proxy
         // guard now THROWS on unknown assertion names, and the common
-        // property getters are implemented for real.
+        // property getters are implemented for real. Backlog line 73: the
+        // `.should` getter must go through the SAME guard — previously it
+        // returned a raw Assertion, so `({a:1}).should.be.sealed` read as
+        // undefined and passed silently.
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
@@ -4490,6 +5228,33 @@ mod tests {
                     try { chai.expect(false).to.be.true; return 'passed'; }
                     catch (e) { return 'threw'; }
                 })());
+                // ── chai.should (backlog line 73) ──
+                chai.should();
+                globalThis.__should_sealed_fail = String((function () {
+                    // VERIFIED bug: ({a:1}).should.be.sealed returned
+                    // undefined (raw Assertion, no Proxy) — must now throw.
+                    try { ({ a: 1 }).should.be.sealed; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_true_ok = String((function () {
+                    // Implemented getter must still WORK through the guard.
+                    try { (true).should.be.true; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_false_true_fail = String((function () {
+                    try { (false).should.be.true; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_unknown_prop = String((function () {
+                    try { (1).should.be.bogusShouldProp; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_method_chain_ok = String((function () {
+                    // Method-chain positive: `equal` reads this._obj through
+                    // the Proxy receiver — must still resolve.
+                    try { (5).should.equal(5); return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
             "#,
             )
             .expect("script should eval");
@@ -4573,6 +5338,99 @@ mod tests {
                 ctx.eval::<String, _>("__chai_true_fail").unwrap(),
                 "threw",
                 "chai false.to.be.true must throw"
+            );
+            // ── chai.should (backlog line 73) ──
+            assert_eq!(
+                ctx.eval::<String, _>("__should_sealed_fail").unwrap(),
+                "threw",
+                "should.be.sealed must throw (was silent undefined)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_true_ok").unwrap(),
+                "ok",
+                "(true).should.be.true must still pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_false_true_fail").unwrap(),
+                "threw",
+                "(false).should.be.true must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_unknown_prop").unwrap(),
+                "threw",
+                "should unknown assertion prop must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_method_chain_ok").unwrap(),
+                "ok",
+                "(5).should.equal(5) method chain must pass through the guard"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pm_expect_chain_allocates_once_not_per_read() {
+        // Backlog line 105: pm.expect was ~10x slower than chai.expect
+        // (2511 ms vs 235 ms over 200k assertions) because EVERY call built
+        // a fresh chain literal with 18 Object.defineProperty calls
+        // (addPropAssertions x4) and guardChain wrapped each object-valued
+        // property read in a NEW Proxy. The chain is now a single class with
+        // the surface on AssertChain.prototype. This test pins the
+        // STRUCTURAL property deterministically (no timing flakiness): after
+        // load, running chains must not call Object.defineProperty at all,
+        // and Proxy allocations must be ~1 per expect + ~1 per .not access,
+        // NOT one per chain-property read.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Instrument AFTER load so module-level defineProperty (the
+                // one-time prototype install) is not counted.
+                globalThis.__defCalls = 0;
+                var __realDefine = Object.defineProperty;
+                Object.defineProperty = function () {
+                    globalThis.__defCalls++;
+                    return __realDefine.apply(Object, arguments);
+                };
+                globalThis.__proxyCalls = 0;
+                var __realProxy = Proxy;
+                Proxy = function () {
+                    globalThis.__proxyCalls++;
+                    return new __realProxy(arguments[0], arguments[1]);
+                };
+
+                // Warm-up + behaviour must be unchanged. (above/below etc.
+                // are chai-shim assertions — the pm chain's surface is
+                // eql/equal/include/match/an/a/property/status/header/
+                // jsonBody, and the guard must still throw on anything else.)
+                pm.expect('x').to.be.an('string').and.to.equal('x');
+                pm.expect(5).not.to.be.a('string');
+                pm.expect([1, 2]).to.include(2);
+                try { pm.expect(1).to.be.bogus; } catch (e) { /* guard still throws */ }
+
+                var defBefore = globalThis.__defCalls;
+                var proxyBefore = globalThis.__proxyCalls;
+                for (var i = 0; i < 500; i++) {
+                    pm.expect('x').to.be.an('string').and.to.equal('x');
+                }
+                globalThis.__defDelta = globalThis.__defCalls - defBefore;
+                globalThis.__proxyDelta = globalThis.__proxyCalls - proxyBefore;
+            "#,
+            )
+            .expect("script should eval");
+
+            let def_delta: i64 = ctx.eval("__defDelta").expect("read defDelta");
+            let proxy_delta: i64 = ctx.eval("__proxyDelta").expect("read proxyDelta");
+            assert_eq!(
+                def_delta, 0,
+                "pm.expect must not call Object.defineProperty per call (got {def_delta})"
+            );
+            assert_eq!(
+                proxy_delta, 500,
+                "pm.expect must allocate exactly one Proxy per call, not per read (got {proxy_delta})"
             );
         });
     }
@@ -4679,7 +5537,11 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__cv_get").unwrap(), "https://api.example.com", "pm.collectionVariables.get");
             assert!(ctx.eval::<bool, _>("__cv_has").unwrap(), "pm.collectionVariables.has");
             assert_eq!(ctx.eval::<String, _>("__cv_obj").unwrap(), r#"{"base":"x","n":3}"#, "toObject must JSON-decode values");
-            assert_eq!(ctx.eval::<String, _>("__cv_set").unwrap(), "k=v", "collectionVariables.set must reach the bridge");
+            assert_eq!(
+                ctx.eval::<String, _>("__cv_set").unwrap(),
+                "k=\"v\"",
+                "collectionVariables.set must reach the bridge JSON-encoded (shim encodes on set)"
+            );
             assert_eq!(ctx.eval::<String, _>("__cv_unset").unwrap(), "k", "collectionVariables.unset must reach the bridge");
             assert_eq!(ctx.eval::<String, _>("__g_get").unwrap(), "global", "pm.globals.get");
             assert!(ctx.eval::<bool, _>("__g_has").unwrap(), "pm.globals.has");
@@ -4803,6 +5665,145 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_set_get_roundtrip_preserves_type() {
+        // Backlog line 89: setters String()-coerced and getters JSON.parse'd
+        // were NOT inverses — a plain string '1234' set through
+        // pm.environment/globals came back as the NUMBER 1234 (and objects
+        // became "[object Object]"). The shim now JSON-encodes on set; these
+        // bridge stubs mirror the REAL decode-on-set/encode-on-get contract
+        // (crates/tropel-sandbox trp.rs), so the round trip must restore the
+        // exact type: strings stay strings, numbers stay numbers, objects
+        // stay objects.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // decode_json_encoded equivalent: JSON string → plain string,
+                // anything else (number/bool/object) → its JSON text.
+                function decodeEnv(v) {
+                    try { var p = JSON.parse(v); return typeof p === 'string' ? p : v; }
+                    catch (e) { return v; }
+                }
+                // decode_json_value equivalent: parse to a serde-like Value.
+                function decodeVal(v) {
+                    try { return JSON.parse(v); } catch (e) { return v; }
+                }
+
+                var env = {};
+                globalThis.__tropel_pm_environment_set = function (k, v) { env[k] = decodeEnv(v); };
+                globalThis.__tropel_pm_environment_get = function (k) { return k in env ? JSON.stringify(env[k]) : null; };
+
+                var col = {};
+                globalThis.__tropel_pm_collection_vars_set = function (k, v) { col[k] = decodeVal(v); };
+                globalThis.__tropel_pm_collection_vars_get = function (k) { return k in col ? JSON.stringify(col[k]) : null; };
+
+                var gl = {};
+                globalThis.__tropel_pm_globals_set = function (k, v) { gl[k] = decodeVal(v); };
+                globalThis.__tropel_pm_globals_get = function (k) { return k in gl ? JSON.stringify(gl[k]) : null; };
+
+                // env: '1234' string stays the STRING '1234' (never number).
+                pm.environment.set('s', '1234');
+                globalThis.__env_s = pm.environment.get('s');
+                globalThis.__env_s_type = typeof globalThis.__env_s;
+                // env: number 42 round-trips as the STRING '42' (env is strings-only).
+                pm.environment.set('n', 42);
+                globalThis.__env_n = pm.environment.get('n');
+                globalThis.__env_n_type = typeof globalThis.__env_n;
+                // env: object round-trips as its JSON text string.
+                pm.environment.set('o', { a: 1 });
+                globalThis.__env_o = pm.environment.get('o');
+
+                // collection: numeric string stays string, object stays object.
+                pm.collectionVariables.set('s', '42');
+                globalThis.__col_s = pm.collectionVariables.get('s');
+                globalThis.__col_s_type = typeof globalThis.__col_s;
+                pm.collectionVariables.set('o', { b: [1, 2] });
+                globalThis.__col_o = JSON.stringify(pm.collectionVariables.get('o'));
+                globalThis.__col_o_type = typeof pm.collectionVariables.get('o');
+
+                // globals: number stays number, string stays string.
+                pm.globals.set('n', 42);
+                globalThis.__gl_n = pm.globals.get('n');
+                globalThis.__gl_n_type = typeof globalThis.__gl_n;
+                pm.globals.set('s', '1234');
+                globalThis.__gl_s = pm.globals.get('s');
+                globalThis.__gl_s_type = typeof globalThis.__gl_s;
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__env_s").unwrap(),
+                "1234",
+                "env string '1234' must round-trip as the STRING '1234'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_s_type").unwrap(),
+                "string",
+                "numeric-looking env string must not be retyped to a number"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_n").unwrap(),
+                "42",
+                "env number 42 round-trips as the string '42' (env is strings-only)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_n_type").unwrap(),
+                "string",
+                "env values are always strings"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_o").unwrap(),
+                "{\"a\":1}",
+                "env object round-trips as its JSON text string"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_s").unwrap(),
+                "42",
+                "collection string '42' must stay the STRING '42'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_s_type").unwrap(),
+                "string",
+                "collection must not retype numeric-looking strings"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_o").unwrap(),
+                "{\"b\":[1,2]}",
+                "collection object must round-trip as an object"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_o_type").unwrap(),
+                "object",
+                "collection object must stay an object"
+            );
+            assert_eq!(
+                ctx.eval::<f64, _>("__gl_n").unwrap(),
+                42.0,
+                "globals number 42 round-trips as the number 42"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_n_type").unwrap(),
+                "number",
+                "globals numbers stay numbers"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_s").unwrap(),
+                "1234",
+                "globals string '1234' round-trips as the STRING '1234'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_s_type").unwrap(),
+                "string",
+                "globals numeric-looking string must stay a string"
+            );
+        });
+    }
+
+    #[test]
     fn test_ws_local_close_dispatches_close_handler() {
         // Backlog line 148: the event-driven k6/ws API (socket.on/send/ping/
         // close/setTimeout + native __tropel_k6_ws_* bridges) is implemented,
@@ -4921,6 +5922,99 @@ mod tests {
                 "server close must dispatch once even with a defensive user close(): {close2_events}"
             );
         });
+    }
+
+    /// Backlog line 63: group() tagged samples with the INNERMOST raw name
+    /// (group=payment) instead of the k6 full path (group=::checkout::payment)
+    /// — and checks samples carried NO group tag at all. Nested group()
+    /// must tag checks + group_duration with the full ::a::b path.
+    #[tokio::test]
+    async fn test_nested_group_tags_use_full_path() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    group('payment', function () {
+                        check(true, { 'ok': true });
+                    });
+                });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration with nested groups must succeed");
+
+        // checks sample must carry group=::checkout::payment (was untagged).
+        let check_groups: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        assert_eq!(
+            check_groups,
+            vec!["::checkout::payment".to_string()],
+            "checks must carry the full group path, got: {:?}",
+            check_groups
+        );
+
+        // group_duration samples: one per level, tagged with the full path
+        // (::checkout and ::checkout::payment), not the bare leaf.
+        let mut durations: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "group_duration")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        durations.sort();
+        assert_eq!(
+            durations,
+            vec!["::checkout".to_string(), "::checkout::payment".to_string()],
+            "group_duration must use full ::a::b paths, got: {:?}",
+            durations
+        );
+    }
+
+    /// Backlog line 63: http_req_* samples recorded inside nested groups
+    /// must carry group=::checkout::payment (k6 parity) — the old code
+    /// stamped the innermost raw name, so two same-named leaf groups under
+    /// different parents merged into one series.
+    #[tokio::test]
+    async fn test_http_in_nested_group_carries_full_path() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    group('payment', function () {
+                        http.get('http://example.com/');
+                    });
+                });
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        // Wire the stub HTTP client so the native http bridge registers on
+        // the first iteration (same pattern as test_setup_can_make_http_calls).
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration with http inside nested groups must succeed");
+
+        let groups: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "http_req_duration")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["::checkout::payment".to_string()],
+            "http_req_duration must carry the full group path, got: {:?}",
+            groups
+        );
     }
 
     #[test]
@@ -5309,6 +6403,102 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_response_to_be_json_html_text_property_form() {
+        // Backlog line 42: chai-postman exposes .json/.html/.text as
+        // PROPERTIES — Postman's own snippets emit `pm.response.to.be.json;`
+        // with NO parens. They were methods here, so reading the property
+        // yielded a truthy Function → silent PASS on any body. Now getters:
+        // the bare property read runs the check and THROWS on mismatch, and
+        // the paren form still works.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'text/html';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'text/html' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '<html>'; }; // NOT JSON
+                globalThis.__tropel_pm_response_body = function () { return '<html>'; };
+
+                // The silent-PASS probe from the backlog: bare property read
+                // on a text/html body must THROW now (was PASS).
+                globalThis.__p_json = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__p_html = String((function () {
+                    try { pm.response.to.be.html; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // Paren form on a NON-matching body must also throw.
+                globalThis.__p_json_paren = String((function () {
+                    try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+
+                // Flip to a valid JSON body: both forms must pass.
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_pm_response_body = function () { return '{"a":1}'; };
+                globalThis.__p_json_ok = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__p_json_paren_ok = String((function () {
+                    try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // html/text on a JSON body must throw.
+                globalThis.__p_html_json = String((function () {
+                    try { pm.response.to.be.html; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json").unwrap(),
+                "threw",
+                "bare to.be.json on text/html must THROW (was silent PASS)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_html").unwrap(),
+                "passed",
+                "to.be.html must pass on text/html"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_paren").unwrap(),
+                "threw",
+                "to.be.json() on text/html must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_ok").unwrap(),
+                "passed",
+                "bare to.be.json on JSON body must pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_paren_ok").unwrap(),
+                "passed",
+                "to.be.json() on JSON body must pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_html_json").unwrap(),
+                "threw",
+                "to.be.html on JSON body must throw"
+            );
+        });
+    }
+
+    #[test]
     fn test_exec_selection_installs_named_export() {
         // A scenario naming `exec: "browse"` must run the `browse` export,
         // NOT the default export (k6 multi-scenario semantics).
@@ -5561,6 +6751,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "[false,true]", "object matcher must be honored");
+    }
+
+    #[tokio::test]
+    async fn test_lodash_string_and_property_shorthand() {
+        // Backlog line 93: string shorthand (`'active'`) and pair shorthand
+        // (`['active',true]`) were broken across filter/find/every/some/
+        // findIndex, and `_.reject(coll,{matcher})` THREW (raw predicate
+        // called as a function). All must normalize through toPredicate.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var users = [
+                    { name: 'a', active: true },
+                    { name: 'b', active: false },
+                    { name: 'c', active: true },
+                ];
+                JSON.stringify([
+                    // String shorthand: filter by property truthiness.
+                    _.filter(users, 'active').map(function (u) { return u.name; }),
+                    // find returns the FIRST active user.
+                    _.find(users, 'active').name,
+                    // findIndex returns the index of the first active user.
+                    _.findIndex(users, 'active'),
+                    // every/some honor the string shorthand.
+                    _.every(users, 'active'),
+                    _.some(users, 'active'),
+                    // Pair shorthand: [key, value] equality.
+                    _.filter(users, ['active', true]).length,
+                    // reject with an object matcher must not throw.
+                    _.reject(users, { active: false }).map(function (u) { return u.name; }),
+                    // some with an object matcher.
+                    _.some(users, { active: true }),
+                    // Dotted path shorthand via _.get.
+                    _.filter([{ a: { b: 1 } }, { a: { b: 0 } }], 'a.b').length,
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "[[\"a\",\"c\"],\"a\",0,false,true,2,[\"a\",\"c\"],true,1]",
+            "string/pair/matcher shorthand across the collection family"
+        );
     }
 
     #[tokio::test]
@@ -5910,6 +7144,71 @@ mod tests {
         assert_eq!(
             out, "[true,\"phrase msg\"]",
             "passphrase encrypt/decrypt round-trips"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_modes_padding_utf16_wordarray_and_missing_algorithms() {
+        // Backlog line 95: ECB/CTR/CFB/OFB silently ran GCM (wrong cipher,
+        // no error); {padding: NoPadding} was ignored (16 bytes → 32);
+        // WordArray.concat corrupted non-4-byte-aligned data ('abc'+'de' →
+        // "abc\0d"); enc.Utf16 was an alias of Utf8; RIPEMD160/SHA224/
+        // HmacSHA384 were undefined.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var key = CryptoJS.lib.WordArray.random(16);
+                var iv = CryptoJS.lib.WordArray.random(16);
+
+                // Unsupported modes must FAIL LOUDLY, not silently run GCM.
+                var ecbThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.ECB, iv: iv }); return 'no'; }
+                    catch (e) { return /ECB/.test(e.message) ? 'ecb' : 'other:' + e.message; }
+                })();
+                var ctrThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.CTR, iv: iv }); return 'no'; }
+                    catch (e) { return /CTR/.test(e.message) ? 'ctr' : 'other:' + e.message; }
+                })();
+                var cfbThrew = (function () {
+                    try { CryptoJS.AES.decrypt(CryptoJS.enc.Hex.parse('00'.repeat(16)), key, { mode: CryptoJS.mode.CFB, iv: iv }); return 'no'; }
+                    catch (e) { return /CFB/.test(e.message) ? 'cfb' : 'other:' + e.message; }
+                })();
+
+                // Unsupported padding must FAIL LOUDLY, not silently pad.
+                var noPadThrew = (function () {
+                    try { CryptoJS.AES.encrypt('x', key, { mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.NoPadding, iv: iv }); return 'no'; }
+                    catch (e) { return /NoPadding/.test(e.message) ? 'nopad' : 'other:' + e.message; }
+                })();
+
+                // WordArray.concat must be bit-aligned: 'abc' + 'de' = 'abcde'.
+                var concatStr = CryptoJS.enc.Utf8.stringify(
+                    CryptoJS.enc.Utf8.parse('abc').concat(CryptoJS.enc.Utf8.parse('de'))
+                );
+
+                // Utf16 must be UTF-16BE (not a Utf8 alias) and round-trip.
+                var utf16 = CryptoJS.enc.Utf16.stringify(CryptoJS.enc.Utf16.parse('héllo'));
+                var utf16Hex = CryptoJS.enc.Utf16.parse('hi').toString(CryptoJS.enc.Hex);
+                var utf16beAlias = CryptoJS.enc.Utf16BE === CryptoJS.enc.Utf16;
+
+                // Missing algorithms now defined and matching known vectors.
+                var sha224 = CryptoJS.SHA224('hello').toString();
+                var ripemd160 = CryptoJS.RIPEMD160('hello').toString();
+                var hmac384 = CryptoJS.HmacSHA384('hello', 'key').toString();
+
+                JSON.stringify([
+                    ecbThrew, ctrThrew, cfbThrew, noPadThrew,
+                    concatStr, utf16, utf16Hex, utf16beAlias,
+                    sha224, ripemd160, hmac384
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\"ecb\",\"ctr\",\"cfb\",\"nopad\",\"abcde\",\"héllo\",\"00680069\",true,\"ea09ae9cc6768c50fcee903ed054556e5bfc8347907f12598aa24193\",\"108f07b8382412612c048d07d13f814118445acd\",\"eacbad575c301fa68afb26dae48b25bf5cd42fd08ed28c08c274ce62df7928f01249976cd8aaf1ab0681d3accedc9543\"]",
+            "modes fail loudly, padding fails loudly, concat aligns, Utf16 is BE, missing algorithms defined"
         );
     }
 
@@ -6437,6 +7736,63 @@ mod tests {
             .expect("iteration must succeed with numeric __VU/__ITER");
     }
 
+    #[tokio::test]
+    async fn test_check_tags_accept_non_string_values() {
+        // Backlog line 97: check(r, {...}, {code: 200}) — a NUMBER tag value
+        // — dropped the ENTIRE tag map (shim JSON.stringify → bridge
+        // from_str::<HashMap<String,String>> failed on {"code":200}, no
+        // warning). k6 coerces tag values to strings, so `code` must survive
+        // as "200" alongside string/bool tags. Exercised through the REAL
+        // bridge (register_script_bridges) and the drained sample sink.
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                check(1, { 'status is 200': function (v) { return v === 1; } },
+                      { code: 200, ok: true, name: 'health' });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+        let checks: Vec<_> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .collect();
+        assert_eq!(
+            checks.len(),
+            1,
+            "one check sample expected, got {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
+        let sample = checks[0];
+        assert_eq!(
+            sample.tags.get("code"),
+            Some("200"),
+            "numeric tag value must survive as a string (k6 coerces)"
+        );
+        assert_eq!(
+            sample.tags.get("ok"),
+            Some("true"),
+            "boolean tag value must survive as a string"
+        );
+        assert_eq!(
+            sample.tags.get("name"),
+            Some("health"),
+            "string tag value must survive"
+        );
+        assert_eq!(
+            sample.tags.get("check"),
+            Some("status is 200"),
+            "the check name must still be stamped"
+        );
+    }
+
     // ── k6/crypto + k6/encoding + k6/timers + randomSeed + x509 ──
 
     #[tokio::test]
@@ -6622,6 +7978,100 @@ mod tests {
                 .await
                 .expect("iteration must succeed — the boundary pump fires the timer");
         }
+    }
+
+    #[tokio::test]
+    async fn test_timer_state_resets_each_iteration() {
+        // Backlog line 99: timer state leaked across iterations —
+        // __tropel_timers is module-scope with no per-iteration reset, so a
+        // setInterval armed in EVERY iteration accumulated live intervals
+        // that all fired on every subsequent pump (linear growth in
+        // callbacks and retained closures for the VU's life). The driver now
+        // calls __tropel_reset_timers() at the start of each iteration.
+        //
+        // The script asserts the invariant itself: at the start of
+        // iteration N>1 the timer table must be EMPTY (the previous
+        // iteration's interval was cleared by the reset). Long ms keeps the
+        // interval pending so it never fires and never self-cleans — with
+        // the leak, iteration 2 would start with 1 live interval and throw.
+        let driver = K6Driver;
+        let script = br#"
+            export default function (data) {
+                var n = (globalThis.__calls = (globalThis.__calls || 0) + 1);
+                // Start of iteration N>1: the previous iteration's interval
+                // must have been cleared by the reset - zero live timers.
+                if (n > 1) {
+                    var liveAtStart = Object.keys(__tropel_timers).length;
+                    if (liveAtStart > 0) {
+                        throw new Error('timer leak across iterations: ' + liveAtStart + ' live at start of iter ' + n);
+                    }
+                }
+                setInterval(function () { globalThis.__fired = (globalThis.__fired || 0) + 1; }, 1000000);
+                // After arming, exactly ONE interval is live (the current
+                // iteration's) - never the accumulated set.
+                if (Object.keys(__tropel_timers).length !== 1) {
+                    throw new Error('expected exactly 1 live timer, got ' + Object.keys(__tropel_timers).length);
+                }
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        for _ in 0..3 {
+            inst.run_iteration(&mut ctx)
+                .await
+                .expect("iteration must succeed — timers must not leak across iterations");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timer_callback_samples_and_abort_survive_final_iteration() {
+        // Backlog line 100: run_iteration drained the sample sink BEFORE
+        // pumping timers, so anything a timer callback recorded landed AFTER
+        // the drain — picked up next iteration, or SILENTLY DISCARDED on the
+        // last one; test.abort() from a timer was delayed or lost. With a
+        // SINGLE iteration (which is the final iteration), a setTimeout(0)
+        // callback that records a check AND calls exec.test.abort() must
+        // have both effects visible after run_iteration returns.
+        let driver = K6Driver;
+        let script = br#"
+            export default function (data) {
+                setTimeout(function () {
+                    check(1, { 'from timer': function (v) { return v === 1; } });
+                    exec.test.abort('stop-from-timer');
+                }, 0);
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+        // The timer callback's check sample must be drained THIS iteration
+        // (the only one — nothing follows to pick it up).
+        let checks: Vec<_> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .collect();
+        assert_eq!(
+            checks.len(),
+            1,
+            "timer-callback check sample must survive the final iteration, got {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
+        // The timer's test.abort() must reach the engine THIS iteration.
+        assert!(
+            ctx.abort_requested,
+            "test.abort() from a timer callback must not be lost"
+        );
+        assert_eq!(
+            ctx.abort_message.as_deref(),
+            Some("stop-from-timer"),
+            "abort message must be the timer's"
+        );
     }
 
     #[tokio::test]

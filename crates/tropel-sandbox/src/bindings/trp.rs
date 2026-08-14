@@ -30,6 +30,28 @@ fn string_to_json_encoded(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_default()
 }
 
+/// Decode a value the JS shim JSON-encoded on set back to a plain string.
+/// Backlog line 89: set/get must be INVERSES. `pm.environment.set('x',
+/// '1234')` sends `JSON.stringify('1234')` = `'"1234"'`; decoding yields the
+/// plain string `1234`. Non-string JSON (numbers, booleans, objects) is
+/// stored as its JSON text — Postman environment variables are strings-only,
+/// so this is the type-safe representation. Unparseable input (e.g. legacy
+/// seeded plain strings) passes through verbatim.
+fn decode_json_encoded(s: &str) -> String {
+    match serde_json::from_str::<Value>(s) {
+        Ok(Value::String(v)) => v,
+        Ok(other) => other.to_string(),
+        Err(_) => s.to_string(),
+    }
+}
+
+/// Decode a value the JS shim JSON-encoded on set back into a serde_json
+/// Value for the collection/global stores. `'{"a":1}'` → object, `'42'` →
+/// number, `'"42"'` → the string "42"; unparseable input → String(raw).
+fn decode_json_value(s: &str) -> Value {
+    serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))
+}
+
 /// Resolve a variable across ALL scopes with Postman precedence:
 /// iteration data > environment > collection > globals (backlog line 145).
 ///
@@ -354,17 +376,21 @@ impl TrpBridge {
             }
 
             // ── Environment ──
-            // NOTE: environment values are returned RAW (not JSON-encoded) on
-            // purpose — Postman environment variables are always strings, and
-            // the shim's `pm.environment.get` returns them as-is (no
-            // JSON.parse). Do NOT "harmonize" this with variables_get's JSON
-            // encoding, or env vars like "123" would round-trip as numbers.
+            // Backlog line 89: set/get must be INVERSES. The shim JSON-encodes
+            // on set (string '1234' → '"1234"', number 42 → '42') and
+            // JSON-parses on get; these bridges store PLAIN values (decode on
+            // set) and JSON-encode on get, so '1234' survives a round trip as
+            // the STRING '1234' — never the number 1234 — while script-set
+            // values stay plain for {{var}} substitution (which reads the
+            // maps directly).
             let state_clone = state.clone();
             set_global!(
                 "__tropel_pm_environment_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.environment.get(&key).cloned()
+                    st.environment
+                        .get(&key)
+                        .map(|v| string_to_json_encoded(v.as_str()))
                 }),
             );
 
@@ -373,7 +399,7 @@ impl TrpBridge {
                 "__tropel_pm_environment_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.environment.insert(key, value);
+                    st.environment.insert(key, decode_json_encoded(&value));
                 }),
             );
 
@@ -421,10 +447,7 @@ impl TrpBridge {
                 "__tropel_pm_variables_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    // Backlog line 137: pm.variables is the LOCAL scope —
-                    // writes land here (highest priority), not in collection.
-                    st.local_vars
-                        .insert(key, serde_json::Value::String(value));
+                    st.collection_vars.insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -457,7 +480,10 @@ impl TrpBridge {
                 "__tropel_pm_environment_to_object",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
-                    st.environment.clone()
+                    st.environment
+                        .iter()
+                        .map(|(k, v)| (k.clone(), string_to_json_encoded(v)))
+                        .collect()
                 }),
             );
 
@@ -479,8 +505,7 @@ impl TrpBridge {
                 "__tropel_pm_collection_vars_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars
-                        .insert(key, serde_json::Value::String(value));
+                    st.collection_vars.insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -529,7 +554,7 @@ impl TrpBridge {
                 "__tropel_pm_globals_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.globals.insert(key, serde_json::Value::String(value));
+                    st.globals.insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -726,6 +751,75 @@ impl TrpBridge {
                             }
                         }
                     }
+                }),
+            );
+
+            // Live auth READ (backlog line 101): the JS shim kept auth in a
+            // module-scope `_pmRequestAuth` singleton, so a request that had
+            // NO auth (or a DIFFERENT auth) on the next iteration still read
+            // the previous iteration's value. The getter returns the CURRENT
+            // request's auth from state (None when unset) so reads are
+            // always per-request — no cross-iteration leakage.
+            let state_clone = state.clone();
+            set_global!(
+                "__tropel_pm_request_auth",
+                Func::from(move || -> Option<String> {
+                    let st = state_clone.lock().unwrap();
+                    st.request.as_ref().and_then(|r| {
+                        r.auth
+                            .as_ref()
+                            .map(|a| serde_json::to_string(a).unwrap_or_default())
+                    })
+                }),
+            );
+
+            // Live body-mode READ (backlog line 101): the JS shim's
+            // `_pmRequestBody.mode` module-scope value persisted across
+            // iterations (a fresh request per iteration re-seeded the raw
+            // text but not the mode). The getter derives the mode from the
+            // CURRENT request's Body variant, so `pm.request.body.mode`
+            // always describes the actual request — no leakage.
+            let state_clone = state.clone();
+            set_global!(
+                "__tropel_pm_request_body_mode",
+                Func::from(move || -> String {
+                    let st = state_clone.lock().unwrap();
+                    match st.request.as_ref().and_then(|r| r.body.as_ref()) {
+                        Some(Body::Raw(_)) | Some(Body::Json(_)) => "raw".to_string(),
+                        Some(Body::FormData(_)) => "formdata".to_string(),
+                        Some(Body::UrlEncoded(_)) => "urlencoded".to_string(),
+                        Some(Body::Binary(_)) => "file".to_string(),
+                        Some(Body::GraphQL { .. }) => "graphql".to_string(),
+                        None => "raw".to_string(),
+                    }
+                }),
+            );
+
+            // ── pm.info (live, backlog line 101) ──
+            // The shim previously shipped a hardcoded stub (eventName
+            // 'test', iteration 0, iterationCount 1, requestName ''). All
+            // five fields are now read from PmState so a test script sees
+            // the real iteration, the real request name, and the configured
+            // iteration count.
+            let state_clone = state.clone();
+            set_global!(
+                "__tropel_pm_info",
+                Func::from(move || -> String {
+                    let st = state_clone.lock().unwrap();
+                    let request_id = st
+                        .request_names
+                        .iter()
+                        .position(|n| n == &st.current_request_name)
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| st.current_request_name.clone());
+                    serde_json::json!({
+                        "eventName": st.event_name,
+                        "iteration": st.iteration_index,
+                        "iterationCount": st.total_iterations.unwrap_or(1),
+                        "requestName": st.current_request_name,
+                        "requestId": request_id,
+                    })
+                    .to_string()
                 }),
             );
 
@@ -1387,6 +1481,50 @@ mod tests {
         assert!(parsed.is_number());
     }
 
+    /// Regression (backlog line 89): setters String()-coerced and getters
+    /// JSON.parse'd were NOT inverses — a plain string '1234' set through
+    /// pm.environment round-tripped as the NUMBER 1234 (and objects became
+    /// "[object Object]"). The shim now JSON-encodes on set; the bridges
+    /// decode-on-set / encode-on-get, so the full cycle (shim encode → bridge
+    /// decode → bridge encode → shim parse) must restore the exact value.
+    #[test]
+    fn test_set_get_json_roundtrip_preserves_type() {
+        // Env bridge: decode on set. JSON string → plain string.
+        assert_eq!(decode_json_encoded("\"1234\""), "1234");
+        // Number/bool/object → stored as JSON text (env is strings-only).
+        assert_eq!(decode_json_encoded("42"), "42");
+        assert_eq!(decode_json_encoded("{\"a\":1}"), "{\"a\":1}");
+        // Unparseable (legacy seeded plain string) → verbatim.
+        assert_eq!(
+            decode_json_encoded("https://api.example.com"),
+            "https://api.example.com"
+        );
+
+        // Full env cycle: set('s','1234') → shim sends '"1234"' → bridge
+        // stores plain '1234' → get bridge returns '"1234"' → shim JSON.parse
+        // → the STRING '1234' (never the number 1234).
+        let stored = decode_json_encoded("\"1234\"");
+        assert_eq!(stored, "1234");
+        let on_get = string_to_json_encoded(&stored);
+        assert_eq!(on_get, "\"1234\"");
+        let parsed: serde_json::Value = serde_json::from_str(&on_get).unwrap();
+        assert!(parsed.is_string());
+        assert_eq!(parsed.as_str().unwrap(), "1234");
+
+        // Collection/global bridge: decode on set to a Value.
+        assert_eq!(decode_json_value("\"42\""), serde_json::json!("42"));
+        assert_eq!(decode_json_value("42"), serde_json::json!(42));
+        assert_eq!(decode_json_value("{\"a\":1}"), serde_json::json!({"a": 1}));
+        assert_eq!(decode_json_value("plain"), serde_json::json!("plain"));
+
+        // Full collection cycle: object set → object out.
+        let obj: Value = decode_json_value("{\"a\":1}");
+        let encoded = variable_value_to_string(&obj);
+        assert_eq!(encoded, "{\"a\":1}");
+        let back: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(back, serde_json::json!({"a": 1}));
+    }
+
     /// Regression (backlog line 145): `pm.variables.get` must resolve with
     /// Postman precedence — iteration data beats environment beats collection
     /// beats globals. The old code skipped iteration data entirely, so a CSV
@@ -1713,6 +1851,113 @@ mod tests {
                 )
                 .unwrap();
             assert!(readonly, "acme/product must be non-writable");
+        });
+    }
+
+    /// Regression (backlog line 101): `pm.info` was a hardcoded stub and
+    /// `pm.request.auth` / `pm.request.body.mode` were module-scope
+    /// singletons — a fresh request on the next iteration (no auth, a
+    /// different body) still read the PREVIOUS iteration's values. The shim
+    /// now reads LIVE from the __tropel_pm_* bridges: pm.info fields come
+    /// from __tropel_pm_info, auth from __tropel_pm_request_auth (null when
+    /// the current request has none), and mode from
+    /// __tropel_pm_request_body_mode. Stub bridges simulate the per-
+    /// iteration state change; reads must follow the bridge, not a stale
+    /// JS-side copy.
+    #[test]
+    fn test_pm_info_auth_and_body_mode_read_live_per_iteration() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+
+            // Iteration 1: a prerequest script SETS auth and a body mode.
+            ctx.eval::<(), _>(
+                r#"
+                // Simulate the sandbox bridges. Per-iteration values change
+                // to prove reads are live, not cached.
+                globalThis.__tropel_pm_info = function () {
+                    return JSON.stringify({ eventName: 'test', iteration: 4,
+                        iterationCount: 25, requestName: 'get-user', requestId: 'r-9' });
+                };
+                globalThis.__tropel_pm_request_auth = function () {
+                    // The CURRENT request has no auth.
+                    return null;
+                };
+                globalThis.__tropel_pm_request_body_mode = function () {
+                    // The CURRENT request's body is urlencoded.
+                    return 'urlencoded';
+                };
+                globalThis.__tropel_pm_request_auth_set = function (j) {
+                    globalThis.__auth_set = j;
+                };
+
+                // Iteration 1: prerequest writes auth + a body mode.
+                pm.request.auth = { type: 'bearer', token: 'stale-token' };
+                pm.request.body = { mode: 'raw', raw: 'x' };
+
+                // Iteration 2: a fresh request with NO auth and a urlencoded
+                // body. Reads must come from the live bridges.
+                var authNow = pm.request.auth;
+                var modeNow = pm.request.body.mode;
+                var info = pm.info;
+                globalThis.__out = JSON.stringify([
+                    authNow, modeNow,
+                    info.eventName, info.iteration, info.iterationCount,
+                    info.requestName, info.requestId
+                ]);
+                "#,
+            )
+            .expect("setup should eval");
+
+            // Parse the exact output so assertions are unambiguous.
+            let v: serde_json::Value =
+                serde_json::from_str(&ctx.eval::<String, _>("__out").unwrap())
+                    .expect("__out must be JSON");
+            let arr = v.as_array().expect("__out must be an array");
+            // auth must be NULL (fresh request has none), NOT the stale
+            // 'stale-token' singleton from iteration 1.
+            assert!(
+                arr[0].is_null(),
+                "pm.request.auth must read the live (absent) auth, got: {arr:?}"
+            );
+            assert!(
+                arr[0].as_str().is_none(),
+                "pm.request.auth must not leak the previous iteration's auth, got: {arr:?}"
+            );
+            // body.mode must follow the live bridge, not the 'raw' written
+            // by iteration 1's body setter.
+            assert_eq!(
+                arr[1].as_str(),
+                Some("urlencoded"),
+                "pm.request.body.mode must read the live mode, got: {arr:?}"
+            );
+            // pm.info fields must be live, not the hardcoded stub.
+            assert_eq!(
+                arr[2].as_str(),
+                Some("test"),
+                "eventName live, got: {arr:?}"
+            );
+            assert_eq!(arr[3], serde_json::json!(4), "iteration live, got: {arr:?}");
+            assert_eq!(
+                arr[4],
+                serde_json::json!(25),
+                "iterationCount live, got: {arr:?}"
+            );
+            assert_eq!(
+                arr[5].as_str(),
+                Some("get-user"),
+                "requestName live, got: {arr:?}"
+            );
+            assert_eq!(arr[6].as_str(), Some("r-9"), "requestId live, got: {arr:?}");
+
+            // The setter still forwards to the auth bridge.
+            let auth_set: String = ctx.eval("__auth_set").unwrap();
+            assert_eq!(
+                auth_set, r#"{"type":"bearer","token":"stale-token"}"#,
+                "pm.request.auth setter must still JSON-encode to the bridge"
+            );
         });
     }
 }
