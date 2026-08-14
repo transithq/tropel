@@ -144,6 +144,12 @@ impl ScenarioRunner {
 
     /// Set the runner configuration.
     pub fn with_config(mut self, config: RunnerConfig) -> Self {
+        // Backlog line 101: pm.info.iterationCount must be live, not the
+        // hardcoded stub's 1 — the configured max_iterations is the count
+        // when known (None for duration-based runs).
+        if let Some(max_iterations) = config.max_iterations {
+            self.pm_state.lock().unwrap().total_iterations = Some(max_iterations);
+        }
         self.config = config;
         self
     }
@@ -273,6 +279,9 @@ impl ScenarioRunner {
 
                 // Run prerequest script
                 if let Some(script) = &item.prerequest {
+                    // Backlog line 101: pm.info.eventName must name the
+                    // running script phase, not a hardcoded "test".
+                    self.pm_state.lock().unwrap().event_name = "prerequest".to_string();
                     let source_url = Some(format!("{}.prerequest.js", item.name));
                     if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await {
                         if self.force_stop.load(Ordering::Acquire) {
@@ -649,6 +658,9 @@ impl ScenarioRunner {
                 // Run test script (skipped when pm.execution.skipRequest() ran)
                 if !skip_item {
                     if let Some(script) = &item.test {
+                        // Backlog line 101: pm.info.eventName names the
+                        // running phase — "test" here, "prerequest" above.
+                        self.pm_state.lock().unwrap().event_name = "test".to_string();
                         let source_url = Some(format!("{}.test.js", item.name));
                         if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await
                         {
