@@ -1177,6 +1177,37 @@ impl DriverInstance for K6DriverInstance {
 /// Backlog line 150: the object now carries REAL `timings` (blocked/dns/
 /// connecting/tls_handshaking/sending/waiting/receiving/duration in ms, from
 /// the reqwest resolver+connector hooks), k6's `error` ("" on success) /
+/// Backlog line 46: degrade a k6 response object to the same status-0 error
+/// response the invalid-method path returns when the per-VU QuickJS heap
+/// (10 MB cap) can't hold the response body. Never panic across the FFI
+/// boundary on untrusted input — the script gets a failed response (checks
+/// fail, http_req_failed counts). Extracted as a free function so the
+/// fallback's field contract is unit-testable without forcing the real
+/// (soft — GC-trigger only) QuickJS memory limit to hard-fail.
+fn degrade_to_status0_error<'js>(
+    obj: &rquickjs::Object<'js>,
+    ctx: &rquickjs::Ctx<'js>,
+    msg: &str,
+) {
+    let _ = obj.set("code", 0);
+    let _ = obj.set("status", 0);
+    let _ = obj.set("status_text", msg);
+    let _ = obj.set("error", msg);
+    let _ = obj.set("error_code", k6_error_code(msg));
+    // Keep the body an ArrayBuffer (empty) so scripts probing
+    // res.body.byteLength don't see a type change; only if even a
+    // zero-length buffer fails (heap fully exhausted) fall back to an
+    // empty string.
+    match rquickjs::ArrayBuffer::new(ctx.clone(), Vec::<u8>::new()) {
+        Ok(ab) => {
+            let _ = obj.set("body", ab);
+        }
+        Err(_) => {
+            let _ = obj.set("body", String::new());
+        }
+    }
+}
+
 /// `error_code` (0 on success, 1xxx series on transport failure), and for
 /// `responseType: "binary"` the body is a native JS ArrayBuffer instead of a
 /// UTF-8 string (binary payloads are no longer silently destroyed).
@@ -1221,9 +1252,21 @@ fn build_k6_response_object<'js>(
     // `responseType: "binary"` → native ArrayBuffer body (raw bytes survive);
     // otherwise UTF-8 text. `none` (k6) sends an empty body.
     if response_type.eq_ignore_ascii_case("binary") {
-        let ab =
-            rquickjs::ArrayBuffer::new(ctx.clone(), body).expect("ArrayBuffer for k6 binary body");
-        let _ = obj.set("body", ab);
+        match rquickjs::ArrayBuffer::new(ctx.clone(), body) {
+            Ok(ab) => {
+                let _ = obj.set("body", ab);
+            }
+            Err(e) => {
+                // Backlog line 46: the per-VU QuickJS heap is capped at
+                // 10 MB, so a server-controlled binary body near that cap
+                // used to panic across the FFI boundary. Never panic on
+                // untrusted input — mirror the invalid-method path and
+                // degrade to a status-0 error response the shim returns to
+                // the script (checks fail, http_req_failed counts).
+                let msg = format!("binary response body allocation failed: {e}");
+                degrade_to_status0_error(&obj, &ctx, &msg);
+            }
+        }
     } else {
         let _ = obj.set("body", String::from_utf8_lossy(&body).into_owned());
     }
@@ -6722,5 +6765,68 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 "\"127.0.0.1\"],20,\"2026-08-08\",\"2027-08-08\",4,\"tropel.example.com\"]"
             )
         );
+    }
+
+    /// Backlog line 46: the per-VU QuickJS heap is capped at 10 MB
+    /// (`K6Driver::init`), so a server-controlled binary body near that cap
+    /// used to panic across the FFI boundary inside the response bridge. Two
+    /// observations drive the test shape: QuickJS's memory limit is a SOFT
+    /// limit (it triggers GC, it does not hard-fail an allocation), so the
+    /// bridge's Err branch can't be forced deterministically through the
+    /// real heap — the degradation CONTRACT is exercised directly via
+    /// [`degrade_to_status0_error`]; and the no-panic FFI property is pinned
+    /// with a body far beyond the cap (the old `.expect()` is what made a
+    /// theoretical OOM a cross-boundary panic).
+    #[tokio::test]
+    async fn test_k6_binary_body_alloc_failure_degrades_to_status0_error() {
+        let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        // (1) The status-0 degradation contract, exercised directly — this
+        //     is exactly what the bridge's Err branch applies.
+        js_ctx.with_ctx(|ctx| {
+            let obj = rquickjs::Object::new(ctx.clone()).unwrap();
+            degrade_to_status0_error(&obj, &ctx, "binary response body allocation failed");
+            let code: i32 = obj.get("code").unwrap();
+            assert_eq!(code, 0, "degraded response is status-0");
+            let status: i32 = obj.get("status").unwrap();
+            assert_eq!(status, 0, "degraded response status is 0");
+            let err: String = obj.get("error").unwrap();
+            assert!(
+                !err.is_empty(),
+                "the status-0 fallback sets a diagnostic error message"
+            );
+            let err_code: i32 = obj.get("error_code").unwrap();
+            assert_eq!(err_code, 1000, "generic k6 error code");
+            // The body stays an ArrayBuffer (empty fallback) so scripts
+            // probing res.body.byteLength don't see a type change.
+            let body: rquickjs::Value = obj.get("body").unwrap();
+            assert!(!body.is_undefined() && !body.is_null(), "body is set");
+        });
+        // (2) No-panic property: a 32 MB binary body on a 10 MB heap must
+        //     never panic across the FFI boundary — the response is
+        //     well-formed either way (the soft limit lets the allocation
+        //     through: code 200 + body; or the fallback fires: code 0).
+        js_ctx.with_ctx(|ctx| {
+            let resp = build_k6_response_object(
+                &ctx,
+                200,
+                "OK".to_string(),
+                vec![0u8; 32 * 1024 * 1024],
+                &HashMap::new(),
+                0.0,
+                None,
+                "",
+                0,
+                "binary",
+            );
+            let code: i32 = resp.get("code").unwrap();
+            assert!(
+                code == 0 || code == 200,
+                "well-formed response under heap pressure, got code {code}"
+            );
+            let body: rquickjs::Value = resp.get("body").unwrap();
+            assert!(!body.is_undefined() && !body.is_null(), "body is set");
+        });
     }
 }
