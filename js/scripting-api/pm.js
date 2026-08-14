@@ -12,17 +12,27 @@ function __tropel_build_binding(namespace) {
     var __ns = namespace || 'pm';
 
 // ── pm.environment ──
+// Backlog line 89: set/get must be INVERSES. The old setter String()-coerced
+// (pm.response.json() → "[object Object]" stored) and the getter returned raw
+// — an object set once could never come back. Values are now JSON-encoded on
+// set (strings stay strings: '1234' is stored as '"1234"', never retyped to
+// the number 1234) and JSON.parsed on get with a raw fallback. The runner's
+// build_scope decodes the same encoding for {{var}} substitution.
 pm.environment = {
     get: function (key) {
-        // Delegates to native environment_get
         if (typeof __tropel_pm_environment_get === 'function') {
-            return __tropel_pm_environment_get(key);
+            var raw = __tropel_pm_environment_get(key);
+            if (raw === null || raw === undefined) return null;
+            try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return null;
     },
     set: function (key, value) {
         if (typeof __tropel_pm_environment_set === 'function') {
-            __tropel_pm_environment_set(key, String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_environment_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -45,7 +55,14 @@ pm.environment = {
     },
     toObject: function () {
         if (typeof __tropel_pm_environment_to_object === 'function') {
-            return __tropel_pm_environment_to_object() || {};
+            var map = __tropel_pm_environment_to_object() || {};
+            var out = {};
+            for (var k in map) {
+                if (map.hasOwnProperty(k)) {
+                    try { out[k] = JSON.parse(map[k]); } catch (e) { out[k] = map[k]; }
+                }
+            }
+            return out;
         }
         return {};
     },
@@ -69,7 +86,10 @@ pm.collectionVariables = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_collection_vars_set === 'function') {
-            __tropel_pm_collection_vars_set(key, value === undefined ? '' : String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_collection_vars_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -114,7 +134,10 @@ pm.globals = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_globals_set === 'function') {
-            __tropel_pm_globals_set(key, value === undefined ? '' : String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_globals_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -162,10 +185,14 @@ pm.variables = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_variables_set === 'function') {
-            // Backlog line 146: every other store coerces String(value);
-            // variables.set passed the RAW value, so a number like 42 hit
-            // the bridge's strict String param and threw TypeError.
-            __tropel_pm_variables_set(key, value === undefined ? '' : String(value));
+            // Backlog line 89/146: JSON-encode so set/get are inverses (an
+            // object set once comes back as an object; '1234' stays the
+            // string '1234'). Line 146: never pass the RAW value into the
+            // strict String bridge param.
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_variables_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -339,23 +366,36 @@ pm.response.to = {
             }
         },
         get info() { assertStatusClass(1, 'info'); },
-        json: function () {
+        // Backlog line 42: chai-postman exposes .json/.html/.text as
+        // PROPERTIES — Postman's own snippets emit `pm.response.to.be.json;`
+        // with NO parens. As methods here, reading the property yielded a
+        // truthy Function and recorded PASS on any body. Now getters: the
+        // check runs on property READ (throws on mismatch, so the bare form
+        // fails instead of silently passing) and the returned callable keeps
+        // the paren form `to.be.json()` working.
+        get json() {
             // Postman parity: to.be.json passes when the body parses as JSON.
             // Content-type is informational — a text/plain body that parses
             // still counts (Postman's chai-postman checks the body first).
             pm.response.json(); // throws on invalid JSON body
+            // The getter has already validated — the callable is a no-op so
+            // the paren form `to.be.json()` doesn't re-run the check (which
+            // would re-read the lazy bridge and allocate a fresh function).
+            return function () {};
         },
-        html: function () {
+        get html() {
             var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
             if (ct.indexOf('html') === -1) {
                 throw new Error('expected response to be HTML, content-type is ' + ct);
             }
+            return function () {};
         },
-        text: function () {
+        get text() {
             var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
             if (ct.indexOf('text') === -1 && ct.indexOf('json') === -1 && ct.indexOf('xml') === -1) {
                 throw new Error('expected response to be text, content-type is ' + ct);
             }
+            return function () {};
         }
     },
     have: {
@@ -443,6 +483,15 @@ pm.test.skip = function (name) {
 // in a Proxy whose `get` trap THROWS on unknown assertion names, so a typo'd
 // or unimplemented assertion fails the check instead of passing silently.
 // The common chai-postman property assertions are implemented below.
+// ── chai-style assertion chain (backlog line 105) ──
+// pm.expect was ~10x slower than chai.expect — measured 2511 ms vs 235 ms
+// over 200k assertions. EVERY call built a fresh chain object literal with
+// 18 Object.defineProperty calls (addPropAssertions) AND guardChain wrapped
+// each object-valued property read in a NEW Proxy. The chain is now a single
+// class: getters/methods live on the prototype (defined ONCE at load), so
+// each pm.expect() allocates one small instance + one proxy, and
+// to/be/not/... return `this` (the same proxy) so a chain of any length
+// never allocates again.
 function guardChain(target) {
     return new Proxy(target, {
         get: function (t, prop, receiver) {
@@ -453,46 +502,71 @@ function guardChain(target) {
                 return Reflect.get(t, prop, receiver);
             }
             if (prop in t) {
-                var v = Reflect.get(t, prop, receiver);
-                // Recurse into nested chain objects so `to.be.true` etc. are
-                // guarded one level deeper.
-                return v !== null && typeof v === 'object' ? guardChain(v) : v;
+                // No recursion needed: every chain getter returns `this`
+                // (already the proxy), so nested reads cost one getter call.
+                return Reflect.get(t, prop, receiver);
             }
             throw new Error("unknown assertion property '" + String(prop) + "'");
         }
     });
 }
 
-// chai-postman property assertions. Each getter THROWS on mismatch so the
-// enclosing pm.test records a failed check (a bare boolean would leave the
-// callback's `undefined` statement result recorded as passed).
-function addPropAssertions(chain, actual, negated) {
+function AssertChain(actual, negated) {
+    this._actual = actual;
+    this._negated = !!negated;
+}
+
+// Chain getters: to/be/been/is/that/which/and/has/have/with/at/of/same all
+// hand back the same (already guarded) chain — defined once on the prototype.
+var chainGetters = ['to', 'be', 'been', 'is', 'that', 'which', 'and', 'has', 'have', 'with', 'at', 'of', 'same'];
+for (var gi = 0; gi < chainGetters.length; gi++) {
+    (function (name) {
+        Object.defineProperty(AssertChain.prototype, name, {
+            get: function () { return this; },
+            enumerable: true
+        });
+    })(chainGetters[gi]);
+}
+
+Object.defineProperty(AssertChain.prototype, 'not', {
+    get: function () {
+        // One extra proxy per .not — used once per assertion, not per read.
+        return guardChain(new AssertChain(this._actual, !this._negated));
+    },
+    enumerable: true
+});
+
+// Property assertions (getters). Each THROWS on mismatch so the enclosing
+// pm.test records a failed check (a bare boolean would leave the callback's
+// `undefined` statement result recorded as passed). Negation-aware via
+// this._negated — installed ONCE on the prototype.
+(function () {
     var checks = {
-        true: function () { return actual === true; },
-        false: function () { return actual === false; },
-        null: function () { return actual === null; },
-        undefined: function () { return actual === undefined; },
-        ok: function () { return !!actual; },
-        empty: function () {
-            if (typeof actual === 'string' || Array.isArray(actual)) return actual.length === 0;
-            if (actual !== null && typeof actual === 'object') return Object.keys(actual).length === 0;
+        true: function (a) { return a === true; },
+        false: function (a) { return a === false; },
+        null: function (a) { return a === null; },
+        undefined: function (a) { return a === undefined; },
+        ok: function (a) { return !!a; },
+        empty: function (a) {
+            if (typeof a === 'string' || Array.isArray(a)) return a.length === 0;
+            if (a !== null && typeof a === 'object') return Object.keys(a).length === 0;
             return false;
         },
-        exist: function () { return actual !== null && actual !== undefined; },
-        NaN: function () { return typeof actual === 'number' && isNaN(actual); },
-        finite: function () { return typeof actual === 'number' && isFinite(actual); }
+        exist: function (a) { return a !== null && a !== undefined; },
+        NaN: function (a) { return typeof a === 'number' && isNaN(a); },
+        finite: function (a) { return typeof a === 'number' && isFinite(a); }
     };
     Object.keys(checks).forEach(function (name) {
-        Object.defineProperty(chain, name, {
+        Object.defineProperty(AssertChain.prototype, name, {
             get: function () {
+                var holds = checks[name](this._actual);
                 // Negated chain: the positive holding means the assertion
                 // FAILS — throw when the check passes, not when it fails.
-                var holds = checks[name]();
-                var passed = negated ? !holds : holds;
+                var passed = this._negated ? !holds : holds;
                 if (!passed) {
                     var label = name === 'ok' ? 'be truthy' : name === 'exist' ? 'exist' : 'be ' + name;
                     throw new Error(
-                        'expected ' + shortJson(actual) + (negated ? ' not' : '') + ' to ' + label
+                        'expected ' + shortJson(this._actual) + (this._negated ? ' not' : '') + ' to ' + label
                     );
                 }
                 return this;
@@ -500,134 +574,106 @@ function addPropAssertions(chain, actual, negated) {
             enumerable: true
         });
     });
-}
+})();
+
+// Value/method assertions — all negation-aware (chai parity; the old shim
+// restricted the negated surface to eql/equal/be, which was a deficit).
+// Every method returns `this` so chains like
+// `pm.expect(x).to.be.an('string').and.to.equal('x')` work (chai parity).
+AssertChain.prototype.eql = function (expected) {
+    var holds = deepEqual(this._actual, expected);
+    if (this._negated ? holds : !holds) {
+        throw new Error(
+            'expected ' + shortJson(this._actual) + (this._negated ? ' not' : '') + ' to eql ' + shortJson(expected)
+        );
+    }
+    return this;
+};
+AssertChain.prototype.equal = function (expected) {
+    var holds = this._actual === expected;
+    if (this._negated ? holds : !holds) {
+        throw new Error(
+            'expected ' + shortJson(this._actual) + (this._negated ? ' not' : '') + ' to equal ' + shortJson(expected)
+        );
+    }
+    return this;
+};
+AssertChain.prototype.include = function (expected) {
+    // Only strings/arrays/objects can be "included into" (chai semantics).
+    // indexOf WITHOUT String coercion: `include(2)` on [10, 20] must FAIL
+    // (strict element membership — "10,20".indexOf("0") would pass) and
+    // `include('2')` on 123 must fail too, exactly like chai.
+    var obj = this._actual;
+    var holds = (typeof obj === 'string' || Array.isArray(obj))
+        ? obj.indexOf(expected) !== -1
+        : (obj !== null && typeof obj === 'object' && expected in obj);
+    if (this._negated ? holds : !holds) {
+        throw new Error('expected value ' + (this._negated ? 'not ' : '') + 'to include ' + shortJson(expected));
+    }
+    return this;
+};
+AssertChain.prototype.match = function (regex) {
+    var holds = regex.test(String(this._actual));
+    if (this._negated ? holds : !holds) {
+        throw new Error('expected value ' + (this._negated ? 'not ' : '') + 'to match ' + regex);
+    }
+    return this;
+};
+AssertChain.prototype.an = function (type) {
+    var holds = typeOf(this._actual) === type;
+    if (this._negated ? holds : !holds) {
+        throw new Error(
+            'expected value ' + (this._negated ? 'not ' : '') + 'to be an ' + type + ', got ' + typeOf(this._actual)
+        );
+    }
+    return this;
+};
+AssertChain.prototype.a = function (type) {
+    return this.an(type);
+};
+AssertChain.prototype.property = function (prop, value) {
+    var obj = this._actual;
+    var has = obj && (prop in obj);
+    var holds = has && (value === undefined || obj[prop] === value);
+    if (this._negated ? holds : !holds) {
+        throw new Error('expected value ' + (this._negated ? 'not ' : '') + 'to have property ' + prop);
+    }
+    return this;
+};
+AssertChain.prototype.status = function (code) {
+    // Must THROW on mismatch (Postman/chai semantics) — a boolean return
+    // makes `pm.test` treat the callback's `undefined` statement result as
+    // passed. Backlog line 143: pm.response.code is a VALUE now.
+    var actual = pm.response.code;
+    var holds = actual === code;
+    if (this._negated ? holds : !holds) {
+        throw new Error('expected response ' + (this._negated ? 'not ' : '') + 'to have status ' + code + ' but got ' + actual);
+    }
+    return this;
+};
+AssertChain.prototype.header = function (key, value) {
+    var header = pm.response.header(key);
+    var holds = header === value;
+    if (this._negated ? holds : !holds) {
+        throw new Error('expected header ' + key + ' ' + (this._negated ? 'not ' : '') + 'to be ' + shortJson(value) + ', got ' + shortJson(header));
+    }
+    return this;
+};
+AssertChain.prototype.jsonBody = function (expected) {
+    var body = pm.response.json();
+    var holds = deepEqual(body, expected);
+    if (this._negated ? holds : !holds) {
+        throw new Error('expected response body ' + (this._negated ? 'not ' : '') + 'to match');
+    }
+    return this;
+};
 
 pm.expect = function (actual) {
-    var chain = {
-        to: {
-            // Backlog line 144: chai semantics — .eql is DEEP equality,
-            // .equal is strict (===). The old mapping was inverted: eql used
-            // === so `pm.expect(pm.response.json()).to.eql({...})` could
-            // never pass against a freshly-parsed body, and equal delegated
-            // to eql.
-            eql: function (expected) {
-                if (!deepEqual(actual, expected)) {
-                    throw new Error(
-                        'expected ' + shortJson(actual) + ' to eql ' + shortJson(expected)
-                    );
-                }
-            },
-            equal: function (expected) {
-                if (actual !== expected) {
-                    throw new Error(
-                        'expected ' + shortJson(actual) + ' to equal ' + shortJson(expected)
-                    );
-                }
-            },
-            include: function (expected) {
-                if (String(actual).indexOf(String(expected)) === -1) {
-                    throw new Error('expected value to include ' + shortJson(expected));
-                }
-            },
-            be: {
-                // chai-style type assertions: pm.expect(x).to.be.an('array')
-                an: function (type) {
-                    if (typeOf(actual) !== type) {
-                        throw new Error(
-                            'expected value to be an ' + type + ', got ' + typeOf(actual)
-                        );
-                    }
-                },
-                a: function (type) {
-                    return this.an(type);
-                }
-            },
-            have: {
-                property: function (prop, value) {
-                    var obj = actual;
-                    var has = obj && (prop in obj);
-                    var passed = has;
-                    if (has && value !== undefined) {
-                        passed = obj[prop] === value;
-                    }
-                    if (!passed) {
-                        throw new Error('expected value to have property ' + prop);
-                    }
-                },
-                status: function (code) {
-                    // Must THROW on mismatch (Postman/chai semantics) — a
-                    // boolean return makes `pm.test` treat the callback's
-                    // `undefined` statement result as passed.
-                    // Backlog line 143: pm.response.code is a VALUE now.
-                    var actual = pm.response.code;
-                    if (actual !== code) {
-                        throw new Error('expected response to have status ' + code + ' but got ' + actual);
-                    }
-                },
-                header: function (key, value) {
-                    var header = pm.response.header(key);
-                    if (header !== value) {
-                        throw new Error('expected header ' + key + ' to be ' + shortJson(value) + ', got ' + shortJson(header));
-                    }
-                },
-                jsonBody: function (expected) {
-                    var body = pm.response.json();
-                    // Backlog line 144: JSON.stringify comparison was
-                    // key-order sensitive — the same failure mode as the old
-                    // eql. Deep-compare instead.
-                    if (!deepEqual(body, expected)) {
-                        throw new Error('expected response body to match');
-                    }
-                }
-            },
-            match: function (regex) {
-                if (!regex.test(String(actual))) {
-                    throw new Error('expected value to match ' + regex);
-                }
-            }
-        },
-        not: {
-            to: {
-                eql: function (expected) {
-                    if (deepEqual(actual, expected)) {
-                        throw new Error(
-                            'expected ' + shortJson(actual) + ' not to eql ' + shortJson(expected)
-                        );
-                    }
-                },
-                equal: function (expected) {
-                    if (actual === expected) {
-                        throw new Error(
-                            'expected ' + shortJson(actual) + ' not to equal ' + shortJson(expected)
-                        );
-                    }
-                },
-                be: {
-                    // Negated property/type assertions:
-                    // `pm.expect(x).not.to.be.true` must THROW when the
-                    // positive holds (the guard applies here too).
-                    an: function (type) {
-                        if (typeOf(actual) === type) {
-                            throw new Error('expected value not to be an ' + type);
-                        }
-                    },
-                    a: function (type) {
-                        return this.an(type);
-                    }
-                }
-            }
-        }
-    };
-    // Install the property assertions on the chain levels where chai-postman
-    // exposes them, then guard the whole chain so ANY unknown name throws.
-    addPropAssertions(chain.to, actual);
-    addPropAssertions(chain.to.be, actual);
-    // Negated chain: both `not.to.true` and the canonical `not.to.be.true`
-    // must be guarded (the getters live on the `be` object, which is a
-    // SEPARATE literal from `not.to`).
-    addPropAssertions(chain.not.to, actual, true);
-    addPropAssertions(chain.not.to.be, actual, true);
-    return guardChain(chain);
+    // One small instance + one proxy per call (backlog line 105). The whole
+    // chain surface lives on AssertChain.prototype; `to`/`be`/`not` return
+    // `this` (the proxy), so the unknown-name guard covers every position
+    // and a chain of any length allocates nothing more.
+    return guardChain(new AssertChain(actual, false));
 };
 
 // ── pm.request ──
@@ -715,7 +761,25 @@ pm.request.headers = {
 // Postman's canonical idiom is `pm.request.body.raw = '...'`, which requires
 // a STABLE object whose `raw` accessor is bridge-wired (a getter returning a
 // fresh object each read would silently swallow the mutation).
-var _pmRequestBody = { mode: 'raw' };
+// Backlog line 101: `mode` was a plain module-scope property — a fresh
+// request per iteration re-seeded the raw text but NOT the mode, so
+// `pm.request.body.mode` leaked the previous iteration's value. It is now
+// a live getter backed by __tropel_pm_request_body_mode (falling back to
+// the last-assigned value when the bridge is absent, e.g. test stubs).
+var _pmRequestBody = {};
+var _pmBodyModeFallback = 'raw';
+Object.defineProperty(_pmRequestBody, 'mode', {
+    get: function () {
+        if (typeof __tropel_pm_request_body_mode === 'function') {
+            var m = __tropel_pm_request_body_mode();
+            if (m) return m;
+        }
+        return _pmBodyModeFallback;
+    },
+    set: function (m) { _pmBodyModeFallback = m || 'raw'; },
+    enumerable: true,
+    configurable: true
+});
 Object.defineProperty(_pmRequestBody, 'raw', {
     get: function () {
         if (typeof __tropel_pm_request_body === 'function') {
@@ -753,7 +817,21 @@ Object.defineProperty(pm.request, 'body', {
 // may inspect it in a test script).
 var _pmRequestAuth = null;
 Object.defineProperty(pm.request, 'auth', {
-    get: function () { return _pmRequestAuth; },
+    // Backlog line 101: the getter was a module-scope singleton, so a
+    // request with NO auth (or a different auth) on the next iteration
+    // still read the previous iteration's value. Read LIVE from the current
+    // request's auth via __tropel_pm_request_auth; fall back to the stored
+    // copy only when the bridge is absent (test stubs / browser slice).
+    get: function () {
+        if (typeof __tropel_pm_request_auth === 'function') {
+            var j = __tropel_pm_request_auth();
+            if (j) {
+                try { return JSON.parse(j); } catch (e) { return null; }
+            }
+            return null;
+        }
+        return _pmRequestAuth;
+    },
     set: function (auth) {
         _pmRequestAuth = auth;
         // JSON.stringify(undefined) is not a string — skip the bridge (and
@@ -821,30 +899,141 @@ function shortJson(v) {
 // key order, nested arrays/objects. Mirrors the jsDeepEqual in
 // js/chai/chai-shim.js — the backlog fix for .eql must not depend on chai
 // being loaded first (pm.js is bundled standalone).
-function deepEqual(a, b) {
+//
+// Backlog line 85: Date/Set/Map/RegExp used to collapse to Object.keys()
+// = [] — ANY two instances compared equal (pm.expect(new Date(1))
+// .to.eql(new Date(999999)) passed). They now compare by VALUE (time for
+// Date, source+flags for RegExp, size + order-insensitive entries for
+// Map/Set). Circular structures no longer overflow the stack (a seen-pair
+// guard: revisiting the exact (a,b) pair mid-compare is assumed equal).
+function deepEqual(a, b, seen) {
     if (a === b) return true;
     if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
     if (a === null || b === null || a === undefined || b === undefined) return a === b;
     if (typeof a !== typeof b) return false;
+    // Date: compare by epoch time; two invalid dates compare equal.
+    if (a instanceof Date || b instanceof Date) {
+        if (!(b instanceof Date)) return false;
+        var ta = a.getTime(), tb = b.getTime();
+        return (isNaN(ta) && isNaN(tb)) || ta === tb;
+    }
+    // RegExp: canonical toString (normalizes flag order — /gi vs /ig are
+    // the same expression, matching chai's deep-eql).
+    if (a instanceof RegExp || b instanceof RegExp) {
+        if (!(b instanceof RegExp)) return false;
+        return String(a) === String(b);
+    }
     if (Array.isArray(a)) {
         if (!Array.isArray(b) || a.length !== b.length) return false;
-        for (var i = 0; i < a.length; i++) {
-            if (!deepEqual(a[i], b[i])) return false;
+        seen = seen || [];
+        for (var s = 0; s < seen.length; s++) {
+            if (seen[s][0] === a && seen[s][1] === b) return true;
         }
+        seen.push([a, b]);
+        for (var i = 0; i < a.length; i++) {
+            if (!deepEqual(a[i], b[i], seen)) {
+                seen.pop();
+                return false;
+            }
+        }
+        seen.pop();
         return true;
     }
     if (typeof a === 'object') {
         if (Array.isArray(b) || b === null || b === undefined) return false;
+        // Map: same size, each entry's key+value finds a deep-equal mate
+        // (order-insensitive).
+        if (a instanceof Map || b instanceof Map) {
+            if (!(b instanceof Map) || a.size !== b.size) return false;
+            // Cycle guard: Map nodes can be self-referential (a Map whose value
+            // is itself); revisiting the exact (a, b) pair mid-compare is
+            // assumed equal.
+            seen = seen || [];
+            for (var s = 0; s < seen.length; s++) {
+                if (seen[s][0] === a && seen[s][1] === b) return true;
+            }
+            seen.push([a, b]);
+            var aEntries = Array.from(a.entries());
+            var bEntries = Array.from(b.entries());
+            var usedB = [];
+            outer:
+            for (var mi = 0; mi < aEntries.length; mi++) {
+                for (var mj = 0; mj < bEntries.length; mj++) {
+                    if (usedB[mj]) continue;
+                    if (deepEqual(aEntries[mi][0], bEntries[mj][0], seen) &&
+                        deepEqual(aEntries[mi][1], bEntries[mj][1], seen)) {
+                        usedB[mj] = true;
+                        continue outer;
+                    }
+                }
+                seen.pop();
+                return false;
+            }
+            seen.pop();
+            return true;
+        }
+        // Set: same size, each member finds a deep-equal mate.
+        if (a instanceof Set || b instanceof Set) {
+            if (!(b instanceof Set) || a.size !== b.size) return false;
+            // Cycle guard: Set nodes can be self-referential (a Set containing
+            // itself); revisiting the exact (a, b) pair mid-compare is assumed
+            // equal.
+            seen = seen || [];
+            for (var s = 0; s < seen.length; s++) {
+                if (seen[s][0] === a && seen[s][1] === b) return true;
+            }
+            seen.push([a, b]);
+            var aMembers = Array.from(a);
+            var bMembers = Array.from(b);
+            var usedS = [];
+            outer2:
+            for (var si = 0; si < aMembers.length; si++) {
+                for (var sj = 0; sj < bMembers.length; sj++) {
+                    if (usedS[sj]) continue;
+                    if (deepEqual(aMembers[si], bMembers[sj], seen)) {
+                        usedS[sj] = true;
+                        continue outer2;
+                    }
+                }
+                seen.pop();
+                return false;
+            }
+            seen.pop();
+            return true;
+        }
+        // Plain object: key-set comparison with a cycle guard.
+        seen = seen || [];
+        for (var k = 0; k < seen.length; k++) {
+            if (seen[k][0] === a && seen[k][1] === b) return true;
+        }
+        seen.push([a, b]);
         var keysA = Object.keys(a).sort();
         var keysB = Object.keys(b).sort();
-        if (keysA.length !== keysB.length) return false;
-        for (var j = 0; j < keysA.length; j++) {
-            if (keysA[j] !== keysB[j]) return false;
-            if (!deepEqual(a[keysA[j]], b[keysB[j]])) return false;
+        if (keysA.length !== keysB.length) {
+            seen.pop();
+            return false;
         }
+        for (var j = 0; j < keysA.length; j++) {
+            if (keysA[j] !== keysB[j] || !deepEqual(a[keysA[j]], b[keysB[j]], seen)) {
+                seen.pop();
+                return false;
+            }
+        }
+        seen.pop();
         return true;
     }
     return a === b;
+}
+
+// Backlog line 88: chai's .include semantics — substring for strings,
+// element membership (strict indexOf) for arrays, KEY membership for
+// objects. The old String(container).indexOf(...) made [11,22].include(1)
+// and {a:1}.include('object') pass.
+function includesValue(container, value) {
+    if (typeof container === 'string') return container.indexOf(value) !== -1;
+    if (Array.isArray(container)) return container.indexOf(value) !== -1;
+    if (container !== null && typeof container === 'object') return value in container;
+    return false;
 }
 
 // ── pm.iterationData ──
@@ -1080,14 +1269,36 @@ pm.execution = {
     }
 };
 
-// ── pm.info ──
-pm.info = {
+// ── pm.info (live, backlog line 101) ──
+// Was a hardcoded stub (eventName 'test', iteration 0, iterationCount 1,
+// requestName '', requestId ''). Each field is now a getter backed by the
+// __tropel_pm_info bridge, so a test script sees the real iteration,
+// request name, and configured iteration count. Falls back to the old
+// stub values when the bridge is absent (test stubs / browser slice).
+var _pmInfoFallback = {
     eventName: 'test',
     iteration: 0,
     iterationCount: 1,
     requestName: '',
     requestId: ''
 };
+function _pmInfoRead() {
+    if (typeof __tropel_pm_info === 'function') {
+        var raw = __tropel_pm_info();
+        if (raw) {
+            try { return JSON.parse(raw); } catch (e) { /* fall through */ }
+        }
+    }
+    return _pmInfoFallback;
+}
+pm.info = {};
+['eventName', 'iteration', 'iterationCount', 'requestName', 'requestId'].forEach(function (k) {
+    Object.defineProperty(pm.info, k, {
+        get: function () { return _pmInfoRead()[k]; },
+        enumerable: true,
+        configurable: true
+    });
+});
 
 // ── pm.metrics (custom metrics) ──
 pm.metrics = {
