@@ -153,6 +153,12 @@ impl ScenarioRunner {
 
     /// Set the runner configuration.
     pub fn with_config(mut self, config: RunnerConfig) -> Self {
+        // Backlog line 101: pm.info.iterationCount must be live, not the
+        // hardcoded stub's 1 — the configured max_iterations is the count
+        // when known (None for duration-based runs).
+        if let Some(max_iterations) = config.max_iterations {
+            self.pm_state.lock().unwrap().total_iterations = Some(max_iterations);
+        }
         self.config = config;
         self
     }
@@ -298,6 +304,14 @@ impl ScenarioRunner {
                 // scope and one cache entry). An error in one script stops
                 // the rest of the chain (Postman behavior) but still counts
                 // as a failure.
+                //
+                // Backlog line 101: pm.info.eventName must name the running
+                // script phase, not a hardcoded "test". Set only when a
+                // prerequest script actually runs (an empty vec must not
+                // leave event_name stale while the request executes).
+                if !item.prerequest.is_empty() {
+                    self.pm_state.lock().unwrap().event_name = "prerequest".to_string();
+                }
                 for (script_idx, script) in item.prerequest.iter().enumerate() {
                     let source_url = Some(format!("{}.prerequest#{}.js", item.name, script_idx));
                     if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await {
@@ -680,6 +694,12 @@ impl ScenarioRunner {
                 // ran) — EACH in its own lexical scope (backlog §4, same as
                 // the prerequest chain).
                 if !skip_item {
+                    // Backlog line 101: pm.info.eventName names the running
+                    // phase — "test" here, "prerequest" above. Set only when
+                    // a test script actually runs.
+                    if !item.test.is_empty() {
+                        self.pm_state.lock().unwrap().event_name = "test".to_string();
+                    }
                     for (script_idx, script) in item.test.iter().enumerate() {
                         let source_url =
                             Some(format!("{}.test#{}.js", item.name, script_idx));
