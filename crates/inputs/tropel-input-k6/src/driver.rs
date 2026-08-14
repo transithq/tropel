@@ -4398,6 +4398,114 @@ mod tests {
     }
 
     #[test]
+    fn test_eql_typed_and_circular_values_compare_by_value() {
+        // Backlog line 85: Date/Set/Map/RegExp collapsed to Object.keys() = []
+        // so ANY two instances compared equal (pm.expect(new Date(1))
+        // .to.eql(new Date(2)) passed). They now compare by value; circular
+        // structures no longer overflow the stack. The same fix landed in all
+        // three deep-equal implementations (pm.js deepEqual, chai-shim
+        // jsDeepEqual, lodash-shim isEqualDeep) — this test locks all three.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/lodash/lodash-shim.js"))
+                .expect("lodash shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                trial('pm_date_same', function () { pm.expect(new Date(1700000000000)).to.eql(new Date(1700000000000)); });
+                trial('pm_date_diff', function () { pm.expect(new Date(1700000000000)).to.eql(new Date(1)); });
+                trial('pm_re_same', function () { pm.expect(/a+b/i).to.eql(/a+b/i); });
+                trial('pm_re_flags', function () { pm.expect(/a+b/i).to.eql(/a+b/g); });
+                trial('pm_re_flag_order', function () { pm.expect(/a+b/gi).to.eql(/a+b/ig); });
+                trial('pm_set_order', function () { pm.expect(new Set([1, 2, 3])).to.eql(new Set([3, 1, 2])); });
+                trial('pm_set_diff', function () { pm.expect(new Set([1, 2])).to.eql(new Set([1, 3])); });
+                trial('pm_map_same', function () { pm.expect(new Map([['a', 1]])).to.eql(new Map([['a', 1]])); });
+                trial('pm_map_diff', function () { pm.expect(new Map([['a', 1]])).to.eql(new Map([['a', 2]])); });
+                trial('pm_cycle_same', function () {
+                    var a = { x: 1 }; a.self = a;
+                    var b = { x: 1 }; b.self = b;
+                    pm.expect(a).to.eql(b);
+                });
+                trial('pm_cycle_diff', function () {
+                    var a = { x: 1 }; a.self = a;
+                    var b = { x: 1 }; b.self = {};
+                    pm.expect(a).to.eql(b);
+                });
+                trial('chai_set_same', function () { chai.expect(new Set([1])).to.eql(new Set([1])); });
+                trial('chai_set_diff', function () { chai.expect(new Set([1])).to.eql(new Set([9])); });
+                trial('lodash_date_same', function () {
+                    if (!_.isEqual(new Date(1700000000000), new Date(1700000000000))) throw new Error('not equal');
+                });
+                trial('lodash_date_diff', function () {
+                    if (_.isEqual(new Date(1), new Date(2))) throw new Error('equal');
+                });
+                trial('lodash_cycle', function () {
+                    var a = { x: 1 }; a.self = a;
+                    if (!_.isEqual(a, a)) throw new Error('not equal');
+                });
+                trial('pm_map_self', function () {
+                    var m = new Map(); m.set('self', m);
+                    var m2 = new Map(); m2.set('self', m2);
+                    pm.expect(m).to.eql(m2);
+                });
+                trial('pm_map_self_diff', function () {
+                    var m = new Map(); m.set('self', m);
+                    var m2 = new Map(); m2.set('self', {});
+                    pm.expect(m).to.eql(m2);
+                });
+                trial('pm_set_self', function () {
+                    var s = new Set(); s.add(s);
+                    var s2 = new Set(); s2.add(s2);
+                    pm.expect(s).to.eql(s2);
+                });
+                trial('pm_map_key_diff', function () {
+                    // Same-size self-referential Maps with different keys: must
+                    // exercise the guarded mate-matching failure pop (not the
+                    // instanceof type-check short-circuit).
+                    var m = new Map(); m.set('a', m);
+                    var m2 = new Map(); m2.set('b', m2);
+                    pm.expect(m).to.eql(m2);
+                });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("pm_date_same"), "true", "equal Dates must eql");
+            assert_eq!(r("pm_date_diff"), "threw", "different Dates must NOT eql");
+            assert_eq!(r("pm_re_same"), "true", "same RegExp source+flags must eql");
+            assert_eq!(r("pm_re_flags"), "threw", "differing RegExp flags must NOT eql");
+            assert_eq!(r("pm_re_flag_order"), "true", "RegExp flag order is normalized (/gi == /ig)");
+            assert_eq!(r("pm_set_order"), "true", "Sets are order-insensitive");
+            assert_eq!(r("pm_set_diff"), "threw", "differing Set members must NOT eql");
+            assert_eq!(r("pm_map_same"), "true", "Maps with equal entries must eql");
+            assert_eq!(r("pm_map_diff"), "threw", "differing Map values must NOT eql");
+            assert_eq!(r("pm_cycle_same"), "true", "circular equal structures must eql");
+            assert_eq!(r("pm_cycle_diff"), "threw", "circular differing structures must throw, not overflow");
+            assert_eq!(r("chai_set_same"), "true", "chai: equal Sets must eql");
+            assert_eq!(r("chai_set_diff"), "threw", "chai: differing Sets must NOT eql");
+            assert_eq!(r("lodash_date_same"), "true", "lodash: equal Dates are isEqual");
+            assert_eq!(r("lodash_date_diff"), "true", "lodash: differing Dates are not isEqual");
+            assert_eq!(r("lodash_cycle"), "true", "lodash: circular self-equality must not overflow");
+            assert_eq!(r("pm_map_self"), "true", "self-referential Maps must eql without stack overflow");
+            assert_eq!(r("pm_map_self_diff"), "threw", "differing self-referential Map values must NOT eql");
+            assert_eq!(r("pm_set_self"), "true", "self-referential Sets must eql without stack overflow");
+            assert_eq!(r("pm_map_key_diff"), "threw", "same-size self-referential Maps with different keys must NOT eql");
+        });
+    }
+
+    #[test]
     fn test_unimplemented_assertion_properties_fail_closed() {
         // Backlog §1 P0: unimplemented assertion PROPERTIES (pm.expect(false)
         // .to.be.true, .to.be.null/.undefined/.ok/.empty, pm.expect(null)
