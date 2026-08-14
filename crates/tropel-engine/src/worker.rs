@@ -340,7 +340,7 @@ impl VUWorkerPool {
             // No worker available (resource exhaustion during growth): run on
             // the CALLER's runtime. `tokio::spawn` requires a runtime context;
             // `spawn_vu` is only reachable from inside one (the ramp loops).
-            Slot::Inline => tokio::spawn(async move { future.await }),
+            Slot::Inline => tokio::spawn(future),
         }
     }
 
@@ -425,7 +425,6 @@ impl Drop for VUWorkerPool {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 thread_local! {
     /// Test-only hook: forces the next `make_worker` call on THIS thread to
     /// fail, exercising the graceful-degradation paths deterministically.
@@ -435,6 +434,7 @@ thread_local! {
     static FAIL_NEXT_WORKER_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
