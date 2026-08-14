@@ -4335,6 +4335,82 @@ mod tests {
     }
 
     #[test]
+    fn test_bru_collection_vars_family() {
+        // TROPEL_PARITY_BRUNO.md §2: Bruno exposes the collection scope via
+        // getCollectionVar/setCollectionVar/hasCollectionVar/delete* — the
+        // shim only had getVar/setVar (aliased to collection). The explicit
+        // family now maps to the __tropel_pm_collection_vars_* bridges.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                var __store = { baseUrl: '"https://api.example.com"', retries: '3' };
+                globalThis.__tropel_pm_collection_vars_get = function (key) {
+                    return Object.prototype.hasOwnProperty.call(__store, key) ? __store[key] : null;
+                };
+                globalThis.__tropel_pm_collection_vars_set = function (key, value) {
+                    __store[key] = value;
+                };
+                globalThis.__tropel_pm_collection_vars_has = function (key) {
+                    return Object.prototype.hasOwnProperty.call(__store, key);
+                };
+                globalThis.__tropel_pm_collection_vars_unset = function (key) {
+                    delete __store[key];
+                };
+                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                    var out = {};
+                    for (var k in __store) out[k] = __store[k];
+                    return out;
+                };
+                var b1 = bru.getCollectionVar('baseUrl');
+                bru.setCollectionVar('token', '"abc"');
+                var h1 = bru.hasCollectionVar('baseUrl');
+                var h2 = bru.hasCollectionVar('missing');
+                bru.deleteCollectionVar('retries');
+                var after = JSON.stringify(__store);
+                bru.deleteAllCollectionVars();
+                var after_all = JSON.stringify(__store);
+                globalThis.__b1_type = typeof b1;
+                globalThis.__h1 = String(h1);
+                globalThis.__h2 = String(h2);
+                globalThis.__after = after;
+                globalThis.__after_all = after_all;
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__b1_type").unwrap(),
+                "string",
+                "bru.getCollectionVar must JSON.parse the bridge value (\"https://…\" is a string, not an object)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h1").unwrap(),
+                "true",
+                "bru.hasCollectionVar must be true for an existing collection var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h2").unwrap(),
+                "false",
+                "bru.hasCollectionVar must be false for a missing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__after").unwrap(),
+                "{\"baseUrl\":\"\\\"https://api.example.com\\\"\",\"token\":\"\\\"abc\\\"\"}",
+                "setCollectionVar must add, deleteCollectionVar must remove (the stub store keeps JSON-encoded values, hence the escaped quotes)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__after_all").unwrap(),
+                "{}",
+                "bru.deleteAllCollectionVars must clear every collection var"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_expect_eql_is_deep_equal() {
         // Backlog line 144: pm.expect(...).to.eql() was strict === while
         // .equal() delegated to eql — inverted vs chai. Deep-equal means a
