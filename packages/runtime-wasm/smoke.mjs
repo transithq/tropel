@@ -8,7 +8,6 @@
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { decodeHttpRequest, Writer } from "./dist/postcard.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -17,8 +16,6 @@ function findArtifact() {
   const candidates = [
     process.env.TROPEL_WASM_PATH,
     path.join(__dirname, "wasm", "tropel_web.wasm"),
-    path.join(__dirname, "..", "..", "target", "wasm32-wasip1", "release-wasm", "tropel_web.wasm"),
-    "C:/tropel-native-target/wasm32-wasip1/release-wasm/tropel_web.wasm",
     path.join(__dirname, "..", "..", "target", "wasm32-wasip1", "release", "tropel_web.wasm"),
     "C:/tropel-native-target/wasm32-wasip1/release/tropel_web.wasm",
   ].filter(Boolean);
@@ -55,6 +52,7 @@ try {
 
 // ── fixture transport (byte-identical semantics to F3's fixture_response) ─
 const seenUrls = [];
+const seenBodies = [];
 const exec = await createExecWasm({
   wasmBytes,
   wasiImports,
@@ -62,14 +60,9 @@ const exec = await createExecWasm({
   onInstantiate: (instance) => wasi.initialize(instance),
   transport: (req) => {
     seenUrls.push(req.url);
-    // Line-44 round trip: the FIRST item carries a JSON body through the
-    // scenario — the wasm encodes it via the real body_to_wire envelope and
-    // this transport decodes it via the real decodeHttpRequest. Assert the
-    // body survived (it used to arrive as a 1-char junk body).
-    if (req.url.includes("/first")) {
-      if (req.body !== '{"a":1}' || req.bodyMode !== "json")
-        fail(`json body must round-trip the wire, got body=${JSON.stringify(req.body)} mode=${req.bodyMode}`);
-    }
+    // Backlog line 44: the first item carries a JSON body; it must arrive
+    // INTACT across the bridge (not the old one-byte junk body).
+    seenBodies.push(req.body);
     return {
       url: req.url,
       statusCode: 200,
@@ -85,7 +78,6 @@ const exec = await createExecWasm({
         sendingMs: 0,
         waitingMs: 5,
         receivingMs: 5,
-        totalMs: 5,
       },
       // One cookie exercises the Option-heavy Cookie wire layout (name/value
       // plain strings, domain/secure/httpOnly as Options) round-trip.
@@ -96,16 +88,14 @@ const exec = await createExecWasm({
 });
 
 // ── the F3 fixture scenario ──────────────────────────────────────────────
-const item = (name, url, test) => ({
+const item = (name, url, test, body) => ({
   name,
   request: {
     url,
     method: "GET",
     headers: {},
     query_params: {},
-    // Line-44 round trip: the first item carries a real JSON body so the
-    // wasm's body_to_wire envelope flows through the actual decoder.
-    body: name === "first" ? { a: 1 } : null,
+    body: body ?? null,
     auth: null,
     certificate: null,
     follow_redirects: true,
@@ -127,13 +117,16 @@ const scenario = {
       "pm.variables.set('carried', 'yes');" +
         "pm.test('status is 200', () => pm.expect(pm.response.code).to.eql(200));" +
         "pm.test('header content-type', () => pm.expect(pm.response.headers.get('content-type')).to.eql('application/json'));" +
-        "pm.execution.setNextRequest('second');"
+        "pm.execution.setNextRequest('second');",
+      // Backlog line 44: a JSON body must survive the tropel_host_http bridge.
+      { ok: true }
     ),
     item(
       "second",
       "https://fixture.test/second",
       "pm.test('carried variable', () => pm.expect(pm.variables.get('carried')).to.eql('yes'));" +
-        "pm.test('second status', () => pm.expect(pm.response.code).to.eql(200));"
+        "pm.test('second status', () => pm.expect(pm.response.code).to.eql(200));",
+      null // no body — symmetric with the F3 fixture
     ),
   ],
   variables: {},
@@ -198,39 +191,12 @@ for (const url of expectedSeen) {
   if (!seenUrls.includes(url)) fail(`transport must have been asked for ${url}`);
 }
 
-// ── line-44 regression: the body envelope decodes unambiguously ──────────
-// The wire body is a JSON envelope (http.rs body_to_wire): every non-Raw
-// variant used to be misread as a 1-char garbage string. Build the wire by
-// hand (Writer mirrors postcard) and assert each mode reconstructs exactly.
-function wireRequestWithBody(envelope) {
-  const w = new Writer();
-  w.str("https://fixture.test/post");
-  w.str("POST");
-  w.strMap({ "content-type": "application/json" });
-  w.strMap({});
-  if (envelope === null) w.optionNone();
-  else {
-    w.optionSome();
-    w.str(envelope);
-  }
-  return decodeHttpRequest(w.toUint8Array());
-}
-const jsonReq = wireRequestWithBody(JSON.stringify({ mode: "json", json: { a: 1 } }));
-if (jsonReq.body !== '{"a":1}')
-  fail(`json body must decode to the JSON text, got ${JSON.stringify(jsonReq.body)}`);
-if (jsonReq.bodyMode !== "json") fail(`json bodyMode must be 'json', got ${jsonReq.bodyMode}`);
-const rawReq = wireRequestWithBody(JSON.stringify({ mode: "raw", raw: "hello" }));
-if (rawReq.body !== "hello") fail(`raw body must decode to the text, got ${JSON.stringify(rawReq.body)}`);
-const urlReq = wireRequestWithBody(JSON.stringify({ mode: "url_encoded", fields: { a: "1", b: "two words" } }));
-if (urlReq.body !== "a=1&b=two+words")
-  fail(`url_encoded body must decode to a query string, got ${JSON.stringify(urlReq.body)}`);
-const binReq = wireRequestWithBody(JSON.stringify({ mode: "binary", data: [1, 2, 3] }));
-if (!binReq.bodyBytes || binReq.bodyBytes.length !== 3 || binReq.bodyBytes[2] !== 3)
-  fail("binary body must decode to raw bytes");
-const noneReq = wireRequestWithBody(null);
-if (noneReq.bodyDecoded !== false || noneReq.body !== null)
-  fail("absent body must decode as null, not garbage");
-console.log("ok: body envelope decodes raw/json/url_encoded/binary/none unambiguously");
+// Backlog line 44: the JSON body on the first item must arrive INTACT —
+// {"ok":true} rendered from the Body::Json envelope — not a one-byte junk
+// string (the old positional postcard reader). The first request per
+// iteration is the JSON-body one.
+if (seenBodies[0] !== '{"ok":true}')
+  fail(`JSON body corrupted across the bridge: got ${JSON.stringify(seenBodies[0])}`);
 
 console.log(`PASS: native-path fixture through wasm32 runtime (${artifact})`);
 console.log(`  iterations: ${outcome.iterations.length}, http_reqs: ${reqs.length}, checks: ${checks.length}`);

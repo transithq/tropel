@@ -225,74 +225,57 @@ export function decodeRunOutcome(bytes: Uint8Array): RunOutcome {
 
 // ── Request (wasm → host, across the tropel_host_http bridge) ────────────
 
-// Decode only the fields the JS host needs to perform an HTTP request. The
-// wire Request (http.rs WireRequest) is: url, method (plain str), headers,
-// query_params, body (Option<str> — a JSON envelope, see body_to_wire).
-// Nothing follows body on the wire: auth/certificate/follow_redirects/
-// timeout/response_type are not part of the v1 wire, so the position stops
-// here (line-44 P0 — the native Body form put ambiguous map/JSON-value
-// shapes here and the decoder produced a 1-char garbage body for JSON POSTs).
+// Backlog line 44: the bridge carries the SDK `Request` as JSON text, not
+// postcard. Its `Body`/`AuthConfig` serde is JSON-oriented (deserialize_any /
+// internally tagged) and postcard refuses it — a postcard decode failed on
+// every non-Raw body, and the old positional reader turned a JSON body into
+// a one-byte junk string while still setting bodyDecoded=true. Same rationale
+// as RunRequest.scenario_json (wire.rs): JSON text is the zero-copy ABI for
+// JSON-oriented SDK types.
 export function decodeHttpRequest(bytes: Uint8Array): HttpRequest {
-  const r = new Reader(bytes);
-  const url = r.str();
-  const method = r.str();
-  const headers = r.strMap();
-  const queryParams = r.strMap();
+  let parsed: {
+    url?: string;
+    method?: string;
+    headers?: Record<string, string>;
+    query_params?: Record<string, string>;
+    body?: unknown;
+  };
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    // A malformed bridge payload must not silently corrupt the request.
+    throw new Error("tropel_host_http: request is not valid JSON");
+  }
+  // Body variants (types.rs custom serde): Raw → string; Json → raw JSON
+  // value; FormData/UrlEncoded/Binary/GraphQL → {"__tropel_body": tag, ...}.
+  // The host sends the body text on the wire, so render each variant back to
+  // text: Raw as-is, Json as JSON.stringify (a JSON POST must go out as the
+  // exact JSON), tagged forms as JSON.stringify of the envelope.
+  //
+  // v1 boundary: the tagged envelopes arrive as their JSON text — deterministic
+  // and host-decodable (a real fix for the old one-byte junk body), but NOT
+  // their native HTTP wire forms (Binary is not raw bytes, FormData is not
+  // urlencoded). Rendering those faithfully is a follow-up, not this item.
   let body: string | null = null;
-  let bodyMode: HttpRequest["bodyMode"] = null;
-  let bodyBytes: Uint8Array | undefined;
-  let formFields: Record<string, string> | undefined;
-  const bodyDecoded = r.optionTag();
-  if (bodyDecoded) {
-    // The wire body is ALWAYS a JSON envelope string (http.rs body_to_wire)
-    // — no postcard shape-sniffing. mode tags the variant unambiguously.
-    // NOTE: r.str() is deliberately OUTSIDE the try — a truncated/mismatched
-    // envelope is a wire version-mismatch and must fail LOUDLY (it traps the
-    // wasm import) rather than degrade to a garbage body like the old
-    // shape-sniffing decoder did (backlog line 44).
-    const envelope = r.str();
-    try {
-      const e = JSON.parse(envelope) as Record<string, unknown>;
-      const mode =
-        typeof e === "object" && e !== null && typeof e.mode === "string"
-          ? e.mode
-          : "raw";
-      switch (mode) {
-        case "raw":
-          body = typeof e.raw === "string" ? e.raw : String(e.raw ?? "");
-          break;
-        case "json":
-          body = JSON.stringify(e.json);
-          break;
-        case "url_encoded":
-          body = new URLSearchParams((e.fields as Record<string, string>) ?? {}).toString();
-          break;
-        case "form_data":
-          formFields = (e.fields as Record<string, string>) ?? {};
-          // v1: URL-encoded default; transports needing multipart build it
-          // from bodyMode + formFields.
-          body = new URLSearchParams(formFields).toString();
-          break;
-        case "graphql":
-          body = JSON.stringify({
-            query: e.query,
-            variables: e.variables ?? {},
-          });
-          break;
-        case "binary":
-          if (Array.isArray(e.data)) bodyBytes = new Uint8Array(e.data as number[]);
-          body = null;
-          break;
-        default:
-          body = envelope;
-      }
-      bodyMode = mode as HttpRequest["bodyMode"];
-    } catch {
-      // Not a JSON envelope (shouldn't happen) — keep the raw text.
-      body = envelope;
+  let bodyDecoded = false;
+  if (parsed.body != null) {
+    bodyDecoded = true;
+    // Raw as-is; every other variant (JSON value, tagged envelope) is JSON
+    // text — stringify the object/scalar alike.
+    if (typeof parsed.body === "string") {
+      body = parsed.body;
+    } else {
+      body = JSON.stringify(parsed.body);
     }
   }
-  return { url, method, headers, queryParams, body, bodyMode, bodyDecoded, bodyBytes, formFields };
+  return {
+    url: parsed.url ?? "",
+    method: parsed.method ?? "GET",
+    headers: parsed.headers ?? {},
+    queryParams: parsed.query_params ?? {},
+    body,
+    bodyDecoded,
+  };
 }
 
 // ── Response (host → wasm, across the tropel_host_http bridge) ───────────
@@ -329,12 +312,6 @@ function writeTimings(w: Writer, t: Timings): void {
   writeDurationMs(w, t.sendingMs);
   writeDurationMs(w, t.waitingMs);
   writeDurationMs(w, t.receivingMs);
-  // Backlog line 43 (P0): `total` is the 8th Timings field on the Rust side
-  // (types.rs:481-521). Postcard is positional — omitting it made the wasm
-  // decode fail with DeserializeUnexpectedEnd on EVERY response that carried
-  // timings (the happy path), and the hand-written TS encoder was the only
-  // host that got it wrong.
-  writeDurationMs(w, t.totalMs);
 }
 
 // Response wire (types.rs): url, status_code(u16), status_text, headers,
