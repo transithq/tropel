@@ -4378,6 +4378,240 @@ mod tests {
     }
 
     #[test]
+    fn test_bru_res_get_status_returns_code_and_status_text() {
+        // TROPEL_PARITY_BRUNO.md §0: res.getStatus() returned the status TEXT
+        // ("OK") while Bruno's docs say it returns the numeric code — the
+        // canonical `expect(res.getStatus()).to.equal(200)` idiom silently
+        // failed. res.getStatusText() is the member that returns the text, and
+        // it didn't exist.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
+                globalThis.__status_code = res.getStatus();
+                globalThis.__status_text = res.getStatusText();
+                globalThis.__status_code_type = typeof res.getStatus();
+                globalThis.__eql_ok = String((function () {
+                    try { return res.getStatus() === 200; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                // Non-200 trial: proves the bridge value is actually read
+                // (a hardcoded 200 constant could not distinguish itself).
+                globalThis.__tropel_pm_response_code = function () { return 404; };
+                globalThis.__tropel_pm_response_status = function () { return 'Not Found'; };
+                globalThis.__status_404 = res.getStatus();
+                globalThis.__status_404_text = res.getStatusText();
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<i64, _>("__status_code").unwrap(),
+                200,
+                "res.getStatus() must return the numeric code (was the text 'OK')"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_code_type").unwrap(),
+                "number",
+                "res.getStatus() must be a number, not a string"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_text").unwrap(),
+                "OK",
+                "res.getStatusText() must return the status text"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__eql_ok").unwrap(),
+                "true",
+                "res.getStatus() === 200 must hold (the canonical Bruno assertion)"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__status_404").unwrap(),
+                404,
+                "res.getStatus() must reflect a non-200 bridge value (404), proving the bridge is read"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_404_text").unwrap(),
+                "Not Found",
+                "res.getStatusText() must reflect the 404 status text"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bru_runtime_vars_route_through_variables_store() {
+        // TROPEL_PARITY_BRUNO.md §2: bru.getVar/setVar used to map to the
+        // COLLECTION vars bridges — but Bruno's getVar/setVar are RUNTIME-scope
+        // (in-memory, per collection run). The mis-scoping silently broke the
+        // core request-chaining idiom (setVar in one request, getVar in the
+        // next). The shim now routes through __tropel_pm_variables_* (the same
+        // fall-through store pm.variables uses), and the family
+        // hasVar/deleteVar/getAllVars/deleteAllVars is exposed.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Route-spy: the VARIABLES bridge must be the one called.
+                var __vars_calls = [];
+                globalThis.__tropel_pm_variables_get = function (key) {
+                    __vars_calls.push('get:' + key);
+                    if (key === 'userId') return '42';
+                    if (key === 'token') return '"abc"';
+                    return null;
+                };
+                globalThis.__tropel_pm_variables_set = function (key, value) {
+                    __vars_calls.push('set:' + key + '=' + value);
+                };
+                globalThis.__tropel_pm_variables_unset = function (key) {
+                    __vars_calls.push('unset:' + key);
+                };
+                // The COLLECTION bridge must NOT be touched.
+                globalThis.__tropel_pm_collection_vars_get = function () {
+                    throw new Error('getVar must not read collection vars');
+                };
+                globalThis.__tropel_pm_collection_vars_set = function () {
+                    throw new Error('setVar must not write collection vars');
+                };
+                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                    return { userId: '42', token: '"abc"', flag: 'true' };
+                };
+                var v1 = bru.getVar('userId');
+                bru.setVar('userId', 42);
+                var h1 = bru.hasVar('userId');
+                var h2 = bru.hasVar('missing');
+                bru.deleteVar('token');
+                var all = bru.getAllVars();
+                bru.deleteAllVars();
+                globalThis.__v1 = v1;
+                globalThis.__v1_type = typeof v1;
+                globalThis.__h1 = String(h1);
+                globalThis.__h2 = String(h2);
+                globalThis.__all_keys = Object.keys(all).sort().join(',');
+                globalThis.__all_userId = all.userId;
+                globalThis.__calls = __vars_calls.join('|');
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__v1_type").unwrap(),
+                "number",
+                "bru.getVar must JSON.parse the bridge value (42 → number, not '42' string)"
+            );
+            assert_eq!(ctx.eval::<i64, _>("__v1").unwrap(), 42);
+            assert_eq!(
+                ctx.eval::<String, _>("__h1").unwrap(),
+                "true",
+                "bru.hasVar must be true for an existing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h2").unwrap(),
+                "false",
+                "bru.hasVar must be false for a missing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__all_keys").unwrap(),
+                "flag,token,userId",
+                "bru.getAllVars must return all runtime vars (JSON-parsed)"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__all_userId").unwrap(),
+                42,
+                "bru.getAllVars must include the runtime var set via setVar as a JSON-parsed NUMBER (request-chaining reads it back)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__calls").unwrap(),
+                "get:userId|set:userId=42|get:userId|get:missing|unset:token|unset:userId|unset:token|unset:flag",
+                "getVar/setVar must hit the variables bridges (not collection), hasVar one lookup each, and deleteAllVars must unset every key"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bru_collection_vars_family() {
+        // TROPEL_PARITY_BRUNO.md §2: Bruno exposes the collection scope via
+        // getCollectionVar/setCollectionVar/hasCollectionVar/delete* — the
+        // shim only had getVar/setVar (aliased to collection). The explicit
+        // family now maps to the __tropel_pm_collection_vars_* bridges.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                var __store = { baseUrl: '"https://api.example.com"', retries: '3' };
+                globalThis.__tropel_pm_collection_vars_get = function (key) {
+                    return Object.prototype.hasOwnProperty.call(__store, key) ? __store[key] : null;
+                };
+                globalThis.__tropel_pm_collection_vars_set = function (key, value) {
+                    __store[key] = value;
+                };
+                globalThis.__tropel_pm_collection_vars_has = function (key) {
+                    return Object.prototype.hasOwnProperty.call(__store, key);
+                };
+                globalThis.__tropel_pm_collection_vars_unset = function (key) {
+                    delete __store[key];
+                };
+                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                    var out = {};
+                    for (var k in __store) out[k] = __store[k];
+                    return out;
+                };
+                var b1 = bru.getCollectionVar('baseUrl');
+                bru.setCollectionVar('token', '"abc"');
+                var h1 = bru.hasCollectionVar('baseUrl');
+                var h2 = bru.hasCollectionVar('missing');
+                bru.deleteCollectionVar('retries');
+                var after = JSON.stringify(__store);
+                bru.deleteAllCollectionVars();
+                var after_all = JSON.stringify(__store);
+                globalThis.__b1_type = typeof b1;
+                globalThis.__h1 = String(h1);
+                globalThis.__h2 = String(h2);
+                globalThis.__after = after;
+                globalThis.__after_all = after_all;
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__b1_type").unwrap(),
+                "string",
+                "bru.getCollectionVar must JSON.parse the bridge value (\"https://…\" is a string, not an object)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h1").unwrap(),
+                "true",
+                "bru.hasCollectionVar must be true for an existing collection var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__h2").unwrap(),
+                "false",
+                "bru.hasCollectionVar must be false for a missing var"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__after").unwrap(),
+                "{\"baseUrl\":\"\\\"https://api.example.com\\\"\",\"token\":\"\\\"abc\\\"\"}",
+                "setCollectionVar must add, deleteCollectionVar must remove (the stub store keeps JSON-encoded values, hence the escaped quotes)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__after_all").unwrap(),
+                "{}",
+                "bru.deleteAllCollectionVars must clear every collection var"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_expect_eql_is_deep_equal() {
         // Backlog line 144: pm.expect(...).to.eql() was strict === while
         // .equal() delegated to eql — inverted vs chai. Deep-equal means a
@@ -4437,6 +4671,251 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__strict_distinct").unwrap(), "threw", "equal must stay strict (no deep-compare)");
             assert_eq!(ctx.eval::<String, _>("__eql_json_body").unwrap(), "true", "parsed JSON body must eql a literal object");
             assert_eq!(ctx.eval::<String, _>("__json_body_ok").unwrap(), "true", "to.have.jsonBody must deep-compare (key order insensitive)");
+        });
+    }
+
+    #[test]
+    fn test_eql_typed_and_circular_values_compare_by_value() {
+        // Backlog line 85: Date/Set/Map/RegExp collapsed to Object.keys() = []
+        // so ANY two instances compared equal (pm.expect(new Date(1))
+        // .to.eql(new Date(2)) passed). They now compare by value; circular
+        // structures no longer overflow the stack. The same fix landed in all
+        // three deep-equal implementations (pm.js deepEqual, chai-shim
+        // jsDeepEqual, lodash-shim isEqualDeep) — this test locks all three.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/lodash/lodash-shim.js"))
+                .expect("lodash shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                trial('pm_date_same', function () { pm.expect(new Date(1700000000000)).to.eql(new Date(1700000000000)); });
+                trial('pm_date_diff', function () { pm.expect(new Date(1700000000000)).to.eql(new Date(1)); });
+                trial('pm_re_same', function () { pm.expect(/a+b/i).to.eql(/a+b/i); });
+                trial('pm_re_flags', function () { pm.expect(/a+b/i).to.eql(/a+b/g); });
+                trial('pm_re_flag_order', function () { pm.expect(/a+b/gi).to.eql(/a+b/ig); });
+                trial('pm_set_order', function () { pm.expect(new Set([1, 2, 3])).to.eql(new Set([3, 1, 2])); });
+                trial('pm_set_diff', function () { pm.expect(new Set([1, 2])).to.eql(new Set([1, 3])); });
+                trial('pm_map_same', function () { pm.expect(new Map([['a', 1]])).to.eql(new Map([['a', 1]])); });
+                trial('pm_map_diff', function () { pm.expect(new Map([['a', 1]])).to.eql(new Map([['a', 2]])); });
+                trial('pm_cycle_same', function () {
+                    var a = { x: 1 }; a.self = a;
+                    var b = { x: 1 }; b.self = b;
+                    pm.expect(a).to.eql(b);
+                });
+                trial('pm_cycle_diff', function () {
+                    var a = { x: 1 }; a.self = a;
+                    var b = { x: 1 }; b.self = {};
+                    pm.expect(a).to.eql(b);
+                });
+                trial('chai_set_same', function () { chai.expect(new Set([1])).to.eql(new Set([1])); });
+                trial('chai_set_diff', function () { chai.expect(new Set([1])).to.eql(new Set([9])); });
+                trial('lodash_date_same', function () {
+                    if (!_.isEqual(new Date(1700000000000), new Date(1700000000000))) throw new Error('not equal');
+                });
+                trial('lodash_date_diff', function () {
+                    if (_.isEqual(new Date(1), new Date(2))) throw new Error('equal');
+                });
+                trial('lodash_cycle', function () {
+                    var a = { x: 1 }; a.self = a;
+                    if (!_.isEqual(a, a)) throw new Error('not equal');
+                });
+                trial('pm_map_self', function () {
+                    var m = new Map(); m.set('self', m);
+                    var m2 = new Map(); m2.set('self', m2);
+                    pm.expect(m).to.eql(m2);
+                });
+                trial('pm_map_self_diff', function () {
+                    var m = new Map(); m.set('self', m);
+                    var m2 = new Map(); m2.set('self', {});
+                    pm.expect(m).to.eql(m2);
+                });
+                trial('pm_set_self', function () {
+                    var s = new Set(); s.add(s);
+                    var s2 = new Set(); s2.add(s2);
+                    pm.expect(s).to.eql(s2);
+                });
+                trial('pm_map_key_diff', function () {
+                    // Same-size self-referential Maps with different keys: must
+                    // exercise the guarded mate-matching failure pop (not the
+                    // instanceof type-check short-circuit).
+                    var m = new Map(); m.set('a', m);
+                    var m2 = new Map(); m2.set('b', m2);
+                    pm.expect(m).to.eql(m2);
+                });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("pm_date_same"), "true", "equal Dates must eql");
+            assert_eq!(r("pm_date_diff"), "threw", "different Dates must NOT eql");
+            assert_eq!(r("pm_re_same"), "true", "same RegExp source+flags must eql");
+            assert_eq!(r("pm_re_flags"), "threw", "differing RegExp flags must NOT eql");
+            assert_eq!(r("pm_re_flag_order"), "true", "RegExp flag order is normalized (/gi == /ig)");
+            assert_eq!(r("pm_set_order"), "true", "Sets are order-insensitive");
+            assert_eq!(r("pm_set_diff"), "threw", "differing Set members must NOT eql");
+            assert_eq!(r("pm_map_same"), "true", "Maps with equal entries must eql");
+            assert_eq!(r("pm_map_diff"), "threw", "differing Map values must NOT eql");
+            assert_eq!(r("pm_cycle_same"), "true", "circular equal structures must eql");
+            assert_eq!(r("pm_cycle_diff"), "threw", "circular differing structures must throw, not overflow");
+            assert_eq!(r("chai_set_same"), "true", "chai: equal Sets must eql");
+            assert_eq!(r("chai_set_diff"), "threw", "chai: differing Sets must NOT eql");
+            assert_eq!(r("lodash_date_same"), "true", "lodash: equal Dates are isEqual");
+            assert_eq!(r("lodash_date_diff"), "true", "lodash: differing Dates are not isEqual");
+            assert_eq!(r("lodash_cycle"), "true", "lodash: circular self-equality must not overflow");
+            assert_eq!(r("pm_map_self"), "true", "self-referential Maps must eql without stack overflow");
+            assert_eq!(r("pm_map_self_diff"), "threw", "differing self-referential Map values must NOT eql");
+            assert_eq!(r("pm_set_self"), "true", "self-referential Sets must eql without stack overflow");
+            assert_eq!(r("pm_map_key_diff"), "threw", "same-size self-referential Maps with different keys must NOT eql");
+        });
+    }
+
+    #[test]
+    fn test_to_not_chain_matches_not_to() {
+        // Backlog line 87: Postman snippets emit `pm.expect(x).to.not.*`
+        // (negation AFTER .to), but only `.not.to.*` existed — the to.not
+        // spelling read as `unknown assertion property 'not'` and recorded
+        // FAIL while chai.expect handled it fine. Both spellings now share
+        // one negated chain.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                // .to.not.* (Postman's spelling) — pass when values differ.
+                trial('to_not_equal_diff', function () { pm.expect(1).to.not.equal(2); });
+                trial('to_not_equal_same', function () { pm.expect(1).to.not.equal(1); });
+                trial('to_not_eql_diff', function () { pm.expect({ a: 1 }).to.not.eql({ b: 2 }); });
+                trial('to_not_eql_same', function () { pm.expect({ a: 1 }).to.not.eql({ a: 1 }); });
+                trial('to_not_be_true_neg', function () { pm.expect(false).to.not.be.true; });
+                trial('to_not_be_true_pos', function () { pm.expect(true).to.not.be.true; });
+                trial('to_not_be_an_neg', function () { pm.expect('x').to.not.be.an('number'); });
+                trial('to_not_be_an_pos', function () { pm.expect(1).to.not.be.an('number'); });
+                trial('to_not_be_a_neg', function () { pm.expect(1).to.not.be.a('string'); });
+                // Negated include/match/have (Postman's "must not contain").
+                trial('to_not_include_absent', function () { pm.expect('abcdef').to.not.include('zzz'); });
+                trial('to_not_include_present', function () { pm.expect('abcdef').to.not.include('bcd'); });
+                trial('to_not_match_no', function () { pm.expect('abcdef').to.not.match(/zzz/); });
+                trial('to_not_match_yes', function () { pm.expect('abcdef').to.not.match(/bcd/); });
+                trial('to_not_have_prop_absent', function () { pm.expect({ a: 1 }).to.not.have.property('b'); });
+                trial('to_not_have_prop_present', function () { pm.expect({ a: 1 }).to.not.have.property('a'); });
+                // Old spelling must still work.
+                trial('not_to_equal_same', function () { pm.expect(1).not.to.equal(1); });
+                trial('not_to_be_true_pos', function () { pm.expect(true).not.to.be.true; });
+                // Guard still applies on the negated chains.
+                trial('to_not_unknown', function () { pm.expect(1).to.not.bogus; });
+                trial('not_to_unknown', function () { pm.expect(1).not.to.bogus; });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("to_not_equal_diff"), "true", "to.not.equal passes when values differ");
+            assert_eq!(r("to_not_equal_same"), "threw", "to.not.equal throws when values match");
+            assert_eq!(r("to_not_eql_diff"), "true", "to.not.eql passes when values differ");
+            assert_eq!(r("to_not_eql_same"), "threw", "to.not.eql throws when values deep-match");
+            assert_eq!(r("to_not_be_true_neg"), "true", "to.not.be.true passes for false");
+            assert_eq!(r("to_not_be_true_pos"), "threw", "to.not.be.true throws for true");
+            assert_eq!(r("to_not_be_an_neg"), "true", "to.not.be.an passes on wrong type");
+            assert_eq!(r("to_not_be_an_pos"), "threw", "to.not.be.an throws on matching type");
+            assert_eq!(r("to_not_be_a_neg"), "true", "to.not.be.a passes on wrong type");
+            assert_eq!(r("to_not_include_absent"), "true", "to.not.include passes when value absent");
+            assert_eq!(r("to_not_include_present"), "threw", "to.not.include throws when value present");
+            assert_eq!(r("to_not_match_no"), "true", "to.not.match passes when no match");
+            assert_eq!(r("to_not_match_yes"), "threw", "to.not.match throws when matched");
+            assert_eq!(r("to_not_have_prop_absent"), "true", "to.not.have.property passes when absent");
+            assert_eq!(r("to_not_have_prop_present"), "threw", "to.not.have.property throws when present");
+            assert_eq!(r("not_to_equal_same"), "threw", "not.to.equal still throws when values match");
+            assert_eq!(r("not_to_be_true_pos"), "threw", "not.to.be.true still throws for true");
+            assert_eq!(r("to_not_unknown"), "threw", "unknown property on to.not throws");
+            assert_eq!(r("not_to_unknown"), "threw", "unknown property on not.to throws");
+        });
+    }
+
+    #[test]
+    fn test_include_uses_chai_value_semantics() {
+        // Backlog line 88: pm.expect(arr).to.include(v) was a SUBSTRING test
+        // (String(arr).indexOf) — [11,22].include(1) passed and
+        // {a:1}.include('object') passed. chai-shim implements it correctly
+        // (array indexOf for arrays, `key in obj` for objects). pm now
+        // mirrors chai: substring for strings, element membership for
+        // arrays, key membership for objects — on BOTH the positive chain
+        // and the negated chain.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                // Arrays: element membership, not substring.
+                trial('pm_arr_include_yes', function () { pm.expect([11, 22]).to.include(22); });
+                trial('pm_arr_include_no', function () { pm.expect([11, 22]).to.include(1); });
+                trial('pm_arr_include_str', function () { pm.expect(['a', 'b']).to.include('b'); });
+                trial('pm_arr_include_str_no', function () { pm.expect(['a', 'b']).to.include('ab'); });
+                // Objects: key membership.
+                trial('pm_obj_include_key', function () { pm.expect({ a: 1 }).to.include('a'); });
+                trial('pm_obj_include_nokey', function () { pm.expect({ a: 1 }).to.include('object'); });
+                // Strings stay substring.
+                trial('pm_str_include_yes', function () { pm.expect('abcdef').to.include('bcd'); });
+                trial('pm_str_include_no', function () { pm.expect('abcdef').to.include('zzz'); });
+                // Negated chain mirrors the same semantics.
+                trial('pm_arr_not_include_yes', function () { pm.expect([11, 22]).to.not.include(1); });
+                trial('pm_arr_not_include_no', function () { pm.expect([11, 22]).to.not.include(22); });
+                // chai parity: both expect()s must agree.
+                trial('chai_arr_include_yes', function () { chai.expect([11, 22]).to.include(22); });
+                trial('chai_arr_include_no', function () { chai.expect([11, 22]).to.include(1); });
+                trial('chai_obj_include_key', function () { chai.expect({ a: 1 }).to.include('a'); });
+                trial('chai_obj_include_nokey', function () { chai.expect({ a: 1 }).to.include('object'); });
+                "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            assert_eq!(r("pm_arr_include_yes"), "true", "array include passes for a present element");
+            assert_eq!(r("pm_arr_include_no"), "threw", "array include must NOT match substrings (11.include(1) was the bug)");
+            assert_eq!(r("pm_arr_include_str"), "true", "string-array include passes for a present member");
+            assert_eq!(r("pm_arr_include_str_no"), "threw", "string-array include must not substring-match ('ab' not in ['a','b'])");
+            assert_eq!(r("pm_obj_include_key"), "true", "object include passes for a present key");
+            assert_eq!(r("pm_obj_include_nokey"), "threw", "object include must test keys, not type names ('object' was the bug)");
+            assert_eq!(r("pm_str_include_yes"), "true", "string include still substring-tests");
+            assert_eq!(r("pm_str_include_no"), "threw", "string include throws when absent");
+            assert_eq!(r("pm_arr_not_include_yes"), "true", "negated array include passes for an absent element");
+            assert_eq!(r("pm_arr_not_include_no"), "threw", "negated array include throws for a present element");
+            assert_eq!(r("chai_arr_include_yes"), "true", "chai array include agrees (element present)");
+            assert_eq!(r("chai_arr_include_no"), "threw", "chai array include agrees (substring must not match)");
+            assert_eq!(r("chai_obj_include_key"), "true", "chai object include agrees (key present)");
+            assert_eq!(r("chai_obj_include_nokey"), "threw", "chai object include agrees (key test)");
         });
     }
 
@@ -4722,7 +5201,11 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__cv_get").unwrap(), "https://api.example.com", "pm.collectionVariables.get");
             assert!(ctx.eval::<bool, _>("__cv_has").unwrap(), "pm.collectionVariables.has");
             assert_eq!(ctx.eval::<String, _>("__cv_obj").unwrap(), r#"{"base":"x","n":3}"#, "toObject must JSON-decode values");
-            assert_eq!(ctx.eval::<String, _>("__cv_set").unwrap(), "k=v", "collectionVariables.set must reach the bridge");
+            assert_eq!(
+                ctx.eval::<String, _>("__cv_set").unwrap(),
+                "k=\"v\"",
+                "collectionVariables.set must reach the bridge JSON-encoded (shim encodes on set)"
+            );
             assert_eq!(ctx.eval::<String, _>("__cv_unset").unwrap(), "k", "collectionVariables.unset must reach the bridge");
             assert_eq!(ctx.eval::<String, _>("__g_get").unwrap(), "global", "pm.globals.get");
             assert!(ctx.eval::<bool, _>("__g_has").unwrap(), "pm.globals.has");
@@ -4841,6 +5324,145 @@ mod tests {
                 ctx.eval::<String, _>("__next_req_null").unwrap(),
                 "null-or-unset",
                 "setNextRequest(null) must not throw (Option<String> bridge param)"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pm_set_get_roundtrip_preserves_type() {
+        // Backlog line 89: setters String()-coerced and getters JSON.parse'd
+        // were NOT inverses — a plain string '1234' set through
+        // pm.environment/globals came back as the NUMBER 1234 (and objects
+        // became "[object Object]"). The shim now JSON-encodes on set; these
+        // bridge stubs mirror the REAL decode-on-set/encode-on-get contract
+        // (crates/tropel-sandbox trp.rs), so the round trip must restore the
+        // exact type: strings stay strings, numbers stay numbers, objects
+        // stay objects.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // decode_json_encoded equivalent: JSON string → plain string,
+                // anything else (number/bool/object) → its JSON text.
+                function decodeEnv(v) {
+                    try { var p = JSON.parse(v); return typeof p === 'string' ? p : v; }
+                    catch (e) { return v; }
+                }
+                // decode_json_value equivalent: parse to a serde-like Value.
+                function decodeVal(v) {
+                    try { return JSON.parse(v); } catch (e) { return v; }
+                }
+
+                var env = {};
+                globalThis.__tropel_pm_environment_set = function (k, v) { env[k] = decodeEnv(v); };
+                globalThis.__tropel_pm_environment_get = function (k) { return k in env ? JSON.stringify(env[k]) : null; };
+
+                var col = {};
+                globalThis.__tropel_pm_collection_vars_set = function (k, v) { col[k] = decodeVal(v); };
+                globalThis.__tropel_pm_collection_vars_get = function (k) { return k in col ? JSON.stringify(col[k]) : null; };
+
+                var gl = {};
+                globalThis.__tropel_pm_globals_set = function (k, v) { gl[k] = decodeVal(v); };
+                globalThis.__tropel_pm_globals_get = function (k) { return k in gl ? JSON.stringify(gl[k]) : null; };
+
+                // env: '1234' string stays the STRING '1234' (never number).
+                pm.environment.set('s', '1234');
+                globalThis.__env_s = pm.environment.get('s');
+                globalThis.__env_s_type = typeof globalThis.__env_s;
+                // env: number 42 round-trips as the STRING '42' (env is strings-only).
+                pm.environment.set('n', 42);
+                globalThis.__env_n = pm.environment.get('n');
+                globalThis.__env_n_type = typeof globalThis.__env_n;
+                // env: object round-trips as its JSON text string.
+                pm.environment.set('o', { a: 1 });
+                globalThis.__env_o = pm.environment.get('o');
+
+                // collection: numeric string stays string, object stays object.
+                pm.collectionVariables.set('s', '42');
+                globalThis.__col_s = pm.collectionVariables.get('s');
+                globalThis.__col_s_type = typeof globalThis.__col_s;
+                pm.collectionVariables.set('o', { b: [1, 2] });
+                globalThis.__col_o = JSON.stringify(pm.collectionVariables.get('o'));
+                globalThis.__col_o_type = typeof pm.collectionVariables.get('o');
+
+                // globals: number stays number, string stays string.
+                pm.globals.set('n', 42);
+                globalThis.__gl_n = pm.globals.get('n');
+                globalThis.__gl_n_type = typeof globalThis.__gl_n;
+                pm.globals.set('s', '1234');
+                globalThis.__gl_s = pm.globals.get('s');
+                globalThis.__gl_s_type = typeof globalThis.__gl_s;
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__env_s").unwrap(),
+                "1234",
+                "env string '1234' must round-trip as the STRING '1234'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_s_type").unwrap(),
+                "string",
+                "numeric-looking env string must not be retyped to a number"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_n").unwrap(),
+                "42",
+                "env number 42 round-trips as the string '42' (env is strings-only)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_n_type").unwrap(),
+                "string",
+                "env values are always strings"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__env_o").unwrap(),
+                "{\"a\":1}",
+                "env object round-trips as its JSON text string"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_s").unwrap(),
+                "42",
+                "collection string '42' must stay the STRING '42'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_s_type").unwrap(),
+                "string",
+                "collection must not retype numeric-looking strings"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_o").unwrap(),
+                "{\"b\":[1,2]}",
+                "collection object must round-trip as an object"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__col_o_type").unwrap(),
+                "object",
+                "collection object must stay an object"
+            );
+            assert_eq!(
+                ctx.eval::<f64, _>("__gl_n").unwrap(),
+                42.0,
+                "globals number 42 round-trips as the number 42"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_n_type").unwrap(),
+                "number",
+                "globals numbers stay numbers"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_s").unwrap(),
+                "1234",
+                "globals string '1234' round-trips as the STRING '1234'"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__gl_s_type").unwrap(),
+                "string",
+                "globals numeric-looking string must stay a string"
             );
         });
     }
