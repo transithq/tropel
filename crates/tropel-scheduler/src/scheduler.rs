@@ -1933,7 +1933,9 @@ mod tests {
         let spawned = 4;
         let target = 8;
         sched.vu_exited(); // concurrent exit: 4 → 3
-        sched.control_spawned.fetch_add(target - spawned, Ordering::AcqRel);
+        sched
+            .control_spawned
+            .fetch_add(target - spawned, Ordering::AcqRel);
 
         // 3 + 4 = 7 — the decrement survives. An absolute store(8) would
         // have clobbered it, leaving the pool silently one VU short.

@@ -441,9 +441,7 @@ mod tests {
         // Declare a 64 GiB body; never send it. Must get 413 back (and the
         // handler must not try to read 64 GiB).
         client
-            .write_all(
-                b"PATCH /v1/status HTTP/1.1\r\nContent-Length: 68719476736\r\n\r\n",
-            )
+            .write_all(b"PATCH /v1/status HTTP/1.1\r\nContent-Length: 68719476736\r\n\r\n")
             .await
             .unwrap();
         let mut resp = Vec::new();
