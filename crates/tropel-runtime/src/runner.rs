@@ -1613,7 +1613,7 @@ mod tests {
         let state = runner.pm_state().lock().unwrap();
         assert_eq!(state.environment.get("saw0").map(String::as_str), Some("1"));
         assert!(
-            state.environment.get("saw1").is_none(),
+            !state.environment.contains_key("saw1"),
             "setNextRequest(null) must end the iteration — item 1 must not run"
         );
     }
@@ -1635,7 +1635,7 @@ mod tests {
         let state = runner.pm_state().lock().unwrap();
         assert_eq!(state.environment.get("saw0").map(String::as_str), Some("1"));
         assert!(
-            state.environment.get("saw1").is_none(),
+            !state.environment.contains_key("saw1"),
             "unknown setNextRequest target must end the iteration"
         );
     }
@@ -1679,11 +1679,11 @@ mod tests {
         assert_eq!(result.script_failures, 0);
         let state = runner.pm_state().lock().unwrap();
         assert!(
-            state.environment.get("saw2").is_some(),
+            state.environment.contains_key("saw2"),
             "the LAST duplicate must win (saw2 set)"
         );
         assert!(
-            state.environment.get("saw1").is_none(),
+            !state.environment.contains_key("saw1"),
             "the FIRST duplicate must NOT run (saw1 unset)"
         );
     }
@@ -1719,7 +1719,7 @@ mod tests {
             "item id must win over the same-named item"
         );
         assert!(
-            state.environment.get("sawName").is_none(),
+            !state.environment.contains_key("sawName"),
             "the same-named item must NOT run (id resolved first)"
         );
     }
