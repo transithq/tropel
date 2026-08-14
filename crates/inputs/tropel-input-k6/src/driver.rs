@@ -784,10 +784,7 @@ fn http_tags_for(
 /// cross-FFI panic from `.expect()` on a body larger than the per-VU heap
 /// cap. Returns `None` only when the heap has no headroom at all — the
 /// caller then propagates a JS exception (never a panic).
-fn k6_error_envelope<'js>(
-    ctx: &rquickjs::Ctx<'js>,
-    msg: &str,
-) -> Option<rquickjs::Object<'js>> {
+fn k6_error_envelope<'js>(ctx: &rquickjs::Ctx<'js>, msg: &str) -> Option<rquickjs::Object<'js>> {
     let e = rquickjs::Object::new(ctx.clone()).ok()?;
     let _ = e.set("code", 0_i32);
     let _ = e.set("status", 0_i32);
@@ -1267,10 +1264,7 @@ fn build_k6_response_object<'js>(
         // be built while headroom still exists. In-between sizes try the
         // ArrayBuffer and fall back to the envelope on failure.
         if body.len() >= K6_VU_HEAP_BYTES {
-            return match k6_error_envelope(
-                ctx,
-                "response body exceeds the per-VU JS heap cap",
-            ) {
+            return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap") {
                 Some(e) => Ok(e),
                 None => Err(rquickjs::Error::Exception),
             };
@@ -1280,11 +1274,11 @@ fn build_k6_response_object<'js>(
                 let _ = obj.set("body", ab);
             }
             Err(_) => {
-                tracing::warn!("k6 binary body allocation failed (heap cap) — status-0 error response");
-                return match k6_error_envelope(
-                    ctx,
-                    "response body exceeds the per-VU JS heap cap",
-                ) {
+                tracing::warn!(
+                    "k6 binary body allocation failed (heap cap) — status-0 error response"
+                );
+                return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap")
+                {
                     Some(e) => Ok(e),
                     None => Err(rquickjs::Error::Exception),
                 };
