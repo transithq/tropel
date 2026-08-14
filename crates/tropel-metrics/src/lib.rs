@@ -141,11 +141,17 @@ mod tests {
         assert_eq!(time_metrics::unit_of("data_sent"), MetricUnit::Data);
         // `*_bytes` custom trends carry `contains: "data"` too.
         assert_eq!(time_metrics::unit_of("my_bytes"), MetricUnit::Data);
-        assert_eq!(time_metrics::unit_of("http_response_body_size"), MetricUnit::Default);
+        assert_eq!(
+            time_metrics::unit_of("http_response_body_size"),
+            MetricUnit::Default
+        );
 
         // Name-heuristic: duration suffixes → Time.
         assert_eq!(time_metrics::unit_of("http_req_duration"), MetricUnit::Time);
-        assert_eq!(time_metrics::unit_of("iteration_duration"), MetricUnit::Time);
+        assert_eq!(
+            time_metrics::unit_of("iteration_duration"),
+            MetricUnit::Time
+        );
         assert_eq!(time_metrics::unit_of("ttfb"), MetricUnit::Time);
 
         // Explicit declaration wins over heuristics (backlog line 32).
