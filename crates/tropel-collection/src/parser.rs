@@ -435,13 +435,16 @@ fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
 /// `tokenRequestParams: [{...}]`), and callers here only ever feed the
 /// result into `String`/`Option<String>` AuthConfig fields.
 fn get_auth_attr(attrs: &[AuthAttribute], key: &str) -> Option<String> {
-    attrs.iter().find(|a| a.key == key).and_then(|a| match &a.value {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Bool(b) => Some(b.to_string()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        other => serde_json::to_string(other).ok(),
-    })
+    attrs
+        .iter()
+        .find(|a| a.key == key)
+        .and_then(|a| match &a.value {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            other => serde_json::to_string(other).ok(),
+        })
 }
 
 /// ALL prerequest scripts in the event chain, outer (collection) → inner
