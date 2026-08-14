@@ -2654,8 +2654,14 @@ mod tests {
         let merged = res
             .http_req_duration
             .expect("headline http_req_duration must exist");
-        assert_eq!(merged.count, 3, "dropped-series samples must reach merged_http_dur");
-        assert_eq!(res.series_dropped, 1, "series_dropped must surface on the result");
+        assert_eq!(
+            merged.count, 3,
+            "dropped-series samples must reach merged_http_dur"
+        );
+        assert_eq!(
+            res.series_dropped, 1,
+            "series_dropped must surface on the result"
+        );
 
         // Existing series still record.
         let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
