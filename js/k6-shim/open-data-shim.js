@@ -37,7 +37,7 @@ function open(path, mode) {
         return result;
     }
     // Binary mode: the native side returns base64; decode into an ArrayBuffer.
-    var binary = base64ToBytes(result);
+    var binary = openDataBase64ToBytes(result);
     var buf = new ArrayBuffer(binary.length);
     var view = new Uint8Array(buf);
     for (var i = 0; i < binary.length; i++) {
@@ -215,7 +215,12 @@ Object.defineProperty(SharedArrayView.prototype, Symbol.iterator, {
 });
 
 // ── Base64 helper for open(path, 'b') ──
-function base64ToBytes(b64) {
+// Backlog line 51: named openData* so it can't clobber k6-shim's
+// `base64ToBytes` (a Uint8Array-returning version the binary response
+// paths call with `.buffer`). open-data-shim loads LAST in
+// K6_NATIVE_SHIM_BUNDLE, so the old global redefinition silently broke
+// http.batch binary entries (a plain Array has no `.buffer`).
+function openDataBase64ToBytes(b64) {
     var CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
     var bytes = [];
     var i;
