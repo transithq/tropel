@@ -764,7 +764,8 @@ impl VUScheduler {
                     // Replace VUs that died during the previous step so the
                     // ramp-up reaches the real target, not a bookkeeping
                     // count (backlog §5 line 162).
-                    self.reap_and_respawn(current_vus, &mut handles, run_vu).await;
+                    self.reap_and_respawn(current_vus, &mut handles, run_vu)
+                        .await;
                     let vu_id = self.alloc_vu_id();
                     let handle = run_vu(self.shared_clone(), vu_id);
                     handles.push(handle);
@@ -882,7 +883,8 @@ impl VUScheduler {
                     if time::Instant::now() >= deadline {
                         break;
                     }
-                    self.reap_and_respawn(current_vus, &mut handles, run_vu).await;
+                    self.reap_and_respawn(current_vus, &mut handles, run_vu)
+                        .await;
                     next_tick += Duration::from_millis(100);
                     time::sleep_until(next_tick.min(deadline)).await;
                 }
@@ -1128,7 +1130,8 @@ impl VUScheduler {
             // every 100ms, so an O(n) is_finished() scan never runs on every
             // 1ms tick (~10M atomic loads/sec on a 10k-VU pool).
             if time::Instant::now() >= next_reap {
-                self.reap_and_respawn(current_vus, &mut handles, run_vu).await;
+                self.reap_and_respawn(current_vus, &mut handles, run_vu)
+                    .await;
                 next_reap += Duration::from_millis(100);
             }
 
@@ -1298,7 +1301,8 @@ impl VUScheduler {
             // every 100ms, so an O(n) is_finished() scan never runs on every
             // 1ms tick (~10M atomic loads/sec on a 10k-VU pool).
             if time::Instant::now() >= next_reap {
-                self.reap_and_respawn(current_vus, &mut handles, run_vu).await;
+                self.reap_and_respawn(current_vus, &mut handles, run_vu)
+                    .await;
                 next_reap += Duration::from_millis(100);
             }
 
