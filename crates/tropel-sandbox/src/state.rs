@@ -35,6 +35,9 @@ pub struct PmState {
     /// `Arc` so a large collection's names are computed ONCE per scenario
     /// (in the engine) instead of re-cloned into every VU's PmState.
     pub request_names: Arc<Vec<String>>,
+    /// Postman item ids of all items in order (for setNextRequest id lookup,
+    /// which Postman resolves BEFORE names — backlog §4). Same Arc sharing.
+    pub request_ids: Arc<Vec<String>>,
     /// Iteration data (from CSV/JSON data file), set per-iteration.
     pub iteration_data: Option<HashMap<String, Value>>,
     /// Whether to skip the remaining tests.
@@ -108,6 +111,7 @@ impl PmState {
             samples: Vec::new(),
             next_request: None,
             request_names: Arc::new(Vec::new()),
+            request_ids: Arc::new(Vec::new()),
             iteration_data: None,
             skip_tests: false,
             skip_request: false,
@@ -160,6 +164,12 @@ impl PmState {
     /// Set the list of request names in order (for resolving setNextRequest by name).
     pub fn set_request_names(&mut self, names: Arc<Vec<String>>) {
         self.request_names = names;
+    }
+
+    /// Set the list of item ids in order (for resolving setNextRequest by id,
+    /// which Postman prioritizes over name — backlog §4).
+    pub fn set_request_ids(&mut self, ids: Arc<Vec<String>>) {
+        self.request_ids = ids;
     }
 
     /// Set the iteration data for the current iteration.

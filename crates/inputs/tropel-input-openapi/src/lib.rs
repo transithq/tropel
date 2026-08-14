@@ -498,6 +498,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             })?;
 
             items.push(ScenarioItem {
+                id: None,
                 name: item_name,
                 request: Some(Request {
                     url: resolved_url,
@@ -511,8 +512,8 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                     timeout: None,
                     response_type: tropel_sdk::ResponseType::Text,
                 }),
-                prerequest: None,
-                test: None,
+                prerequest: vec![],
+                test: vec![],
                 assertions: vec![],
                 items: vec![],
             });
