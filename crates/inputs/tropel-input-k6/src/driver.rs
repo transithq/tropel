@@ -6224,8 +6224,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out,
-            "[[\"a\",\"c\"],\"a\",0,false,true,2,[\"a\",\"c\"],true,1]",
+            out, "[[\"a\",\"c\"],\"a\",0,false,true,2,[\"a\",\"c\"],true,1]",
             "string/pair/matcher shorthand across the collection family"
         );
     }
