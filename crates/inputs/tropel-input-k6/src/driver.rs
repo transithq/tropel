@@ -1128,6 +1128,22 @@ impl DriverInstance for K6DriverInstance {
             self.register_ws_bridges();
         }
 
+        // Backlog line 99: timer state must not leak across iterations.
+        // __tropel_timers is module-scope in k6-shim.js; without a reset,
+        // a setInterval armed in every iteration accumulates live intervals
+        // that all fire on every subsequent pump (linear callback growth +
+        // retained closures for the VU's life). Reset at the START of each
+        // iteration so only timers armed during THIS iteration stay live —
+        // they fire at this iteration's boundary pump, then are cleared.
+        let _ = self.js_ctx.with_ctx(|rq_ctx| {
+            if let Ok(reset) = rq_ctx
+                .globals()
+                .get::<_, rquickjs::Function>("__tropel_reset_timers")
+            {
+                let _ = reset.call::<_, rquickjs::Value>(());
+            }
+        });
+
         // Sync VuContext state into JS globals (__tropel_vu_id, etc.)
         self.sync_globals(ctx).await?;
 
@@ -1148,6 +1164,33 @@ impl DriverInstance for K6DriverInstance {
                 Some("k6-iteration.js".to_string()),
             )
             .await;
+
+        // k6/timers (backlog line 131): fire due setTimeout/setInterval
+        // callbacks at the iteration boundary. k6 runs its timers on the VU
+        // event loop; Tropel executes JS synchronously per iteration, so the
+        // closest equivalent is pumping them here — which is exactly what
+        // unblocks the lodash debounce/throttle shims. A throwing callback
+        // is logged (not fatal), matching a best-effort event loop.
+        //
+        // Backlog line 100: the pump must run BEFORE the sample drain. Timer
+        // callbacks record samples (and may test.abort()) through the same
+        // bridge closures; draining first meant a callback's samples landed
+        // after the drain — picked up next iteration, or silently DISCARDED
+        // on the last one, and a timer's abort was delayed or lost.
+        // NOTE: the pump also runs BEFORE the error return below so timers
+        // armed in this iteration still drain even when the iteration itself
+        // threw (strict event-loop behavior — timers are not hostage to a
+        // throw).
+        let _ = self.js_ctx.with_ctx(|rq_ctx| {
+            if let Ok(pump) = rq_ctx
+                .globals()
+                .get::<_, rquickjs::Function>("__tropel_pump_timers")
+            {
+                if let Err(e) = pump.call::<_, rquickjs::Value>(()) {
+                    tracing::warn!("k6 timer callback error: {}", e);
+                }
+            }
+        });
 
         // Drain samples recorded by the native bridge closures during this
         // iteration (http_req_*, checks, custom metrics) into the VuContext
@@ -1174,29 +1217,11 @@ impl DriverInstance for K6DriverInstance {
         ctx.samples.extend(bridge_samples);
 
         // Surface test.abort() to the engine so the run stops cleanly.
+        // Runs AFTER the pump (line 100: a timer callback's test.abort()
+        // must reach the engine this iteration, not next).
         if let Some(msg) = std::mem::take(&mut *self.abort_requested.lock().unwrap()) {
             ctx.abort(Some(msg));
         }
-
-        // k6/timers (backlog line 131): fire due setTimeout/setInterval
-        // callbacks at the iteration boundary. k6 runs its timers on the VU
-        // event loop; Tropel executes JS synchronously per iteration, so the
-        // closest equivalent is pumping them here — which is exactly what
-        // unblocks the lodash debounce/throttle shims. A throwing callback
-        // is logged (not fatal), matching a best-effort event loop.
-        // NOTE: the pump runs BEFORE the error return below so timers armed
-        // in this iteration still drain even when the iteration itself threw
-        // (strict event-loop behavior — timers are not hostage to a throw).
-        let _ = self.js_ctx.with_ctx(|rq_ctx| {
-            if let Ok(pump) = rq_ctx
-                .globals()
-                .get::<_, rquickjs::Function>("__tropel_pump_timers")
-            {
-                if let Err(e) = pump.call::<_, rquickjs::Value>(()) {
-                    tracing::warn!("k6 timer callback error: {}", e);
-                }
-            }
-        });
 
         // A rejected/thrown default export must fail the iteration (the
         // engine logs it and bumps the error path), not be swallowed.
@@ -5114,7 +5139,10 @@ mod tests {
         // .to.exist, and chai .empty/.exist/.NaN/.finite) used to read as
         // `undefined` and pm.test recorded GREEN — a silent pass. The Proxy
         // guard now THROWS on unknown assertion names, and the common
-        // property getters are implemented for real.
+        // property getters are implemented for real. Backlog line 73: the
+        // `.should` getter must go through the SAME guard — previously it
+        // returned a raw Assertion, so `({a:1}).should.be.sealed` read as
+        // undefined and passed silently.
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
@@ -5200,6 +5228,33 @@ mod tests {
                     try { chai.expect(false).to.be.true; return 'passed'; }
                     catch (e) { return 'threw'; }
                 })());
+                // ── chai.should (backlog line 73) ──
+                chai.should();
+                globalThis.__should_sealed_fail = String((function () {
+                    // VERIFIED bug: ({a:1}).should.be.sealed returned
+                    // undefined (raw Assertion, no Proxy) — must now throw.
+                    try { ({ a: 1 }).should.be.sealed; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_true_ok = String((function () {
+                    // Implemented getter must still WORK through the guard.
+                    try { (true).should.be.true; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_false_true_fail = String((function () {
+                    try { (false).should.be.true; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_unknown_prop = String((function () {
+                    try { (1).should.be.bogusShouldProp; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__should_method_chain_ok = String((function () {
+                    // Method-chain positive: `equal` reads this._obj through
+                    // the Proxy receiver — must still resolve.
+                    try { (5).should.equal(5); return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
             "#,
             )
             .expect("script should eval");
@@ -5283,6 +5338,99 @@ mod tests {
                 ctx.eval::<String, _>("__chai_true_fail").unwrap(),
                 "threw",
                 "chai false.to.be.true must throw"
+            );
+            // ── chai.should (backlog line 73) ──
+            assert_eq!(
+                ctx.eval::<String, _>("__should_sealed_fail").unwrap(),
+                "threw",
+                "should.be.sealed must throw (was silent undefined)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_true_ok").unwrap(),
+                "ok",
+                "(true).should.be.true must still pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_false_true_fail").unwrap(),
+                "threw",
+                "(false).should.be.true must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_unknown_prop").unwrap(),
+                "threw",
+                "should unknown assertion prop must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__should_method_chain_ok").unwrap(),
+                "ok",
+                "(5).should.equal(5) method chain must pass through the guard"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pm_expect_chain_allocates_once_not_per_read() {
+        // Backlog line 105: pm.expect was ~10x slower than chai.expect
+        // (2511 ms vs 235 ms over 200k assertions) because EVERY call built
+        // a fresh chain literal with 18 Object.defineProperty calls
+        // (addPropAssertions x4) and guardChain wrapped each object-valued
+        // property read in a NEW Proxy. The chain is now a single class with
+        // the surface on AssertChain.prototype. This test pins the
+        // STRUCTURAL property deterministically (no timing flakiness): after
+        // load, running chains must not call Object.defineProperty at all,
+        // and Proxy allocations must be ~1 per expect + ~1 per .not access,
+        // NOT one per chain-property read.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Instrument AFTER load so module-level defineProperty (the
+                // one-time prototype install) is not counted.
+                globalThis.__defCalls = 0;
+                var __realDefine = Object.defineProperty;
+                Object.defineProperty = function () {
+                    globalThis.__defCalls++;
+                    return __realDefine.apply(Object, arguments);
+                };
+                globalThis.__proxyCalls = 0;
+                var __realProxy = Proxy;
+                Proxy = function () {
+                    globalThis.__proxyCalls++;
+                    return new __realProxy(arguments[0], arguments[1]);
+                };
+
+                // Warm-up + behaviour must be unchanged. (above/below etc.
+                // are chai-shim assertions — the pm chain's surface is
+                // eql/equal/include/match/an/a/property/status/header/
+                // jsonBody, and the guard must still throw on anything else.)
+                pm.expect('x').to.be.an('string').and.to.equal('x');
+                pm.expect(5).not.to.be.a('string');
+                pm.expect([1, 2]).to.include(2);
+                try { pm.expect(1).to.be.bogus; } catch (e) { /* guard still throws */ }
+
+                var defBefore = globalThis.__defCalls;
+                var proxyBefore = globalThis.__proxyCalls;
+                for (var i = 0; i < 500; i++) {
+                    pm.expect('x').to.be.an('string').and.to.equal('x');
+                }
+                globalThis.__defDelta = globalThis.__defCalls - defBefore;
+                globalThis.__proxyDelta = globalThis.__proxyCalls - proxyBefore;
+            "#,
+            )
+            .expect("script should eval");
+
+            let def_delta: i64 = ctx.eval("__defDelta").expect("read defDelta");
+            let proxy_delta: i64 = ctx.eval("__proxyDelta").expect("read proxyDelta");
+            assert_eq!(
+                def_delta, 0,
+                "pm.expect must not call Object.defineProperty per call (got {def_delta})"
+            );
+            assert_eq!(
+                proxy_delta, 500,
+                "pm.expect must allocate exactly one Proxy per call, not per read (got {proxy_delta})"
             );
         });
     }
@@ -6330,6 +6478,102 @@ mod tests {
             );
             let err: String = obj.get("error").expect("error field");
             assert!(!err.is_empty(), "envelope must carry an error message");
+        });
+    }
+
+    #[test]
+    fn test_pm_response_to_be_json_html_text_property_form() {
+        // Backlog line 42: chai-postman exposes .json/.html/.text as
+        // PROPERTIES — Postman's own snippets emit `pm.response.to.be.json;`
+        // with NO parens. They were methods here, so reading the property
+        // yielded a truthy Function → silent PASS on any body. Now getters:
+        // the bare property read runs the check and THROWS on mismatch, and
+        // the paren form still works.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'text/html';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'text/html' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '<html>'; }; // NOT JSON
+                globalThis.__tropel_pm_response_body = function () { return '<html>'; };
+
+                // The silent-PASS probe from the backlog: bare property read
+                // on a text/html body must THROW now (was PASS).
+                globalThis.__p_json = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__p_html = String((function () {
+                    try { pm.response.to.be.html; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // Paren form on a NON-matching body must also throw.
+                globalThis.__p_json_paren = String((function () {
+                    try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+
+                // Flip to a valid JSON body: both forms must pass.
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_pm_response_body = function () { return '{"a":1}'; };
+                globalThis.__p_json_ok = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__p_json_paren_ok = String((function () {
+                    try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // html/text on a JSON body must throw.
+                globalThis.__p_html_json = String((function () {
+                    try { pm.response.to.be.html; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json").unwrap(),
+                "threw",
+                "bare to.be.json on text/html must THROW (was silent PASS)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_html").unwrap(),
+                "passed",
+                "to.be.html must pass on text/html"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_paren").unwrap(),
+                "threw",
+                "to.be.json() on text/html must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_ok").unwrap(),
+                "passed",
+                "bare to.be.json on JSON body must pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_json_paren_ok").unwrap(),
+                "passed",
+                "to.be.json() on JSON body must pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__p_html_json").unwrap(),
+                "threw",
+                "to.be.html on JSON body must throw"
+            );
         });
     }
 
@@ -7813,6 +8057,100 @@ mod tests {
                 .await
                 .expect("iteration must succeed — the boundary pump fires the timer");
         }
+    }
+
+    #[tokio::test]
+    async fn test_timer_state_resets_each_iteration() {
+        // Backlog line 99: timer state leaked across iterations —
+        // __tropel_timers is module-scope with no per-iteration reset, so a
+        // setInterval armed in EVERY iteration accumulated live intervals
+        // that all fired on every subsequent pump (linear growth in
+        // callbacks and retained closures for the VU's life). The driver now
+        // calls __tropel_reset_timers() at the start of each iteration.
+        //
+        // The script asserts the invariant itself: at the start of
+        // iteration N>1 the timer table must be EMPTY (the previous
+        // iteration's interval was cleared by the reset). Long ms keeps the
+        // interval pending so it never fires and never self-cleans — with
+        // the leak, iteration 2 would start with 1 live interval and throw.
+        let driver = K6Driver;
+        let script = br#"
+            export default function (data) {
+                var n = (globalThis.__calls = (globalThis.__calls || 0) + 1);
+                // Start of iteration N>1: the previous iteration's interval
+                // must have been cleared by the reset - zero live timers.
+                if (n > 1) {
+                    var liveAtStart = Object.keys(__tropel_timers).length;
+                    if (liveAtStart > 0) {
+                        throw new Error('timer leak across iterations: ' + liveAtStart + ' live at start of iter ' + n);
+                    }
+                }
+                setInterval(function () { globalThis.__fired = (globalThis.__fired || 0) + 1; }, 1000000);
+                // After arming, exactly ONE interval is live (the current
+                // iteration's) - never the accumulated set.
+                if (Object.keys(__tropel_timers).length !== 1) {
+                    throw new Error('expected exactly 1 live timer, got ' + Object.keys(__tropel_timers).length);
+                }
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        for _ in 0..3 {
+            inst.run_iteration(&mut ctx)
+                .await
+                .expect("iteration must succeed — timers must not leak across iterations");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timer_callback_samples_and_abort_survive_final_iteration() {
+        // Backlog line 100: run_iteration drained the sample sink BEFORE
+        // pumping timers, so anything a timer callback recorded landed AFTER
+        // the drain — picked up next iteration, or SILENTLY DISCARDED on the
+        // last one; test.abort() from a timer was delayed or lost. With a
+        // SINGLE iteration (which is the final iteration), a setTimeout(0)
+        // callback that records a check AND calls exec.test.abort() must
+        // have both effects visible after run_iteration returns.
+        let driver = K6Driver;
+        let script = br#"
+            export default function (data) {
+                setTimeout(function () {
+                    check(1, { 'from timer': function (v) { return v === 1; } });
+                    exec.test.abort('stop-from-timer');
+                }, 0);
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+        // The timer callback's check sample must be drained THIS iteration
+        // (the only one — nothing follows to pick it up).
+        let checks: Vec<_> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .collect();
+        assert_eq!(
+            checks.len(),
+            1,
+            "timer-callback check sample must survive the final iteration, got {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
+        // The timer's test.abort() must reach the engine THIS iteration.
+        assert!(
+            ctx.abort_requested,
+            "test.abort() from a timer callback must not be lost"
+        );
+        assert_eq!(
+            ctx.abort_message.as_deref(),
+            Some("stop-from-timer"),
+            "abort message must be the timer's"
+        );
     }
 
     #[tokio::test]
