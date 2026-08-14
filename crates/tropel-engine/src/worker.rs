@@ -269,15 +269,19 @@ impl VUWorkerPool {
             // acquisition; the freshly-built worker is surplus. Signal it to
             // stop and reap it, then re-check. The surplus worker is
             // GUARANTEED idle (never inserted, so `spawn_on` can't reach it),
-            // so the notify is consumed promptly and `recv()` can't deadlock.
+            // so the notify is consumed promptly.
             drop(workers);
             worker.shutdown.notify_one();
-            if let Some(exited) = &worker.exited {
-                let _ = exited.recv();
-            }
-            if let Some(thread) = worker.thread {
-                let _ = thread.join();
-            }
+            // Backlog line 160: the old code did a BLOCKING `exited.recv()` +
+            // `thread.join()` here — on the ramp loop's async thread. During a
+            // 10 000-VU ramp the growth CAS loses constantly, so each retry
+            // stalled the whole ramp on thread teardown. The surplus worker is
+            // guaranteed idle and its thread exits on its own right after the
+            // notify (its `block_on` returns), so DETACH it — dropping the
+            // JoinHandle lets the OS reclaim the thread when it finishes,
+            // with zero blocking and no throwaway reaper thread.
+            drop(worker.thread);
+            drop(worker.exited);
         }
     }
 
