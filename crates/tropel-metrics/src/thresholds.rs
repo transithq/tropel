@@ -415,10 +415,7 @@ fn metric_base_name(key: &str) -> &str {
 /// `p(95)<0.01` gate pass on a 100%-failure run (backlog line 60).
 fn series_supports_percentile(m: &MetricSummary, stat: &str) -> bool {
     match stat {
-        "min" | "max" => matches!(
-            m.metric_type,
-            MetricType::Trend | MetricType::Gauge
-        ),
+        "min" | "max" => matches!(m.metric_type, MetricType::Trend | MetricType::Gauge),
         _ => m.metric_type == MetricType::Trend,
     }
 }
@@ -1026,11 +1023,17 @@ mod tests {
         // p95 on a Rate must NOT evaluate to the hardcoded 0 (which would
         // pass `p(95) < 0.01`) — it must fail closed.
         let result = evaluate_single_threshold("http_req_failed.p95 < 0.01", &metrics);
-        assert!(!result.0, "p95 on a Rate must fail closed, not read the hardcoded 0");
+        assert!(
+            !result.0,
+            "p95 on a Rate must fail closed, not read the hardcoded 0"
+        );
         let result = evaluate_single_threshold("http_req_failed.p(90) < 0.01", &metrics);
         assert!(!result.0, "p(90) on a Rate must fail closed too");
         let result = evaluate_single_threshold("http_req_failed.max < 0.01", &metrics);
-        assert!(!result.0, "max on a Rate must fail closed (Rate hardcodes min/max = 0)");
+        assert!(
+            !result.0,
+            "max on a Rate must fail closed (Rate hardcodes min/max = 0)"
+        );
         // Sanity: a MEANINGFUL Rate stat still resolves — `rate` is the
         // failure ratio (1.0 on an all-failed run) and must breach `> 0.5`.
         let result = evaluate_single_threshold("http_req_failed.rate > 0.5", &metrics);
@@ -1124,19 +1127,13 @@ mod tests {
             histogram: None,
         };
         let metrics = make_metrics_with(series);
-        let result = evaluate_single_threshold(
-            "http_req_failed{url=/a}.p95 < 0.01",
-            &metrics,
-        );
+        let result = evaluate_single_threshold("http_req_failed{url=/a}.p95 < 0.01", &metrics);
         assert!(
             !result.0,
             "tag-scoped p95 on a Rate must fail closed, not read the hardcoded 0"
         );
         // The real rate on that tag still resolves.
-        let result = evaluate_single_threshold(
-            "http_req_failed{url=/a}.rate > 0.5",
-            &metrics,
-        );
+        let result = evaluate_single_threshold("http_req_failed{url=/a}.rate > 0.5", &metrics);
         assert!(result.0, "tag-scoped rate 1.0 should be > 0.5");
     }
 
