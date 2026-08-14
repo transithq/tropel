@@ -15,9 +15,39 @@ var CryptoJS = CryptoJS || {};
         return (encoder || CryptoJS.enc.Hex).stringify(this);
     };
 
+    // Real CryptoJS concat is bit-aligned (backlog line 95): the old
+    // `words.concat(words)` corrupted non-4-byte-aligned data ('abc'+'de'
+    // became "abc\0d" because the partial last word was not shifted). Zero
+    // the unused low bits of the partial word, then merge byte-by-byte when
+    // `this.sigBytes % 4 !== 0`, or word-by-word when aligned.
+    WordArray.prototype.clamp = function () {
+        var words = this.words;
+        var sigBytes = this.sigBytes;
+        words[sigBytes >>> 2] &= 0xffffffff << (32 - (sigBytes % 4) * 8);
+        words.length = Math.ceil(sigBytes / 4);
+        return this;
+    };
+
     WordArray.prototype.concat = function (wordArray) {
-        this.words = this.words.concat(wordArray.words);
-        this.sigBytes += wordArray.sigBytes;
+        if (wordArray.sigBytes <= 0) return this;
+        this.clamp();
+        var thisWords = this.words;
+        var thatWords = wordArray.words;
+        var thisSigBytes = this.sigBytes;
+        var thatSigBytes = wordArray.sigBytes;
+        if (thisSigBytes % 4) {
+            // Bit-aligned merge: shift the incoming words right by the
+            // partial-byte offset of this.sigBytes.
+            for (var i = 0; i < thatSigBytes; i++) {
+                var thatByte = (thatWords[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xff;
+                thisWords[(thisSigBytes + i) >>> 2] |=
+                    thatByte << (24 - ((thisSigBytes + i) % 4) * 8);
+            }
+        } else {
+            thisWords = thisWords.concat(thatWords);
+            this.words = thisWords;
+        }
+        this.sigBytes += thatSigBytes;
         return this;
     };
 
@@ -181,7 +211,85 @@ var CryptoJS = CryptoJS || {};
         }
     };
 
-    CryptoJS.enc.Utf16 = CryptoJS.enc.Utf8;
+    // Utf16 is UTF-16BE with surrogate-pair support (backlog line 95 — the
+    // old `Utf16 = Utf8` alias silently produced the wrong bytes for every
+    // non-ASCII string). Utf16LE swaps the byte order; Utf16BE is the alias
+    // real CryptoJS exposes alongside Utf16.
+    CryptoJS.enc.Utf16 = {
+        stringify: function (wordArray) {
+            var bytes = bytesFromWordArray(wordArray);
+            var str = '';
+            for (var i = 0; i + 1 < bytes.length; i += 2) {
+                var hi = (bytes[i] << 8) | bytes[i + 1];
+                if (hi >= 0xD800 && hi <= 0xDBFF && i + 3 < bytes.length) {
+                    var lo = (bytes[i + 2] << 8) | bytes[i + 3];
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        str += String.fromCharCode(hi, lo);
+                        i += 2;
+                        continue;
+                    }
+                }
+                str += String.fromCharCode(hi);
+            }
+            return str;
+        },
+        parse: function (str) {
+            var bytes = [];
+            for (var i = 0; i < str.length; i++) {
+                var c = str.charCodeAt(i);
+                if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) {
+                    var lo = str.charCodeAt(i + 1);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        // UTF-16 encodes a code point as TWO 2-byte code units
+                        // (high+low surrogate), not a 3-byte sequence — the
+                        // naive 3-byte write broke the '😀' round trip.
+                        bytes.push((c >> 8) & 0xFF);
+                        bytes.push(c & 0xFF);
+                        bytes.push((lo >> 8) & 0xFF);
+                        bytes.push(lo & 0xFF);
+                        i++;
+                        continue;
+                    }
+                }
+                bytes.push((c >> 8) & 0xFF);
+                bytes.push(c & 0xFF);
+            }
+            return wordArrayFromBytes(bytes);
+        }
+    };
+
+    CryptoJS.enc.Utf16BE = CryptoJS.enc.Utf16;
+
+    CryptoJS.enc.Utf16LE = {
+        stringify: function (wordArray) {
+            var bytes = bytesFromWordArray(wordArray);
+            var str = '';
+            for (var i = 0; i + 1 < bytes.length; i += 2) {
+                var c = (bytes[i + 1] << 8) | bytes[i];
+                if (c >= 0xD800 && c <= 0xDBFF && i + 3 < bytes.length) {
+                    var lo = (bytes[i + 3] << 8) | bytes[i + 2];
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        str += String.fromCharCode(c, lo);
+                        i += 2;
+                        continue;
+                    }
+                }
+                str += String.fromCharCode(c);
+            }
+            return str;
+        },
+        parse: function (str) {
+            var be = CryptoJS.enc.Utf16.parse(str);
+            var bytes = bytesFromWordArray(be);
+            for (var i = 0; i + 1 < bytes.length; i += 2) {
+                var t = bytes[i];
+                bytes[i] = bytes[i + 1];
+                bytes[i + 1] = t;
+            }
+            return wordArrayFromBytes(bytes);
+        }
+    };
+
     CryptoJS.enc.Latin1 = {
         stringify: function (wordArray) {
             var bytes = bytesFromWordArray(wordArray);
@@ -284,6 +392,13 @@ var CryptoJS = CryptoJS || {};
                     throw new Error('SHA3 unavailable: native keccak not installed');
                 }
                 break;
+            case 'SHA224':
+                if (typeof __tropel_native_sha224 === 'function') {
+                    result = wordArrayFromBytes(__tropel_native_sha224(allBytes));
+                } else {
+                    result = this._fallbackHash(allBytes, 'SHA224');
+                }
+                break;
             case 'RIPEMD160':
                 if (typeof __tropel_native_ripemd160 === 'function') {
                     result = wordArrayFromBytes(__tropel_native_ripemd160(allBytes));
@@ -357,6 +472,15 @@ var CryptoJS = CryptoJS || {};
         return hasher.finalize(message);
     };
 
+    // Backlog line 95: SHA224 / RIPEMD160 / HmacSHA384 were undefined.
+    CryptoJS.SHA224 = function (message) {
+        return createHasher('SHA224').finalize(message);
+    };
+
+    CryptoJS.RIPEMD160 = function (message) {
+        return createHasher('RIPEMD160').finalize(message);
+    };
+
     // ── HMAC ──
     CryptoJS.HmacSHA1 = function (message, key) {
         var msgBytes = typeof message === 'string'
@@ -414,6 +538,26 @@ var CryptoJS = CryptoJS || {};
         throw new Error('HMAC-SHA512 native function not available');
     };
 
+    // Backlog line 95: HmacSHA384 was undefined. The native k6/crypto hmac
+    // dispatcher already handles 'sha384', so route through it.
+    CryptoJS.HmacSHA384 = function (message, key) {
+        var msgBytes = typeof message === 'string'
+            ? bytesFromWordArray(CryptoJS.enc.Utf8.parse(message))
+            : bytesFromWordArray(message);
+        var keyBytes = typeof key === 'string'
+            ? bytesFromWordArray(CryptoJS.enc.Utf8.parse(key))
+            : bytesFromWordArray(key);
+
+        if (typeof __tropel_native_hmac === 'function') {
+            var out = __tropel_native_hmac('sha384', keyBytes, msgBytes);
+            if (out === null || out === undefined) {
+                throw new Error('HMAC-SHA384 native function not available');
+            }
+            return wordArrayFromBytes(out);
+        }
+        throw new Error('HMAC-SHA384 native function not available');
+    };
+
     // ── EncryptedMessage helpers ──
     CryptoJS.lib = CryptoJS.lib || {};
     CryptoJS.lib.WordArray = WordArray;
@@ -456,6 +600,31 @@ var CryptoJS = CryptoJS || {};
         return undefined;
     }
 
+    function resolvePadding(padding) {
+        if (typeof padding === 'string') return padding;
+        if (padding && padding.name) return padding.name;
+        return undefined;
+    }
+
+    // Backlog line 95: ECB/CTR/CFB/OFB SILENTLY ran GCM (the only branch was
+    // CBC-vs-everything-else), producing ciphertext under the wrong mode with
+    // no error — and {padding: NoPadding} was ignored (native CBC always
+    // PKCS7-pads, so 16 bytes became 32). The native bridges implement exactly
+    // CBC and GCM, so anything else must FAIL LOUDLY with the mode/padding
+    // named instead of silently emitting wrong ciphertext.
+    function assertSupportedCipher(mode, padding) {
+        if (mode !== 'CBC' && mode !== 'GCM') {
+            throw new Error(
+                'AES mode ' + mode + ' is not supported (only CBC and GCM are implemented)'
+            );
+        }
+        if (padding !== undefined && padding !== 'Pkcs7') {
+            throw new Error(
+                'AES padding ' + padding + ' is not supported (only Pkcs7 is implemented)'
+            );
+        }
+    }
+
     // ── AES (real encryption via native Rust) ──
     /// Derive a key+IV from a passphrase using OpenSSL-compatible EVP_BytesToKey.
     /// For AES-256-GCM: key=32 bytes, iv=12 bytes.
@@ -480,7 +649,8 @@ var CryptoJS = CryptoJS || {};
         ///   message: string or WordArray (plaintext)
         ///   key: 32-byte key (WordArray) or passphrase (string, uses EVP_BytesToKey)
         ///   options: { iv: WordArray|bytes (12 for GCM, 16 for CBC),
-        ///              mode: 'GCM' (default) | 'CBC' }
+        ///              mode: 'CBC' (default) | 'GCM' — only these two are
+        ///              implemented; ECB/CTR/CFB/OFB fail loudly (line 95) }
         /// Returns: { ciphertext: WordArray, key: WordArray, iv: WordArray,
         ///            salt: WordArray (empty for direct keys), toString: fn }
         encrypt: function (message, key, options) {
@@ -492,6 +662,8 @@ var CryptoJS = CryptoJS || {};
             options = options || {};
             // CryptoJS default is CBC/PKCS7, not GCM (backlog line 155).
             var mode = resolveMode(options.mode) || 'CBC';
+            var padding = resolvePadding(options.padding) || 'Pkcs7';
+            assertSupportedCipher(mode, padding);
             var ivLen = mode === 'CBC' ? 16 : 12;
             var keyLen = 32; // AES-256 passphrase derivation (CryptoJS default)
 
@@ -593,12 +765,14 @@ var CryptoJS = CryptoJS || {};
         /// Decrypt with AES-256-GCM or AES-256-CBC
         ///   ciphertext: result from encrypt() or { ciphertext: WordArray }
         ///   key: 32-byte key (WordArray) or passphrase (string, uses EVP_BytesToKey)
-        ///   options: { iv: WordArray|bytes, mode: 'GCM' (default) | 'CBC' }
+        ///   options: { iv: WordArray|bytes, mode: 'CBC' (default) | 'GCM' }
         /// Returns: WordArray (decrypted plaintext)
         decrypt: function (ciphertext, key, options) {
             var ct = ciphertext.ciphertext || ciphertext;
             options = options || {};
             var mode = resolveMode(options.mode) || 'CBC';
+            var padding = resolvePadding(options.padding) || 'Pkcs7';
+            assertSupportedCipher(mode, padding);
             var ivLen = mode === 'CBC' ? 16 : 12;
             var keyLen = 32;
 

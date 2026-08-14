@@ -1398,6 +1398,15 @@ pub fn merge_snapshots(
         }
     }
     let mut agg = Aggregator::new();
+    // Adopt the workers' summary trend stats (backlog line 59c): the
+    // controller's `Aggregator::new()` seeds k6 defaults, so the
+    // `absorb_snapshot` empty-check never fires — a worker that declared
+    // e.g. `summaryTrendStats: ["p(75)"]` would lose its stats and its
+    // `p(75)` percentiles would fall back to tracked buckets. The first
+    // non-empty worker declaration wins (matches single-node behavior).
+    if let Some(snap) = snapshots.iter().find(|s| !s.summary_trend_stats.is_empty()) {
+        agg.summary_trend_stats = snap.summary_trend_stats.clone();
+    }
     agg.retain_histograms = config_needs_histograms(&agg.summary_trend_stats, &effective);
     agg.effective_thresholds = effective;
     for snap in &snapshots {
@@ -1596,14 +1605,21 @@ fn config_needs_histograms(
 ) -> bool {
     trend_stats.iter().any(|s| stat_needs_histogram(s))
         || thresholds.values().any(|t| {
-            // Mirror `evaluate_single_threshold`: the expression is
-            // "<metric_ref> <op> <value>", so parse ONLY the first token.
-            // Passing the whole expression would make the stat come out as
-            // e.g. "75 < 300" (the `.rfind('.')` grabs the trailing value)
-            // and retention would never trigger.
-            let metric_ref = t.expression.split_whitespace().next().unwrap_or("");
-            let (_, _, stat) = parse_metric_ref(metric_ref);
-            stat.map(stat_needs_histogram).unwrap_or(false)
+            // Mirror `evaluate_single_threshold` for COMPOUND AND/OR
+            // expressions (backlog line 59b): a threshold like
+            // `p(95)<500 && p(75)<300` has TWO clauses, and retention must
+            // trigger if ANY clause references a non-tracked percentile.
+            // The old code parsed only the first whitespace token, so the
+            // second clause's stat silently fell back to a tracked bucket.
+            t.expression
+                .split("||")
+                .flat_map(|g| g.split("&&"))
+                .filter(|c| !c.trim().is_empty())
+                .any(|clause| {
+                    let metric_ref = clause.split_whitespace().next().unwrap_or("");
+                    let (_, _, stat) = parse_metric_ref(metric_ref);
+                    stat.map(stat_needs_histogram).unwrap_or(false)
+                })
         })
 }
 
@@ -1823,6 +1839,104 @@ mod tests {
             &stats,
             &std::collections::HashMap::new()
         ));
+
+        // COMPOUND AND/OR expressions (backlog line 59b): the second clause's
+        // non-tracked p(75) must trigger retention even though the FIRST
+        // clause's p95 is a tracked bucket — the old code only parsed the
+        // first whitespace token and silently missed the second stat.
+        thresholds.insert(
+            "compound".into(),
+            ThresholdConfig {
+                expression: "http_req_duration.p95 < 500 && http_req_duration.p75 < 300".into(),
+                abort_on_fail: true,
+                delay_abort_eval: None,
+            },
+        );
+        assert!(config_needs_histograms(
+            &k6_default_trend_stats(),
+            &thresholds
+        ));
+        // OR-form and bare-second-clause forms behave the same.
+        thresholds.insert(
+            "or-form".into(),
+            ThresholdConfig {
+                expression: "http_req_failed < 0.01 || http_req_duration.p(90.5) < 300".into(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        assert!(config_needs_histograms(
+            &k6_default_trend_stats(),
+            &thresholds
+        ));
+        // A compound where EVERY clause is tracked stays false (no histogram
+        // clone on the hot path). Use a FRESH map — the accumulated
+        // `thresholds` above still holds the p(75)/p(90.5) entries, which
+        // would (correctly) keep retention on.
+        let mut all_tracked = std::collections::HashMap::new();
+        all_tracked.insert(
+            "all-tracked".into(),
+            ThresholdConfig {
+                expression: "http_req_duration.p95 < 500 && http_req_duration.p99 < 900".into(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        assert!(!config_needs_histograms(
+            &k6_default_trend_stats(),
+            &all_tracked
+        ));
+    }
+
+    /// Regression (backlog line 59c): `merge_snapshots` seeded the
+    /// controller's `Aggregator` with k6 default trend stats, so a worker
+    /// that declared e.g. `summaryTrendStats: ["p(75)"]` lost its stats and
+    /// its `p(75)` percentiles fell back to a tracked bucket. The merge must
+    /// adopt the FIRST non-empty worker declaration.
+    #[test]
+    fn merge_snapshots_adopts_worker_trend_stats() {
+        use tropel_core::config::ThresholdConfig;
+
+        let mut snap_thresholds = HashMap::new();
+        snap_thresholds.insert(
+            "http_req_duration".to_string(),
+            ThresholdConfig {
+                expression: "http_req_duration{expected_response:true} < 400".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        // Worker declares a custom summaryTrendStats set (non-default).
+        let worker_stats = vec!["avg".to_string(), "p(75)".to_string()];
+        let snap = MetricsSnapshot {
+            series: vec![],
+            totals: HashMap::new(),
+            summary_trend_stats: worker_stats.clone(),
+            thresholds: snap_thresholds,
+        };
+        let result = merge_snapshots(vec![snap], std::collections::HashMap::new()).expect("merge");
+        // The worker's declaration must be adopted, NOT the k6 defaults.
+        assert_eq!(result.summary_trend_stats, worker_stats);
+        // The p(75) declaration implies histograms are retained for exactness.
+        assert!(
+            result.summary_trend_stats.iter().any(|s| s == "p(75)"),
+            "adopted stats must contain the non-tracked percentile"
+        );
+
+        // A worker with EMPTY stats must not clobber a non-empty sibling.
+        let with_stats = MetricsSnapshot {
+            series: vec![],
+            totals: HashMap::new(),
+            summary_trend_stats: vec!["p(99.9)".to_string()],
+            thresholds: HashMap::new(),
+        };
+        let empty = MetricsSnapshot {
+            summary_trend_stats: vec![],
+            ..with_stats.clone()
+        };
+        let result2 = merge_snapshots(vec![empty, with_stats], std::collections::HashMap::new())
+            .expect("merge");
+        assert_eq!(result2.summary_trend_stats, vec!["p(99.9)".to_string()]);
     }
 
     #[test]
