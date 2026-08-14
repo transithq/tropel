@@ -61,9 +61,14 @@ export interface HttpRequest {
   method: string;
   headers: Record<string, string>;
   queryParams: Record<string, string>;
-  /** Raw string body (Body::Raw) when present and decodable; else null. */
+  /**
+   * The request body rendered as TEXT for any present variant: Body::Raw
+   * as-is; Body::Json via JSON.stringify; the tagged envelopes
+   * (FormData/UrlEncoded/Binary/GraphQL) via JSON.stringify of the
+   * {"__tropel_body":...} object. Null when the request has no body.
+   */
   body: string | null;
-  /** Whether the body was present on the wire (even if undecodable). */
+  /** Whether a body was present on the wire at all. */
   bodyDecoded: boolean;
 }
 
