@@ -5309,6 +5309,101 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_response_to_be_guarded_status_assertions() {
+        // Backlog line 41: pm.response.to.be.* was a bare object literal, so
+        // .notFound/.unauthorized/.forbidden/.badRequest/.accepted/.rateLimited
+        // /.withBody/.teapot all read as `undefined` and recorded PASS on any
+        // response. The tree is now guardChain-wrapped: exact-status getters
+        // THROW on mismatch, and ANY unknown assertion name throws too.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 404; };
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_pm_response_body = function () { return 'not found'; };
+
+                // Exact-status getters: only notFound passes on 404.
+                globalThis.__b_not_found = String((function () {
+                    try { pm.response.to.be.notFound; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_unauthorized = String((function () {
+                    try { pm.response.to.be.unauthorized; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_forbidden = String((function () {
+                    try { pm.response.to.be.forbidden; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_bad_request = String((function () {
+                    try { pm.response.to.be.badRequest; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_accepted = String((function () {
+                    try { pm.response.to.be.accepted; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_rate_limited = String((function () {
+                    try { pm.response.to.be.rateLimited; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_teapot = String((function () {
+                    try { pm.response.to.be.teapot; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_with_body = String((function () {
+                    try { pm.response.to.be.withBody; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+
+                // guardChain: a name that is not implemented ANYWHERE must
+                // throw, not silently pass.
+                globalThis.__b_unknown = String((function () {
+                    try { pm.response.to.be.nonexistentAssertion; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+
+                // withBody/withoutBody respond to the actual body.
+                globalThis.__b_without_body = String((function () {
+                    try { pm.response.to.be.withoutBody; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__b_not_found").unwrap(), "passed", "404 must pass notFound");
+            assert_eq!(ctx.eval::<String, _>("__b_unauthorized").unwrap(), "threw", "404 must NOT be unauthorized");
+            assert_eq!(ctx.eval::<String, _>("__b_forbidden").unwrap(), "threw", "404 must NOT be forbidden");
+            assert_eq!(ctx.eval::<String, _>("__b_bad_request").unwrap(), "threw", "404 must NOT be badRequest");
+            assert_eq!(ctx.eval::<String, _>("__b_accepted").unwrap(), "threw", "404 must NOT be accepted");
+            assert_eq!(ctx.eval::<String, _>("__b_rate_limited").unwrap(), "threw", "404 must NOT be rateLimited");
+            assert_eq!(ctx.eval::<String, _>("__b_teapot").unwrap(), "threw", "404 must NOT be teapot");
+            assert_eq!(ctx.eval::<String, _>("__b_with_body").unwrap(), "passed", "non-empty body must pass withBody");
+            assert_eq!(ctx.eval::<String, _>("__b_unknown").unwrap(), "threw", "unknown assertion must throw (no silent PASS)");
+            assert_eq!(ctx.eval::<String, _>("__b_without_body").unwrap(), "threw", "non-empty body must NOT pass withoutBody");
+
+            // The original silent-PASS probe from the backlog: on a 200,
+            // .notFound must now FAIL instead of recording PASS.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__b_not_found_200 = String((function () {
+                    try { pm.response.to.be.notFound; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+            assert_eq!(
+                ctx.eval::<String, _>("__b_not_found_200").unwrap(),
+                "threw",
+                "200 must FAIL notFound (the silent-PASS bug)"
+            );
+        });
+    }
+
+    #[test]
     fn test_exec_selection_installs_named_export() {
         // A scenario naming `exec: "browse"` must run the `browse` export,
         // NOT the default export (k6 multi-scenario semantics).

@@ -325,7 +325,23 @@ function assertStatusClass(classCode, label) {
     }
 }
 
-pm.response.to = {
+// chai-postman exact-status assertion (Backlog line 41): .notFound must only
+// pass when the code is exactly 404, etc. Throws on mismatch so the enclosing
+// pm.test records a single FAILED check.
+function assertStatusExact(code, label) {
+    var c = pm.response.code;
+    if (c !== code) {
+        throw new Error('expected response to be ' + label + ' (status ' + code + '), got ' + c);
+    }
+}
+
+// Backlog line 41: pm.response.to.be.* was a BARE object literal — the
+// guardChain Proxy that fixed pm.expect was never applied here, so any
+// assertion name absent from the literal (.notFound, .teapot, ...) read as
+// `undefined` and the enclosing pm.test recorded GREEN on every response.
+// The whole `to` tree is now guarded (unknown names THROW) and the
+// chai-postman exact-status assertions are implemented below.
+pm.response.to = guardChain({
     be: {
         get success() { assertStatusClass(2, 'success'); },
         get ok() { assertStatusClass(2, 'ok'); },
@@ -339,6 +355,29 @@ pm.response.to = {
             }
         },
         get info() { assertStatusClass(1, 'info'); },
+        // chai-postman exact-status assertions. Each THROWS when the code
+        // doesn't match, so pm.test records a single FAILED check instead of
+        // the old silent PASS.
+        get notFound() { assertStatusExact(404, 'notFound'); },
+        get unauthorized() { assertStatusExact(401, 'unauthorized'); },
+        get forbidden() { assertStatusExact(403, 'forbidden'); },
+        get badRequest() { assertStatusExact(400, 'badRequest'); },
+        get accepted() { assertStatusExact(202, 'accepted'); },
+        get rateLimited() { assertStatusExact(429, 'rateLimited'); },
+        get tooManyRequests() { assertStatusExact(429, 'tooManyRequests'); },
+        get teapot() { assertStatusExact(418, 'teapot'); },
+        get withBody() {
+            var b = pm.response.text();
+            if (!b || b.length === 0) {
+                throw new Error('expected response to have a body');
+            }
+        },
+        get withoutBody() {
+            var b = pm.response.text();
+            if (b && b.length > 0) {
+                throw new Error('expected response to have no body');
+            }
+        },
         json: function () {
             // Postman parity: to.be.json passes when the body parses as JSON.
             // Content-type is informational — a text/plain body that parses
@@ -393,7 +432,7 @@ pm.response.to = {
             }
         }
     }
-};
+});
 
 // ── pm.test ──
 pm.test = function (name, fn) {
