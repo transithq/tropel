@@ -1348,10 +1348,7 @@ pub fn merge_snapshots(
     // e.g. `summaryTrendStats: ["p(75)"]` would lose its stats and its
     // `p(75)` percentiles would fall back to tracked buckets. The first
     // non-empty worker declaration wins (matches single-node behavior).
-    if let Some(snap) = snapshots
-        .iter()
-        .find(|s| !s.summary_trend_stats.is_empty())
-    {
+    if let Some(snap) = snapshots.iter().find(|s| !s.summary_trend_stats.is_empty()) {
         agg.summary_trend_stats = snap.summary_trend_stats.clone();
     }
     agg.retain_histograms = config_needs_histograms(&agg.summary_trend_stats, &effective);
@@ -1789,8 +1786,7 @@ mod tests {
         thresholds.insert(
             "compound".into(),
             ThresholdConfig {
-                expression: "http_req_duration.p95 < 500 && http_req_duration.p75 < 300"
-                    .into(),
+                expression: "http_req_duration.p95 < 500 && http_req_duration.p75 < 300".into(),
                 abort_on_fail: true,
                 delay_abort_eval: None,
             },
@@ -1857,8 +1853,7 @@ mod tests {
             summary_trend_stats: worker_stats.clone(),
             thresholds: snap_thresholds,
         };
-        let result =
-            merge_snapshots(vec![snap], std::collections::HashMap::new()).expect("merge");
+        let result = merge_snapshots(vec![snap], std::collections::HashMap::new()).expect("merge");
         // The worker's declaration must be adopted, NOT the k6 defaults.
         assert_eq!(result.summary_trend_stats, worker_stats);
         // The p(75) declaration implies histograms are retained for exactness.
@@ -1878,11 +1873,8 @@ mod tests {
             summary_trend_stats: vec![],
             ..with_stats.clone()
         };
-        let result2 = merge_snapshots(
-            vec![empty, with_stats],
-            std::collections::HashMap::new(),
-        )
-        .expect("merge");
+        let result2 = merge_snapshots(vec![empty, with_stats], std::collections::HashMap::new())
+            .expect("merge");
         assert_eq!(result2.summary_trend_stats, vec!["p(99.9)".to_string()]);
     }
 
