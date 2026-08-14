@@ -5313,6 +5313,73 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_expect_chain_allocates_once_not_per_read() {
+        // Backlog line 105: pm.expect was ~10x slower than chai.expect
+        // (2511 ms vs 235 ms over 200k assertions) because EVERY call built
+        // a fresh chain literal with 18 Object.defineProperty calls
+        // (addPropAssertions x4) and guardChain wrapped each object-valued
+        // property read in a NEW Proxy. The chain is now a single class with
+        // the surface on AssertChain.prototype. This test pins the
+        // STRUCTURAL property deterministically (no timing flakiness): after
+        // load, running chains must not call Object.defineProperty at all,
+        // and Proxy allocations must be ~1 per expect + ~1 per .not access,
+        // NOT one per chain-property read.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Instrument AFTER load so module-level defineProperty (the
+                // one-time prototype install) is not counted.
+                globalThis.__defCalls = 0;
+                var __realDefine = Object.defineProperty;
+                Object.defineProperty = function () {
+                    globalThis.__defCalls++;
+                    return __realDefine.apply(Object, arguments);
+                };
+                globalThis.__proxyCalls = 0;
+                var __realProxy = Proxy;
+                Proxy = function () {
+                    globalThis.__proxyCalls++;
+                    return new __realProxy(arguments[0], arguments[1]);
+                };
+
+                // Warm-up + behaviour must be unchanged. (above/below etc.
+                // are chai-shim assertions — the pm chain's surface is
+                // eql/equal/include/match/an/a/property/status/header/
+                // jsonBody, and the guard must still throw on anything else.)
+                pm.expect('x').to.be.an('string').and.to.equal('x');
+                pm.expect(5).not.to.be.a('string');
+                pm.expect([1, 2]).to.include(2);
+                try { pm.expect(1).to.be.bogus; } catch (e) { /* guard still throws */ }
+
+                var defBefore = globalThis.__defCalls;
+                var proxyBefore = globalThis.__proxyCalls;
+                for (var i = 0; i < 500; i++) {
+                    pm.expect('x').to.be.an('string').and.to.equal('x');
+                }
+                globalThis.__defDelta = globalThis.__defCalls - defBefore;
+                globalThis.__proxyDelta = globalThis.__proxyCalls - proxyBefore;
+            "#,
+            )
+            .expect("script should eval");
+
+            let def_delta: i64 = ctx.eval("__defDelta").expect("read defDelta");
+            let proxy_delta: i64 = ctx.eval("__proxyDelta").expect("read proxyDelta");
+            assert_eq!(
+                def_delta, 0,
+                "pm.expect must not call Object.defineProperty per call (got {def_delta})"
+            );
+            assert_eq!(
+                proxy_delta, 500,
+                "pm.expect must allocate exactly one Proxy per call, not per read (got {proxy_delta})"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_collection_vars_globals_request_cookies() {
         // Backlog line 145: pm.collectionVariables / pm.globals / pm.request /
         // pm.cookies / pm.expect.fail / pm.test.skip / postman.setNextRequest
