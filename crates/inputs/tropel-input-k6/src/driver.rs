@@ -78,9 +78,14 @@ impl Driver for K6Driver {
 
     fn detect(&self, bytes: &[u8]) -> bool {
         if let Ok(text) = std::str::from_utf8(bytes) {
-            // Reject Postman collections (handled by the Postman adapter)
-            let looks_like_collection = text.contains("postman") || text.contains("\"item\"");
-            if looks_like_collection {
+            // Reject ACTUAL Postman collections (handled by the Postman
+            // adapter) using the SAME STRUCTURAL check the Postman adapter
+            // uses — a JSON doc whose top-level info.schema points at the
+            // getpostman.com collection schema. Substring matching is
+            // forbidden (backlog line 61): a k6 script hitting k6's own
+            // documented postman-echo.com endpoint legitimately contains
+            // the word "postman" and was rejected.
+            if crate::is_postman_collection(text) {
                 return false;
             }
             let has_export_default = text.contains("export default");
