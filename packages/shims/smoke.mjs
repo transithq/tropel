@@ -75,6 +75,31 @@ for (const [name, rel] of K6_ORDER) {
   if (entry.source !== repoSource) fail(`'${name}' source differs from ${rel}`);
 }
 
+// ── shared-scope name collisions (k6 family) ─────────────────────────────
+// The k6 shims are concatenated into ONE shared scope
+// (K6_NATIVE_SHIM_BUNDLE / render()), so a duplicate top-level function
+// silently shadows the earlier definition — last file wins regardless of
+// which file is conceptually authoritative. Regression guard for the
+// base64ToBytes collision: open-data-shim's helper is private-named
+// (openDataBase64ToBytes) so the k6-shim's Uint8Array version — whose
+// .buffer is consumed by http()/file callers — must be the ONLY definition.
+const joinedK6 = k6Bundle.map((e) => e.source).join("\n");
+const b64Defs = [...joinedK6.matchAll(/function\s+base64ToBytes\s*\(/g)];
+if (b64Defs.length !== 1)
+  fail(
+    `k6 bundle defines base64ToBytes ${b64Defs.length} times (expected exactly 1 — open-data-shim must keep its private openDataBase64ToBytes name)`
+  );
+// Scope the body check to the single definition (bounded by the NEXT top-level
+// `function` or the bundle end) so a later unrelated `.subarray(0, o)` can
+// never false-pass a plain-Array regression.
+const defStart = b64Defs[0].index;
+const nextFn = joinedK6.indexOf("function ", defStart + 1);
+const defEnd = nextFn === -1 ? joinedK6.length : nextFn;
+if (defEnd < 0 || !joinedK6.slice(defStart, defEnd).includes("return out.subarray(0, o);"))
+  fail("base64ToBytes must be the k6-shim Uint8Array version (returns .subarray(0, o))");
+if (!joinedK6.includes("openDataBase64ToBytes"))
+  fail("open-data-shim's private openDataBase64ToBytes helper is missing");
+
 // ── shim/ copies must match their js/ twins (tarball completeness) ───────
 // The shipped shim/ dir is FLAT — build.sh copies each repo source to its
 // bare basename (js/chai/chai-shim.js -> shim/chai-shim.js) — so the twin
