@@ -6449,6 +6449,29 @@ mod tests {
                 globalThis.__be_json = String((function () {
                     try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
                 })());
+                // Backlog line 42 (P0): Postman snippets read `to.be.json;` as a
+                // PROPERTY (no parens). A bare function value used to read as
+                // truthy → silent PASS; the getter must run the check on the read.
+                globalThis.__be_json_prop = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // Backlog line 41 (P0): the specific chai-postman status helpers
+                // used to be absent → undefined → silent PASS. Now real getters.
+                globalThis.__be_not_found = String((function () {
+                    try { pm.response.to.be.notFound; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__be_unauthorized = String((function () {
+                    try { pm.response.to.be.unauthorized; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__be_with_body = String((function () {
+                    try { pm.response.to.be.withBody; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // Backlog line 41 (P0): the guardChain Proxy — ANY unknown
+                // assertion name must THROW (failed check), never read as
+                // undefined and record green.
+                globalThis.__be_unknown = String((function () {
+                    try { pm.response.to.be.nonexistentAssertion; return 'passed'; } catch (e) { return 'threw'; }
+                })());
                 globalThis.__have_hdr = String((function () {
                     try { pm.response.to.have.header('Content-Type', 'application/json'); return 'passed'; } catch (e) { return 'threw'; }
                 })());
@@ -6467,9 +6490,65 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__be_server_error").unwrap(), "threw", "404 must NOT be serverError");
             assert_eq!(ctx.eval::<String, _>("__be_error").unwrap(), "passed", "404 must be error (>=400)");
             assert_eq!(ctx.eval::<String, _>("__be_json").unwrap(), "passed", "content-type json + valid body must pass to.be.json()");
+            assert_eq!(ctx.eval::<String, _>("__be_json_prop").unwrap(), "passed", "property read to.be.json must run the check (valid JSON body)");
+            assert_eq!(ctx.eval::<String, _>("__be_not_found").unwrap(), "passed", "404 must be notFound");
+            assert_eq!(ctx.eval::<String, _>("__be_unauthorized").unwrap(), "threw", "404 must NOT be unauthorized (401)");
+            assert_eq!(ctx.eval::<String, _>("__be_with_body").unwrap(), "passed", "non-empty body must pass to.be.withBody");
+            assert_eq!(ctx.eval::<String, _>("__be_unknown").unwrap(), "threw", "unknown to.be.<name> must throw, not silently pass");
             assert_eq!(ctx.eval::<String, _>("__have_hdr").unwrap(), "passed", "to.have.header must pass when header matches");
             assert_eq!(ctx.eval::<String, _>("__have_body").unwrap(), "passed", "to.have.body must pass when substring present");
             assert_eq!(ctx.eval::<String, _>("__have_json_body").unwrap(), "passed", "to.have.jsonBody must deep-compare");
+
+            // The EXACT silent-pass the backlog verified (line 42): a bare
+            // PROPERTY read `pm.response.to.be.json;` on a non-JSON body used
+            // to record PASS (truthy function). With the getter form it must
+            // throw — re-point the json bridge at a throwing body.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_json = function () { throw new Error('body is not JSON'); };
+                globalThis.__be_json_prop_bad = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("second eval should succeed");
+            assert_eq!(
+                ctx.eval::<String, _>("__be_json_prop_bad").unwrap(),
+                "threw",
+                "bare to.be.json property read on a non-JSON body must throw (line 42 silent pass)"
+            );
+        });
+    }
+
+    #[test]
+    fn oversized_binary_body_degrades_to_status0_envelope_not_panic() {
+        // Backlog line 46 (P0): a server-controlled binary response body at/over
+        // the per-VU heap cap used to `.expect()`-panic ACROSS the QuickJS FFI
+        // boundary. build_k6_response_object must return the status-0 error
+        // envelope (same shape as the invalid-method path) instead.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let obj = build_k6_response_object(
+                &ctx,
+                200,
+                "OK".into(),
+                vec![0u8; K6_VU_HEAP_BYTES], // >= cap → guaranteed-OOM pre-check
+                &HashMap::new(),
+                5.0,
+                None,
+                "",
+                0,
+                "binary",
+            )
+            .expect("status-0 envelope build must succeed");
+            let code: i32 = obj.get("code").expect("code field");
+            assert_eq!(
+                code, 0,
+                "oversized binary body must degrade to status 0, got {code}"
+            );
+            let err: String = obj.get("error").expect("error field");
+            assert!(!err.is_empty(), "envelope must carry an error message");
         });
     }
 
