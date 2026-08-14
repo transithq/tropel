@@ -8330,8 +8330,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 0,
                 "binary",
             )
-            .expect("the pre-guard returns the degraded status-0 envelope as Ok — "
-                "no allocation is attempted for a 32 MB body on a 10 MB heap");
+            .expect("pre-guard returns degraded status-0 Ok; 32 MB body never reaches the alloc");
             let code: i32 = resp.get("code").unwrap();
             assert!(
                 code == 0 || code == 200,
