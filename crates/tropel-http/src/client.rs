@@ -1053,11 +1053,12 @@ impl HttpClient {
 /// authority — the inner clients are built WITHOUT a built-in store (see
 /// [`HttpClient::build_client`]), so nothing can leak a global jar across VUs.
 ///
-/// Not `Clone` (`reqwest::cookie::Jar` is not `Clone`) — construct one per VU
-/// from the shared client inside the VU's spawn closure.
+/// The jar is `Arc`-wrapped so the runner and the PM bridge can SHARE one
+/// jar per VU (backlog line 159) — construct one client, then derive the
+/// other with [`VuCookieClient::clone_with_shared_jar`].
 pub struct VuCookieClient {
     inner: HttpClient,
-    jar: reqwest::cookie::Jar,
+    jar: Arc<reqwest::cookie::Jar>,
 }
 
 impl VuCookieClient {
@@ -1066,7 +1067,23 @@ impl VuCookieClient {
         Self {
             inner,
             // `Jar` derives `Default` (its only constructor in reqwest 0.13).
-            jar: reqwest::cookie::Jar::default(),
+            jar: Arc::new(reqwest::cookie::Jar::default()),
+        }
+    }
+
+    /// Clone the shared inner client while REUSING this client's jar.
+    ///
+    /// Backlog line 159: the scenario runner and the PM bridge used to each
+    /// construct a fresh `VuCookieClient::new`, giving every VU TWO empty
+    /// jars. The canonical Postman auth pattern — prerequest
+    /// `pm.sendRequest` → `/login` → `Set-Cookie` — landed the session
+    /// cookie in the BRIDGE jar, while every collection request went out
+    /// through the RUNNER jar with no session → 401 for the whole run. Both
+    /// must observe the same jar, so derive one client from the other.
+    pub fn clone_with_shared_jar(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            jar: self.jar.clone(),
         }
     }
 
@@ -1089,7 +1106,7 @@ impl VuCookieClient {
         signer: Option<&dyn AuthSigner>,
     ) -> Result<HttpResponse> {
         self.inner
-            .execute_with_jar(request, signer, Some(&self.jar))
+            .execute_with_jar(request, signer, Some(self.jar.as_ref()))
             .await
     }
 }
@@ -1547,6 +1564,55 @@ mod tests {
                 .unwrap();
             assert_eq!(echo_b.status_code, 200);
             assert_eq!(echo_b.body_text().unwrap(), "none");
+        });
+    }
+
+    #[test]
+    fn shared_jar_clone_lets_bridge_cookie_reach_runner_requests() {
+        // Regression (backlog line 159): the scenario runner and the PM
+        // bridge each constructed a FRESH `VuCookieClient::new`, giving every
+        // VU two empty jars. The canonical Postman auth pattern — prerequest
+        // `pm.sendRequest` → `/login` → `Set-Cookie` — landed the session
+        // cookie in the BRIDGE jar, while collection requests went out
+        // through the RUNNER jar with no session → 401 for the whole run.
+        // Clients derived via `clone_with_shared_jar` must share ONE jar.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (addr, _server) = spawn_cookie_test_server();
+            let shared = HttpClient::new(&HttpConfig::default()).unwrap();
+            let base = format!("http://{addr}");
+
+            // The runner client owns the VU's jar; the bridge is derived
+            // from it (this is exactly what vu_loop.rs does now).
+            let runner = VuCookieClient::new(shared.clone());
+            let bridge = runner.clone_with_shared_jar();
+
+            // Prerequest auth: pm.sendRequest → /login sets the session
+            // cookie through the BRIDGE client.
+            let set = bridge
+                .execute(&get_request(&format!("{base}/set")), None)
+                .await
+                .unwrap();
+            assert_eq!(set.status_code, 200);
+            assert_eq!(set.cookies.len(), 1);
+            assert_eq!(set.cookies[0].name, "sid");
+
+            // The very next collection request must carry the session cookie
+            // — before the fix, the runner's empty jar sent no session and
+            // the server returned the auth endpoint's 401.
+            let echo = runner
+                .execute(&get_request(&format!("{base}/echo")), None)
+                .await
+                .unwrap();
+            assert_eq!(echo.status_code, 200);
+            assert_eq!(
+                echo.body_text().unwrap(),
+                "sid=abc123",
+                "cookie set via the bridge must be visible to the runner's jar"
+            );
         });
     }
 
