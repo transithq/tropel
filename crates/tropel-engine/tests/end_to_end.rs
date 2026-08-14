@@ -293,7 +293,7 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
         .expect("http_req_duration summary present");
     assert!(dur.count > 0, "http_req_duration has samples");
     assert!(
-        dur.max > 0,
+        dur.max > 0.0,
         "http_req_duration max > 0 (real latency measured)"
     );
 

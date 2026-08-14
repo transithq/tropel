@@ -20,21 +20,27 @@ impl StdoutReporter {
         let base = m.key.split('{').next().unwrap_or(&m.key);
         let is_time = crate::json_stream::is_time_metric(base);
         let unit = if is_time { "ms" } else { "" };
+        // Time metrics carry fractional-ms precision (backlog line 57), so
+        // min/med/max/p() render with 2 decimals — a 0.3 ms p50 must not
+        // display as 0. Non-time trends stay integer-width. avg/mean keeps
+        // its unconditional 2 decimals (k6 shows byte trends with 2 decimals
+        // too).
+        let prec = if is_time { 2 } else { 0 };
 
         let mut parts: Vec<String> = Vec::new();
         for stat in stats {
             if let Some(v) = trend_stat_value(stat, m) {
                 match stat.trim() {
                     s if s.starts_with("p(") => {
-                        parts.push(format!("{}={:.0}{unit}", stat.trim(), v))
+                        parts.push(format!("{}={:.prec$}{unit}", stat.trim(), v, prec = prec))
                     }
                     "avg" | "mean" => parts.push(format!("avg={:.2}{unit}", v)),
-                    "min" => parts.push(format!("min={:.0}{unit}", v)),
-                    "max" => parts.push(format!("max={:.0}{unit}", v)),
+                    "min" => parts.push(format!("min={:.prec$}{unit}", v, prec = prec)),
+                    "max" => parts.push(format!("max={:.prec$}{unit}", v, prec = prec)),
                     "count" => parts.push(format!("count={:.0}", v)),
                     "sum" => parts.push(format!("sum={:.2}{unit}", v)),
                     "rate" => parts.push(format!("rate={:.4}", v)),
-                    "med" | "median" => parts.push(format!("med={:.0}{unit}", v)),
+                    "med" | "median" => parts.push(format!("med={:.prec$}{unit}", v, prec = prec)),
                     _ => parts.push(format!("{}={:.2}", stat.trim(), v)),
                 }
             }
@@ -318,7 +324,7 @@ mod tests {
     use tropel_core::config::ThresholdConfig;
     use tropel_metrics::collector::{MetricSummary, MetricType};
 
-    fn trend(key: &str, mean: f64, p50: u64, p90: u64, p95: u64, p99: u64) -> MetricSummary {
+    fn trend(key: &str, mean: f64, p50: f64, p90: f64, p95: f64, p99: f64) -> MetricSummary {
         MetricSummary {
             key: key.to_string(),
             tags: vec![],
@@ -326,8 +332,8 @@ mod tests {
             count: 10,
             sum: mean * 10.0,
             mean,
-            min: (mean * 0.5) as u64,
-            max: (mean * 1.5) as u64,
+            min: mean * 0.5,
+            max: mean * 1.5,
             p50,
             p90,
             p95,
@@ -351,8 +357,8 @@ mod tests {
             checks_passed: 2,
             checks_failed: 0,
             run_duration: Duration::from_secs(10),
-            http_req_duration: Some(trend("http_req_duration", 134.89, 150, 268, 272, 338)),
-            iteration_duration: Some(trend("iteration_duration", 294.58, 262, 279, 321, 1_150)),
+            http_req_duration: Some(trend("http_req_duration", 134.89, 150.0, 268.0, 272.0, 338.0)),
+            iteration_duration: Some(trend("iteration_duration", 294.58, 262.0, 279.0, 321.0, 1_150.0)),
             summary_trend_stats: vec![],
             effective_thresholds: HashMap::new(),
             ..Default::default()
@@ -375,7 +381,7 @@ mod tests {
     #[test]
     fn render_trend_uses_ms_for_time_metrics_only() {
         let mut out = String::new();
-        let m = trend("http_req_duration", 134.89, 150, 268, 272, 338);
+        let m = trend("http_req_duration", 134.89, 150.0, 268.0, 272.0, 338.0);
         let stats = vec![
             "avg".to_string(),
             "min".to_string(),
@@ -385,11 +391,12 @@ mod tests {
         ];
         StdoutReporter::render_trend(&mut out, "", &m, &stats);
         // Values are ms end-to-end (backlog §0): avg=134.89ms, med=150ms,
-        // p(90)=268ms — no /1000 anywhere.
+        // p(90)=268ms — no /1000 anywhere. Time metrics render with 2
+        // decimals (backlog line 57) so sub-ms p-values stay visible.
         assert!(out.contains("avg=134.89ms"), "{out}");
-        assert!(out.contains("med=150ms"), "{out}");
-        assert!(out.contains("p(90)=268ms"), "{out}");
-        assert!(out.contains("min=67ms"), "{out}");
+        assert!(out.contains("med=150.00ms"), "{out}");
+        assert!(out.contains("p(90)=268.00ms"), "{out}");
+        assert!(out.contains("min=67.44ms"), "{out}");
     }
 
     #[test]
@@ -400,10 +407,10 @@ mod tests {
         let m = trend(
             "http_response_body_size",
             2_500_000.0,
-            2_400_000,
-            3_000_000,
-            3_200_000,
-            3_500_000,
+            2_400_000.0,
+            3_000_000.0,
+            3_200_000.0,
+            3_500_000.0,
         );
         let stats = vec!["avg".to_string(), "med".to_string()];
         StdoutReporter::render_trend(&mut out, "", &m, &stats);
@@ -443,8 +450,8 @@ mod tests {
     #[test]
     fn render_per_url_breakdown_when_multiple_urls() {
         let mut r = result_with();
-        let mut a = trend("http_req_duration{url=/a}", 100.0, 100, 150, 160, 200);
-        let mut b = trend("http_req_duration{url=/b}", 200.0, 200, 250, 260, 300);
+        let mut a = trend("http_req_duration{url=/a}", 100.0, 100.0, 150.0, 160.0, 200.0);
+        let mut b = trend("http_req_duration{url=/b}", 200.0, 200.0, 250.0, 260.0, 300.0);
         a.tags = vec![("url".to_string(), "/a".to_string())];
         b.tags = vec![("url".to_string(), "/b".to_string())];
         r.per_url = vec![a, b];

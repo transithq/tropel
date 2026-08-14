@@ -481,21 +481,18 @@ fn get_tag_scoped_metric_value(
         }
         Some("min") => {
             // Return the MINIMUM min across all matches
-            matched
-                .iter()
-                .map(|m| m.min as f64)
-                .fold(f64::MAX, f64::min)
+            matched.iter().map(|m| m.min).fold(f64::MAX, f64::min)
         }
         Some("max") => {
             // Return the MAXIMUM max across all matches
-            matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max)
+            matched.iter().map(|m| m.max).fold(0.0_f64, f64::max)
         }
         Some("p50") | Some("median") | Some("med") => {
-            matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
+            matched.iter().map(|m| m.p50).fold(0.0_f64, f64::max)
         }
-        Some("p90") => matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max),
-        Some("p95") => matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max),
-        Some("p99") => matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max),
+        Some("p90") => matched.iter().map(|m| m.p90).fold(0.0_f64, f64::max),
+        Some("p95") => matched.iter().map(|m| m.p95).fold(0.0_f64, f64::max),
+        Some("p99") => matched.iter().map(|m| m.p99).fold(0.0_f64, f64::max),
         // Any other pNN / p(NN) percentile — exact from the retained
         // histogram of each matching series; worst (highest) wins across
         // matches (consistent with the tracked buckets above).
@@ -576,15 +573,15 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         // the tag-scoped path.
         Some("min") => matched
             .iter()
-            .map(|m| m.min as f64)
+            .map(|m| m.min)
             .fold(f64::MAX, f64::min),
-        Some("max") => matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max),
+        Some("max") => matched.iter().map(|m| m.max).fold(0.0_f64, f64::max),
         Some("p50") | Some("median") | Some("med") => {
-            matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
+            matched.iter().map(|m| m.p50).fold(0.0_f64, f64::max)
         }
-        Some("p90") => matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max),
-        Some("p95") => matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max),
-        Some("p99") => matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max),
+        Some("p90") => matched.iter().map(|m| m.p90).fold(0.0_f64, f64::max),
+        Some("p95") => matched.iter().map(|m| m.p95).fold(0.0_f64, f64::max),
+        Some("p99") => matched.iter().map(|m| m.p99).fold(0.0_f64, f64::max),
         Some(s) if parse_percentile(s).is_some() => {
             let pct = parse_percentile(s).expect("guarded");
             matched
@@ -709,13 +706,13 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         }),
         "http_req_duration" => metrics.http_req_duration.as_ref().and_then(|d| {
             match stat {
-                Some("avg") => Some(d.mean),
-                Some("min") => Some(d.min as f64),
-                Some("max") => Some(d.max as f64),
-                Some("p50") | Some("median") | Some("med") => Some(d.p50 as f64),
-                Some("p90") => Some(d.p90 as f64),
-                Some("p95") => Some(d.p95 as f64),
-                Some("p99") => Some(d.p99 as f64),
+            Some("avg") => Some(d.mean),
+            Some("min") => Some(d.min),
+            Some("max") => Some(d.max),
+            Some("p50") | Some("median") | Some("med") => Some(d.p50),
+            Some("p90") => Some(d.p90),
+            Some("p95") => Some(d.p95),
+            Some("p99") => Some(d.p99),
                 Some("count") => Some(d.count as f64),
                 // k6's `value` stat on a trend = the most recent sample.
                 Some("value") | Some("last") => Some(d.last),
@@ -772,12 +769,12 @@ mod tests {
                 count: 100,
                 sum: 50000.0,
                 mean: 500.0,
-                min: 50,
-                max: 2000,
-                p50: 450,
-                p90: 900,
-                p95: 1200,
-                p99: 1800,
+                min: 50.0,
+                max: 2000.0,
+                p50: 450.0,
+                p90: 900.0,
+                p95: 1200.0,
+                p99: 1800.0,
                 last: 0.0,
                 rate: 0.0,
                 histogram: None,
@@ -974,12 +971,12 @@ mod tests {
             count: 1500,
             sum: 1500.0,
             mean: 1.0,
-            min: 1,
-            max: 1,
-            p50: 1,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 1.0,
             rate: 0.0,
             histogram: None,
@@ -1009,12 +1006,12 @@ mod tests {
             count: 3_000_000,
             sum: 3_000_000.0,
             mean: 1.0,
-            min: 1,
-            max: 1,
-            p50: 1,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 1.0,
             rate: 0.0,
             histogram: None,
@@ -1083,12 +1080,12 @@ mod tests {
             count: 3_000_000,
             sum: 3_000_000.0,
             mean: 1.0,
-            min: 1,
-            max: 1,
-            p50: 1,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 1.0,
             rate: 0.0,
             histogram: None,
@@ -1119,7 +1116,7 @@ mod tests {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_ms(i * 100);
+            h.record_ms((i * 100) as f64);
         }
         MetricsResult {
             http_req_duration: Some(MetricSummary {
@@ -1129,18 +1126,61 @@ mod tests {
                 count: 10,
                 sum: 5500.0,
                 mean: 550.0,
-                min: 100,
-                max: 1000,
-                p50: 500,
-                p90: 900,
-                p95: 950,
-                p99: 990,
+                min: 100.0,
+                max: 1000.0,
+                p50: 500.0,
+                p90: 900.0,
+                p95: 950.0,
+                p99: 990.0,
                 last: 0.0,
                 rate: 0.0,
                 histogram: Some(h),
             }),
             ..Default::default()
         }
+    }
+
+    /// Backlog line 57 headline: a 0.3 ms p95 was quantized to 1 ms, so a
+    /// `p(95) < 1` threshold could never pass on a healthy sub-ms localhost
+    /// service. With µs-precision histograms and f64-ms stats it must.
+    #[test]
+    fn test_threshold_p95_sub_ms_can_pass() {
+        use crate::histogram::LatencyHistogram;
+        let mut h = LatencyHistogram::new();
+        for _ in 0..1000 {
+            h.record_ms(0.3);
+        }
+        let metrics = MetricsResult {
+            http_req_duration: Some(MetricSummary {
+                key: "http_req_duration".into(),
+                tags: vec![],
+                metric_type: MetricType::Trend,
+                count: 1000,
+                sum: 300.0,
+                mean: 0.3,
+                min: 0.3,
+                max: 0.3,
+                p50: 0.3,
+                p90: 0.3,
+                p95: 0.3,
+                p99: 0.3,
+                last: 0.0,
+                rate: 0.0,
+                histogram: Some(h),
+            }),
+            ..Default::default()
+        };
+        let result = evaluate_single_threshold("http_req_duration.p95 < 1", &metrics);
+        assert!(
+            result.0,
+            "p(95) < 1 must PASS on a 0.3 ms service (got {})",
+            result.1
+        );
+        assert!(
+            (result.1 - 0.3).abs() < 0.01,
+            "p95 should be ~0.3 ms, not 1 (got {})",
+            result.1
+        );
     }
 
     #[test]
@@ -1194,7 +1234,7 @@ mod tests {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_ms(i * 100);
+            h.record_ms((i * 100) as f64);
         }
         let mut m = MetricsResult::default();
         m.metrics.push(MetricSummary {
@@ -1204,12 +1244,12 @@ mod tests {
             count: 10,
             sum: 5500.0,
             mean: 550.0,
-            min: 100,
-            max: 1000,
-            p50: 500,
-            p90: 900,
-            p95: 950,
-            p99: 990,
+            min: 100.0,
+            max: 1000.0,
+            p50: 500.0,
+            p90: 900.0,
+            p95: 950.0,
+            p99: 990.0,
             last: 0.0,
             rate: 0.0,
             histogram: Some(h),
@@ -1230,7 +1270,7 @@ mod tests {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_ms(i * 100);
+            h.record_ms((i * 100) as f64);
         }
         let mut metrics = MetricsResult::default();
         metrics.metrics.push(MetricSummary {
@@ -1240,12 +1280,12 @@ mod tests {
             count: 10,
             sum: 5500.0,
             mean: 550.0,
-            min: 100,
-            max: 1000,
-            p50: 500,
-            p90: 900,
-            p95: 950,
-            p99: 990,
+            min: 100.0,
+            max: 1000.0,
+            p50: 500.0,
+            p90: 900.0,
+            p95: 950.0,
+            p99: 990.0,
             last: 0.0,
             rate: 0.0,
             histogram: Some(h),
@@ -1267,12 +1307,12 @@ mod tests {
             count: 80,
             sum: 32000.0,
             mean: 400.0,
-            min: 50,
-            max: 1500,
-            p50: 350,
-            p90: 700,
-            p95: 900,
-            p99: 1400,
+            min: 50.0,
+            max: 1500.0,
+            p50: 350.0,
+            p90: 700.0,
+            p95: 900.0,
+            p99: 1400.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1284,12 +1324,12 @@ mod tests {
             count: 10,
             sum: 15000.0,
             mean: 1500.0,
-            min: 500,
-            max: 3000,
-            p50: 1200,
-            p90: 2500,
-            p95: 2800,
-            p99: 3000,
+            min: 500.0,
+            max: 3000.0,
+            p50: 1200.0,
+            p90: 2500.0,
+            p95: 2800.0,
+            p99: 3000.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1371,12 +1411,12 @@ mod tests {
             count: 100,
             sum: 20.0, // 20% failed
             mean: 0.2,
-            min: 0,
-            max: 1,
-            p50: 0,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 0.0,
+            max: 1.0,
+            p50: 0.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 0.0,
             rate: 0.2,
             histogram: None,
@@ -1388,12 +1428,12 @@ mod tests {
             count: 100,
             sum: 100.0, // 100% failed
             mean: 1.0,
-            min: 0,
-            max: 1,
-            p50: 1,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 0.0,
+            max: 1.0,
+            p50: 1.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 0.0,
             rate: 1.0,
             histogram: None,
@@ -1421,12 +1461,12 @@ mod tests {
             count: 7,
             sum: 7.0,
             mean: 1.0,
-            min: 0,
-            max: 1,
-            p50: 0,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 0.0,
+            max: 1.0,
+            p50: 0.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1438,12 +1478,12 @@ mod tests {
             count: 3,
             sum: 3.0,
             mean: 1.0,
-            min: 0,
-            max: 1,
-            p50: 0,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 0.0,
+            max: 1.0,
+            p50: 0.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1465,12 +1505,12 @@ mod tests {
             count: 5,
             sum: 1000.0,
             mean: 200.0,
-            min: 50,
-            max: 400,
-            p50: 200,
-            p90: 300,
-            p95: 350,
-            p99: 390,
+            min: 50.0,
+            max: 400.0,
+            p50: 200.0,
+            p90: 300.0,
+            p95: 350.0,
+            p99: 390.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1482,12 +1522,12 @@ mod tests {
             count: 500, // high count — would swamp `login` if prefix-folded
             sum: 1.0,
             mean: 1.0,
-            min: 1,
-            max: 1,
-            p50: 1,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1499,12 +1539,12 @@ mod tests {
             count: 500,
             sum: 1.0,
             mean: 1.0,
-            min: 1,
-            max: 1,
-            p50: 1,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1537,12 +1577,12 @@ mod tests {
             count: 2,
             sum: 400.0,
             mean: 200.0,
-            min: 100,
-            max: 300,
-            p50: 200,
-            p90: 250,
-            p95: 280,
-            p99: 290,
+            min: 100.0,
+            max: 300.0,
+            p50: 200.0,
+            p90: 250.0,
+            p95: 280.0,
+            p99: 290.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1554,12 +1594,12 @@ mod tests {
             count: 900,
             sum: 1.0,
             mean: 1.0,
-            min: 1,
-            max: 1,
-            p50: 1,
-            p90: 1,
-            p95: 1,
-            p99: 1,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1593,12 +1633,12 @@ mod tests {
             count: 80,
             sum: 32000.0,
             mean: 400.0,
-            min: 50,
-            max: 1500,
-            p50: 350,
-            p90: 700,
-            p95: 900,
-            p99: 1400,
+            min: 50.0,
+            max: 1500.0,
+            p50: 350.0,
+            p90: 700.0,
+            p95: 900.0,
+            p99: 1400.0,
             last: 0.0,
             rate: 0.0,
             histogram: None,
