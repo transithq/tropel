@@ -276,9 +276,7 @@ impl ScenarioRunner {
             // Items without a request (e.g. transpiled TS/ES module scripts) still
             // execute their prerequest and test scripts.
             if item.items.is_empty()
-                && (item.request.is_some()
-                    || !item.prerequest.is_empty()
-                    || !item.test.is_empty())
+                && (item.request.is_some() || !item.prerequest.is_empty() || !item.test.is_empty())
             {
                 // Set request info in PM state
                 {
@@ -311,10 +309,7 @@ impl ScenarioRunner {
                                 iteration_index
                             );
                         } else {
-                            tracing::warn!(
-                                "VU {} prerequest script error: {}",
-                                iteration_index, e
-                            );
+                            tracing::warn!("VU {} prerequest script error: {}", iteration_index, e);
                             // Backlog line 98: script failures were swallowed —
                             // no failed check, no metric, exit 0. Record a
                             // failed check so the failure is visible in the
@@ -681,10 +676,8 @@ impl ScenarioRunner {
                 // the prerequest chain).
                 if !skip_item {
                     for (script_idx, script) in item.test.iter().enumerate() {
-                        let source_url =
-                            Some(format!("{}.test#{}.js", item.name, script_idx));
-                        if let Err(e) =
-                            Self::run_script(&mut self.js_ctx, script, source_url).await
+                        let source_url = Some(format!("{}.test#{}.js", item.name, script_idx));
+                        if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await
                         {
                             if self.force_stop.load(Ordering::Acquire) {
                                 // Deliberate force-stop interrupted the eval —
@@ -699,10 +692,7 @@ impl ScenarioRunner {
                                 tracing::warn!("VU {} test script error: {}", iteration_index, e);
                                 // Backlog line 98: record a failed check so the
                                 // failure is visible and drives a non-zero exit.
-                                record_script_failure(
-                                    &mut result,
-                                    &format!("{}.test", item.name),
-                                );
+                                record_script_failure(&mut result, &format!("{}.test", item.name));
                             }
                             break;
                         }
@@ -1376,7 +1366,10 @@ mod tests {
             "folder must be descended into — the leaf with the folded scripts must execute"
         );
         assert!(
-            execution_items[0].prerequest.iter().any(|s| s.contains("pm.environment.set")),
+            execution_items[0]
+                .prerequest
+                .iter()
+                .any(|s| s.contains("pm.environment.set")),
             "the folded collection/folder prerequest must ride on the leaf"
         );
         let names: Arc<Vec<String>> =
@@ -1470,7 +1463,8 @@ mod tests {
                 request: None,
                 prerequest: vec![
                     "const baseUrl = 'https://api.example.com'; // COLLECTION".into(),
-                    "const baseUrl = 'https://api.example.com/v2'; if (true) { return; } // FOLDER".into(),
+                    "const baseUrl = 'https://api.example.com/v2'; if (true) { return; } // FOLDER"
+                        .into(),
                     "pm.environment.set('token', 'tok-42'); // REQUEST".into(),
                 ],
                 test: vec![],
@@ -1487,14 +1481,8 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
-        let mut runner = ScenarioRunner::new(
-            scenario,
-            execution_items,
-            names,
-            client,
-            0,
-            "scopes".into(),
-        );
+        let mut runner =
+            ScenarioRunner::new(scenario, execution_items, names, client, 0, "scopes".into());
 
         let mut js_ctx = Box::new(
             JsContext::new(None, None)
@@ -1551,7 +1539,8 @@ mod tests {
             HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client should construct"),
         ));
-        let runner = ScenarioRunner::new(scenario, execution_items, names, client, 0, "jumps".into());
+        let runner =
+            ScenarioRunner::new(scenario, execution_items, names, client, 0, "jumps".into());
         let mut js_ctx = Box::new(
             JsContext::new(None, None)
                 .await
