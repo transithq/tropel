@@ -52,6 +52,7 @@ try {
 
 // ── fixture transport (byte-identical semantics to F3's fixture_response) ─
 const seenUrls = [];
+const seenBodies = [];
 const exec = await createExecWasm({
   wasmBytes,
   wasiImports,
@@ -59,6 +60,9 @@ const exec = await createExecWasm({
   onInstantiate: (instance) => wasi.initialize(instance),
   transport: (req) => {
     seenUrls.push(req.url);
+    // Backlog line 44: the first item carries a JSON body; it must arrive
+    // INTACT across the bridge (not the old one-byte junk body).
+    seenBodies.push(req.body);
     return {
       url: req.url,
       statusCode: 200,
@@ -84,14 +88,14 @@ const exec = await createExecWasm({
 });
 
 // ── the F3 fixture scenario ──────────────────────────────────────────────
-const item = (name, url, test) => ({
+const item = (name, url, test, body) => ({
   name,
   request: {
     url,
     method: "GET",
     headers: {},
     query_params: {},
-    body: null,
+    body: body ?? null,
     auth: null,
     certificate: null,
     follow_redirects: true,
@@ -113,13 +117,16 @@ const scenario = {
       "pm.variables.set('carried', 'yes');" +
         "pm.test('status is 200', () => pm.expect(pm.response.code).to.eql(200));" +
         "pm.test('header content-type', () => pm.expect(pm.response.headers.get('content-type')).to.eql('application/json'));" +
-        "pm.execution.setNextRequest('second');"
+        "pm.execution.setNextRequest('second');",
+      // Backlog line 44: a JSON body must survive the tropel_host_http bridge.
+      { ok: true }
     ),
     item(
       "second",
       "https://fixture.test/second",
       "pm.test('carried variable', () => pm.expect(pm.variables.get('carried')).to.eql('yes'));" +
-        "pm.test('second status', () => pm.expect(pm.response.code).to.eql(200));"
+        "pm.test('second status', () => pm.expect(pm.response.code).to.eql(200));",
+      null // no body — symmetric with the F3 fixture
     ),
   ],
   variables: {},
@@ -183,6 +190,13 @@ const expectedSeen = [
 for (const url of expectedSeen) {
   if (!seenUrls.includes(url)) fail(`transport must have been asked for ${url}`);
 }
+
+// Backlog line 44: the JSON body on the first item must arrive INTACT —
+// {"ok":true} rendered from the Body::Json envelope — not a one-byte junk
+// string (the old positional postcard reader). The first request per
+// iteration is the JSON-body one.
+if (seenBodies[0] !== '{"ok":true}')
+  fail(`JSON body corrupted across the bridge: got ${JSON.stringify(seenBodies[0])}`);
 
 console.log(`PASS: native-path fixture through wasm32 runtime (${artifact})`);
 console.log(`  iterations: ${outcome.iterations.length}, http_reqs: ${reqs.length}, checks: ${checks.length}`);
