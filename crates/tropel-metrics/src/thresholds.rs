@@ -407,6 +407,38 @@ fn metric_base_name(key: &str) -> &str {
     }
 }
 
+/// Can this series supply a truthful value for the given percentile-style
+/// stat (`p50`/`p90`/`p95`/`p99`/arbitrary `pNN`, plus `min`/`max` which the
+/// tracked buckets fold in)? Only Trend tracks a real distribution; Gauge
+/// tracks real min/max from its samples. Counter and Rate summaries hardcode
+/// p50..p99 (and Rate also min/max) to 0 — reading them would let a
+/// `p(95)<0.01` gate pass on a 100%-failure run (backlog line 60).
+fn series_supports_percentile(m: &MetricSummary, stat: &str) -> bool {
+    match stat {
+        "min" | "max" => matches!(m.metric_type, MetricType::Trend | MetricType::Gauge),
+        _ => m.metric_type == MetricType::Trend,
+    }
+}
+
+/// Does a percentile-style stat on this match set require fail-closed
+/// handling? `percentile_stat` is true for `min`/`max`/`p50`/`p90`/`p95`/
+/// `p99`/`median`/`med` and any arbitrary `pNN`/`p(NN)`; the guard then
+/// returns `true` (caller must fail closed) unless EVERY matched series can
+/// supply a truthful value for that stat. Shared by the tag-scoped and
+/// unscoped custom-metric paths so the two can never drift (backlog line 60).
+fn percentile_guard_fails(matched: &[&MetricSummary], stat: Option<&str>) -> bool {
+    let percentile_stat = matches!(
+        stat,
+        Some("min" | "max" | "p50" | "median" | "med" | "p90" | "p95" | "p99")
+    ) || stat.is_some_and(|s| parse_percentile(s).is_some());
+    if !percentile_stat {
+        return false;
+    }
+    !matched
+        .iter()
+        .all(|m| series_supports_percentile(m, stat.expect("percentile_stat implies a stat")))
+}
+
 /// Get a metric value for a tag-scoped threshold by searching the metrics list.
 /// Looks for entries whose BASE name equals the metric name and that carry
 /// all the specified tag key=value pairs (matched STRUCTURALLY against each
@@ -464,12 +496,15 @@ fn get_tag_scoped_metric_value(
     // accumulated value would masquerade as every percentile, so `errors.p95`
     // (or any custom counter like `data_received.p95`) must FAIL CLOSED, not
     // resolve to the counter's 1.0 bucket and pass a `> 0.5` gate.
-    let all_counter = matched.iter().all(|m| m.metric_type == MetricType::Counter);
-    let percentile_stat = matches!(
-        stat,
-        Some("min" | "max" | "p50" | "median" | "med" | "p90" | "p95" | "p99")
-    ) || stat.is_some_and(|s| parse_percentile(s).is_some());
-    if all_counter && percentile_stat {
+    // Backlog §1 + line 60: percentile/min/max stats are only meaningful on
+    // series that actually track a distribution or real extremes. The old
+    // guard checked `all(Counter)` only, so a **Rate** summary (p50..p99
+    // hardcoded 0) let `http_req_failed: ['p(95)<0.01']` PASS on a
+    // 100%-failure run, and a **Gauge** (p50..p99 hardcoded 0) passed
+    // `queue_depth.p95 < 10` trivially. Fail closed unless EVERY matched
+    // series supports the stat (Trend for percentiles; Trend/Gauge for
+    // min/max — Gauge tracks real extremes from its samples).
+    if percentile_guard_fails(&matched, stat) {
         return None;
     }
 
@@ -560,15 +595,15 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
     if matched.is_empty() {
         return None;
     }
-    // Backlog §1: percentile/min/max stats on a Counter are meaningless — fail
-    // closed, mirroring the tag-scoped path (a custom counter's p95 bucket is
-    // 1.0 and must not pass a `> 0.5` gate).
-    let all_counter = matched.iter().all(|m| m.metric_type == MetricType::Counter);
-    let percentile_stat = matches!(
-        stat,
-        Some("min" | "max" | "p50" | "median" | "med" | "p90" | "p95" | "p99")
-    ) || stat.is_some_and(|s| parse_percentile(s).is_some());
-    if all_counter && percentile_stat {
+    // Backlog §1 + line 60: percentile/min/max stats are only meaningful on
+    // series that actually track a distribution or real extremes. The old
+    // guard checked `all(Counter)` only, so a **Rate** summary (p50..p99
+    // hardcoded 0) let `http_req_failed: ['p(95)<0.01']` PASS on a
+    // 100%-failure run, and a **Gauge** (p50..p99 hardcoded 0) passed
+    // `queue_depth.p95 < 10` trivially. Fail closed unless EVERY matched
+    // series supports the stat (Trend for percentiles; Trend/Gauge for
+    // min/max — Gauge tracks real extremes from its samples).
+    if percentile_guard_fails(&matched, stat) {
         return None;
     }
     Some(match stat {
@@ -947,6 +982,159 @@ mod tests {
         let metrics = make_metrics();
         let result = evaluate_single_threshold("http_reqs.p95 < 1", &metrics);
         assert!(!result.0, "p95 on a Counter must fail closed");
+    }
+
+    // ── Backlog line 60: Rate/Gauge percentile stats fail closed ──
+
+    /// Build a MetricsResult whose `metrics` list carries the given custom
+    /// series (used to simulate `http_req_failed` as a Rate and
+    /// `queue_depth` as a Gauge without driving a full run).
+    fn make_metrics_with(series: MetricSummary) -> MetricsResult {
+        let mut m = make_metrics();
+        m.metrics.push(series);
+        m
+    }
+
+    #[test]
+    fn rate_percentile_stat_fails_closed() {
+        // THE regression (backlog line 60): `http_req_failed` is a **Rate**;
+        // its summary hardcodes p50..p99 = 0. The OLD guard only checked
+        // `all(Counter)`, so `http_req_failed: ['p(95)<0.01']` on a
+        // 100%-failure run read p95 = 0 < 0.01 and PASSED. It must fail
+        // closed instead — a Rate has no distribution to percentile.
+        let series = MetricSummary {
+            key: "http_req_failed".into(),
+            tags: vec![],
+            metric_type: MetricType::Rate,
+            count: 100,
+            sum: 100.0, // every request failed → rate = 1.0
+            mean: 1.0,
+            min: 0,
+            max: 0,
+            p50: 0,
+            p90: 0,
+            p95: 0,
+            p99: 0,
+            last: 0.0,
+            rate: 1.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(series);
+        // p95 on a Rate must NOT evaluate to the hardcoded 0 (which would
+        // pass `p(95) < 0.01`) — it must fail closed.
+        let result = evaluate_single_threshold("http_req_failed.p95 < 0.01", &metrics);
+        assert!(
+            !result.0,
+            "p95 on a Rate must fail closed, not read the hardcoded 0"
+        );
+        let result = evaluate_single_threshold("http_req_failed.p(90) < 0.01", &metrics);
+        assert!(!result.0, "p(90) on a Rate must fail closed too");
+        let result = evaluate_single_threshold("http_req_failed.max < 0.01", &metrics);
+        assert!(
+            !result.0,
+            "max on a Rate must fail closed (Rate hardcodes min/max = 0)"
+        );
+        // Sanity: a MEANINGFUL Rate stat still resolves — `rate` is the
+        // failure ratio (1.0 on an all-failed run) and must breach `> 0.5`.
+        let result = evaluate_single_threshold("http_req_failed.rate > 0.5", &metrics);
+        assert!(result.0, "rate 1.0 should be > 0.5");
+        let result = evaluate_single_threshold("http_req_failed.avg > 0.5", &metrics);
+        assert!(result.0, "avg 1.0 should be > 0.5");
+    }
+
+    #[test]
+    fn gauge_percentile_stat_fails_closed_but_min_max_resolve() {
+        // Same class (backlog line 60): a `new Gauge('queue_depth')` summary
+        // hardcodes p50..p99 = 0, so `queue_depth: ['p(95)<10']` passed
+        // trivially. Percentiles must fail closed — but Gauge tracks REAL
+        // min/max from its samples, so those two stats must still resolve.
+        let series = MetricSummary {
+            key: "queue_depth".into(),
+            tags: vec![],
+            metric_type: MetricType::Gauge,
+            count: 100,
+            sum: 5000.0,
+            mean: 50.0,
+            min: 5,
+            max: 200,
+            p50: 0,
+            p90: 0,
+            p95: 0,
+            p99: 0,
+            last: 75.0,
+            rate: 0.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(series);
+        // Percentiles must fail closed, not read the hardcoded 0.
+        let result = evaluate_single_threshold("queue_depth.p95 < 10", &metrics);
+        assert!(
+            !result.0,
+            "p95 on a Gauge must fail closed, not read the hardcoded 0"
+        );
+        let result = evaluate_single_threshold("queue_depth.p(99.9) < 10", &metrics);
+        assert!(!result.0, "arbitrary p(99.9) on a Gauge must fail closed");
+        // But the real extremes resolve: max 200 > 100, min 5 < 10.
+        let result = evaluate_single_threshold("queue_depth.max > 100", &metrics);
+        assert!(result.0, "Gauge max 200 should be > 100");
+        let result = evaluate_single_threshold("queue_depth.min < 10", &metrics);
+        assert!(result.0, "Gauge min 5 should be < 10");
+        // And the tracked avg resolves too.
+        let result = evaluate_single_threshold("queue_depth.avg > 40", &metrics);
+        assert!(result.0, "Gauge avg 50 should be > 40");
+    }
+
+    #[test]
+    fn trend_percentile_stats_still_resolve() {
+        // Sanity: the broader guard must not break real Trend percentiles
+        // (the ONLY type with a genuine distribution).
+        let metrics = make_metrics();
+        let result = evaluate_single_threshold("http_req_duration.p95 < 5000", &metrics);
+        assert!(result.0, "Trend p95 1200 should be < 5000");
+        let result = evaluate_single_threshold("http_req_duration.p(75) < 5000", &metrics);
+        assert!(
+            result.0,
+            "arbitrary p(75) on a Trend (retained histogram) should resolve"
+        );
+        let result = evaluate_single_threshold("http_req_duration.min > 10", &metrics);
+        assert!(result.0, "Trend min 50 should be > 10");
+        let result = evaluate_single_threshold("http_req_duration.max > 1000", &metrics);
+        assert!(result.0, "Trend max 2000 should be > 1000");
+    }
+
+    #[test]
+    fn tag_scoped_rate_percentile_fails_closed() {
+        // The tag-scoped path (get_tag_scoped_metric_value) had the same
+        // `all(Counter)`-only guard — a tag-scoped Rate percentile must fail
+        // closed there too (backlog line 60). The tag value is colon-free
+        // (`/a`) because parse_metric_ref's `:`-vs-`=` separator heuristic
+        // would mis-split a value containing `://`.
+        let series = MetricSummary {
+            key: "http_req_failed{url=/a}".into(),
+            tags: vec![("url".into(), "/a".into())],
+            metric_type: MetricType::Rate,
+            count: 50,
+            sum: 50.0,
+            mean: 1.0,
+            min: 0,
+            max: 0,
+            p50: 0,
+            p90: 0,
+            p95: 0,
+            p99: 0,
+            last: 0.0,
+            rate: 1.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(series);
+        let result = evaluate_single_threshold("http_req_failed{url=/a}.p95 < 0.01", &metrics);
+        assert!(
+            !result.0,
+            "tag-scoped p95 on a Rate must fail closed, not read the hardcoded 0"
+        );
+        // The real rate on that tag still resolves.
+        let result = evaluate_single_threshold("http_req_failed{url=/a}.rate > 0.5", &metrics);
+        assert!(result.0, "tag-scoped rate 1.0 should be > 0.5");
     }
 
     #[test]
