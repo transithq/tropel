@@ -428,8 +428,23 @@ fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
     }
 }
 
+/// Fetch an auth attribute by key, stringifying any JSON value shape:
+/// strings pass through verbatim, booleans/numbers become their literal
+/// text, and arrays/objects become compact JSON. Null (or absent) → None.
+/// Real Postman OAuth exports mix all of these (`usePkce: true`,
+/// `tokenRequestParams: [{...}]`), and callers here only ever feed the
+/// result into `String`/`Option<String>` AuthConfig fields.
 fn get_auth_attr(attrs: &[AuthAttribute], key: &str) -> Option<String> {
-    attrs.iter().find(|a| a.key == key).map(|a| a.value.clone())
+    attrs
+        .iter()
+        .find(|a| a.key == key)
+        .and_then(|a| match &a.value {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            other => serde_json::to_string(other).ok(),
+        })
 }
 
 /// ALL prerequest scripts in the event chain, outer (collection) → inner
@@ -1135,6 +1150,96 @@ mod tests {
             parse_collection_str(json).is_err(),
             "malformed request must fail loudly, not become an empty folder"
         );
+    }
+
+    #[test]
+    fn test_oauth_boolean_and_array_attr_values_do_not_break_parse() {
+        // P0 (backlog §4): real Postman OAuth1/OAuth2 exports carry
+        // non-string attribute values — booleans (`"addParamsToHeader":
+        // true`, `"usePkce": true`) and arrays (`"tokenRequestParams":
+        // [...]`). AuthAttribute.value was `String`, so the WHOLE collection
+        // failed to deserialize. Values are now structured JSON and
+        // stringified on read (strings verbatim, booleans/numbers as literal
+        // text, arrays/objects as compact JSON).
+        let json = r#"{
+            "info": {"name": "OAuth", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "auth": {
+                "type": "oauth2",
+                "oauth2": [
+                    {"key": "accessToken", "value": "tok123", "type": "string"},
+                    {"key": "tokenType", "value": "Bearer", "type": "string"},
+                    {"key": "usePkce", "value": true, "type": "boolean"},
+                    {"key": "tokenRequestParams", "value": [{"key": "audience", "value": "api"}], "type": "array"}
+                ]
+            },
+            "item": [{
+                "name": "Secure",
+                "request": {"method": "GET", "url": {"raw": "https://api.example.com/secure"}}
+            }]
+        }"#;
+
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match req.auth.as_ref() {
+            Some(AuthConfig::OAuth2 {
+                access_token,
+                token_type,
+            }) => {
+                assert_eq!(access_token, "tok123");
+                assert_eq!(token_type.as_deref(), Some("Bearer"));
+            }
+            other => panic!("expected OAuth2 auth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_oauth1_boolean_attr_values_stringify() {
+        // P0 (backlog §4): OAuth1 exports include `"addParamsToHeader":
+        // true` / `"includeBodyHash": true`. Before the fix these booleans
+        // failed AuthAttribute deserialization and killed the whole
+        // collection; now they stringify to "true".
+        let json = r#"{
+            "info": {"name": "OAuth1", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "auth": {
+                "type": "oauth1",
+                "oauth1": [
+                    {"key": "consumerKey", "value": "ck", "type": "string"},
+                    {"key": "consumerSecret", "value": "cs", "type": "string"},
+                    {"key": "token", "value": "t", "type": "string"},
+                    {"key": "tokenSecret", "value": "ts", "type": "string"},
+                    {"key": "addParamsToHeader", "value": true, "type": "boolean"}
+                ]
+            },
+            "item": [{
+                "name": "Signed",
+                "request": {"method": "GET", "url": {"raw": "https://api.example.com/signed"}}
+            }]
+        }"#;
+
+        let collection = parse_collection_str(json).unwrap();
+        // The raw attribute list must keep the boolean and stringify it.
+        let attrs = collection.auth.as_ref().unwrap().oauth1.clone();
+        assert_eq!(
+            get_auth_attr(&attrs, "addParamsToHeader").as_deref(),
+            Some("true")
+        );
+        assert_eq!(get_auth_attr(&attrs, "consumerKey").as_deref(), Some("ck"));
+        assert_eq!(get_auth_attr(&attrs, "nope"), None);
+
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match req.auth.as_ref() {
+            Some(AuthConfig::OAuth1 {
+                consumer_key,
+                token,
+                ..
+            }) => {
+                assert_eq!(consumer_key, "ck");
+                assert_eq!(token.as_deref(), Some("t"));
+            }
+            other => panic!("expected OAuth1 auth, got {:?}", other),
+        }
     }
 
     #[test]

@@ -225,34 +225,57 @@ export function decodeRunOutcome(bytes: Uint8Array): RunOutcome {
 
 // ── Request (wasm → host, across the tropel_host_http bridge) ────────────
 
-// Decode only the fields the JS host needs to perform an HTTP request. The
-// wire Request (types.rs) is: url, method (custom str serde), headers,
-// query_params, body (Option<Body>), auth, certificate, follow_redirects,
-// timeout, response_type. Body uses tagged/untagged custom serde that is not
-// cheap to decode positionally; v1 reads it as Option<str> (Raw bodies — the
-// Postman-parser default) and reports anything else as null + a flag.
+// Backlog line 44: the bridge carries the SDK `Request` as JSON text, not
+// postcard. Its `Body`/`AuthConfig` serde is JSON-oriented (deserialize_any /
+// internally tagged) and postcard refuses it — a postcard decode failed on
+// every non-Raw body, and the old positional reader turned a JSON body into
+// a one-byte junk string while still setting bodyDecoded=true. Same rationale
+// as RunRequest.scenario_json (wire.rs): JSON text is the zero-copy ABI for
+// JSON-oriented SDK types.
 export function decodeHttpRequest(bytes: Uint8Array): HttpRequest {
-  const r = new Reader(bytes);
-  const url = r.str();
-  const method = r.str();
-  const headers = r.strMap();
-  const queryParams = r.strMap();
+  let parsed: {
+    url?: string;
+    method?: string;
+    headers?: Record<string, string>;
+    query_params?: Record<string, string>;
+    body?: unknown;
+  };
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    // A malformed bridge payload must not silently corrupt the request.
+    throw new Error("tropel_host_http: request is not valid JSON");
+  }
+  // Body variants (types.rs custom serde): Raw → string; Json → raw JSON
+  // value; FormData/UrlEncoded/Binary/GraphQL → {"__tropel_body": tag, ...}.
+  // The host sends the body text on the wire, so render each variant back to
+  // text: Raw as-is, Json as JSON.stringify (a JSON POST must go out as the
+  // exact JSON), tagged forms as JSON.stringify of the envelope.
+  //
+  // v1 boundary: the tagged envelopes arrive as their JSON text — deterministic
+  // and host-decodable (a real fix for the old one-byte junk body), but NOT
+  // their native HTTP wire forms (Binary is not raw bytes, FormData is not
+  // urlencoded). Rendering those faithfully is a follow-up, not this item.
   let body: string | null = null;
   let bodyDecoded = false;
-  if (r.optionTag()) {
-    // Body::Raw(s) → JSON string on the wire. Other variants encode as
-    // tagged maps / raw JSON values which need structural knowledge to skip;
-    // v1 only attempts the string form. bodyDecoded only means "the option
-    // was Some" — a non-Raw variant may still come back null (misread),
-    // which is positionally harmless since nothing follows body on the wire.
+  if (parsed.body != null) {
     bodyDecoded = true;
-    try {
-      body = r.str();
-    } catch {
-      body = null;
+    // Raw as-is; every other variant (JSON value, tagged envelope) is JSON
+    // text — stringify the object/scalar alike.
+    if (typeof parsed.body === "string") {
+      body = parsed.body;
+    } else {
+      body = JSON.stringify(parsed.body);
     }
   }
-  return { url, method, headers, queryParams, body, bodyDecoded };
+  return {
+    url: parsed.url ?? "",
+    method: parsed.method ?? "GET",
+    headers: parsed.headers ?? {},
+    queryParams: parsed.query_params ?? {},
+    body,
+    bodyDecoded,
+  };
 }
 
 // ── Response (host → wasm, across the tropel_host_http bridge) ───────────
