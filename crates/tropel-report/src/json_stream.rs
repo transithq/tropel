@@ -121,11 +121,7 @@ impl JsonStreamOutput {
                 "data": {
                     "name": metric_name,
                     "type": k6_metric_type(&sample.sample_type),
-                    "contains": if is_time_metric(&metric_name) {
-                        "time"
-                    } else {
-                        "default"
-                    },
+                    "contains": tropel_metrics::time_metrics::unit_of(&metric_name).as_str(),
                     "thresholds": [],
                     "submetrics": null,
                 },
@@ -199,13 +195,12 @@ fn k6_timestamp(t: std::time::SystemTime) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
-/// True for metrics k6 marks `contains: "time"` (rendered in ms). Duration
-/// trends carry duration suffixes/prefixes; everything else is `default`.
-/// Delegates to the tropel-metrics registry+heuristic — the SINGLE source of
-/// truth (backlog §0) — so json-stream, stdout, and handleSummary always
-/// agree on which metrics are time metrics.
-pub(crate) fn is_time_metric(metric: &str) -> bool {
-    tropel_metrics::time_metrics::is_time_metric(metric)
+/// k6's `contains` unit for a metric ("time"/"data"/"default"). Delegates
+/// to the tropel-metrics registry+heuristic — the SINGLE source of truth
+/// (backlog §0/§32) — so json-stream, stdout, and handleSummary always
+/// agree on which metric carries which unit.
+pub(crate) fn metric_unit(metric: &str) -> tropel_metrics::MetricUnit {
+    tropel_metrics::time_metrics::unit_of(metric)
 }
 
 #[async_trait]
