@@ -102,8 +102,8 @@ const item = (name, url, test, body) => ({
     timeout: null,
     response_type: "text",
   },
-  prerequest: null,
-  test,
+  prerequest: [],
+  test: [test],
   assertions: [],
   items: [],
 });

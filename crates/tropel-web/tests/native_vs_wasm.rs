@@ -77,6 +77,7 @@ fn fixture_response(req: &Request) -> Result<Response> {
 /// axis F3 names (status, headers, variable state, assertion results, trace).
 fn fixture_run_request() -> RunRequest {
     let item = |name: &str, url: &str, test: Option<&str>, body: Option<Body>| ScenarioItem {
+        id: None,
         name: name.into(),
         request: Some(Request {
             url: url.into(),
@@ -90,8 +91,8 @@ fn fixture_run_request() -> RunRequest {
             timeout: None,
             response_type: ResponseType::Text,
         }),
-        prerequest: None,
-        test: test.map(str::to_string),
+        prerequest: vec![],
+        test: test.map(|t| vec![t.to_string()]).unwrap_or_default(),
         assertions: vec![],
         items: vec![],
     };
