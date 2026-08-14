@@ -49,6 +49,10 @@ impl Engine {
     }
 
     pub async fn run(&self, config: &JobConfig) -> Result<EngineResult> {
+        // Forget any unit declarations from a previous run in this process
+        // (backlog line 32) — the registry must never leak across runs.
+        tropel_metrics::time_metrics::clear();
+
         let registry = Arc::new(self.extension_registry.clone());
         let format_hint = config.input_type.clone();
         let metrics = Arc::new(MetricsCollector::new());

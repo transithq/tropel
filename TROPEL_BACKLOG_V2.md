@@ -29,7 +29,7 @@
 ## §0 · ✅ THE UNITS PROBLEM IS FIXED
 
 - [x] **µs → ms migration is complete and verified end-to-end.** Every emitter produces ms (`runner.rs:518`, `vu_loop.rs:205`, `driver.rs:867,891`, `tropel-x-grpc:537`, `wasm/driver.rs:770`); the ms→µs `*1000` is deleted from the k6 threshold translator and the `/1000` heuristic is gone from the reporters. **CLI/YAML thresholds and k6-script thresholds now provably mean the same thing.** This was the largest cross-cutting defect in the previous pass.
-- [ ] **P2 · No explicit unit model exists.** `MetricType` describes aggregation, not unit; `Sample.value` is an undocumented `f64`. `time_metrics` (`tropel-metrics/lib.rs:23-63`) is a process-global `OnceLock<Mutex<HashSet<String>>>`, never cleared, purely cosmetic (picks `contains:"time"` and the `ms` suffix, triggers no conversion). `myTrend.add(seconds)` is stored raw and rendered with an `ms` suffix. Adopt k6's `Time`/`Data`/`Default` model.
+- [x] **P2 · No explicit unit model exists.** `MetricType` describes aggregation, not unit; `Sample.value` is an undocumented `f64`. `time_metrics` (`tropel-metrics/lib.rs:23-63`) is a process-global `OnceLock<Mutex<HashSet<String>>>`, never cleared, purely cosmetic (picks `contains:"time"` and the `ms` suffix, triggers no conversion). `myTrend.add(seconds)` is stored raw and rendered with an `ms` suffix. Adopt k6's `Time`/`Data`/`Default` model.
 - [ ] **P3 · Stale µs comments on live code** — `tropel-runtime/runner.rs:566` ("all in μs", 27 lines above a `*1000.0`), `tropel-report/output.rs:195`, and ~8 collector tests encoding 25 ms as `25_000.0` (they exercise a unit production no longer uses).
 
 ---
