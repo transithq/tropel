@@ -1492,10 +1492,8 @@ impl VUScheduler {
         // handles may have resolved in that select. `is_finished()` is a
         // NON-polling check, so filtering here is safe. The survivors are the
         // stragglers that ignored the stop signal.
-        let mut pending: Vec<&mut tokio::task::JoinHandle<()>> = handles
-            .iter_mut()
-            .filter(|h| !h.is_finished())
-            .collect();
+        let mut pending: Vec<&mut tokio::task::JoinHandle<()>> =
+            handles.iter_mut().filter(|h| !h.is_finished()).collect();
         if pending.is_empty() {
             tracing::debug!("All VU handles resolved");
             return;
