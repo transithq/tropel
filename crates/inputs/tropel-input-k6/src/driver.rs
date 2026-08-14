@@ -5309,6 +5309,78 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_response_to_be_json_html_text_property_form() {
+        // Backlog line 42: chai-postman exposes .json/.html/.text as
+        // PROPERTIES — Postman's own snippets emit `pm.response.to.be.json;`
+        // with NO parens. They were methods here, so reading the property
+        // yielded a truthy Function → silent PASS on any body. Now getters:
+        // the bare property read runs the check and THROWS on mismatch, and
+        // the paren form still works.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'text/html';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'text/html' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '<html>'; }; // NOT JSON
+                globalThis.__tropel_pm_response_body = function () { return '<html>'; };
+
+                // The silent-PASS probe from the backlog: bare property read
+                // on a text/html body must THROW now (was PASS).
+                globalThis.__p_json = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__p_html = String((function () {
+                    try { pm.response.to.be.html; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // Paren form on a NON-matching body must also throw.
+                globalThis.__p_json_paren = String((function () {
+                    try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+
+                // Flip to a valid JSON body: both forms must pass.
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_pm_response_body = function () { return '{"a":1}'; };
+                globalThis.__p_json_ok = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__p_json_paren_ok = String((function () {
+                    try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // html/text on a JSON body must throw.
+                globalThis.__p_html_json = String((function () {
+                    try { pm.response.to.be.html; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__p_json").unwrap(), "threw", "bare to.be.json on text/html must THROW (was silent PASS)");
+            assert_eq!(ctx.eval::<String, _>("__p_html").unwrap(), "passed", "to.be.html must pass on text/html");
+            assert_eq!(ctx.eval::<String, _>("__p_json_paren").unwrap(), "threw", "to.be.json() on text/html must throw");
+            assert_eq!(ctx.eval::<String, _>("__p_json_ok").unwrap(), "passed", "bare to.be.json on JSON body must pass");
+            assert_eq!(ctx.eval::<String, _>("__p_json_paren_ok").unwrap(), "passed", "to.be.json() on JSON body must pass");
+            assert_eq!(ctx.eval::<String, _>("__p_html_json").unwrap(), "threw", "to.be.html on JSON body must throw");
+        });
+    }
+
+    #[test]
     fn test_exec_selection_installs_named_export() {
         // A scenario naming `exec: "browse"` must run the `browse` export,
         // NOT the default export (k6 multi-scenario semantics).
