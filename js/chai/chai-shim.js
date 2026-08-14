@@ -718,7 +718,6 @@ var chai = chai || {};
                 throw new Error("unknown assertion property '" + String(prop) + "'");
             }
         });
-        return proxy;
     }
 
     // ── chai.expect ──
