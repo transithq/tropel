@@ -12,17 +12,27 @@ function __tropel_build_binding(namespace) {
     var __ns = namespace || 'pm';
 
 // ── pm.environment ──
+// Backlog line 89: set/get must be INVERSES. The old setter String()-coerced
+// (pm.response.json() → "[object Object]" stored) and the getter returned raw
+// — an object set once could never come back. Values are now JSON-encoded on
+// set (strings stay strings: '1234' is stored as '"1234"', never retyped to
+// the number 1234) and JSON.parsed on get with a raw fallback. The runner's
+// build_scope decodes the same encoding for {{var}} substitution.
 pm.environment = {
     get: function (key) {
-        // Delegates to native environment_get
         if (typeof __tropel_pm_environment_get === 'function') {
-            return __tropel_pm_environment_get(key);
+            var raw = __tropel_pm_environment_get(key);
+            if (raw === null || raw === undefined) return null;
+            try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return null;
     },
     set: function (key, value) {
         if (typeof __tropel_pm_environment_set === 'function') {
-            __tropel_pm_environment_set(key, String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_environment_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -45,7 +55,14 @@ pm.environment = {
     },
     toObject: function () {
         if (typeof __tropel_pm_environment_to_object === 'function') {
-            return __tropel_pm_environment_to_object() || {};
+            var map = __tropel_pm_environment_to_object() || {};
+            var out = {};
+            for (var k in map) {
+                if (map.hasOwnProperty(k)) {
+                    try { out[k] = JSON.parse(map[k]); } catch (e) { out[k] = map[k]; }
+                }
+            }
+            return out;
         }
         return {};
     },
@@ -69,7 +86,10 @@ pm.collectionVariables = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_collection_vars_set === 'function') {
-            __tropel_pm_collection_vars_set(key, value === undefined ? '' : String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_collection_vars_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -114,7 +134,10 @@ pm.globals = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_globals_set === 'function') {
-            __tropel_pm_globals_set(key, value === undefined ? '' : String(value));
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_globals_set(key, encoded);
         }
     },
     unset: function (key) {
@@ -162,10 +185,14 @@ pm.variables = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_variables_set === 'function') {
-            // Backlog line 146: every other store coerces String(value);
-            // variables.set passed the RAW value, so a number like 42 hit
-            // the bridge's strict String param and threw TypeError.
-            __tropel_pm_variables_set(key, value === undefined ? '' : String(value));
+            // Backlog line 89/146: JSON-encode so set/get are inverses (an
+            // object set once comes back as an object; '1234' stays the
+            // string '1234'). Line 146: never pass the RAW value into the
+            // strict String bridge param.
+            var encoded;
+            try { encoded = value === undefined ? '' : JSON.stringify(value); }
+            catch (e) { encoded = value === undefined ? '' : String(value); }
+            __tropel_pm_variables_set(key, encoded);
         }
     },
     unset: function (key) {
