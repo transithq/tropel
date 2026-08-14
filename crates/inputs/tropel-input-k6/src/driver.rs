@@ -6246,6 +6246,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_lodash_string_and_property_shorthand() {
+        // Backlog line 93: string shorthand (`'active'`) and pair shorthand
+        // (`['active',true]`) were broken across filter/find/every/some/
+        // findIndex, and `_.reject(coll,{matcher})` THREW (raw predicate
+        // called as a function). All must normalize through toPredicate.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var users = [
+                    { name: 'a', active: true },
+                    { name: 'b', active: false },
+                    { name: 'c', active: true },
+                ];
+                JSON.stringify([
+                    // String shorthand: filter by property truthiness.
+                    _.filter(users, 'active').map(function (u) { return u.name; }),
+                    // find returns the FIRST active user.
+                    _.find(users, 'active').name,
+                    // findIndex returns the index of the first active user.
+                    _.findIndex(users, 'active'),
+                    // every/some honor the string shorthand.
+                    _.every(users, 'active'),
+                    _.some(users, 'active'),
+                    // Pair shorthand: [key, value] equality.
+                    _.filter(users, ['active', true]).length,
+                    // reject with an object matcher must not throw.
+                    _.reject(users, { active: false }).map(function (u) { return u.name; }),
+                    // some with an object matcher.
+                    _.some(users, { active: true }),
+                    // Dotted path shorthand via _.get.
+                    _.filter([{ a: { b: 1 } }, { a: { b: 0 } }], 'a.b').length,
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "[[\"a\",\"c\"],\"a\",0,false,true,2,[\"a\",\"c\"],true,1]",
+            "string/pair/matcher shorthand across the collection family"
+        );
+    }
+
+    #[tokio::test]
     async fn test_lodash_set_blocks_proto_pollution() {
         // Backlog line 155: `_.set({}, '__proto__.polluted', 1)` polluted
         // the per-VU context for the whole run.
