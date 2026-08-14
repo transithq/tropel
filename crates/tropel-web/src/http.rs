@@ -2,8 +2,12 @@
 //!
 //! TROPEL_WASM_BUILD.md Step 5A: the wasm module imports a synchronous host
 //! function from the `env` module (`tropel_host_http`) — the JS host
-//! implements it and supplies responses. `Request` and `Response` cross the
-//! bridge postcard-encoded over linear memory (packed `(ptr << 32) | len`).
+//! implements it and supplies responses. The wire formats mirror the
+//! documented split in `wire.rs`: `Request` crosses as JSON text (the SDK's
+//! `Body`/`AuthConfig` serde is JSON-oriented and postcard refuses
+//! `deserialize_any` — the same reason `Scenario` is carried as
+//! `scenario_json`), while `Response` crosses postcard-encoded. Both go over
+//! linear memory packed as `(ptr << 32) | len`.
 //!
 //! On native (tests), there is no host import: a test-injectable handler
 //! stands in, so the full run path — runner → client → samples — is
@@ -21,8 +25,10 @@ pub struct WebHttpClient;
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
 extern "C" {
-    /// Host-provided synchronous HTTP bridge. `req` is a postcard-encoded
-    /// `Request`; the return value packs `(ptr << 32) | len` of a
+    /// Host-provided synchronous HTTP bridge. `req` is a JSON-encoded
+    /// `Request` (its `Body`/`AuthConfig` serde is JSON-oriented and cannot
+    /// round-trip postcard — the exact hazard wire.rs documents for
+    /// `Scenario`); the return value packs `(ptr << 32) | len` of a
     /// postcard-encoded `Response` in linear memory, or `0` on error.
     fn tropel_host_http(req_ptr: *const u8, req_len: usize) -> u64;
 }
@@ -69,7 +75,13 @@ pub mod native_seam {
 fn bridge(req: &Request) -> Result<Response> {
     #[cfg(target_arch = "wasm32")]
     {
-        let bytes = postcard::to_stdvec(req)
+        // JSON, not postcard: `Body`'s Deserialize routes through
+        // serde_json::Value (deserialize_any) and `AuthConfig` is internally
+        // tagged — both refuse postcard, so a postcard-encoded `Request` with
+        // a JSON/AUTH body failed to decode and the TS host silently sent a
+        // one-byte junk body (backlog line 44). Same rationale as
+        // `RunRequest.scenario_json` in wire.rs.
+        let bytes = serde_json::to_vec(req)
             .map_err(|e| tropel_sdk::TropelError::Http(format!("encode request: {e}")))?;
         let packed = unsafe { tropel_host_http(bytes.as_ptr(), bytes.len()) };
         if packed == 0 {
