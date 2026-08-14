@@ -5656,9 +5656,7 @@ mod tests {
     /// ws_req_failed=1.0 — previously hardcoded 0.0.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ws_abnormal_close_marks_req_failed() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -5701,9 +5699,7 @@ mod tests {
     /// only errors and abnormal closures are failures.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ws_normal_close_stays_not_failed() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
