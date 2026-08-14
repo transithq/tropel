@@ -1595,6 +1595,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// VU ids are handed to `run_vu` for data-row rotation / worker pinning /
     /// `exec.vu.idInTest`. They must be unique across scenarios (each scenario
