@@ -1806,7 +1806,7 @@ mod tests {
             set.record(0.0, &trend);
         }
         for _ in 0..10 {
-            set.record(25_000.0, &trend); // 25 ms in µs
+            set.record(25.0, &trend); // 25 ms
         }
 
         assert_eq!(set.count, 10_000.0, "count must include zero samples");
@@ -1874,22 +1874,23 @@ mod tests {
 
     #[test]
     fn test_trend_fractional_values_round_not_truncate() {
-        // Regression: `value as u64` truncated fractional µs, so
-        // `myTrend.add(0.25)` (ms) recorded 0 µs → p(95)=0, max=0 while
-        // avg stayed meaningful. Values ≥ 0.5 µs must round into the
-        // histogram instead of vanishing.
+        // Regression: `value as u64` truncated fractional ms to 0 µs, so
+        // `myTrend.add(0.25)` recorded 0 → p(95)=0, max=0 while
+        // avg stayed meaningful. `record_ms` converts fractional ms to µs
+        // internally (0.25 ms = 250 µs) and rounds, so sub-ms samples
+        // must land in the histogram instead of vanishing.
         let mut set = MetricSet::new(MetricType::Trend, None);
         let trend = SampleType::Trend;
 
-        set.record(0.25, &trend); // truncation would drop this to 0
-        set.record(0.6, &trend); // 600 µs
-        set.record(2_500.0, &trend); // 2.5 ms
+        set.record(0.25, &trend); // 0.25 ms (250 µs)
+        set.record(0.6, &trend); // 0.6 ms (600 µs)
+        set.record(2.5, &trend); // 2.5 ms
 
         assert_eq!(set.count, 3.0);
         let stats = set.trend_stats();
         assert_eq!(stats.count, 3, "all samples must be in the histogram");
         assert!(
-            stats.max >= 2_500.0,
+            stats.max >= 2.5,
             "2.5 ms sample must be recorded (max={})",
             stats.max
         );
@@ -1952,7 +1953,7 @@ mod tests {
         // Custom Trend sharing the "checks" prefix must NOT fold in.
         agg.record(Sample {
             metric: "checks_latency".into(),
-            value: 250_000.0,
+            value: 250.0,
             tags,
             timestamp: ts,
             sample_type: SampleType::Trend,
@@ -1997,16 +1998,16 @@ mod tests {
             });
         };
 
-        // 2 URLs × 2 statuses × fixed durations (µs).
-        // url=/a status=200: 1000, 2000
-        // url=/a status=500: 4000, 8000
-        // url=/b status=200: 3000, 6000
-        // url=/b status=500: 12000, 16000
+        // 2 URLs × 2 statuses × fixed durations (ms).
+        // url=/a status=200: 1, 2
+        // url=/a status=500: 4, 8
+        // url=/b status=200: 3, 6
+        // url=/b status=500: 12, 16
         let cases: Vec<(&str, &str, u64, u64)> = vec![
-            ("/a", "200", 1000, 2000),
-            ("/a", "500", 4000, 8000),
-            ("/b", "200", 3000, 6000),
-            ("/b", "500", 12000, 16000),
+            ("/a", "200", 1, 2),
+            ("/a", "500", 4, 8),
+            ("/b", "200", 3, 6),
+            ("/b", "500", 12, 16),
         ];
         for (url, status, d1, d2) in &cases {
             for d in [*d1, *d2] {
@@ -2061,14 +2062,14 @@ mod tests {
         rec(
             &mut agg,
             "iteration_duration",
-            500_000.0,
+            500.0,
             SampleType::Trend,
             vec![],
         );
         rec(
             &mut agg,
             "iteration_duration",
-            900_000.0,
+            900.0,
             SampleType::Trend,
             vec![],
         );
@@ -2092,24 +2093,24 @@ mod tests {
         // http_req_failed: 4 failures out of 8 requests → 0.5.
         assert_eq!(res.http_req_failed, 0.5);
 
-        // ── Exact trend stats (µs) for the merged http_req_duration ──
+        // ── Exact trend stats (ms) for the merged http_req_duration ──
         let dur = res
             .http_req_duration
             .as_ref()
             .expect("headline http_req_duration");
         assert_eq!(dur.count, 8);
-        assert_eq!(dur.sum, 52_000.0); // 1k+2k+4k+8k+3k+6k+12k+16k
-        assert_eq!(dur.mean, 6500.0);
+        assert_eq!(dur.sum, 52.0); // 1+2+4+8+3+6+12+16
+        assert_eq!(dur.mean, 6.5);
         // min/max are raw observed values (backlog line 57) so exact
         // coverage holds; percentiles stay histogram-bucket-quantized.
         assert!(
-            dur.min <= 1000.0 && dur.min >= 990.0,
-            "min={} covers 1000",
+            dur.min <= 1.0 && dur.min >= 0.99,
+            "min={} covers 1",
             dur.min
         );
         assert!(
-            dur.max >= 16000.0 && dur.max <= 16150.0,
-            "max={} covers 16000",
+            dur.max >= 16.0 && dur.max <= 16.15,
+            "max={} covers 16",
             dur.max
         );
 
@@ -2118,8 +2119,8 @@ mod tests {
             .as_ref()
             .expect("headline iteration_duration");
         assert_eq!(iter.count, 2);
-        assert_eq!(iter.sum, 1_400_000.0);
-        assert_eq!(iter.mean, 700_000.0);
+        assert_eq!(iter.sum, 1_400.0); // 500 + 900 ms
+        assert_eq!(iter.mean, 700.0);
 
         // ── Series-level exactness ──
         // 4 per-(url,status,method) http_req_duration series × 2 samples each.
@@ -2135,12 +2136,12 @@ mod tests {
             assert_eq!(s.count, 2);
         }
         // Exact min/max per (url, status) series.
-        let expect_min_max: std::collections::HashMap<(&str, &str), (u64, u64)> =
+        let expect_min_max: std::collections::HashMap<(&str, &str), (f64, f64)> =
             std::collections::HashMap::from([
-                (("/a", "200"), (1000, 2000)),
-                (("/a", "500"), (4000, 8000)),
-                (("/b", "200"), (3000, 6000)),
-                (("/b", "500"), (12000, 16000)),
+                (("/a", "200"), (1.0, 2.0)),
+                (("/a", "500"), (4.0, 8.0)),
+                (("/b", "200"), (3.0, 6.0)),
+                (("/b", "500"), (12.0, 16.0)),
             ]);
         for s in &dur_series {
             let url = s.tags.iter().find(|(k, _)| k == "url").unwrap().1.as_str();
@@ -2151,8 +2152,7 @@ mod tests {
                 .unwrap()
                 .1
                 .as_str();
-            let (want_min, want_max) = expect_min_max[&(url, status)];
-            let (wmin, wmax) = (want_min as f64, want_max as f64);
+            let (wmin, wmax) = expect_min_max[&(url, status)];
             // Raw min/max (backlog line 57): assert coverage with tolerance.
             assert!(
                 s.min <= wmin && s.min >= wmin - wmin / 100.0,
@@ -2521,7 +2521,7 @@ mod tests {
         for ms in [1u64, 2, 3] {
             agg.record(Sample {
                 metric: "http_req_duration".into(),
-                value: (ms * 1000) as f64,
+                value: ms as f64,
                 tags: tags.clone(),
                 timestamp: ts,
                 sample_type: SampleType::Trend,
@@ -2533,7 +2533,7 @@ mod tests {
         for ms in [50u64, 100] {
             agg2.record(Sample {
                 metric: "http_req_duration".into(),
-                value: (ms * 1000) as f64,
+                value: ms as f64,
                 tags: Arc::new(tropel_sdk::types::TagMap::new()),
                 timestamp: ts,
                 sample_type: SampleType::Trend,
@@ -2545,7 +2545,7 @@ mod tests {
             merge_snapshots(vec![snap_a, snap_b], std::collections::HashMap::new()).unwrap();
         let m = merged.http_req_duration.expect("merged duration");
         assert_eq!(m.count, 5, "all 5 samples must merge");
-        assert!(m.max >= 100_000.0, "max must reflect the merged buckets");
+        assert!(m.max >= 100.0, "max must reflect the merged buckets");
     }
 
     #[test]
@@ -2668,7 +2668,7 @@ mod tests {
                 ]));
                 agg.record(Sample {
                     metric: "http_req_duration".into(),
-                    value: (ms * 1000) as f64,
+                    value: ms as f64,
                     tags,
                     timestamp: ts,
                     sample_type: SampleType::Trend,
@@ -2679,7 +2679,7 @@ mod tests {
         for _ in 0..2 {
             agg.record(Sample {
                 metric: "iteration_duration".into(),
-                value: 42_000.0,
+                value: 42.0,
                 tags: Arc::new(tropel_sdk::types::TagMap::new()),
                 timestamp: ts,
                 sample_type: SampleType::Trend,
@@ -2690,13 +2690,13 @@ mod tests {
 
         let hd = res.http_req_duration.expect("headline http_req_duration");
         assert_eq!(hd.count, 6, "all 6 duration samples merged");
-        // 10+20+30+10+20+30 ms = 120 ms = 120_000 µs.
-        assert_eq!(hd.sum, 120_000.0);
+        // 10+20+30+10+20+30 ms = 120 ms.
+        assert_eq!(hd.sum, 120.0);
         // p95 over [10,20,30]x2 is the max (30 ms); hdr-histogram bucket
-        // rounding lands on the bucket edge (30015), never below the true
+        // rounding lands on the bucket edge (30.015), never below the true
         // value — assert within tolerance, not exact.
         assert!(
-            hd.p95 >= 30_000.0 && hd.p95 <= 30_100.0,
+            hd.p95 >= 30.0 && hd.p95 <= 30.1,
             "p95 over 10/20/30 x2 must be ~30ms, got {}",
             hd.p95
         );
@@ -2715,6 +2715,6 @@ mod tests {
 
         let id = res.iteration_duration.expect("headline iteration_duration");
         assert_eq!(id.count, 2);
-        assert_eq!(id.sum, 84_000.0);
+        assert_eq!(id.sum, 84.0);
     }
 }

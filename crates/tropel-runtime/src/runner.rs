@@ -563,7 +563,7 @@ impl ScenarioRunner {
                                     });
 
                                     // ═══════════════════════════════════════
-                                    // HTTP sub-timing metrics (Trend, all in μs)
+                                    // HTTP sub-timing metrics (Trend, all in ms)
                                     // ═══════════════════════════════════════
                                     // These match k6's http_req_* sub-timing
                                     // metrics. http_req_dns is a Tropel extra (k6

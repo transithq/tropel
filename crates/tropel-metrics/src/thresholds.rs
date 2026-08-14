@@ -1186,7 +1186,7 @@ mod tests {
     #[test]
     fn test_arbitrary_percentile_exact_not_mean() {
         let metrics = make_histogram_metrics();
-        // p75 of 100..1000 (10 values) is ~775-800 µs. The mean is 550.
+        // p75 of 100..1000 (10 values) is ~775-800 ms. The mean is 550.
         let result = evaluate_single_threshold("http_req_duration.p75 < 600", &metrics);
         assert!(
             !result.0,
