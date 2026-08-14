@@ -449,8 +449,7 @@ impl TrpBridge {
                     let mut st = state_clone.lock().unwrap();
                     // Backlog line 137: pm.variables is the LOCAL scope —
                     // writes land here (highest priority), not in collection.
-                    st.local_vars
-                        .insert(key, serde_json::Value::String(value));
+                    st.local_vars.insert(key, decode_json_value(&value));
                 }),
             );
 

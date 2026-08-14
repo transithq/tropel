@@ -2434,7 +2434,7 @@ mod tests {
             assert!(
                 echo.ends_with(":BODY"),
                 "{} must deliver its body, server saw: {}",
-                format!("{:?}", method),
+                format_args!("{:?}", method),
                 echo
             );
         }
