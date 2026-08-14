@@ -366,23 +366,36 @@ pm.response.to = {
             }
         },
         get info() { assertStatusClass(1, 'info'); },
-        json: function () {
+        // Backlog line 42: chai-postman exposes .json/.html/.text as
+        // PROPERTIES — Postman's own snippets emit `pm.response.to.be.json;`
+        // with NO parens. As methods here, reading the property yielded a
+        // truthy Function and recorded PASS on any body. Now getters: the
+        // check runs on property READ (throws on mismatch, so the bare form
+        // fails instead of silently passing) and the returned callable keeps
+        // the paren form `to.be.json()` working.
+        get json() {
             // Postman parity: to.be.json passes when the body parses as JSON.
             // Content-type is informational — a text/plain body that parses
             // still counts (Postman's chai-postman checks the body first).
             pm.response.json(); // throws on invalid JSON body
+            // The getter has already validated — the callable is a no-op so
+            // the paren form `to.be.json()` doesn't re-run the check (which
+            // would re-read the lazy bridge and allocate a fresh function).
+            return function () {};
         },
-        html: function () {
+        get html() {
             var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
             if (ct.indexOf('html') === -1) {
                 throw new Error('expected response to be HTML, content-type is ' + ct);
             }
+            return function () {};
         },
-        text: function () {
+        get text() {
             var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
             if (ct.indexOf('text') === -1 && ct.indexOf('json') === -1 && ct.indexOf('xml') === -1) {
                 throw new Error('expected response to be text, content-type is ' + ct);
             }
+            return function () {};
         }
     },
     have: {
