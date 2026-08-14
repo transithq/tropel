@@ -1081,10 +1081,7 @@ mod tests {
             .find(|m| m.key == "vus")
             .map(|m| m.count)
             .unwrap_or(0);
-        assert!((
-            vus >= 1,
-            "sampler must emit the t=0 sample, got {vus}"
-        );
+        assert!(vus >= 1, "sampler must emit the t=0 sample, got {vus}");
         assert!(
             vus <= 4,
             "vus sampler storm: {vus} samples in 2.3s — must be ~2, not per-VU"
