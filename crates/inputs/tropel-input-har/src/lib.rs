@@ -356,6 +356,7 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
 
     Ok(ScenarioItem {
         name: item_name,
+        id: None,
         request: Some(Request {
             url,
             method,
@@ -368,8 +369,8 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         }),
-        prerequest: None,
-        test: None,
+        prerequest: vec![],
+        test: vec![],
         assertions: vec![],
         items: vec![],
     })
