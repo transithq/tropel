@@ -545,32 +545,18 @@ impl HttpClient {
             // `Custom` arm binds `m: &String`, so `current_method` is NOT
             // moved out of — it is still needed by the redirect-rewrite
             // logic below (303 → GET etc.).
+            // Backlog line 140: the body was attached ONLY for POST/PUT/PATCH,
+            // so DELETE/OPTIONS/TRACE and custom-method bodies were silently
+            // dropped. The builder is now method-agnostic — any method gets
+            // whatever body it is given (Postman's GET/HEAD pruning lives in
+            // the collection parser via protocolProfileBehavior
+            // .disableBodyPruning). HEAD/CONNECT edge cases: reqwest tolerates
+            // a body on HEAD; CONNECT is rejected below.
             let mut req_builder = match &current_method {
                 Method::GET => client.get(&current_url),
-                Method::POST => {
-                    let rb = client.post(&current_url);
-                    if let Some(bytes) = &current_body {
-                        rb.body(reqwest::Body::from(bytes.clone()))
-                    } else {
-                        rb
-                    }
-                }
-                Method::PUT => {
-                    let rb = client.put(&current_url);
-                    if let Some(bytes) = &current_body {
-                        rb.body(reqwest::Body::from(bytes.clone()))
-                    } else {
-                        rb
-                    }
-                }
-                Method::PATCH => {
-                    let rb = client.patch(&current_url);
-                    if let Some(bytes) = &current_body {
-                        rb.body(reqwest::Body::from(bytes.clone()))
-                    } else {
-                        rb
-                    }
-                }
+                Method::POST => client.post(&current_url),
+                Method::PUT => client.put(&current_url),
+                Method::PATCH => client.patch(&current_url),
                 Method::DELETE => client.delete(&current_url),
                 Method::HEAD => client.head(&current_url),
                 Method::OPTIONS => client.request(reqwest::Method::OPTIONS, &current_url),
@@ -589,6 +575,9 @@ impl HttpClient {
                     client.request(method, &current_url)
                 }
             };
+            if let Some(bytes) = &current_body {
+                req_builder = req_builder.body(reqwest::Body::from(bytes.clone()));
+            }
 
             // Add headers
             if let Some(content_type) = &multipart_content_type {
@@ -2308,5 +2297,72 @@ mod tests {
             1,
             "discarded bodies must not tear down the pooled connection"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bodies_sent_for_all_methods_including_delete_options_trace_custom() {
+        // Regression (backlog line 140): the request builder attached the
+        // body ONLY for POST/PUT/PATCH — DELETE/OPTIONS/TRACE and custom
+        // methods (PURGE, …) silently dropped it. The builder is now
+        // method-agnostic; every method must deliver its body. (Postman's
+        // GET/HEAD pruning lives in the collection parser, so the transport
+        // must not re-introduce it here.)
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let raw = String::from_utf8_lossy(&buf);
+                    let method = raw
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().next())
+                        .unwrap_or("")
+                        .to_string();
+                    let saw_body = raw.contains("hello-from-140");
+                    let body = format!("{}:{}", method, if saw_body { "BODY" } else { "NONE" });
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+
+        for method in [
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::Custom("PURGE".to_string()),
+        ] {
+            let req = Request {
+                url: format!("http://{}/x", addr),
+                method: method.clone(),
+                body: Some(Body::Raw("hello-from-140".to_string())),
+                ..Default::default()
+            };
+            let resp = client.execute(&req, None).await.unwrap();
+            let echo = String::from_utf8_lossy(&resp.body).to_string();
+            assert!(
+                echo.ends_with(":BODY"),
+                "{} must deliver its body, server saw: {}",
+                format_args!("{:?}", method),
+                echo
+            );
+        }
+
+        server.abort();
     }
 }
