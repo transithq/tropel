@@ -132,7 +132,7 @@ pub(crate) fn print_scenario_summary(scenario: &Scenario) {
             match &item.request {
                 Some(req) => {
                     out.0 += 1;
-                    let scripted = item.test.is_some() || item.prerequest.is_some();
+                    let scripted = !item.test.is_empty() || !item.prerequest.is_empty();
                     if scripted {
                         out.1 += 1;
                     }
