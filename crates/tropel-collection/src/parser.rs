@@ -522,7 +522,15 @@ fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
                 algorithm,
             })
         }
-        _ => None,
+        // Explicit auth with an UNKNOWN type (e.g. NTLM, edgegrid, ...) must
+        // NOT fall back to None — None means "no auth configured → inherit
+        // the parent scope", and the runner re-applies collection auth on
+        // None, silently sending the collection's bearer token to an
+        // endpoint that explicitly declared a different scheme (P1,
+        // credential-leak shaped). Postman overrides, never inherits, when a
+        // request declares its own auth; an unsupported scheme sends no
+        // auth header at all.
+        _ => Some(AuthConfig::NoAuth),
     }
 }
 
@@ -1159,6 +1167,35 @@ mod tests {
         assert!(
             matches!(req.auth.as_ref(), Some(AuthConfig::NoAuth)),
             "noauth must block inheritance (AuthConfig::NoAuth), got {:?}",
+            req.auth
+        );
+    }
+
+    #[test]
+    fn test_unknown_auth_type_does_not_leak_collection_token() {
+        // Regression (backlog line 139): a request explicitly configured for
+        // an auth type we don't support (NTLM) mapped to None, which the
+        // runner treats as "inherit" — sending the collection's bearer token
+        // to that endpoint. An explicit but unsupported scheme must yield
+        // AuthConfig::NoAuth (send nothing), never the collection's token.
+        let json = r#"{
+            "info": {"name": "Ntlm", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "coll_tok"}]},
+            "item": [{
+                "name": "Windows",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/windows"},
+                    "auth": {"type": "ntlm", "ntlm": [{"key": "username", "value": "u"}, {"key": "password", "value": "p"}]}
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert!(
+            matches!(req.auth.as_ref(), Some(AuthConfig::NoAuth)),
+            "unknown explicit auth must NOT inherit collection auth (NoAuth), got {:?}",
             req.auth
         );
     }
