@@ -560,7 +560,7 @@ async fn run_command(cli: Cli) -> Result<()> {
     // zero-VU "green" run — the scheduler swallowed the parse error and the
     // run exited 0 with http_reqs: 0. Validate the execution config up front
     // so a bad duration fails fast with a clear config error.
-    config.execution.validate()?;
+    tropel_scheduler::validate_execution_config(&config.execution)?;
 
     tracing::info!("Execution config: {:?}", config.execution); // Create the engine with extension registry (subprocess + WASM plugins
                                                                 // registered the same way `inspect`/`list` do — one shared builder).

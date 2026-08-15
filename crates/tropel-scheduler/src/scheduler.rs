@@ -543,7 +543,7 @@ impl VUScheduler {
         // dispatch. Without this, an unparseable `duration` / stage duration
         // / maxDuration was silently defaulted (10s stage, 10min maxDuration)
         // or swallowed entirely, producing a zero-VU green run.
-        self.config.validate()?;
+        validate_execution_config(&self.config)?;
         match self.config.as_ref() {
             ExecutionConfig::ConstantVus {
                 vus,
@@ -1671,6 +1671,46 @@ fn graceful_stop_duration(s: &Option<String>) -> Duration {
 
 fn parse_duration(s: &str) -> Result<Duration> {
     tropel_sdk::parse_duration(s)
+}
+
+/// Backlog line 53: validate every duration string in an `ExecutionConfig`
+/// BEFORE any VU dispatch, so a malformed `duration` / stage duration /
+/// `max_duration` fails the run loudly instead of a zero-VU green run.
+/// The SDK dropped the old `validate()` method; per-variant parsing in
+/// `run()` still happens, but this central check guarantees the error is
+/// raised before a single VU is spawned.
+///
+/// Public so the engine CLI can fail fast on `-d 30x` before the engine
+/// even constructs a scheduler (same backlog line 53 guarantee).
+pub fn validate_execution_config(config: &ExecutionConfig) -> Result<()> {
+    match config {
+        ExecutionConfig::ConstantVus { duration, .. }
+        | ExecutionConfig::ConstantArrivalRate { duration, .. } => {
+            parse_duration(duration)?;
+        }
+        ExecutionConfig::RampingVus { stages, .. } => {
+            for stage in stages {
+                parse_duration(&stage.duration)?;
+            }
+        }
+        ExecutionConfig::RampingArrivalRate { stages, .. } => {
+            for stage in stages {
+                parse_duration(&stage.duration)?;
+            }
+        }
+        ExecutionConfig::SharedIterations { max_duration, .. }
+        | ExecutionConfig::PerVUIterations { max_duration, .. } => {
+            if let Some(d) = max_duration {
+                parse_duration(d)?;
+            }
+        }
+        ExecutionConfig::ExternallyControlled { duration, .. } => {
+            if let Some(d) = duration {
+                parse_duration(d)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
