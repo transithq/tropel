@@ -227,6 +227,7 @@ mod tests {
             },
             items: vec![ScenarioItem {
                 name: "ping".into(),
+                id: None,
                 request: Some(tropel_sdk::types::Request {
                     url: "https://example.com/ping".into(),
                     method: Method::GET,
@@ -239,8 +240,8 @@ mod tests {
                     timeout: None,
                     response_type: tropel_sdk::types::ResponseType::Text,
                 }),
-                prerequest: None,
-                test: Some("pm.test('ok', () => pm.expect(true).to.be.true);".into()),
+                prerequest: vec![],
+                test: vec!["pm.test('ok', () => pm.expect(true).to.be.true);".into()],
                 assertions: vec![],
                 items: vec![],
             }],

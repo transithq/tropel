@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tropel_core::config::{
@@ -547,6 +548,164 @@ async fn non_tracked_percentile_threshold_completes_healthy_run() -> Result<()> 
             hd.p95
         );
     }
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog line 47: a malformed duration (`-d 30x`) used to produce a
+/// zero-VU GREEN run — the engine swallowed the scheduler's parse error
+/// (`executor.run(...).await.ok()`) and exited 0 with http_reqs: 0. The
+/// scheduler error must surface as a VU-init failure so the run fails
+/// loudly after reporting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_duration_fails_run_instead_of_zero_vu_green() -> Result<()> {
+    let coll = write_collection("http://127.0.0.1:9", "bad-dur");
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 5,
+            duration: "30x".to_string(), // unparseable
+            graceful_stop: Some("1s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds: HashMap::new(),
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+
+    assert!(
+        result.vu_init_failures > 0,
+        "malformed duration must fail the run loudly (vu_init_failures={})",
+        result.vu_init_failures
+    );
+    assert_eq!(
+        result.metrics.http_reqs, 0,
+        "no requests can run with a rejected execution config"
+    );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog line 47, same class: a present-but-unparseable `maxDuration`
+/// used to silently become the 10-minute k6 default, changing the profile
+/// without any error. It must fail loudly too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_max_duration_fails_run_instead_of_silent_default() -> Result<()> {
+    let coll = write_collection("http://127.0.0.1:9", "bad-maxdur");
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::SharedIterations {
+            iterations: 1,
+            max_duration: Some("10x".to_string()), // unparseable
+            vus: 1,
+            graceful_stop: Some("1s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds: HashMap::new(),
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+
+    assert!(
+        result.vu_init_failures > 0,
+        "unparseable max_duration must fail the run loudly (vu_init_failures={})",
+        result.vu_init_failures
+    );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog line 45: the mid-run abort coordinator fed thresholds a
+/// `MetricsResult` whose `run_duration` was ZERO (the collector's `results()`
+/// only gets the real elapsed stamped AFTER the run by the engine), so
+/// counter `rate`/`avg` thresholds divided by 0 and evaluated to 0.0 — and
+/// abortOnFail killed healthy runs at the coordinator's first ~2s check.
+/// A 1-VU 3s run against the echo server with `http_reqs.rate > 0` +
+/// abortOnFail must run to completion: run_duration must exceed the ~2s
+/// window where the old code aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn midrun_rate_threshold_with_abort_on_fail_does_not_kill_healthy_run() -> Result<()> {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (srv, _peak) = start_echo_server(seen.clone()).await;
+    let coll = write_collection(&format!("http://{srv}"), "rate-abort");
+
+    // The canonical k6 throughput gate: requests per second must be REAL.
+    let mut thresholds = HashMap::new();
+    thresholds.insert(
+        "http_reqs".to_string(),
+        ThresholdConfig {
+            expression: "http_reqs.rate > 0".to_string(),
+            abort_on_fail: true,
+            delay_abort_eval: None,
+        },
+    );
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "3s".to_string(),
+            graceful_stop: Some("2s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds,
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+    let m = &result.metrics;
+
+    // The run must NOT have been cut at the ~2s first check: a healthy 3s
+    // run leaves run_duration ≈ 3s, an abort at t≈2s leaves ≈ 2s. The 2.8s
+    // bar leaves headroom against a late first check on a loaded CI (the
+    // coordinator ticker uses MissedTickBehavior::Delay, and `results()` is
+    // a full aggregate rebuild) without any red risk on the fixed path.
+    assert!(
+        m.run_duration >= Duration::from_secs(2) + Duration::from_millis(800),
+        "run survived the mid-run abort check (run_duration={:?}, expected >= 2.8s)",
+        m.run_duration
+    );
+    assert!(m.http_reqs > 0, "requests were made");
+
+    // The threshold itself evaluates to a PASS post-run (rate = reqs/elapsed).
+    let threshold_results = evaluate_thresholds(&result.effective_thresholds, m);
+    let t = threshold_results
+        .iter()
+        .find(|t| t.name == "http_reqs")
+        .expect("threshold evaluated");
+    assert!(
+        t.passed,
+        "threshold '{}' passed (actual={})",
+        t.expression, t.actual
+    );
 
     let _ = std::fs::remove_file(&coll);
     Ok(())

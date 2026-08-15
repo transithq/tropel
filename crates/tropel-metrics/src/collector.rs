@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc};
 use tropel_sdk::types::{Sample, SampleType};
@@ -573,6 +573,16 @@ struct Aggregator {
     /// Cardinality cap for the series map (see [`MAX_SERIES`]). A field so
     /// tests can shrink it; production uses the const default.
     max_series: usize,
+    /// When the aggregator came to life. `build_results` reports
+    /// `started.elapsed()` as `run_duration` — backlog line 45 (P0): the old
+    /// hardcoded `Duration::ZERO` made every MID-RUN rate/avg threshold
+    /// evaluation (the ~2 s abortOnFail tick) compute 0.0 per second, so
+    /// `http_reqs: ['rate>100', abortOnFail]` aborted healthy runs at t=2 s
+    /// and marked them tainted even without abortOnFail. The engine still
+    /// stamps the authoritative post-run duration over the result. (Rate over
+    /// a tiny early-run elapsed can spike — inherent k6-style rate semantics,
+    /// and the abort tick only fires after ~2 s.)
+    started: Instant,
     /// Incremental merged http_req_duration headline (Trend). Maintained on
     /// every recorded sample so `build_results` (the ~2 s abort-path tick)
     /// reads PRE-MERGED stats instead of re-cloning/re-merging every full
@@ -588,6 +598,15 @@ struct Aggregator {
     merged_per_group: std::collections::BTreeMap<(String, String), MetricSet>,
     /// Samples dropped because the `max_series` cardinality cap was reached.
     series_dropped: u64,
+    /// Incremental http_req_failed counters — request count (total) and
+    /// value sum (failed) — maintained on EVERY sample, including ones
+    /// dropped by the cardinality guard, so the headline failure rate covers
+    /// the whole run (backlog line 59: the per-series sum covered only
+    /// surviving series). NOTE: distributed snapshots carry only `self.data`
+    /// series, so worker-side dropped failures can't be recovered by the
+    /// controller's rebuild_merged — same gap as the old per-series loop.
+    http_req_failed_requests: u64,
+    http_req_failed_sum: f64,
 }
 
 impl Aggregator {
@@ -600,11 +619,14 @@ impl Aggregator {
             histogram_max_ms: None,
             retain_histograms: false,
             max_series: MAX_SERIES,
+            started: Instant::now(),
             merged_http_dur: None,
             merged_iter_dur: None,
             merged_per_url: std::collections::BTreeMap::new(),
             merged_per_group: std::collections::BTreeMap::new(),
             series_dropped: 0,
+            http_req_failed_requests: 0,
+            http_req_failed_sum: 0.0,
         }
     }
 
@@ -671,17 +693,28 @@ impl Aggregator {
             self.totals.insert(sample.metric.to_string(), sample.value);
         }
 
+        // Incremental http_req_failed counters — BEFORE the cardinality guard
+        // so samples dropped for new series still count toward the headline
+        // failure rate (backlog line 59: the old per-series sum in
+        // `build_results` covered only surviving series while `http_reqs`
+        // kept climbing from `totals`, so the rate silently shrank).
+        if sample.metric.as_ref() == "http_req_failed" {
+            self.http_req_failed_requests += 1;
+            self.http_req_failed_sum += sample.value;
+        }
+
         // Cardinality guard: never let the series map grow past `max_series`.
         // The runner tags every request with the full URL in BOTH `url` and
         // `name`, so a high-cardinality input (unique URL per request) must
         // not OOM the aggregator. New series beyond the cap are dropped
-        // (counted, not stored) — existing series keep recording. The
-        // TAG-KEYED accumulators (per-series, per-url, per-group) are bounded
-        // by the cap and are skipped for dropped series — but the SINGLE
-        // headline accumulators (merged_http_dur / merged_iter_dur) are not
-        // tag-keyed, so they are still fed below: skipping them froze
-        // http_req_duration/iteration_duration percentiles while http_reqs
-        // kept climbing (backlog line 53).
+        // (counted, not stored) — existing series keep recording, and the
+        // name-keyed `totals` map stays complete so headline counters keep
+        // accumulating under pressure. The tag-keyed incremental maps
+        // (per-URL/per-group) are bounded by the same cap and are correctly
+        // skipped — but the SINGLE headline accumulators (merged_http_dur /
+        // merged_iter_dur) are NOT tag-keyed, so they must keep recording or
+        // the headline percentiles freeze while `http_reqs` keeps climbing
+        // (backlog line 53).
         if !self.data.contains_key(&key) && self.data.len() >= self.max_series {
             self.series_dropped += 1;
             if self.series_dropped == 1 {
@@ -766,8 +799,11 @@ impl Aggregator {
         let mut metrics = Vec::new();
         let mut http_reqs: u64 = 0;
         let mut http_req_duration: Option<MetricSummary> = None;
-        let mut http_req_failed_count: f64 = 0.0;
-        let mut http_req_failed_total: f64 = 0.0;
+        // Incremental counters maintained in `record()` on EVERY sample
+        // (incl. cardinality-dropped ones) — see `Aggregator`. The old
+        // per-series loop sum here covered only surviving series.
+        let http_req_failed_count: f64 = self.http_req_failed_sum;
+        let http_req_failed_total: f64 = self.http_req_failed_requests as f64;
         let mut errors: u64 = 0;
         let mut checks_total: u64 = 0;
         let mut checks_passed: u64 = 0;
@@ -1075,16 +1111,10 @@ impl Aggregator {
             ));
         }
 
-        // Backlog line 53: the in-loop per-series sum above covered only
-        // SURVIVING series — under cardinality pressure the headline failure
-        // rate was computed from a partial numerator while the displayed
-        // http_reqs denominator stayed complete (stdout multiplies the two).
-        // Read both from the name-keyed totals map (complete by
-        // construction): every request emits one http_reqs Counter (1.0) and
-        // one http_req_failed Rate (1.0 on failure), so
-        // sum(failed)/sum(http_reqs) is the true failure rate.
-        http_req_failed_count = self.totals.get("http_req_failed").copied().unwrap_or(0.0);
-        http_req_failed_total = self.totals.get("http_reqs").copied().unwrap_or(0.0);
+        // http_req_failed rate: the incremental counters (http_req_failed_sum
+        // / http_req_failed_requests, maintained in `record()` on EVERY
+        // sample incl. cardinality-dropped ones) are the single source —
+        // see backlog lines 53/59.
 
         // Headline counters: take the MAX of the surviving series and the
         // totals map. `totals` is keyed by metric NAME and accumulates EVERY
@@ -1123,7 +1153,10 @@ impl Aggregator {
             },
             iterations,
             vus_max,
-            run_duration: Duration::ZERO,
+            // Backlog line 45 (P0): REAL mid-run elapsed — a ZERO here made
+            // every rate/avg threshold compute 0.0 and abortOnFail killed
+            // healthy runs (the engine stamps the final value post-run).
+            run_duration: self.started.elapsed(),
             summary_trend_stats: self.summary_trend_stats.clone(),
             effective_thresholds: self.effective_thresholds.clone(),
         }
@@ -1274,6 +1307,11 @@ impl Aggregator {
         self.merged_iter_dur = None;
         self.merged_per_url.clear();
         self.merged_per_group.clear();
+        // Recompute the incremental http_req_failed counters from the merged
+        // series map (distributed path adds series directly to `self.data`,
+        // bypassing `record()`).
+        self.http_req_failed_requests = 0;
+        self.http_req_failed_sum = 0.0;
         let hmax = self.histogram_max_ms;
         for (key, set) in &self.data {
             if key.metric.as_ref() == "http_req_duration" {
@@ -1298,6 +1336,9 @@ impl Aggregator {
                     .merged_iter_dur
                     .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
                 merged.merge_from(set);
+            } else if key.metric.as_ref() == "http_req_failed" {
+                self.http_req_failed_requests += set.count as u64;
+                self.http_req_failed_sum += set.sum;
             }
             if let Some(group) = key.tags.iter().find(|(k, _)| k.as_ref() == "group") {
                 self.merged_per_group
@@ -2040,6 +2081,33 @@ mod tests {
     }
 
     #[test]
+    fn mid_run_results_report_real_elapsed_duration() {
+        // Backlog line 45 (P0): build_results hardcoded run_duration to ZERO,
+        // so the ~2 s abortOnFail tick evaluated `rate`/`avg` as 0.0 per
+        // second — `http_reqs: ['rate>100', abortOnFail]` aborted healthy
+        // runs at t=2 s and marked runs tainted even without abortOnFail.
+        // The aggregator's own clock must yield a REAL mid-run duration.
+        let ts = std::time::SystemTime::now();
+        let mut agg = Aggregator::new();
+        let mut t = tropel_sdk::types::TagMap::new();
+        t.insert("url", "https://x.test/");
+        agg.record(Sample {
+            metric: "http_reqs".to_string().into(),
+            value: 1.0,
+            tags: Arc::new(t),
+            timestamp: ts,
+            sample_type: SampleType::Counter,
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let res = agg.build_results();
+        assert!(
+            res.run_duration >= Duration::from_millis(15),
+            "mid-run run_duration must be real elapsed (>= sleep), got {:?}",
+            res.run_duration
+        );
+    }
+
+    #[test]
     fn golden_numbers_every_result_field_exact() {
         // Backlog §6 P1: every metric assertion in the real-load tests is
         // `> 0` / `>= 2` / config-derived — nothing validates a reported
@@ -2698,6 +2766,23 @@ mod tests {
         assert_eq!(agg.data.len(), 2, "series map must stay at max_series");
         assert_eq!(agg.series_dropped, 1, "dropped series must be counted");
 
+        // The dropped /c sample still feeds the SINGLE headline accumulator
+        // (backlog line 59: merged_http_dur is NOT tag-keyed, so the guard
+        // must not skip it — the old code froze the headline percentiles
+        // while http_reqs kept climbing from `totals`).
+        let res = agg.build_results();
+        let merged = res
+            .http_req_duration
+            .expect("headline http_req_duration must exist");
+        assert_eq!(
+            merged.count, 3,
+            "dropped-series samples must reach merged_http_dur"
+        );
+        assert_eq!(
+            res.series_dropped, 1,
+            "series_dropped must surface on the result"
+        );
+
         // Existing series still record.
         let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
             ("url", "/a"),
@@ -2776,6 +2861,51 @@ mod tests {
         assert_eq!(
             dur.max, 100,
             "headline max reflects the dropped 100 ms sample (was 10 — frozen)"
+        );
+    }
+
+    #[test]
+    fn test_cardinality_cap_http_req_failed_rate_covers_dropped_series() {
+        // Regression (backlog line 59): http_req_failed was summed inside the
+        // per-series loop, so the failure RATE covered only surviving series
+        // while http_reqs was complete. The incremental counters must include
+        // samples dropped by the cardinality guard.
+        let mut agg = Aggregator::new();
+        agg.max_series = 1;
+        let ts = std::time::SystemTime::now();
+
+        // One surviving FAILED series + one DROPPED PASSED series. This shape
+        // is what distinguishes the paths: the old per-series sum over the
+        // surviving series only would report 1/1 = 1.0; the incremental
+        // counters must report 1/2 = 0.5.
+        let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
+            ("url", "/a"),
+            ("name", "/a"),
+        ]));
+        agg.record(Sample {
+            metric: "http_req_failed".into(),
+            value: 1.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Rate,
+        });
+        let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
+            ("url", "/b"),
+            ("name", "/b"),
+        ]));
+        agg.record(Sample {
+            metric: "http_req_failed".into(),
+            value: 0.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Rate,
+        });
+        assert_eq!(agg.series_dropped, 1, "second series must be dropped");
+
+        let res = agg.build_results();
+        assert_eq!(
+            res.http_req_failed, 0.5,
+            "rate must cover the dropped-series PASS too (1 failed / 2 total)"
         );
     }
 
