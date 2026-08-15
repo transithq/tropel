@@ -1260,6 +1260,7 @@ impl DriverInstance for K6DriverInstance {
 /// fail, http_req_failed counts). Extracted as a free function so the
 /// fallback's field contract is unit-testable without forcing the real
 /// (soft — GC-trigger only) QuickJS memory limit to hard-fail.
+#[cfg(test)] // master's inline pre-guard owns the production degradation path
 fn degrade_to_status0_error<'js>(
     obj: &rquickjs::Object<'js>,
     ctx: &rquickjs::Ctx<'js>,
@@ -8689,7 +8690,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         //     is exactly what the bridge's Err branch applies.
         js_ctx.with_ctx(|ctx| {
             let obj = rquickjs::Object::new(ctx.clone()).unwrap();
-            degrade_to_status0_error(&obj, &ctx, "binary response body allocation failed");
+            degrade_to_status0_error(&obj, ctx, "binary response body allocation failed");
             let code: i32 = obj.get("code").unwrap();
             assert_eq!(code, 0, "degraded response is status-0");
             let status: i32 = obj.get("status").unwrap();
@@ -8713,7 +8714,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         //     envelope as Ok — the allocation is never attempted.
         js_ctx.with_ctx(|ctx| {
             let resp = build_k6_response_object(
-                &ctx,
+                ctx,
                 200,
                 "OK".to_string(),
                 vec![0u8; 32 * 1024 * 1024],
@@ -8723,6 +8724,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 "",
                 0,
                 "binary",
+                &[],
             )
             .expect("pre-guard returns degraded status-0 Ok; 32 MB body never reaches the alloc");
             let code: i32 = resp.get("code").unwrap();
