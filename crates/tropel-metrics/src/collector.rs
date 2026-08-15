@@ -2922,7 +2922,7 @@ mod tests {
             "headline includes the dropped series' sample (was 2 — frozen)"
         );
         assert_eq!(
-            dur.max, 100,
+            dur.max, 100.0,
             "headline max reflects the dropped 100 ms sample (was 10 — frozen)"
         );
     }
