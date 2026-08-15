@@ -539,6 +539,11 @@ impl VUScheduler {
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
+        // Backlog line 53: reject a malformed execution config BEFORE any
+        // dispatch. Without this, an unparseable `duration` / stage duration
+        // / maxDuration was silently defaulted (10s stage, 10min maxDuration)
+        // or swallowed entirely, producing a zero-VU green run.
+        validate_execution_config(&self.config)?;
         match self.config.as_ref() {
             ExecutionConfig::ConstantVus {
                 vus,
@@ -570,11 +575,13 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                // Default maxDuration to 10 minutes (matching k6 behavior)
-                let max_dur = max_duration
-                    .as_ref()
-                    .and_then(|d| parse_duration(d).ok())
-                    .or(Some(Duration::from_secs(600)));
+                // Default maxDuration to 10 minutes (matching k6 behavior).
+                // A PROVIDED but unparseable maxDuration is a config error,
+                // not a silent default (backlog line 53).
+                let max_dur = match max_duration {
+                    Some(d) => Some(parse_duration(d)?),
+                    None => Some(Duration::from_secs(600)),
+                };
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_shared_iterations(*iterations, max_dur, grace, &run_vu)
@@ -603,11 +610,13 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                // Default maxDuration to 10 minutes (matching k6 behavior)
-                let max_dur = max_duration
-                    .as_ref()
-                    .and_then(|d| parse_duration(d).ok())
-                    .or(Some(Duration::from_secs(600)));
+                // Default maxDuration to 10 minutes (matching k6 behavior).
+                // A PROVIDED but unparseable maxDuration is a config error,
+                // not a silent default (backlog line 53).
+                let max_dur = match max_duration {
+                    Some(d) => Some(parse_duration(d)?),
+                    None => Some(Duration::from_secs(600)),
+                };
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_per_vu_iterations(*vus, *iterations, max_dur, grace, &run_vu)
@@ -641,7 +650,12 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                let duration = duration.as_ref().and_then(|d| parse_duration(d).ok());
+                // A PROVIDED but unparseable duration is a config error, not
+                // a silent `None` (backlog line 53).
+                let duration = match duration {
+                    Some(d) => Some(parse_duration(d)?),
+                    None => None,
+                };
                 let grace = graceful_stop_duration(graceful_stop);
                 self.run_externally_controlled(*vus, *max_vus, duration, grace, &run_vu)
                     .await;
@@ -1659,10 +1673,72 @@ fn parse_duration(s: &str) -> Result<Duration> {
     tropel_sdk::parse_duration(s)
 }
 
+/// Backlog line 53: validate every duration string in an `ExecutionConfig`
+/// BEFORE any VU dispatch, so a malformed `duration` / stage duration /
+/// `max_duration` fails the run loudly instead of a zero-VU green run.
+/// The SDK dropped the old `validate()` method; per-variant parsing in
+/// `run()` still happens, but this central check guarantees the error is
+/// raised before a single VU is spawned.
+///
+/// Public so the engine CLI can fail fast on `-d 30x` before the engine
+/// even constructs a scheduler (same backlog line 53 guarantee).
+pub fn validate_execution_config(config: &ExecutionConfig) -> Result<()> {
+    match config {
+        ExecutionConfig::ConstantVus { duration, .. }
+        | ExecutionConfig::ConstantArrivalRate { duration, .. } => {
+            parse_duration(duration)?;
+        }
+        ExecutionConfig::RampingVus { stages, .. } => {
+            for stage in stages {
+                parse_duration(&stage.duration)?;
+            }
+        }
+        ExecutionConfig::RampingArrivalRate { stages, .. } => {
+            for stage in stages {
+                parse_duration(&stage.duration)?;
+            }
+        }
+        ExecutionConfig::SharedIterations { max_duration, .. }
+        | ExecutionConfig::PerVUIterations { max_duration, .. } => {
+            if let Some(d) = max_duration {
+                parse_duration(d)?;
+            }
+        }
+        ExecutionConfig::ExternallyControlled { duration, .. } => {
+            if let Some(d) = duration {
+                parse_duration(d)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// Backlog line 53: a malformed duration (`-d 30x`) used to produce a
+    /// zero-VU green run — `run()` swallowed the parse error and exited 0
+    /// with http_reqs: 0. `run()` must now reject the config up front.
+    #[tokio::test]
+    async fn run_rejects_malformed_duration_up_front() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 50,
+            duration: "30x".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        let result = sched
+            .run(|_sched, _vu_id| tokio::task::spawn(async {}))
+            .await;
+        assert!(
+            result.is_err(),
+            "malformed duration must fail the run, not run zero VUs"
+        );
+        // And the executor must not have started any VU work.
+        assert_eq!(sched.active_vus().await, 0);
+    }
 
     /// VU ids are handed to `run_vu` for data-row rotation / worker pinning /
     /// `exec.vu.idInTest`. They must be unique across scenarios (each scenario
