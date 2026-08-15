@@ -351,10 +351,18 @@ where
         script_failures: script_failures.clone(),
     };
 
-    executor
+    // Backlog line 53: `executor.run(...).await.ok()` used to DISCARD the
+    // scheduler's error — a rejected execution config (e.g. a malformed
+    // duration) ran zero VUs and exited 0 with http_reqs: 0. Any executor
+    // rejection is now counted as a VU-init failure so the engine fails the
+    // run loudly instead of reporting a green zero-work run.
+    if let Err(e) = executor
         .run(move |sched, vu_id| run_vu(sched, vu_id, &shared))
         .await
-        .ok();
+    {
+        tracing::error!("Scenario '{}': executor rejected the run: {}", sc_name, e);
+        vu_init_failures.fetch_add(1, Ordering::SeqCst);
+    }
 
     // A VU that failed to START (driver init / client creation) means the
     // requested load was NOT delivered — surfacing the count loudly here (and
@@ -936,7 +944,14 @@ fn spawn_abort_coordinator(
             }
             let elapsed = test_start.elapsed();
             if elapsed > Duration::from_secs(1) {
-                let results = metrics.results().await;
+                let mut results = metrics.results().await;
+                // Backlog line 45: `results()` stamps run_duration as ZERO —
+                // the engine writes the real elapsed only AFTER the run, so
+                // mid-run counter `rate`/`avg` thresholds divided by 0 and
+                // evaluated to 0.0, and abortOnFail killed healthy runs at
+                // the first check (~2s). Stamp the same wall-clock elapsed
+                // the engine uses post-run so mid-run rates are real.
+                results.run_duration = elapsed;
                 // k6 `tainted`: ANY failed threshold (abortOnFail or not)
                 // marks the run so the control API status doc reports
                 // `tainted: true` (backlog line 154).
