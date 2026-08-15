@@ -257,6 +257,21 @@ impl VUScheduler {
             .store(current_vus.saturating_sub(target), Ordering::Release);
     }
 
+    /// Arm ONE additional ramp-down surplus slot without discarding unclaimed
+    /// ones (backlog line 161 — ramp-down is a cliff, not a ramp).
+    ///
+    /// Stepped arming via [`Self::set_ramp_down_target`] OVERWRITES
+    /// `remaining` on every call, so each step re-arms only its own single
+    /// slot: slots a VU hasn't claimed yet are discarded, and since VUs claim
+    /// only at their loop top (a 2s iteration → one claim opportunity per 2s
+    /// window), a synchronized pool sheds ~1 VU per window and the rest burst
+    /// out at the final re-arm. Incrementing instead of overwriting preserves
+    /// every unclaimed slot, so the pool sheds at the rate the target drops.
+    pub fn arm_ramp_down_step(&self, target: u32) {
+        self.ramp_down_target.store(target, Ordering::Release);
+        self.ramp_down_remaining.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Reset ramp-down state back to "not ramping down".
     /// Called after a ramp-down stage drains fully (all surplus VUs exited)
     /// so a later stage's target/remaining can't spuriously claim. When a
@@ -524,6 +539,11 @@ impl VUScheduler {
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
+        // Backlog line 53: reject a malformed execution config BEFORE any
+        // dispatch. Without this, an unparseable `duration` / stage duration
+        // / maxDuration was silently defaulted (10s stage, 10min maxDuration)
+        // or swallowed entirely, producing a zero-VU green run.
+        validate_execution_config(&self.config)?;
         match self.config.as_ref() {
             ExecutionConfig::ConstantVus {
                 vus,
@@ -546,7 +566,7 @@ impl VUScheduler {
                 let grace_rd = graceful_stop_duration(graceful_ramp_down);
                 let grace = graceful_stop_duration(graceful_stop);
                 self.run_ramping(*start_vus, stages, grace_rd, grace, &run_vu)
-                    .await?;
+                    .await;
                 Ok(())
             }
             ExecutionConfig::SharedIterations {
@@ -555,10 +575,10 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                // Default maxDuration to 10 minutes when ABSENT (k6
-                // behavior); a present-but-unparseable value must fail
-                // loudly, not silently become 10 minutes (backlog line 47).
-                let max_dur = match max_duration.as_ref() {
+                // Default maxDuration to 10 minutes (matching k6 behavior).
+                // A PROVIDED but unparseable maxDuration is a config error,
+                // not a silent default (backlog line 53).
+                let max_dur = match max_duration {
                     Some(d) => Some(parse_duration(d)?),
                     None => Some(Duration::from_secs(600)),
                 };
@@ -590,11 +610,12 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                // Same class as SharedIterations (backlog line 47): a
-                // present-but-unparseable maxDuration must fail loudly.
-                let max_dur = match max_duration.as_ref() {
+                // Default maxDuration to 10 minutes (matching k6 behavior).
+                // A PROVIDED but unparseable maxDuration is a config error,
+                // not a silent default (backlog line 53).
+                let max_dur = match max_duration {
                     Some(d) => Some(parse_duration(d)?),
-                    None => None,
+                    None => Some(Duration::from_secs(600)),
                 };
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
@@ -619,7 +640,7 @@ impl VUScheduler {
                     grace,
                     &run_vu,
                 )
-                .await?;
+                .await;
                 Ok(())
             }
             ExecutionConfig::ExternallyControlled {
@@ -629,9 +650,9 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                // Same class (backlog line 47): a present-but-unparseable
-                // duration must fail loudly, not silently mean "no cap".
-                let duration = match duration.as_ref() {
+                // A PROVIDED but unparseable duration is a config error, not
+                // a silent `None` (backlog line 53).
+                let duration = match duration {
                     Some(d) => Some(parse_duration(d)?),
                     None => None,
                 };
@@ -689,8 +710,7 @@ impl VUScheduler {
         grace_rd: Duration,
         grace: Duration,
         run_vu: &F,
-    ) -> Result<()>
-    where
+    ) where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         tracing::info!("Starting ramping VUs: start={}", start_vus);
@@ -711,9 +731,7 @@ impl VUScheduler {
         // ramp-down gradually lowers the target so VUs exit over the duration
         // instead of as a cliff.
         for stage in stages {
-            // Backlog line 47: an unparseable stage duration must fail
-            // loudly, not silently become 10 s (which changed the profile).
-            let stage_duration = parse_duration(&stage.duration)?;
+            let stage_duration = parse_duration(&stage.duration).unwrap_or(Duration::from_secs(10));
             let target = stage.target;
 
             tracing::info!(
@@ -776,10 +794,14 @@ impl VUScheduler {
                 let stage_nanos = stage_duration.as_nanos();
                 for step in 1..=delta {
                     // Interpolate the ramp-down target from current_vus down
-                    // to `target`, one unit at a time. Arm EXACTLY ONE surplus
-                    // slot per step (remaining = new_target+1 - new_target = 1)
-                    // so exactly one VU exits per step window — a true linear
-                    // ramp. Re-arming to a GROWING value (current_vus -
+                    // to `target`, one unit at a time. Each step ADDS one
+                    // surplus slot (arm_ramp_down_step INCREMENTS remaining)
+                    // instead of overwriting it — the old set_ramp_down_target
+                    // re-armed only the current step's single slot, discarding
+                    // slots VUs hadn't claimed at their loop top yet, so a
+                    // synchronized pool shed ~1 VU per iteration window and
+                    // the rest burst out at the final re-arm (backlog line
+                    // 161). Re-arming to a GROWING value (current_vus -
                     // new_target = step) would let VUs exit in bursts and
                     // overshoot below the final target.
                     let new_target = current_vus - step;
@@ -790,7 +812,7 @@ impl VUScheduler {
                     let offset =
                         Duration::from_nanos((stage_nanos * step as u128 / delta as u128) as u64);
                     time::sleep_until(stage_start + offset).await;
-                    self.set_ramp_down_target(new_target, new_target + 1);
+                    self.arm_ramp_down_step(new_target);
                     tracing::debug!(
                         "Ramp-down step: target {new_target} (from {current_vus}, grace: {:?})",
                         grace_rd
@@ -867,7 +889,6 @@ impl VUScheduler {
         Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
 
         tracing::info!("Ramping VUs finished");
-        Ok(())
     }
 
     /// Run with shared iterations across all VUs.
@@ -917,10 +938,12 @@ impl VUScheduler {
         // with "JoinHandle polled after completion" if a completed handle is
         // re-polled. The old code joined here and then joined AGAIN in
         // `await_handles_bounded`, which panicked the scenario task on every
-        // shared-iterations run. After this block the handles are dropped:
-        // drained VUs are already done, and in the max_duration branch the
-        // level-triggered stop flag plus the engine's active_vus drain loop
-        // let any stragglers exit on their own.
+        // shared-iterations run. In the max_duration branch we DO still call
+        // `await_handles_bounded` (after the select releases its borrow), but
+        // it now skips handles the select already polled to completion (via
+        // the non-polling `is_finished()` check) and aborts only the
+        // stragglers, so no handle is ever re-polled.
+        let mut hit_max_dur = false;
         if let Some(max_dur) = max_duration {
             let all_done = futures::future::join_all(handles.iter_mut());
             tokio::pin!(all_done);
@@ -938,6 +961,7 @@ impl VUScheduler {
                         "Shared iterations: max_duration ({:?}) reached — requesting stop",
                         max_dur
                     );
+                    hit_max_dur = true;
                     self.request_stop();
                     self.wait_for_drain(grace).await;
                 }
@@ -945,6 +969,17 @@ impl VUScheduler {
         } else {
             // No cap — join all VU handles directly (single join, no re-poll).
             futures::future::join_all(handles.iter_mut()).await;
+        }
+
+        // Backlog P2 (line 158): the handles used to be dropped here
+        // un-aborted, so a VU that ignored the stop signal kept issuing HTTP
+        // through the entire summary phase — its samples landed after
+        // results() and were lost. The select above may have already polled
+        // some handles to completion (re-polling panics tokio), so
+        // await_handles_bounded skips finished handles and aborts the
+        // stragglers.
+        if hit_max_dur {
+            Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
         }
 
         tracing::info!("Shared iterations finished");
@@ -1123,20 +1158,20 @@ impl VUScheduler {
         max_vus: u32,
         grace: Duration,
         run_vu: &F,
-    ) -> Result<()>
-    where
+    ) where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
-        // Compute total duration from all stages — an unparseable stage
-        // must fail loudly, not be silently skipped (backlog line 47).
+        // Compute total duration from all stages
         let mut total_duration = Duration::ZERO;
         for stage in stages {
-            total_duration += parse_duration(&stage.duration)?;
+            if let Ok(d) = parse_duration(&stage.duration) {
+                total_duration += d;
+            }
         }
 
         if total_duration == Duration::ZERO {
             tracing::warn!("Ramping arrival rate: total duration is zero, nothing to run");
-            return Ok(());
+            return;
         }
 
         tracing::info!(
@@ -1161,7 +1196,7 @@ impl VUScheduler {
             let mut data = Vec::with_capacity(stages.len());
             let mut prev_target = start_rate;
             for stage in stages {
-                let dur = parse_duration(&stage.duration)?;
+                let dur = parse_duration(&stage.duration).unwrap_or(Duration::from_secs(10));
                 let dur = dur.max(Duration::from_millis(1));
                 let dur_secs = dur.as_secs_f64();
                 data.push((dur_secs, prev_target, stage.target));
@@ -1254,7 +1289,6 @@ impl VUScheduler {
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
         tracing::info!("Ramping arrival rate finished (dropped: {})", dropped_total);
-        Ok(())
     }
 
     /// Run with per-VU iterations — each VU runs exactly N iterations independently.
@@ -1288,7 +1322,12 @@ impl VUScheduler {
         // max_duration is a CAP, not a mandatory wait.
         // Race the JOIN of all VU handles against the timeout (same startup-race
         // fix as run_shared_iterations — see there). Each JoinHandle is polled
-        // exactly once (re-polling a completed handle panics tokio).
+        // exactly once (re-polling a completed handle panics tokio). In the
+        // max_duration branch we DO still call `await_handles_bounded` (after
+        // the select releases its borrow), which skips handles the select
+        // already polled to completion via the non-polling `is_finished()`
+        // check.
+        let mut hit_max_dur = false;
         if let Some(max_dur) = max_duration {
             let all_done = futures::future::join_all(handles.iter_mut());
             tokio::pin!(all_done);
@@ -1306,6 +1345,7 @@ impl VUScheduler {
                         "Per-VU iterations: max_duration ({:?}) reached — requesting stop",
                         max_dur
                     );
+                    hit_max_dur = true;
                     self.request_stop();
                     self.wait_for_drain(grace).await;
                 }
@@ -1313,6 +1353,14 @@ impl VUScheduler {
         } else {
             // No cap — join all VU handles directly (single join, no re-poll).
             futures::future::join_all(handles.iter_mut()).await;
+        }
+
+        // Backlog P2 (line 158): same as run_shared_iterations — the handles
+        // used to be dropped un-aborted, letting stragglers issue HTTP through
+        // the summary phase. Abort them now (finished handles are skipped, not
+        // re-polled).
+        if hit_max_dur {
+            Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
         }
 
         tracing::info!("Per-VU iterations finished");
@@ -1428,10 +1476,16 @@ impl VUScheduler {
                     let handle = run_vu(self.shared_clone(), self.alloc_vu_id());
                     handles.push(handle);
                 }
-                // Synchronous bump — the next tick sees this count even if
-                // the new VUs haven't registered in `active_vus` yet, so a
-                // lagging registration can never trigger a double-spawn.
-                self.control_spawned.store(target, Ordering::Release);
+                // Add the DELTA, never an absolute store: a VU that exited
+                // concurrently (its `vu_exited` decrement landed between the
+                // `load` above and here) must not be clobbered — the old
+                // `store(target)` overwrote those decrements, so the pool
+                // permanently undershot its target (backlog line 164).
+                // `fetch_add` keeps every concurrent decrement, and the next
+                // tick's `target > spawned` sees the true shortfall and
+                // re-spawns the straggler.
+                self.control_spawned
+                    .fetch_add(target - spawned, Ordering::AcqRel);
                 tracing::debug!("Externally-controlled: VU pool {} → {}", spawned, target);
             } else if target < spawned {
                 // Shrink: reuse the ramp-down claim mechanism so exactly
@@ -1470,10 +1524,24 @@ impl VUScheduler {
     /// elapses (the detached tasks are abandoned, matching k6's behaviour of
     /// hard-aborting the run after the grace window).
     async fn await_handles_bounded(handles: &mut [tokio::task::JoinHandle<()>], bound: Duration) {
-        // Inline the join_all into the timeout so its &mut borrows of `handles`
-        // are released when the timeout yields Err — the abort loop below can
-        // then re-borrow immutably.
-        match tokio::time::timeout(bound, futures::future::join_all(handles.iter_mut())).await {
+        // Drop handles the caller's `select!` already polled to completion.
+        // Re-polling a completed JoinHandle panics tokio ("JoinHandle polled
+        // after completion"), and the iteration executors reach us AFTER a
+        // select between join_all and the max_duration timeout — so some
+        // handles may have resolved in that select. `is_finished()` is a
+        // NON-polling check, so filtering here is safe. The survivors are the
+        // stragglers that ignored the stop signal.
+        let mut pending: Vec<&mut tokio::task::JoinHandle<()>> =
+            handles.iter_mut().filter(|h| !h.is_finished()).collect();
+        if pending.is_empty() {
+            tracing::debug!("All VU handles resolved");
+            return;
+        }
+
+        // Inline the join_all into the timeout so its &mut borrows of
+        // `pending` are released when the timeout yields Err — the abort loop
+        // below can then re-borrow immutably.
+        match tokio::time::timeout(bound, futures::future::join_all(pending.iter_mut())).await {
             Ok(_) => tracing::debug!("All VU handles resolved"),
             Err(_) => {
                 tracing::warn!(
@@ -1485,7 +1553,7 @@ impl VUScheduler {
                 // call) kept issuing HTTP after the run reported finished. Abort
                 // is the backstop; the flag-aware JS interrupt and the
                 // interruptible sleep are the primary mechanism.
-                for handle in handles.iter() {
+                for handle in pending.iter() {
                     handle.abort();
                 }
             }
@@ -1605,9 +1673,72 @@ fn parse_duration(s: &str) -> Result<Duration> {
     tropel_sdk::parse_duration(s)
 }
 
+/// Backlog line 53: validate every duration string in an `ExecutionConfig`
+/// BEFORE any VU dispatch, so a malformed `duration` / stage duration /
+/// `max_duration` fails the run loudly instead of a zero-VU green run.
+/// The SDK dropped the old `validate()` method; per-variant parsing in
+/// `run()` still happens, but this central check guarantees the error is
+/// raised before a single VU is spawned.
+///
+/// Public so the engine CLI can fail fast on `-d 30x` before the engine
+/// even constructs a scheduler (same backlog line 53 guarantee).
+pub fn validate_execution_config(config: &ExecutionConfig) -> Result<()> {
+    match config {
+        ExecutionConfig::ConstantVus { duration, .. }
+        | ExecutionConfig::ConstantArrivalRate { duration, .. } => {
+            parse_duration(duration)?;
+        }
+        ExecutionConfig::RampingVus { stages, .. } => {
+            for stage in stages {
+                parse_duration(&stage.duration)?;
+            }
+        }
+        ExecutionConfig::RampingArrivalRate { stages, .. } => {
+            for stage in stages {
+                parse_duration(&stage.duration)?;
+            }
+        }
+        ExecutionConfig::SharedIterations { max_duration, .. }
+        | ExecutionConfig::PerVUIterations { max_duration, .. } => {
+            if let Some(d) = max_duration {
+                parse_duration(d)?;
+            }
+        }
+        ExecutionConfig::ExternallyControlled { duration, .. } => {
+            if let Some(d) = duration {
+                parse_duration(d)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Backlog line 53: a malformed duration (`-d 30x`) used to produce a
+    /// zero-VU green run — `run()` swallowed the parse error and exited 0
+    /// with http_reqs: 0. `run()` must now reject the config up front.
+    #[tokio::test]
+    async fn run_rejects_malformed_duration_up_front() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 50,
+            duration: "30x".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        let result = sched
+            .run(|_sched, _vu_id| tokio::task::spawn(async {}))
+            .await;
+        assert!(
+            result.is_err(),
+            "malformed duration must fail the run, not run zero VUs"
+        );
+        // And the executor must not have started any VU work.
+        assert_eq!(sched.active_vus().await, 0);
+    }
 
     /// VU ids are handed to `run_vu` for data-row rotation / worker pinning /
     /// `exec.vu.idInTest`. They must be unique across scenarios (each scenario
@@ -1751,8 +1882,7 @@ mod tests {
                         Duration::from_millis(40),
                         &run_vu,
                     )
-                    .await
-                    .unwrap();
+                    .await;
             })
         };
         // Sample for 200ms total (10 x 20ms). The run lasts ~260ms (60+80+120)
@@ -1915,6 +2045,39 @@ mod tests {
         sched2.set_ramp_down_target(0, 1);
         assert!(sched2.try_claim_ramp_down(1).await);
         assert_eq!(sched2.control_spawned.load(Ordering::Acquire), 0);
+    }
+
+    /// Backlog line 164: the reconcile grow path must ADD the delta
+    /// (`fetch_add`) instead of storing the absolute target — an absolute
+    /// store clobbers a concurrent `vu_exited` decrement, so the pool
+    /// permanently undershoots its target and the control loop never
+    /// re-spawns the straggler. This mirrors the grow sequence: load
+    /// `spawned`, spawn, then bump by the delta; a VU exiting mid-grow must
+    /// survive.
+    #[tokio::test]
+    async fn control_grow_adds_delta_not_absolute_store() {
+        let sched = VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        sched.control_spawned.store(4, Ordering::Release);
+
+        // Grow from spawned=4 to target=8, exactly as the reconcile loop
+        // does. Between the load and the bump, one VU exits (its
+        // `vu_exited` decrement lands first).
+        let spawned = 4;
+        let target = 8;
+        sched.vu_exited(); // concurrent exit: 4 → 3
+        sched
+            .control_spawned
+            .fetch_add(target - spawned, Ordering::AcqRel);
+
+        // 3 + 4 = 7 — the decrement survives. An absolute store(8) would
+        // have clobbered it, leaving the pool silently one VU short.
+        assert_eq!(sched.control_spawned.load(Ordering::Acquire), 7);
     }
 
     /// Locked (backlog line 170): a VU exiting for ANY reason (not just a
@@ -2205,6 +2368,42 @@ mod tests {
         assert!(!sched.try_claim_ramp_down(4).await); // below target
     }
 
+    /// Backlog §5 P2 (line 161): `set_ramp_down_target` OVERWRITES
+    /// `remaining` on every call, so each stepped re-arm discarded every
+    /// unclaimed slot — a synchronized pool shed ~1 VU per iteration window
+    /// and the rest burst out at the final re-arm. `arm_ramp_down_step`
+    /// INCREMENTS instead: N arms must yield N claimable surplus slots, and
+    /// a claim between two arms must not be discarded by the second arm.
+    #[tokio::test]
+    async fn arm_ramp_down_step_accumulates_slots_across_steps() {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+
+        // Arm 3 steps (100 → 99, 98, 97). Active stays 100, so all qualify.
+        sched.arm_ramp_down_step(99);
+        sched.arm_ramp_down_step(98);
+        sched.arm_ramp_down_step(97);
+
+        // One VU claims mid-way — under the OLD overwrite semantics, the
+        // second arm would have discarded this claim.
+        assert!(sched.try_claim_ramp_down(100).await);
+        // One more arm must ADD a slot, not reset the count.
+        sched.arm_ramp_down_step(96);
+
+        // 3 claims left (4 armed − 1 claimed), then the pool is drained.
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(sched.try_claim_ramp_down(100).await);
+        assert!(
+            !sched.try_claim_ramp_down(100).await,
+            "4th claim must fail: exactly 4 slots were armed, 1 already claimed"
+        );
+    }
+
     /// Backlog §5 P2 (line 160): the ramp loop used act-then-sleep with a
     /// per-step `stage_duration / delta` `Duration` division — a fine ramp
     /// (more steps than the stage has milliseconds) truncated every step and
@@ -2251,5 +2450,86 @@ mod tests {
             elapsed < Duration::from_millis(60),
             "fine ramp must complete in ≈ stage duration, not step-count × 1ms timer floor (took {elapsed:?})"
         );
+    }
+
+    /// Backlog §5 P2 (line 158): the max_duration branch of
+    /// `run_shared_iterations` used to DROP the VU handles un-aborted, so a
+    /// VU that outlived the cap kept running (issuing HTTP) through the whole
+    /// summary phase — its samples landed after `results()` and were lost.
+    /// The branch now awaits the stragglers before returning, so by the time
+    /// the run reports done, every VU task has actually ended.
+    #[tokio::test]
+    async fn shared_iterations_waits_for_slow_stragglers_after_max_duration() {
+        let sched = VUScheduler::new(&ExecutionConfig::SharedIterations {
+            iterations: 100_000, // never exhausts — max_duration is the only exit
+            max_duration: Some("30ms".to_string()),
+            vus: 2,
+            graceful_stop: Some("20ms".to_string()),
+            think_time: Default::default(),
+        });
+
+        // A straggler VU: sleeps past the max_duration cap and only then
+        // finishes its (simulated) iteration. Completion is tracked with an
+        // atomic (JoinHandle is not Clone, so the test can't retain the
+        // handles itself) — the counter increments only when the task body
+        // actually runs to completion.
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_c = completed.clone();
+        let run_vu = move |_sched: Arc<VUScheduler>, _id: u32| {
+            let completed = completed_c.clone();
+            tokio::spawn(async move {
+                // Outlive max_duration (30ms) before the iteration ends.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                completed.fetch_add(1, Ordering::Release);
+            })
+        };
+
+        let start = std::time::Instant::now();
+        sched
+            .run_shared_iterations(
+                100_000,
+                Some(Duration::from_millis(30)),
+                Duration::from_millis(20),
+                &run_vu,
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        // Every VU task must have run to completion when the executor returns
+        // — the old code returned at the 30ms cap with the stragglers still
+        // sleeping (their bodies never reached the counter increment).
+        assert_eq!(
+            completed.load(Ordering::Acquire),
+            2,
+            "all VUs must finish before the run returns (handles were dropped un-aborted)"
+        );
+        // The wait is bounded (HANDLE_JOIN_BOUND) and these VUs end on their
+        // own at ~100ms — the run should return promptly, not at the bound.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "straggler wait should be prompt, took {elapsed:?}"
+        );
+    }
+
+    /// Backlog §5 P2 (line 158): `await_handles_bounded` must skip handles a
+    /// caller's select! already polled to completion — re-polling a completed
+    /// JoinHandle panics tokio ("JoinHandle polled after completion"). The
+    /// max_duration branch reaches it after exactly such a select, so the
+    /// filter (via the NON-polling `is_finished()`) is what makes the call
+    /// safe there.
+    #[tokio::test]
+    async fn await_handles_bounded_skips_already_polled_handles() {
+        // Simulate the select! in the iteration executors: poll a handle to
+        // completion once via join_all, leaving it in the vec.
+        let done = tokio::spawn(async {});
+        let mut handles = vec![done];
+        futures::future::join_all(handles.iter_mut()).await;
+
+        // Re-polling `done` would panic tokio. is_finished() skips it, so
+        // this must return cleanly (and promptly — no pending handles).
+        let start = std::time::Instant::now();
+        VUScheduler::await_handles_bounded(&mut handles, Duration::from_millis(10)).await;
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(handles[0].is_finished());
     }
 }

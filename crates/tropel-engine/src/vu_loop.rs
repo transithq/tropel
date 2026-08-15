@@ -358,30 +358,17 @@ where
         last_active_vus: last_active_vus.clone(),
     };
 
-    // Backlog line 47: a malformed execution config (e.g. `-d 30x`) made
-    // the scheduler's run() return Err, which the old `.ok()` swallowed —
-    // zero VUs ran and the run exited 0 with http_reqs: 0. Surface it as a
-    // VU-init failure so the engine fails the run loudly (same convention
-    // as a panicked scenario task, engine.rs).
+    // Backlog line 53: `executor.run(...).await.ok()` used to DISCARD the
+    // scheduler's error — a rejected execution config (e.g. a malformed
+    // duration) ran zero VUs and exited 0 with http_reqs: 0. Any executor
+    // rejection is now counted as a VU-init failure so the engine fails the
+    // run loudly instead of reporting a green zero-work run.
     if let Err(e) = executor
         .run(move |sched, vu_id| run_vu(sched, vu_id, &shared))
         .await
     {
-        tracing::error!(
-            "Scenario '{}': scheduler rejected the execution config: {}",
-            sc_name,
-            e
-        );
-        // Don't leave the 2s abort poller keeping the metrics aggregator
-        // alive on the error path — and stop the control API task too
-        // (reviewer fix: it was only aborted in the normal tail).
-        if let Some(monitor) = abort_monitor {
-            monitor.abort();
-        }
-        if let Some(handle) = control_server {
-            handle.abort();
-        }
-        return (1, 0);
+        tracing::error!("Scenario '{}': executor rejected the run: {}", sc_name, e);
+        vu_init_failures.fetch_add(1, Ordering::SeqCst);
     }
 
     // A VU that failed to START (driver init / client creation) means the
@@ -961,7 +948,14 @@ fn spawn_abort_coordinator(
             }
             let elapsed = test_start.elapsed();
             if elapsed > Duration::from_secs(1) {
-                let results = metrics.results().await;
+                let mut results = metrics.results().await;
+                // Backlog line 45: `results()` stamps run_duration as ZERO —
+                // the engine writes the real elapsed only AFTER the run, so
+                // mid-run counter `rate`/`avg` thresholds divided by 0 and
+                // evaluated to 0.0, and abortOnFail killed healthy runs at
+                // the first check (~2s). Stamp the same wall-clock elapsed
+                // the engine uses post-run so mid-run rates are real.
+                results.run_duration = elapsed;
                 // k6 `tainted`: ANY failed threshold (abortOnFail or not)
                 // marks the run so the control API status doc reports
                 // `tainted: true` (backlog line 154).
