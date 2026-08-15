@@ -119,6 +119,7 @@ fn convert_items(
                 let mut events = parent_events.to_vec();
                 events.extend(folder.event.iter().cloned());
                 let scenario_item = ScenarioItem {
+                    id: folder.id.clone(),
                     name: folder.name.clone(),
                     request: None,
                     // The folder's own scripts are ALSO folded into every
@@ -159,6 +160,7 @@ fn convert_request_item(
     events.extend(req.event.iter().cloned());
 
     ScenarioItem {
+        id: req.id.clone(),
         name: req.name.clone(),
         request: Some(request),
         prerequest: find_prerequest_script(&events),
@@ -185,7 +187,7 @@ fn convert_request(
 
     let mut url = build_url(detail);
 
-    let headers: HashMap<String, String> = detail
+    let mut headers: HashMap<String, String> = detail
         .header
         .iter()
         .filter(|h| !h.disabled)
@@ -195,6 +197,19 @@ fn convert_request(
     let query_params = build_query_params(detail, &mut url);
 
     let body = convert_body(detail.body.as_ref());
+
+    // Backlog line 138: `options.raw.language` selects the Content-Type for
+    // a raw body (Postman: language "json" → `application/json`, etc.). The
+    // field was parsed and never read — inject the header when the user has
+    // not already set one (case-insensitively).
+    if let Some(content_type) = raw_content_type(detail.body.as_ref()) {
+        let has_ct = headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-type"));
+        if !has_ct {
+            headers.insert("Content-Type".to_string(), content_type);
+        }
+    }
 
     Request {
         url,
@@ -276,12 +291,37 @@ fn build_url(detail: &RequestDetail) -> String {
         None => return String::new(),
     };
 
-    if let Some(raw) = &url.raw {
+    let mut result = if let Some(raw) = &url.raw {
         if !raw.is_empty() {
-            return raw.clone();
+            raw.clone()
+        } else {
+            assemble_url(url)
+        }
+    } else {
+        assemble_url(url)
+    };
+
+    // Backlog line 138: Postman path variables are declared in
+    // `url.variable` as `{key, value}` and referenced in the URL as `:key`
+    // segments (e.g. `https://api.test/users/:id`). They were parsed and
+    // never read — substitute each declared variable into the URL now.
+    for v in &url.variable {
+        // Guard against malformed declarations: an empty key would build
+        // ":" and replace EVERY colon in the URL (protocol + port).
+        if v.key.is_empty() {
+            continue;
+        }
+        if let Some(value) = &v.value {
+            let key = format!(":{}", v.key);
+            result = result.replace(&key, value);
         }
     }
 
+    result
+}
+
+/// Assemble a URL from the structured fields (used when `url.raw` is absent).
+fn assemble_url(url: &UrlDetail) -> String {
     let proto = url.protocol.as_deref().unwrap_or("https");
     let host = url.host.join(".");
     let port = url
@@ -316,7 +356,24 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                     params
                         .iter()
                         .filter(|p| !p.disabled)
-                        .map(|p| (p.key.clone(), p.value.clone().unwrap_or_default()))
+                        .map(|p| {
+                            let value = if p.param_type.as_deref() == Some("file") {
+                                // Backlog line 138: a file part's content
+                                // comes from `src` (a path on disk), not
+                                // `value` — it used to become an EMPTY text
+                                // field. Read the file's text content
+                                // (lossy for binary files — the FormData
+                                // model is HashMap<String, String>).
+                                p.src
+                                    .as_ref()
+                                    .and_then(|s| std::fs::read(s).ok())
+                                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                                    .unwrap_or_default()
+                            } else {
+                                p.value.clone().unwrap_or_default()
+                            };
+                            (p.key.clone(), value)
+                        })
                         .collect(),
                 )
             }),
@@ -330,14 +387,55 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                     variables,
                 }
             }),
-            "file" => b
-                .file
-                .as_ref()
-                .and_then(|f| f.content.clone().map(Body::Raw)),
+            "file" => {
+                if let Some(f) = b.file.as_ref() {
+                    // Exported `content` wins when present (literal body
+                    // text). Backlog line 138: mode:"file" with only `src`
+                    // used to yield NO body at all — read the file from
+                    // disk as binary bytes.
+                    if let Some(content) = &f.content {
+                        if !content.is_empty() {
+                            return Some(Body::Raw(content.clone()));
+                        }
+                    }
+                    if let Some(src) = &f.src {
+                        if let Ok(bytes) = std::fs::read(src) {
+                            return Some(Body::Binary(bytes));
+                        }
+                    }
+                }
+                None
+            }
             _ => b.raw.clone().map(Body::Raw),
         },
         None => None,
     }
+}
+
+/// Postman raw-body `options.raw.language` → Content-Type header (backlog
+/// line 138): a raw body declared as `"language": "json"` must send
+/// `application/json`. Only known languages map; unknown ones get no header.
+fn raw_content_type(body: Option<&RequestBody>) -> Option<String> {
+    let b = body?;
+    if b.mode != "raw" {
+        return None;
+    }
+    let language = b
+        .options
+        .as_ref()?
+        .raw
+        .as_ref()?
+        .language
+        .as_deref()?
+        .to_ascii_lowercase();
+    Some(match language.as_str() {
+        "json" => "application/json".to_string(),
+        "text" => "text/plain".to_string(),
+        "xml" => "application/xml".to_string(),
+        "html" => "text/html".to_string(),
+        "javascript" => "application/javascript".to_string(),
+        _ => return None,
+    })
 }
 
 fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
@@ -448,41 +546,39 @@ fn get_auth_attr(attrs: &[AuthAttribute], key: &str) -> Option<String> {
 }
 
 /// ALL prerequest scripts in the event chain, outer (collection) → inner
-/// (request), concatenated into one script string. Postman is additive: a
-/// collection, each enclosing folder, and the request itself may each
-/// contribute a prerequest script and EVERY one runs, before the request,
-/// in that order. The old find-first behavior silently dropped outer
-/// scripts the moment a deeper level had its own (P0).
-fn find_prerequest_script(events: &[Event]) -> Option<String> {
-    let scripts: Vec<String> = events
+/// (request), as a LIST — one entry per script, NOT concatenated. Postman is
+/// additive: a collection, each enclosing folder, and the request itself may
+/// each contribute a prerequest script and EVERY one runs, before the
+/// request, in that order. The old find-first behavior silently dropped
+/// outer scripts the moment a deeper level had its own (P0).
+///
+/// Each script stays its own element so the runner compiles it into its own
+/// lexical scope (backlog §4): a `const baseUrl` at collection level and at
+/// request level must NOT collide, a top-level `return` only exits its own
+/// script, and each script caches independently — the old single joined
+/// string (`"\n;\n"`) shared one scope, so a redeclared const killed the
+/// whole chain.
+fn find_prerequest_script(events: &[Event]) -> Vec<String> {
+    events
         .iter()
         .filter(|e| e.listen == "prerequest")
         .filter_map(|e| e.script.as_ref())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
-        .collect();
-    if scripts.is_empty() {
-        None
-    } else {
-        Some(scripts.join("\n;\n"))
-    }
+        .collect()
 }
 
-/// ALL test scripts in the event chain, outer → inner, concatenated into
-/// one script string (see `find_prerequest_script`).
-fn find_test_script(events: &[Event]) -> Option<String> {
-    let scripts: Vec<String> = events
+/// ALL test scripts in the event chain, outer → inner, as a LIST — one
+/// entry per script, NOT concatenated (same per-script lexical-scope
+/// semantics as `find_prerequest_script`).
+fn find_test_script(events: &[Event]) -> Vec<String> {
+    events
         .iter()
         .filter(|e| e.listen == "test")
         .filter_map(|e| e.script.as_ref())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
-        .collect();
-    if scripts.is_empty() {
-        None
-    } else {
-        Some(scripts.join("\n;\n"))
-    }
+        .collect()
 }
 
 #[cfg(test)]
@@ -550,6 +646,140 @@ mod tests {
 
         let collection = parse_collection_str(json).unwrap();
         assert_eq!(collection.variable.len(), 2);
+    }
+
+    #[test]
+    fn test_path_variables_substituted_in_url() {
+        // Backlog line 138: url.variable declares path variables referenced
+        // as `:key` segments; they were parsed and never read.
+        let json = r#"{
+            "info": {
+                "name": "PV",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "item": [{
+                "name": "Get User",
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": "https://api.test/users/:id",
+                        "host": ["api", "test"],
+                        "path": ["users", ":id"],
+                        "variable": [{"key": "id", "value": "42"}]
+                    }
+                }
+            }]
+        }"#;
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().expect("request");
+        assert_eq!(req.url, "https://api.test/users/42");
+    }
+
+    #[test]
+    fn test_raw_language_sets_content_type() {
+        // Backlog line 138: options.raw.language ("json") must set
+        // Content-Type: application/json — the field was parsed, never read.
+        let json = r#"{
+            "info": {
+                "name": "CT",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "item": [{
+                "name": "Post",
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.test/echo",
+                    "body": {
+                        "mode": "raw",
+                        "raw": "{\"a\":1}",
+                        "options": {"raw": {"language": "json"}}
+                    }
+                }
+            }]
+        }"#;
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().expect("request");
+        assert_eq!(
+            req.headers.get("Content-Type").map(String::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn test_file_body_reads_src_from_disk() {
+        // Backlog line 138: mode:"file" with only `src` (no exported
+        // content) yielded NO body at all — read the file from disk.
+        let path = std::env::temp_dir().join("tropel-test-upload.txt");
+        std::fs::write(&path, b"file-bytes-123").expect("write temp file");
+        let src = path.display().to_string().replace('\\', "\\\\");
+        let json = format!(
+            r#"{{
+                "info": {{
+                    "name": "F",
+                    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                }},
+                "item": [{{
+                    "name": "Upload",
+                    "request": {{
+                        "method": "POST",
+                        "url": "https://api.test/upload",
+                        "body": {{"mode": "file", "file": {{"src": "{src}"}}}}
+                    }}
+                }}]
+            }}"#
+        );
+        let collection = parse_collection_str(&json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().expect("request");
+        match &req.body {
+            Some(Body::Binary(bytes)) => assert_eq!(bytes, b"file-bytes-123"),
+            other => panic!("expected Binary body, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_formdata_file_part_reads_src() {
+        // Backlog line 138: a formdata part with type:"file" became an
+        // EMPTY text field — the content comes from `src` on disk.
+        let path = std::env::temp_dir().join("tropel-test-form.txt");
+        std::fs::write(&path, b"part-contents").expect("write temp file");
+        let src = path.display().to_string().replace('\\', "\\\\");
+        let json = format!(
+            r#"{{
+                "info": {{
+                    "name": "FD",
+                    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                }},
+                "item": [{{
+                    "name": "Form",
+                    "request": {{
+                        "method": "POST",
+                        "url": "https://api.test/form",
+                        "body": {{
+                            "mode": "formdata",
+                            "formdata": [
+                                {{"key": "name", "value": "alice"}},
+                                {{"key": "file", "type": "file", "src": "{src}"}}
+                            ]
+                        }}
+                    }}
+                }}]
+            }}"#
+        );
+        let collection = parse_collection_str(&json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().expect("request");
+        match &req.body {
+            Some(Body::FormData(map)) => {
+                assert_eq!(map.get("name").map(String::as_str), Some("alice"));
+                assert_eq!(map.get("file").map(String::as_str), Some("part-contents"));
+            }
+            other => panic!("expected FormData body, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -664,9 +894,9 @@ mod tests {
         let collection = parse_collection_str(json).unwrap();
         let scenario = collection_to_scenario(collection, HashMap::new());
 
-        assert!(scenario.items[0].prerequest.is_some());
-        assert!(scenario.items[0].test.is_some());
-        assert!(scenario.items[0].test.as_ref().unwrap().contains("pm.test"));
+        assert!(!scenario.items[0].prerequest.is_empty());
+        assert!(!scenario.items[0].test.is_empty());
+        assert!(scenario.items[0].test[0].contains("pm.test"));
     }
 
     #[test]
@@ -711,24 +941,20 @@ mod tests {
         assert_eq!(folder.name, "Folder");
         let inner = &folder.items[0];
 
-        // Prerequest: ALL three levels concatenated, outer→inner.
-        let pre = inner
-            .prerequest
-            .as_ref()
-            .expect("leaf must carry prerequest");
-        let c = pre
-            .find("COLLECTION_PREREQUEST")
-            .expect("collection script folded");
-        let f = pre.find("FOLDER_PREREQUEST").expect("folder script folded");
-        let i = pre.find("INNER_PREREQUEST").expect("request script kept");
-        assert!(c < f && f < i, "prerequest must be outer→inner, got: {pre}");
+        // Prerequest: ALL three levels folded as a LIST, outer→inner, each
+        // in its own element (per-script lexical scope, backlog §4).
+        let pre = &inner.prerequest;
+        assert_eq!(pre.len(), 3, "all three levels must fold, got: {pre:?}");
+        assert!(pre[0].contains("COLLECTION_PREREQUEST"));
+        assert!(pre[1].contains("FOLDER_PREREQUEST"));
+        assert!(pre[2].contains("INNER_PREREQUEST"));
 
-        // Test: ALL three levels concatenated, outer→inner.
-        let t = inner.test.as_ref().expect("leaf must carry test");
-        let c = t.find("COLLECTION_TEST").expect("collection test folded");
-        let f = t.find("FOLDER_TEST").expect("folder test folded");
-        let i = t.find("INNER_TEST").expect("request test kept");
-        assert!(c < f && f < i, "test must be outer→inner, got: {t}");
+        // Test: ALL three levels folded, outer→inner.
+        let t = &inner.test;
+        assert_eq!(t.len(), 3, "all three test levels must fold, got: {t:?}");
+        assert!(t[0].contains("COLLECTION_TEST"));
+        assert!(t[1].contains("FOLDER_TEST"));
+        assert!(t[2].contains("INNER_TEST"));
     }
 
     #[test]
@@ -751,18 +977,10 @@ mod tests {
         }"#;
 
         let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
-        let pre = scenario.items[0]
-            .prerequest
-            .as_ref()
-            .expect("leaf must carry prerequest");
-        let c = pre
-            .find("COLL_PRE")
-            .expect("collection script must be inherited");
-        let r = pre.find("REQ_PRE").expect("request script must be present");
-        assert!(
-            c < r,
-            "inherited script must run before the request's own: {pre}"
-        );
+        let pre = &scenario.items[0].prerequest;
+        assert_eq!(pre.len(), 2, "inherited + own script, got: {pre:?}");
+        assert!(pre[0].contains("COLL_PRE"), "inherited script first");
+        assert!(pre[1].contains("REQ_PRE"), "request's own script second");
     }
 
     #[test]
@@ -1120,10 +1338,10 @@ mod tests {
         assert_eq!(req.url, "https://api.example.com/shapes");
         assert_eq!(req.headers.get("X-No-Value").map(String::as_str), Some(""));
         // String-form exec must still surface as a test script.
-        let test = scenario.items[0].test.as_ref().expect("test script parsed");
+        let test = &scenario.items[0].test;
         assert!(
-            test.contains("pm.test"),
-            "string-form exec joined into script"
+            test[0].contains("pm.test"),
+            "string-form exec must surface as a test script"
         );
     }
 

@@ -886,6 +886,8 @@ struct WasmScenario {
 
 #[derive(serde::Deserialize)]
 struct WasmItem {
+    #[serde(default)]
+    id: Option<String>,
     name: String,
     #[serde(default)]
     request: Option<WasmRequest>,
@@ -966,10 +968,14 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
         .iter()
         .map(|wi| -> Result<ScenarioItem> {
             Ok(ScenarioItem {
+                id: wi.id.clone(),
                 name: wi.name.clone(),
                 request: wi.request.as_ref().map(convert_request).transpose()?,
-                prerequest: wi.prerequest.clone(),
-                test: wi.test.clone(),
+                // The wire format keeps a single Option<string> (backlog §4:
+                // WASM adapters emit one script); ScenarioItem now carries a
+                // LIST so each script runs in its own lexical scope.
+                prerequest: wi.prerequest.clone().map(|s| vec![s]).unwrap_or_default(),
+                test: wi.test.clone().map(|s| vec![s]).unwrap_or_default(),
                 assertions: wi.assertions.clone(),
                 items: Vec::new(),
             })
@@ -990,10 +996,11 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
             .map(|wi| -> Result<ScenarioItem> {
                 let children = build_item_tree(&wi.items)?;
                 Ok(ScenarioItem {
+                    id: wi.id.clone(),
                     name: wi.name.clone(),
                     request: wi.request.as_ref().map(convert_request).transpose()?,
-                    prerequest: wi.prerequest.clone(),
-                    test: wi.test.clone(),
+                    prerequest: wi.prerequest.clone().map(|s| vec![s]).unwrap_or_default(),
+                    test: wi.test.clone().map(|s| vec![s]).unwrap_or_default(),
                     assertions: wi.assertions.clone(),
                     items: children,
                 })
