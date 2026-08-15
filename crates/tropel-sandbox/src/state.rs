@@ -15,6 +15,11 @@ pub struct PmState {
     pub collection_vars: HashMap<String, Value>,
     /// Global variables.
     pub globals: HashMap<String, Value>,
+    /// Local variables (pm.variables) — Postman's highest-priority scope.
+    /// Backlog line 137: pm.variables.set used to write to collection_vars
+    /// while get read data > env > collection, so set-then-get could return
+    /// a different value. Local is its own store now, checked first.
+    pub local_vars: HashMap<String, Value>,
     /// Current response (set before test script runs).
     pub response: Option<Response>,
     /// Current request being executed.
@@ -103,6 +108,7 @@ impl PmState {
             environment: HashMap::new(),
             collection_vars: HashMap::new(),
             globals: HashMap::new(),
+            local_vars: HashMap::new(),
             response: None,
             request: None,
             assertions: AssertionCounters::default(),

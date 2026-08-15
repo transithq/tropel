@@ -754,6 +754,10 @@ impl ScenarioRunner {
             env.insert(k.clone(), v.clone());
         }
         tropel_variables::VariableScope {
+            // pm.variables is the LOCAL scope — Postman's highest priority
+            // (backlog line 137): script-set values must win over data/env
+            // for {{var}} substitution in later requests.
+            local: state.local_vars.clone(),
             data,
             env,
             collection: state.collection_vars.clone(),
@@ -938,8 +942,8 @@ mod tests {
 
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
-            id: None,
             name: name.to_string(),
+            id: None,
             request: Some(tropel_sdk::types::Request {
                 url: format!("http://example.com/{name}"),
                 method: Method::GET,
@@ -961,8 +965,8 @@ mod tests {
 
     fn folder(name: &str, items: Vec<ScenarioItem>) -> ScenarioItem {
         ScenarioItem {
-            id: None,
             name: name.to_string(),
+            id: None,
             request: None,
             prerequest: vec![],
             test: vec![],
@@ -1044,8 +1048,8 @@ mod tests {
         // A leaf with no request and no scripts is not executable; it must
         // not appear in the run order.
         let inert = ScenarioItem {
-            id: None,
             name: "inert".into(),
+            id: None,
             request: None,
             prerequest: vec![],
             test: vec![],
@@ -1175,8 +1179,8 @@ mod tests {
             auth: None,
             items: vec![
                 ScenarioItem {
-                    id: None,
                     name: "item-a".into(),
+                    id: None,
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/a".into(),
                         method: Method::GET,
@@ -1195,8 +1199,8 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
-                    id: None,
                     name: "item-b".into(),
+                    id: None,
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/b".into(),
                         method: Method::GET,
@@ -1267,8 +1271,8 @@ mod tests {
             // forever. Both items are script-only — no network traffic.
             items: vec![
                 ScenarioItem {
-                    id: None,
                     name: "self".into(),
+                    id: None,
                     request: None,
                     prerequest: vec!["postman.setNextRequest('self');".into()],
                     test: vec![],
@@ -1276,8 +1280,8 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
-                    id: None,
                     name: "after".into(),
+                    id: None,
                     request: None,
                     prerequest: vec!["// inert".into()],
                     test: vec![],
@@ -1364,8 +1368,8 @@ mod tests {
             items: vec![folder(
                 "Folder",
                 vec![ScenarioItem {
-                    id: None,
                     name: "inner".into(),
+                    id: None,
                     request: None,
                     prerequest: vec![
                         "pm.environment.set('token', 'tok-42'); // COLLECTION; FOLDER; REQUEST"
@@ -1478,8 +1482,8 @@ mod tests {
             //      string would throw here) AND returns early
             //   2: request — must STILL run (return only exits script 1)
             items: vec![ScenarioItem {
-                id: None,
                 name: "scoped".into(),
+                id: None,
                 request: None,
                 prerequest: vec![
                     "const baseUrl = 'https://api.example.com'; // COLLECTION".into(),
@@ -1752,6 +1756,32 @@ mod tests {
             state.environment.get("sawIdx2").map(String::as_str),
             Some("1"),
             "execution continues past the jump target (Postman flow)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pm_variables_local_scope_shadows_iteration_data() {
+        // Backlog line 137: pm.variables.set wrote to COLLECTION scope while
+        // get read data > env > collection — set-then-get disagreed when
+        // iteration data had the same key. pm.variables is Postman's LOCAL
+        // (highest-priority) scope: the set value must win, both for
+        // pm.variables.get and for {{var}} substitution in later requests.
+        let mut runner = runner_with_scripts(vec![
+            script_item("first", "pm.variables.set('token', 'local-tok');"),
+            script_item(
+                "second",
+                "pm.environment.set('saw', pm.variables.get('token'));",
+            ),
+        ])
+        .await;
+        let data: HashMap<String, serde_json::Value> =
+            HashMap::from([("token".into(), serde_json::Value::String("data-tok".into()))]);
+        let _ = runner.run_iteration(0, Some(data), &HashMap::new()).await;
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("saw").map(String::as_str),
+            Some("local-tok"),
+            "pm.variables (local scope) must win over iteration data"
         );
     }
 }

@@ -187,7 +187,7 @@ fn convert_request(
 
     let mut url = build_url(detail);
 
-    let headers: HashMap<String, String> = detail
+    let mut headers: HashMap<String, String> = detail
         .header
         .iter()
         .filter(|h| !h.disabled)
@@ -197,6 +197,19 @@ fn convert_request(
     let query_params = build_query_params(detail, &mut url);
 
     let body = convert_body(detail.body.as_ref());
+
+    // Backlog line 138: `options.raw.language` selects the Content-Type for
+    // a raw body (Postman: language "json" → `application/json`, etc.). The
+    // field was parsed and never read — inject the header when the user has
+    // not already set one (case-insensitively).
+    if let Some(content_type) = raw_content_type(detail.body.as_ref()) {
+        let has_ct = headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-type"));
+        if !has_ct {
+            headers.insert("Content-Type".to_string(), content_type);
+        }
+    }
 
     Request {
         url,
@@ -278,12 +291,37 @@ fn build_url(detail: &RequestDetail) -> String {
         None => return String::new(),
     };
 
-    if let Some(raw) = &url.raw {
+    let mut result = if let Some(raw) = &url.raw {
         if !raw.is_empty() {
-            return raw.clone();
+            raw.clone()
+        } else {
+            assemble_url(url)
+        }
+    } else {
+        assemble_url(url)
+    };
+
+    // Backlog line 138: Postman path variables are declared in
+    // `url.variable` as `{key, value}` and referenced in the URL as `:key`
+    // segments (e.g. `https://api.test/users/:id`). They were parsed and
+    // never read — substitute each declared variable into the URL now.
+    for v in &url.variable {
+        // Guard against malformed declarations: an empty key would build
+        // ":" and replace EVERY colon in the URL (protocol + port).
+        if v.key.is_empty() {
+            continue;
+        }
+        if let Some(value) = &v.value {
+            let key = format!(":{}", v.key);
+            result = result.replace(&key, value);
         }
     }
 
+    result
+}
+
+/// Assemble a URL from the structured fields (used when `url.raw` is absent).
+fn assemble_url(url: &UrlDetail) -> String {
     let proto = url.protocol.as_deref().unwrap_or("https");
     let host = url.host.join(".");
     let port = url
@@ -318,7 +356,24 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                     params
                         .iter()
                         .filter(|p| !p.disabled)
-                        .map(|p| (p.key.clone(), p.value.clone().unwrap_or_default()))
+                        .map(|p| {
+                            let value = if p.param_type.as_deref() == Some("file") {
+                                // Backlog line 138: a file part's content
+                                // comes from `src` (a path on disk), not
+                                // `value` — it used to become an EMPTY text
+                                // field. Read the file's text content
+                                // (lossy for binary files — the FormData
+                                // model is HashMap<String, String>).
+                                p.src
+                                    .as_ref()
+                                    .and_then(|s| std::fs::read(s).ok())
+                                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                                    .unwrap_or_default()
+                            } else {
+                                p.value.clone().unwrap_or_default()
+                            };
+                            (p.key.clone(), value)
+                        })
                         .collect(),
                 )
             }),
@@ -332,14 +387,55 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                     variables,
                 }
             }),
-            "file" => b
-                .file
-                .as_ref()
-                .and_then(|f| f.content.clone().map(Body::Raw)),
+            "file" => {
+                if let Some(f) = b.file.as_ref() {
+                    // Exported `content` wins when present (literal body
+                    // text). Backlog line 138: mode:"file" with only `src`
+                    // used to yield NO body at all — read the file from
+                    // disk as binary bytes.
+                    if let Some(content) = &f.content {
+                        if !content.is_empty() {
+                            return Some(Body::Raw(content.clone()));
+                        }
+                    }
+                    if let Some(src) = &f.src {
+                        if let Ok(bytes) = std::fs::read(src) {
+                            return Some(Body::Binary(bytes));
+                        }
+                    }
+                }
+                None
+            }
             _ => b.raw.clone().map(Body::Raw),
         },
         None => None,
     }
+}
+
+/// Postman raw-body `options.raw.language` → Content-Type header (backlog
+/// line 138): a raw body declared as `"language": "json"` must send
+/// `application/json`. Only known languages map; unknown ones get no header.
+fn raw_content_type(body: Option<&RequestBody>) -> Option<String> {
+    let b = body?;
+    if b.mode != "raw" {
+        return None;
+    }
+    let language = b
+        .options
+        .as_ref()?
+        .raw
+        .as_ref()?
+        .language
+        .as_deref()?
+        .to_ascii_lowercase();
+    Some(match language.as_str() {
+        "json" => "application/json".to_string(),
+        "text" => "text/plain".to_string(),
+        "xml" => "application/xml".to_string(),
+        "html" => "text/html".to_string(),
+        "javascript" => "application/javascript".to_string(),
+        _ => return None,
+    })
 }
 
 fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
@@ -550,6 +646,140 @@ mod tests {
 
         let collection = parse_collection_str(json).unwrap();
         assert_eq!(collection.variable.len(), 2);
+    }
+
+    #[test]
+    fn test_path_variables_substituted_in_url() {
+        // Backlog line 138: url.variable declares path variables referenced
+        // as `:key` segments; they were parsed and never read.
+        let json = r#"{
+            "info": {
+                "name": "PV",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "item": [{
+                "name": "Get User",
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": "https://api.test/users/:id",
+                        "host": ["api", "test"],
+                        "path": ["users", ":id"],
+                        "variable": [{"key": "id", "value": "42"}]
+                    }
+                }
+            }]
+        }"#;
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().expect("request");
+        assert_eq!(req.url, "https://api.test/users/42");
+    }
+
+    #[test]
+    fn test_raw_language_sets_content_type() {
+        // Backlog line 138: options.raw.language ("json") must set
+        // Content-Type: application/json — the field was parsed, never read.
+        let json = r#"{
+            "info": {
+                "name": "CT",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "item": [{
+                "name": "Post",
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.test/echo",
+                    "body": {
+                        "mode": "raw",
+                        "raw": "{\"a\":1}",
+                        "options": {"raw": {"language": "json"}}
+                    }
+                }
+            }]
+        }"#;
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().expect("request");
+        assert_eq!(
+            req.headers.get("Content-Type").map(String::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn test_file_body_reads_src_from_disk() {
+        // Backlog line 138: mode:"file" with only `src` (no exported
+        // content) yielded NO body at all — read the file from disk.
+        let path = std::env::temp_dir().join("tropel-test-upload.txt");
+        std::fs::write(&path, b"file-bytes-123").expect("write temp file");
+        let src = path.display().to_string().replace('\\', "\\\\");
+        let json = format!(
+            r#"{{
+                "info": {{
+                    "name": "F",
+                    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                }},
+                "item": [{{
+                    "name": "Upload",
+                    "request": {{
+                        "method": "POST",
+                        "url": "https://api.test/upload",
+                        "body": {{"mode": "file", "file": {{"src": "{src}"}}}}
+                    }}
+                }}]
+            }}"#
+        );
+        let collection = parse_collection_str(&json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().expect("request");
+        match &req.body {
+            Some(Body::Binary(bytes)) => assert_eq!(bytes, b"file-bytes-123"),
+            other => panic!("expected Binary body, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_formdata_file_part_reads_src() {
+        // Backlog line 138: a formdata part with type:"file" became an
+        // EMPTY text field — the content comes from `src` on disk.
+        let path = std::env::temp_dir().join("tropel-test-form.txt");
+        std::fs::write(&path, b"part-contents").expect("write temp file");
+        let src = path.display().to_string().replace('\\', "\\\\");
+        let json = format!(
+            r#"{{
+                "info": {{
+                    "name": "FD",
+                    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                }},
+                "item": [{{
+                    "name": "Form",
+                    "request": {{
+                        "method": "POST",
+                        "url": "https://api.test/form",
+                        "body": {{
+                            "mode": "formdata",
+                            "formdata": [
+                                {{"key": "name", "value": "alice"}},
+                                {{"key": "file", "type": "file", "src": "{src}"}}
+                            ]
+                        }}
+                    }}
+                }}]
+            }}"#
+        );
+        let collection = parse_collection_str(&json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().expect("request");
+        match &req.body {
+            Some(Body::FormData(map)) => {
+                assert_eq!(map.get("name").map(String::as_str), Some("alice"));
+                assert_eq!(map.get("file").map(String::as_str), Some("part-contents"));
+            }
+            other => panic!("expected FormData body, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
