@@ -87,4 +87,6 @@ temp/
 # ── Backlog docs — local only, never tracked (avoids CI churn) ─
 /TROPEL_BACKLOG_V2.md
 /TROPEL_BACKLOG_V2_X.md
+
+# Freebuff local app database (never commit)
 .freebuff/
