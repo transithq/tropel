@@ -147,7 +147,20 @@ function k6HTTPRequest(method, url, body, params) {
         };
     }
 
-    var resp = new K6Response(respCode, respBody, normalizedHeaders, timings, url);
+    // Backlog line 102: cookies from the native bridge (k6 shape) and the
+    // request that produced this response. k6's Response.request is the
+    // REQUEST (method/url/headers/body/cookies) — not the response — so
+    // headers come from canonical.headers and body from canonical.body.
+    var resp = new K6Response(
+        respCode, respBody, normalizedHeaders, timings, url,
+        result.cookies, {
+            method: canonical.method,
+            url: canonical.url,
+            headers: canonical.headers,
+            body: canonical.body,
+            cookies: result.cookies || {}
+        }
+    );
     // Backlog line 150: k6 Response.error ("" on success) / error_code (0 on
     // success, 1xxx on transport failure) — `if (res.error)` now detects
     // failures like k6.
@@ -463,14 +476,102 @@ function escapeMultipartFieldName(name) {
 // Response object (k6-compatible)
 // ══════════════════════════════════════════════════════════════════
 
-function K6Response(status, body, headers, timings, url) {
+// Backlog line 102: res.cookies / res.request / proto / remote_ip / html()
+// were absent — res.cookies['sid'] threw TypeError. Cookies are real data
+// from the native bridge (name -> [cookie objects], k6 shape); request is
+// the k6 Response.request {method, url, headers, body, cookies}; proto /
+// remote_ip are best-effort defaults (reqwest doesn't expose the wire
+// version or peer IP through the SDK Response), present so scripts never
+// throw on them.
+function K6Response(status, body, headers, timings, url, cookies, requestInfo) {
     this.status = status;
     this.body = body;
     this.headers = headers || {};
     this.timings = timings || { blocked: 0, connecting: 0, tls_handshaking: 0, sending: 0, waiting: 0, receiving: 0, duration: 0 };
     this.url = url || '';
     this.status_text = String(status) + ' ' + getStatusText(status);
+    this.cookies = cookies || {};
+    this.request = requestInfo || { method: 'GET', url: url || '', headers: this.headers, body: body, cookies: this.cookies };
+    this.proto = 'HTTP/1.1';
+    this.remote_ip = '';
 }
+
+// Backlog line 102: res.html() was absent entirely. k6 parses the body
+// into a jQuery-like Selection (goquery); quickjs has no DOM parser, so
+// this is a regex-based subset covering the common idioms — find by tag /
+// #id / .class, plus html()/text()/attr()/eq()/size(). Complex or unknown
+// selectors yield an EMPTY selection (never throw), matching k6's
+// behaviour for a no-match.
+function K6HtmlSelection(body) {
+    this._body = String(body || '');
+    this._els = [this._body]; // one "element": the whole document
+    this.length = 1;
+}
+K6HtmlSelection.prototype.find = function (selector) {
+    var s = String(selector || '').trim();
+    var matches = [];
+    // Capture the WHOLE element (open tag + content + matching close tag, or
+    // a self-closing tag), so .text() returns the element's text exactly like
+    // goquery's find() — matching only the open tag would strip it to ''.
+    var re = null;
+    if (/^#/.test(s)) {
+        var id = s.slice(1);
+        re = new RegExp(
+            '<([a-z][a-z0-9]*)[^>]*\\sid=["\']' + id + '["\'][^>]*>[\\s\\S]*?<\\/\\1>'
+            + '|<[a-z][a-z0-9]*[^>]*\\sid=["\']' + id + '["\'][^>]*\\/>',
+            'gi'
+        );
+    } else if (/^\./.test(s)) {
+        var cls = s.slice(1);
+        re = new RegExp(
+            '<([a-z][a-z0-9]*)[^>]*\\sclass=["\'][^"\']*\\b' + cls + '\\b[^"\']*["\'][^>]*>[\\s\\S]*?<\\/\\1>'
+            + '|<[a-z][a-z0-9]*[^>]*\\sclass=["\'][^"\']*\\b' + cls + '\\b[^"\']*["\'][^>]*\\/>',
+            'gi'
+        );
+    } else if (/^[a-z][a-z0-9]*$/.test(s)) {
+        re = new RegExp(
+            '<(' + s + ')\\b[^>]*>[\\s\\S]*?<\\/\\1>|<' + s + '\\b[^>]*\\/>',
+            'gi'
+        );
+    }
+    if (re) {
+        var m;
+        while ((m = re.exec(this._body)) !== null) matches.push(m[0]);
+    }
+    var out = new K6HtmlSelection('');
+    out._els = matches;
+    out.length = matches.length;
+    return out;
+};
+K6HtmlSelection.prototype.html = function () {
+    return this._els.join('');
+};
+K6HtmlSelection.prototype.text = function () {
+    return this._els.map(function (e) { return String(e).replace(/<[^>]*>/g, ''); }).join('');
+};
+K6HtmlSelection.prototype.attr = function (name) {
+    if (!this._els.length) return undefined;
+    var re = new RegExp('\\s' + name + '=["\']([^"\']*)["\']', 'i');
+    var m = String(this._els[0]).match(re);
+    return m ? m[1] : undefined;
+};
+K6HtmlSelection.prototype.eq = function (i) {
+    var out = new K6HtmlSelection('');
+    out._els = [this._els[i]].filter(function (e) { return e !== undefined; });
+    out.length = out._els.length;
+    return out;
+};
+K6HtmlSelection.prototype.size = function () {
+    return this.length;
+};
+K6Response.prototype.html = function () {
+    // Only text bodies carry parseable HTML; binary/none responseTypes
+    // yield an empty selection rather than garbage from coercion.
+    if (typeof this.body === 'string') {
+        return new K6HtmlSelection(this.body);
+    }
+    return new K6HtmlSelection('');
+};
 
 // Backlog line 154: k6's res.json() accepts an OPTIONAL selector. k6 uses
 // gjson-style dotted paths ('a.b.0' -> obj.a.b[0], also array wildcards like
@@ -697,7 +798,19 @@ http.batch = function (requests) {
                     duration: timings.duration || rtime
                 };
             }
-            var resp = new K6Response(code, bodyVal, normalizedHeaders, timings, entry.url);
+            var resp = new K6Response(
+                code, bodyVal, normalizedHeaders, timings, entry.url,
+                raw.cookies, {
+                    // k6 parity: Response.request is the REQUEST, so headers
+                    // are the serialized request headers from the first loop
+                    // (the response headers live on res.headers, not here).
+                    method: entry.method || 'GET',
+                    url: entry.url || '',
+                    headers: normalized[ei] ? JSON.parse(normalized[ei].headers_json) : {},
+                    body: entry.body !== undefined ? entry.body : '',
+                    cookies: raw.cookies || {}
+                }
+            );
             resp.error = raw.error || '';
             resp.error_code = raw.error_code || 0;
             if (isArrayInput) {
