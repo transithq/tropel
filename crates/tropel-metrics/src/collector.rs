@@ -204,14 +204,22 @@ impl MetricSet {
                 // count/sum covered everything → arithmetically impossible
                 // results like `min > avg` and wrong p-values.
                 //
-                // Values are rounded (not truncated) because `value as u64`
-                // silently dropped sub-µs samples: `myTrend.add(0.25)` (ms)
-                // became 0 µs → p(95)=0, max=0. Rounding keeps fractional
-                // µs values ≥ 0.5 in the distribution.
+                // Sub-ms samples are preserved end-to-end (backlog line 57):
+                // `record_ms` converts fractional ms to μs internally, so a
+                // 0.3 ms p50 lands in its true bucket instead of being
+                // quantized to 1 ms. Raw min/max are tracked as exact f64 so
+                // `min ≤ avg` always holds even when every sample is 0
+                // (histogram clamps 0 to its 1 μs low bound).
                 let h = self
                     .histogram
                     .get_or_insert_with(|| LatencyHistogram::with_max(self.histogram_max_ms));
-                h.record_ms(value.max(0.0).round() as u64);
+                h.record_ms(value.max(0.0));
+                if value < self.min {
+                    self.min = value;
+                }
+                if value > self.max {
+                    self.max = value;
+                }
                 self.count += 1.0;
                 self.sum += value;
             }
@@ -244,14 +252,16 @@ impl MetricSet {
                 mine.merge(h);
             }
         }
-        if self.metric_type == MetricType::Gauge {
+        if self.metric_type == MetricType::Gauge || self.metric_type == MetricType::Trend {
             if other.min < self.min {
                 self.min = other.min;
             }
             if other.max > self.max {
                 self.max = other.max;
             }
-            self.last = other.last;
+            if self.metric_type == MetricType::Gauge {
+                self.last = other.last;
+            }
         }
     }
 
@@ -853,12 +863,12 @@ impl Aggregator {
                     count: set.sum as u64,
                     sum: set.sum,
                     mean: set.mean(),
-                    min: 0,
-                    max: 0,
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: 0.0,
+                    max: 0.0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: 0.0,
                     rate: 0.0,
                     histogram: None,
@@ -870,12 +880,12 @@ impl Aggregator {
                     count: set.count as u64,
                     sum: set.sum,
                     mean: set.mean(),
-                    min: 0,
-                    max: 0,
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: 0.0,
+                    max: 0.0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: 0.0,
                     rate: set.rate(),
                     histogram: None,
@@ -887,20 +897,12 @@ impl Aggregator {
                     count: set.count as u64,
                     sum: set.sum,
                     mean: set.mean(),
-                    min: if set.min == f64::MAX {
-                        0
-                    } else {
-                        set.min as u64
-                    },
-                    max: if set.max == f64::MIN {
-                        0
-                    } else {
-                        set.max as u64
-                    },
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: if set.min == f64::MAX { 0.0 } else { set.min },
+                    max: if set.max == f64::MIN { 0.0 } else { set.max },
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: set.last,
                     rate: 0.0,
                     histogram: None,
@@ -911,6 +913,8 @@ impl Aggregator {
                     set.count as u64,
                     set.sum,
                     set.mean(),
+                    set.min,
+                    set.max,
                     &set.trend_stats(),
                     retain_histograms.then(|| set.histogram.clone()).flatten(),
                 ),
@@ -992,6 +996,8 @@ impl Aggregator {
                 merged.count as u64,
                 merged.sum,
                 merged.mean(),
+                merged.min,
+                merged.max,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -1011,6 +1017,8 @@ impl Aggregator {
                     merged.count as u64,
                     merged.sum,
                     merged.mean(),
+                    merged.min,
+                    merged.max,
                     &merged.trend_stats(),
                     retain_histograms
                         .then(|| merged.histogram.clone())
@@ -1024,12 +1032,12 @@ impl Aggregator {
                     count: merged.sum as u64,
                     sum: merged.sum,
                     mean: merged.mean(),
-                    min: 0,
-                    max: 0,
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: 0.0,
+                    max: 0.0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: 0.0,
                     rate: 0.0,
                     histogram: None,
@@ -1041,12 +1049,12 @@ impl Aggregator {
                     count: merged.count as u64,
                     sum: merged.sum,
                     mean: merged.mean(),
-                    min: 0,
-                    max: 0,
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: 0.0,
+                    max: 0.0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: 0.0,
                     rate: merged.rate(),
                     histogram: None,
@@ -1059,19 +1067,19 @@ impl Aggregator {
                     sum: merged.sum,
                     mean: merged.mean(),
                     min: if merged.min == f64::MAX {
-                        0
+                        0.0
                     } else {
-                        merged.min as u64
+                        merged.min
                     },
                     max: if merged.max == f64::MIN {
-                        0
+                        0.0
                     } else {
-                        merged.max as u64
+                        merged.max
                     },
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: merged.last,
                     rate: 0.0,
                     histogram: None,
@@ -1088,6 +1096,8 @@ impl Aggregator {
                 merged.count as u64,
                 merged.sum,
                 merged.mean(),
+                merged.min,
+                merged.max,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -1103,6 +1113,8 @@ impl Aggregator {
                 merged.count as u64,
                 merged.sum,
                 merged.mean(),
+                merged.min,
+                merged.max,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -1420,12 +1432,15 @@ pub fn merge_snapshots(
 /// iteration_duration headline, http_req_duration headline). Trend is the
 /// only type that reads histogram-derived percentiles, so the other four
 /// `MetricSummary` constructions stay inline.
+#[allow(clippy::too_many_arguments)] // key/tags/count/sum/mean/raw min/max/stats/histogram mirror MetricSummary's shape
 fn trend_summary(
     key: String,
     tags: Vec<(String, String)>,
     count: u64,
     sum: f64,
     mean: f64,
+    raw_min: f64,
+    raw_max: f64,
     stats: &HistogramStats,
     histogram: Option<LatencyHistogram>,
 ) -> MetricSummary {
@@ -1436,8 +1451,12 @@ fn trend_summary(
         count,
         sum,
         mean,
-        min: stats.min,
-        max: stats.max,
+        // Raw observed min/max (exact f64). The histogram's own min is
+        // clamped to its 1 µs low bound, so an all-zero series would report
+        // min=0.001 ms while avg=0 (backlog line 57: min > avg). Raw values
+        // keep `min ≤ avg` true for every distribution.
+        min: if raw_min == f64::MAX { 0.0 } else { raw_min },
+        max: if raw_max == f64::MIN { 0.0 } else { raw_max },
         p50: stats.p50,
         p90: stats.p90,
         p95: stats.p95,
@@ -1468,18 +1487,18 @@ pub struct MetricSummary {
     pub sum: f64,
     /// Mean value (sum / count).
     pub mean: f64,
-    /// Minimum value (Trend/Gauge only).
-    pub min: u64,
-    /// Maximum value (Trend/Gauge only).
-    pub max: u64,
-    /// p50 / median (Trend only).
-    pub p50: u64,
-    /// p90 (Trend only).
-    pub p90: u64,
-    /// p95 (Trend only).
-    pub p95: u64,
-    /// p99 (Trend only).
-    pub p99: u64,
+    /// Minimum value (Trend/Gauge only, fractional ms for Trend).
+    pub min: f64,
+    /// Maximum value (Trend/Gauge only, fractional ms for Trend).
+    pub max: f64,
+    /// p50 / median (Trend only, fractional ms).
+    pub p50: f64,
+    /// p90 (Trend only, fractional ms).
+    pub p90: f64,
+    /// p95 (Trend only, fractional ms).
+    pub p95: f64,
+    /// p99 (Trend only, fractional ms).
+    pub p99: f64,
     /// Last/gauge value (Gauge only).
     pub last: f64,
     /// Rate (Rate only: sum/count).
@@ -1580,9 +1599,9 @@ pub fn k6_default_trend_stats() -> Vec<String> {
 pub fn trend_stat_value(stat: &str, m: &MetricSummary) -> Option<f64> {
     match stat.trim() {
         "avg" | "mean" => Some(m.mean),
-        "min" => Some(m.min as f64),
-        "med" | "median" => Some(m.p50 as f64),
-        "max" => Some(m.max as f64),
+        "min" => Some(m.min),
+        "med" | "median" => Some(m.p50),
+        "max" => Some(m.max),
         "count" => Some(m.count as f64),
         "sum" => Some(m.sum),
         "rate" => Some(m.rate),
@@ -1686,13 +1705,13 @@ pub fn parse_percentile(stat: &str) -> Option<f64> {
 /// summaries.
 pub fn percentile_value(m: &MetricSummary, pct: f64) -> f64 {
     if let Some(h) = &m.histogram {
-        h.percentile(pct) as f64
+        h.percentile(pct)
     } else {
         match pct {
-            x if x <= 50.0 => m.p50 as f64,
-            x if x <= 90.0 => m.p90 as f64,
-            x if x <= 95.0 => m.p95 as f64,
-            _ => m.p99 as f64,
+            x if x <= 50.0 => m.p50,
+            x if x <= 90.0 => m.p90,
+            x if x <= 95.0 => m.p95,
+            _ => m.p99,
         }
     }
 }
@@ -1969,15 +1988,55 @@ mod tests {
         );
         let mean = set.mean();
         assert!(
-            (stats.min as f64) <= mean,
+            stats.min <= mean,
             "min ({}) must be <= avg ({}) — the old bug produced min > avg",
             stats.min,
             mean
         );
-        // With 9990/10000 zeros, even p99 sits in the zero bucket.
-        assert_eq!(
-            stats.p99, 1,
-            "p99 should reflect the zero-majority population"
+        // With 9990/10000 zeros, even p99 sits in the zero bucket (1 µs
+        // clamp = 0.001 ms).
+        assert!(
+            (stats.p99 - 0.001).abs() < 1e-9,
+            "p99 should reflect the zero-majority population (p99={})",
+            stats.p99
+        );
+    }
+
+    #[test]
+    fn test_trend_sub_ms_values_keep_true_bucket() {
+        // Backlog line 57 headline: a localhost service with true p50 = 0.3 ms
+        // used to report min=1 max=1 med=1 p(95)=1 (integer-ms floor) while
+        // avg=0.34 — impossible, and `p(95) < 1` could never pass. Sub-ms
+        // samples must land in their true µs bucket and surface as f64 ms.
+        let mut set = MetricSet::new(MetricType::Trend, None);
+        let trend = SampleType::Trend;
+        for _ in 0..1000 {
+            set.record(0.3, &trend); // 300 µs
+        }
+
+        assert_eq!(set.count, 1000.0);
+        let stats = set.trend_stats();
+        assert_eq!(stats.count, 1000);
+        assert!(
+            (stats.min - 0.3).abs() < 0.001,
+            "min must be ~0.3 ms, not the old 1 ms floor (min={})",
+            stats.min
+        );
+        assert!(
+            (stats.p50 - 0.3).abs() < 0.001,
+            "p50 must be ~0.3 ms (p50={})",
+            stats.p50
+        );
+        assert!(
+            (stats.p95 - 0.3).abs() < 0.001,
+            "p95 must be ~0.3 ms — a p(95) < 1 threshold can now pass (p95={})",
+            stats.p95
+        );
+        assert!(
+            stats.min <= stats.max,
+            "min ({}) <= max ({})",
+            stats.min,
+            stats.max
         );
     }
 
@@ -1991,20 +2050,20 @@ mod tests {
         let trend = SampleType::Trend;
 
         set.record(0.25, &trend); // truncation would drop this to 0
-        set.record(0.6, &trend); // rounds to 1 µs
+        set.record(0.6, &trend); // 600 µs
         set.record(2_500.0, &trend); // 2.5 ms
 
         assert_eq!(set.count, 3.0);
         let stats = set.trend_stats();
         assert_eq!(stats.count, 3, "all samples must be in the histogram");
         assert!(
-            stats.max >= 2_500,
+            stats.max >= 2_500.0,
             "2.5 ms sample must be recorded (max={})",
             stats.max
         );
         assert!(
-            stats.min >= 1,
-            "0.25/0.6 are clamped to the 1 µs floor (min={}) — not dropped to 0",
+            stats.min >= 0.25,
+            "0.25/0.6 ms are preserved sub-ms (min={}) — not dropped to 0",
             stats.min
         );
     }
@@ -2012,9 +2071,10 @@ mod tests {
     #[test]
     fn test_trend_all_zero_samples_stay_in_population() {
         // Direct pin of the clamp path: an all-zero trend (every sub-timing
-        // 0 on pooled reuse) must still record every sample — min == max == 1
-        // µs (hdrhistogram floor), count fully populated. (min <= avg cannot
-        // hold here: the 1 µs clamp makes min == 1 while the mean is 0 µs.)
+        // 0 on pooled reuse) must still record every sample — clamped to the
+        // 1 µs (= 0.001 ms) hdrhistogram floor, count fully populated. The
+        // RAW min/max tracking (backlog line 57) keeps `min ≤ avg` true even
+        // though the histogram's own min is 0.001 ms.
         let mut set = MetricSet::new(MetricType::Trend, None);
         let trend = SampleType::Trend;
         for _ in 0..100 {
@@ -2024,9 +2084,12 @@ mod tests {
         assert_eq!(set.count, 100.0);
         let stats = set.trend_stats();
         assert_eq!(stats.count, 100, "all 100 zeros must be recorded");
-        assert_eq!(stats.min, 1);
-        assert_eq!(stats.max, 1);
+        assert!((stats.min - 0.001).abs() < 1e-9);
+        assert!((stats.max - 0.001).abs() < 1e-9);
         assert_eq!(set.sum, 0.0);
+        // Raw min/max stay exact (0.0) — the summary min is 0, so min <= avg.
+        assert_eq!(set.min, 0.0);
+        assert_eq!(set.max, 0.0);
     }
 
     #[test]
@@ -2232,16 +2295,15 @@ mod tests {
         assert_eq!(dur.count, 8);
         assert_eq!(dur.sum, 52_000.0); // 1k+2k+4k+8k+3k+6k+12k+16k
         assert_eq!(dur.mean, 6500.0);
-        // min/max come from hdr-histogram, whose max() reports the bucket
-        // UPPER EDGE (16007 for 16000 at sigfig 3), so assert coverage not
-        // exact equality — the sample must never be excluded.
+        // min/max are raw observed values (backlog line 57) so exact
+        // coverage holds; percentiles stay histogram-bucket-quantized.
         assert!(
-            dur.min <= 1000 && dur.min >= 990,
+            dur.min <= 1000.0 && dur.min >= 990.0,
             "min={} covers 1000",
             dur.min
         );
         assert!(
-            dur.max >= 16000 && dur.max <= 16150,
+            dur.max >= 16000.0 && dur.max <= 16150.0,
             "max={} covers 16000",
             dur.max
         );
@@ -2285,15 +2347,16 @@ mod tests {
                 .1
                 .as_str();
             let (want_min, want_max) = expect_min_max[&(url, status)];
-            // Bucket-quantized min/max: assert coverage, not exact equality.
+            let (wmin, wmax) = (want_min as f64, want_max as f64);
+            // Raw min/max (backlog line 57): assert coverage with tolerance.
             assert!(
-                s.min <= want_min && s.min >= want_min.saturating_sub(want_min / 100),
-                "min {} covers {want_min} for {url} {status}",
+                s.min <= wmin && s.min >= wmin - wmin / 100.0,
+                "min {} covers {wmin} for {url} {status}",
                 s.min
             );
             assert!(
-                s.max >= want_max && s.max <= want_max + want_max / 100 + 1,
-                "max {} covers {want_max} for {url} {status}",
+                s.max >= wmax && s.max <= wmax + wmax / 100.0 + 1.0,
+                "max {} covers {wmax} for {url} {status}",
                 s.max
             );
         }
@@ -2677,7 +2740,7 @@ mod tests {
             merge_snapshots(vec![snap_a, snap_b], std::collections::HashMap::new()).unwrap();
         let m = merged.http_req_duration.expect("merged duration");
         assert_eq!(m.count, 5, "all 5 samples must merge");
-        assert!(m.max >= 100_000, "max must reflect the merged buckets");
+        assert!(m.max >= 100_000.0, "max must reflect the merged buckets");
     }
 
     #[test]
@@ -2890,7 +2953,7 @@ mod tests {
         // rounding lands on the bucket edge (30015), never below the true
         // value — assert within tolerance, not exact.
         assert!(
-            hd.p95 >= 30_000 && hd.p95 <= 30_100,
+            hd.p95 >= 30_000.0 && hd.p95 <= 30_100.0,
             "p95 over 10/20/30 x2 must be ~30ms, got {}",
             hd.p95
         );

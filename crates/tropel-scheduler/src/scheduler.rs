@@ -684,8 +684,23 @@ impl VUScheduler {
             handles.push(handle);
         }
 
-        // Wait for the test duration
-        time::sleep(duration).await;
+        // Wait for the test duration, reaping and respawning VUs that die
+        // mid-run (backlog §5 line 162) so the pool holds `vus` for the
+        // whole run. The 100ms absolute-offset tick bounds replacement
+        // latency; `sleep_until` on a past deadline fires immediately, so a
+        // run shorter than one tick still ends at exactly `duration` (the
+        // old code slept the full duration — this preserves that). The reap
+        // is a no-op once a stop is requested (drain, not death).
+        let deadline = time::Instant::now() + duration;
+        let mut next_tick = time::Instant::now();
+        loop {
+            if time::Instant::now() >= deadline {
+                break;
+            }
+            self.reap_and_respawn(vus, &mut handles, run_vu).await;
+            next_tick += Duration::from_millis(100);
+            time::sleep_until(next_tick.min(deadline)).await;
+        }
 
         // Signal soft stop — VUs finish their current iteration
         self.request_stop();
@@ -775,6 +790,11 @@ impl VUScheduler {
                     let offset =
                         Duration::from_nanos((stage_nanos * step as u128 / delta as u128) as u64);
                     time::sleep_until(stage_start + offset).await;
+                    // Replace VUs that died during the previous step so the
+                    // ramp-up reaches the real target, not a bookkeeping
+                    // count (backlog §5 line 162).
+                    self.reap_and_respawn(current_vus, &mut handles, run_vu)
+                        .await;
                     let vu_id = self.alloc_vu_id();
                     let handle = run_vu(self.shared_clone(), vu_id);
                     handles.push(handle);
@@ -866,6 +886,16 @@ impl VUScheduler {
                     );
                     current_vus = real;
                 }
+
+                // Drop the finished handles of VUs that exited INTENTIONALLY
+                // during this ramp-down (claim at loop top → task ends). If
+                // left in place, a following HOLD stage's reap_and_respawn
+                // would mistake them for VUs that died mid-run and respawn
+                // the pool back UP to its pre-ramp size (backlog §5 line 162
+                // interplay — the hold must hold the reduced target). In the
+                // timed-out path these are the stragglers that exited before
+                // the grace window closed.
+                handles.retain(|h| !h.is_finished());
             } else {
                 // ── Constant stage: hold the current VU count for the FULL
                 //    stage duration (k6 holds `target` VUs). VUs keep
@@ -875,7 +905,22 @@ impl VUScheduler {
                     current_vus,
                     stage_duration
                 );
-                time::sleep(stage_duration).await;
+                // Absolute-offset 100ms ticks: replace VUs that die during
+                // the hold so the pool holds the stage target (backlog §5
+                // line 162). sleep_until on a past deadline fires
+                // immediately, so a stage shorter than one tick still lasts
+                // exactly its configured duration.
+                let deadline = time::Instant::now() + stage_duration;
+                let mut next_tick = time::Instant::now();
+                loop {
+                    if time::Instant::now() >= deadline {
+                        break;
+                    }
+                    self.reap_and_respawn(current_vus, &mut handles, run_vu)
+                        .await;
+                    next_tick += Duration::from_millis(100);
+                    time::sleep_until(next_tick.min(deadline)).await;
+                }
             }
         }
 
@@ -1081,6 +1126,7 @@ impl VUScheduler {
         // bucket still refills accurately because we measure elapsed, not ticks.
         let start = time::Instant::now();
         let mut last_target: u64 = 0;
+        let mut next_reap = time::Instant::now();
 
         while start.elapsed() < duration {
             let elapsed_secs = start.elapsed().as_secs_f64();
@@ -1118,6 +1164,23 @@ impl VUScheduler {
                 "Arrival-rate",
                 elapsed_secs,
             );
+
+            // Replace VUs that died mid-run so the demand-driven pool keeps
+            // its capacity (backlog §5 line 162). Gated to every 100ms — an
+            // O(n) is_finished() scan on the 1ms tick would add ~10M atomic
+            // loads/sec on a 10k-VU pool to the hottest loop.
+            // Replace VUs that died mid-run so the demand-driven pool keeps
+            // its capacity (backlog §5 line 162). Gated on WALL-CLOCK elapsed
+            // (not a tick counter — 1ms sleeps can take ~15ms under Windows
+            // timer granularity, so a tick-based gate would fire only at
+            // tick 0, before any VU has died, on a short run) and checked
+            // every 100ms, so an O(n) is_finished() scan never runs on every
+            // 1ms tick (~10M atomic loads/sec on a 10k-VU pool).
+            if time::Instant::now() >= next_reap {
+                self.reap_and_respawn(current_vus, &mut handles, run_vu)
+                    .await;
+                next_reap += Duration::from_millis(100);
+            }
 
             last_target = target_tokens;
 
@@ -1242,6 +1305,7 @@ impl VUScheduler {
 
         let start = time::Instant::now();
         let mut last_target: u64 = 0;
+        let mut next_reap = time::Instant::now();
 
         while start.elapsed() < total_duration {
             let elapsed_secs = start.elapsed().as_secs_f64();
@@ -1275,6 +1339,19 @@ impl VUScheduler {
                 "Ramping arrival-rate",
                 elapsed_secs,
             );
+
+            // Replace VUs that died mid-run so the demand-driven pool keeps
+            // its capacity (backlog §5 line 162). Gated on WALL-CLOCK elapsed
+            // (not a tick counter — 1ms sleeps can take ~15ms under Windows
+            // timer granularity, so a tick-based gate would fire only at
+            // tick 0, before any VU has died, on a short run) and checked
+            // every 100ms, so an O(n) is_finished() scan never runs on every
+            // 1ms tick (~10M atomic loads/sec on a 10k-VU pool).
+            if time::Instant::now() >= next_reap {
+                self.reap_and_respawn(current_vus, &mut handles, run_vu)
+                    .await;
+                next_reap += Duration::from_millis(100);
+            }
 
             last_target = target;
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1523,6 +1600,74 @@ impl VUScheduler {
     /// the final join loop forever. Resolves when all handles end or `bound`
     /// elapses (the detached tasks are abandoned, matching k6's behaviour of
     /// hard-aborting the run after the grace window).
+    /// Replace VUs that died mid-run so the pool holds its target count for
+    /// the whole run (backlog §5 line 162). `current_vus` was pure
+    /// bookkeeping and NO executor except externally-controlled reaped dead
+    /// VUs — a VU panicking at iteration 500 of a 30-min run silently left
+    /// the test at 99 VUs, then 98…, and since `vu_init_failures` counts
+    /// only startup, the run exited 0 with the summary reporting the
+    /// requested count.
+    ///
+    /// Reaps finished handles with the NON-polling `is_finished()` check
+    /// (safe after a `select!` that already polled some handles — see
+    /// `await_handles_bounded`) and respawns replacements with fresh ids
+    /// (the monotonic allocator guarantees a respawned id never collides
+    /// with a still-live VU). No-op while a stop is requested or a
+    /// ramp-down is armed — those exits are intentional and must not be
+    /// fought.
+    ///
+    /// Wired into the DURATION-based executors (constant, ramping,
+    /// arrival-rate, ramping-arrival-rate) where the pool size IS the
+    /// contract. `shared-iterations` and `per-vu-iterations` are exempt by
+    /// design: in shared-iterations the survivors consume the shared
+    /// counter, so a panicked VU's budget self-heals; in per-vu-iterations
+    /// a VU exits normally once its N iterations are done, so replacing it
+    /// would inflate the total iteration count.
+    async fn reap_and_respawn<F>(
+        &self,
+        target: u32,
+        handles: &mut Vec<tokio::task::JoinHandle<()>>,
+        run_vu: &F,
+    ) where
+        F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+    {
+        if self.is_stop_requested() || self.is_force_stop_requested() {
+            return;
+        }
+        // Ramp-down exits are intentional (VUs claim a surplus slot and exit
+        // at their loop top) — replacing them would fight the ramp. A HOLD
+        // following a ramp-down whose drain TIMED OUT also keeps the target
+        // armed, so a VU dying during that hold is deliberately not replaced
+        // (stragglers may still be exiting).
+        if self.ramp_down_target.load(Ordering::Acquire) != u32::MAX {
+            return;
+        }
+        // Single pass: count AND reap in the retain closure, so handles that
+        // finish between a separate count and retain can't shrink the pool by
+        // the window delta (they'd be dropped without a respawn).
+        let mut dead = 0usize;
+        handles.retain(|h| {
+            if h.is_finished() {
+                dead += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if dead == 0 {
+            return;
+        }
+        tracing::warn!(
+            "{} VU(s) died mid-run — respawning replacements to hold the pool at {}",
+            dead,
+            target
+        );
+        for _ in 0..dead {
+            let handle = run_vu(self.shared_clone(), self.alloc_vu_id());
+            handles.push(handle);
+        }
+    }
+
     async fn await_handles_bounded(handles: &mut [tokio::task::JoinHandle<()>], bound: Duration) {
         // Drop handles the caller's `select!` already polled to completion.
         // Re-polling a completed JoinHandle panics tokio ("JoinHandle polled
@@ -2379,6 +2524,156 @@ mod tests {
         sched.set_ramp_down_target(5, 10);
         assert!(!sched.try_claim_ramp_down(5).await); // at target
         assert!(!sched.try_claim_ramp_down(4).await); // below target
+    }
+
+    /// Backlog §5 P2 (line 162): no executor replaced a VU that died mid-run
+    /// — `current_vus` was pure bookkeeping and only externally-controlled
+    /// reaped dead VUs, so a VU panicking at iteration 500 of a 30-min run
+    /// silently shrank the pool and the summary still reported the requested
+    /// count. The constant executor must respawn a replacement so the pool
+    /// holds its target for the whole duration.
+    #[tokio::test]
+    async fn constant_respawns_vu_that_dies_mid_run() {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 2,
+            duration: "300ms".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawns_c = spawns.clone();
+        let run_vu = move |sched: Arc<VUScheduler>, _id: u32| {
+            let spawns = spawns_c.clone();
+            tokio::spawn(async move {
+                let n = spawns.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // The FIRST VU dies immediately (panic-like early exit).
+                    return;
+                }
+                // Surviving VUs run until the run stops.
+                loop {
+                    if sched.is_stop_requested() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        };
+        sched
+            .run_constant(
+                2,
+                Duration::from_millis(300),
+                Duration::from_millis(50),
+                &run_vu,
+            )
+            .await;
+        // 2 initial + 1 replacement for the dead VU. Before the fix the run
+        // ended at 1 live VU with no respawn.
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            3,
+            "a VU that died mid-run must be replaced"
+        );
+    }
+
+    /// Same contract for the RAMPING executor: a VU that dies during a HOLD
+    /// stage must be replaced so the pool holds the stage target.
+    #[tokio::test]
+    async fn ramping_hold_respawns_vu_that_dies_mid_stage() {
+        use tropel_core::config::Stage;
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::RampingVus {
+            start_vus: 2,
+            stages: vec![Stage {
+                duration: "300ms".to_string(),
+                target: 2,
+            }],
+            graceful_ramp_down: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawns_c = spawns.clone();
+        let run_vu = move |sched: Arc<VUScheduler>, _id: u32| {
+            let spawns = spawns_c.clone();
+            tokio::spawn(async move {
+                let n = spawns.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return; // die immediately
+                }
+                loop {
+                    if sched.is_stop_requested() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        };
+        sched
+            .run_ramping(
+                2,
+                &[Stage {
+                    duration: "300ms".to_string(),
+                    target: 2,
+                }],
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                &run_vu,
+            )
+            .await;
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            3,
+            "a VU that died mid-hold must be replaced"
+        );
+    }
+
+    /// The ARRIVAL-RATE executor also holds its pool as the contract: a VU
+    /// that dies mid-run must be respawned (backlog §5 line 162). This path
+    /// reaps on a 100ms gate inside the 1ms tick loop, so it exercises the
+    /// tick_count gating, not just the shared helper.
+    #[tokio::test]
+    async fn arrival_rate_respawns_vu_that_dies_mid_run() {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawns_c = spawns.clone();
+        let run_vu = move |sched: Arc<VUScheduler>, _id: u32| {
+            let spawns = spawns_c.clone();
+            tokio::spawn(async move {
+                let n = spawns.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return; // die immediately
+                }
+                loop {
+                    if sched.is_stop_requested() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        };
+        // Rate 0 keeps queued tokens at 0, so grow_arrival_pool never grows
+        // the pool under token pressure — the only extra spawn must come from
+        // reap_and_respawn replacing the dead VU (2 pre-alloc + 1 respawn).
+        sched
+            .run_arrival_rate(
+                0.0,
+                2,
+                8,
+                Duration::from_millis(300),
+                Duration::from_millis(50),
+                &run_vu,
+            )
+            .await;
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            3,
+            "a VU that died mid-run must be replaced in the arrival pool"
+        );
     }
 
     /// Backlog §5 P2 (line 161): `set_ramp_down_target` OVERWRITES

@@ -346,7 +346,7 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
         .expect("http_req_duration summary present");
     assert!(dur.count > 0, "http_req_duration has samples");
     assert!(
-        dur.max > 0,
+        dur.max > 0.0,
         "http_req_duration max > 0 (real latency measured)"
     );
 
@@ -538,16 +538,98 @@ async fn non_tracked_percentile_threshold_completes_healthy_run() -> Result<()> 
     // ~500ms and the rest ~10ms, the tracked p95 lands in the slow region
     // (~500ms) while p75 stays fast. If the latency-tail server silently
     // broke (all-fast), this fails loudly instead of passing vacuously — the
-    // old code would also have completed an all-fast run. (p95 is the u64
-    // tracked bucket in ms on this branch.)
+    // old code would also have completed an all-fast run.
     assert!(m.http_reqs > 0, "requests fired, got {}", m.http_reqs);
     if let Some(hd) = &m.http_req_duration {
         assert!(
-            hd.p95 >= 200,
+            hd.p95 >= 200.0,
             "latency tail must be present: p95 = {}, want >= 200ms",
             hd.p95
         );
     }
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog line 47: a malformed duration (`-d 30x`) used to produce a
+/// zero-VU GREEN run — the engine swallowed the scheduler's parse error
+/// (`executor.run(...).await.ok()`) and exited 0 with http_reqs: 0. The
+/// scheduler error must surface as a VU-init failure so the run fails
+/// loudly after reporting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_duration_fails_run_instead_of_zero_vu_green() -> Result<()> {
+    let coll = write_collection("http://127.0.0.1:9", "bad-dur");
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 5,
+            duration: "30x".to_string(), // unparseable
+            graceful_stop: Some("1s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds: HashMap::new(),
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+
+    assert!(
+        result.vu_init_failures > 0,
+        "malformed duration must fail the run loudly (vu_init_failures={})",
+        result.vu_init_failures
+    );
+    assert_eq!(
+        result.metrics.http_reqs, 0,
+        "no requests can run with a rejected execution config"
+    );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog line 47, same class: a present-but-unparseable `maxDuration`
+/// used to silently become the 10-minute k6 default, changing the profile
+/// without any error. It must fail loudly too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_max_duration_fails_run_instead_of_silent_default() -> Result<()> {
+    let coll = write_collection("http://127.0.0.1:9", "bad-maxdur");
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::SharedIterations {
+            iterations: 1,
+            max_duration: Some("10x".to_string()), // unparseable
+            vus: 1,
+            graceful_stop: Some("1s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds: HashMap::new(),
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+
+    assert!(
+        result.vu_init_failures > 0,
+        "unparseable max_duration must fail the run loudly (vu_init_failures={})",
+        result.vu_init_failures
+    );
 
     let _ = std::fs::remove_file(&coll);
     Ok(())
