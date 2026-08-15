@@ -321,7 +321,7 @@ mod tests {
     use tropel_core::config::ThresholdConfig;
     use tropel_metrics::collector::{MetricSummary, MetricType};
 
-    fn trend(key: &str, mean: f64, p50: u64, p90: u64, p95: u64, p99: u64) -> MetricSummary {
+    fn trend(key: &str, mean: f64, p50: f64, p90: f64, p95: f64, p99: f64) -> MetricSummary {
         MetricSummary {
             key: key.to_string(),
             tags: vec![],
@@ -329,8 +329,8 @@ mod tests {
             count: 10,
             sum: mean * 10.0,
             mean,
-            min: (mean * 0.5) as u64,
-            max: (mean * 1.5) as u64,
+            min: mean * 0.5,
+            max: mean * 1.5,
             p50,
             p90,
             p95,
@@ -354,8 +354,22 @@ mod tests {
             checks_passed: 2,
             checks_failed: 0,
             run_duration: Duration::from_secs(10),
-            http_req_duration: Some(trend("http_req_duration", 134.89, 150, 268, 272, 338)),
-            iteration_duration: Some(trend("iteration_duration", 294.58, 262, 279, 321, 1_150)),
+            http_req_duration: Some(trend(
+                "http_req_duration",
+                134.89,
+                150.0,
+                268.0,
+                272.0,
+                338.0,
+            )),
+            iteration_duration: Some(trend(
+                "iteration_duration",
+                294.58,
+                262.0,
+                279.0,
+                321.0,
+                1_150.0,
+            )),
             summary_trend_stats: vec![],
             effective_thresholds: HashMap::new(),
             ..Default::default()
@@ -378,7 +392,7 @@ mod tests {
     #[test]
     fn render_trend_uses_ms_for_time_metrics_only() {
         let mut out = String::new();
-        let m = trend("http_req_duration", 134.89, 150, 268, 272, 338);
+        let m = trend("http_req_duration", 134.89, 150.0, 268.0, 272.0, 338.0);
         let stats = vec![
             "avg".to_string(),
             "min".to_string(),
@@ -403,10 +417,10 @@ mod tests {
         let m = trend(
             "http_response_body_size",
             2_500_000.0,
-            2_400_000,
-            3_000_000,
-            3_200_000,
-            3_500_000,
+            2_400_000.0,
+            3_000_000.0,
+            3_200_000.0,
+            3_500_000.0,
         );
         let stats = vec!["avg".to_string(), "med".to_string()];
         StdoutReporter::render_trend(&mut out, "", &m, &stats);
@@ -446,8 +460,22 @@ mod tests {
     #[test]
     fn render_per_url_breakdown_when_multiple_urls() {
         let mut r = result_with();
-        let mut a = trend("http_req_duration{url=/a}", 100.0, 100, 150, 160, 200);
-        let mut b = trend("http_req_duration{url=/b}", 200.0, 200, 250, 260, 300);
+        let mut a = trend(
+            "http_req_duration{url=/a}",
+            100.0,
+            100.0,
+            150.0,
+            160.0,
+            200.0,
+        );
+        let mut b = trend(
+            "http_req_duration{url=/b}",
+            200.0,
+            200.0,
+            250.0,
+            260.0,
+            300.0,
+        );
         a.tags = vec![("url".to_string(), "/a".to_string())];
         b.tags = vec![("url".to_string(), "/b".to_string())];
         r.per_url = vec![a, b];

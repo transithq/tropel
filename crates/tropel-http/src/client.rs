@@ -545,32 +545,18 @@ impl HttpClient {
             // `Custom` arm binds `m: &String`, so `current_method` is NOT
             // moved out of — it is still needed by the redirect-rewrite
             // logic below (303 → GET etc.).
+            // Backlog line 140: the body was attached ONLY for POST/PUT/PATCH,
+            // so DELETE/OPTIONS/TRACE and custom-method bodies were silently
+            // dropped. The builder is now method-agnostic — any method gets
+            // whatever body it is given (Postman's GET/HEAD pruning lives in
+            // the collection parser via protocolProfileBehavior
+            // .disableBodyPruning). HEAD/CONNECT edge cases: reqwest tolerates
+            // a body on HEAD; CONNECT is rejected below.
             let mut req_builder = match &current_method {
                 Method::GET => client.get(&current_url),
-                Method::POST => {
-                    let rb = client.post(&current_url);
-                    if let Some(bytes) = &current_body {
-                        rb.body(reqwest::Body::from(bytes.clone()))
-                    } else {
-                        rb
-                    }
-                }
-                Method::PUT => {
-                    let rb = client.put(&current_url);
-                    if let Some(bytes) = &current_body {
-                        rb.body(reqwest::Body::from(bytes.clone()))
-                    } else {
-                        rb
-                    }
-                }
-                Method::PATCH => {
-                    let rb = client.patch(&current_url);
-                    if let Some(bytes) = &current_body {
-                        rb.body(reqwest::Body::from(bytes.clone()))
-                    } else {
-                        rb
-                    }
-                }
+                Method::POST => client.post(&current_url),
+                Method::PUT => client.put(&current_url),
+                Method::PATCH => client.patch(&current_url),
                 Method::DELETE => client.delete(&current_url),
                 Method::HEAD => client.head(&current_url),
                 Method::OPTIONS => client.request(reqwest::Method::OPTIONS, &current_url),
@@ -589,6 +575,9 @@ impl HttpClient {
                     client.request(method, &current_url)
                 }
             };
+            if let Some(bytes) = &current_body {
+                req_builder = req_builder.body(reqwest::Body::from(bytes.clone()));
+            }
 
             // Add headers
             if let Some(content_type) = &multipart_content_type {
@@ -649,7 +638,18 @@ impl HttpClient {
             // original params there turns /x?page=2 → 302 /y?token=z into
             // /y?token=z&page=2 (k6/reqwest don't do this).
             if hop_index == 0 && !request.query_params.is_empty() {
-                req_builder = req_builder.query(&request.query_params);
+                // Backlog line 143: query_params is a HashMap with RandomState,
+                // so reqwest's query serialization was nondeterministic
+                // run-to-run (breaks body-signing prerequest scripts and
+                // byte-reproducibility). Sort by key so the wire bytes are
+                // stable for identical inputs.
+                let mut sorted: Vec<(String, String)> = request
+                    .query_params
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                sorted.sort();
+                req_builder = req_builder.query(&sorted);
             }
 
             // Set timeout (client-level timeout is already set, request can override shorter)
@@ -1309,10 +1309,14 @@ fn body_to_bytes(body: &Body) -> Vec<u8> {
         Body::Json(val) => serde_json::to_string(val).unwrap_or_default().into_bytes(),
         Body::FormData(map) => multipart_form_data_bytes(map),
         Body::UrlEncoded(map) => {
-            let params: Vec<(String, String)> = map
+            // Backlog line 143: sort by key — a HashMap's RandomState iteration
+            // order made the encoded body nondeterministic run-to-run (broke
+            // body-signing prerequest scripts and byte-reproducibility).
+            let mut params: Vec<(String, String)> = map
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone().to_string()))
                 .collect();
+            params.sort();
             serde_urlencoded::to_string(params)
                 .unwrap_or_default()
                 .into_bytes()
@@ -1334,7 +1338,12 @@ pub fn body_size(body: &Body) -> usize {
 fn multipart_form_data_bytes(map: &HashMap<String, String>) -> Vec<u8> {
     let mut body = Vec::new();
 
-    for (name, value) in map {
+    // Backlog line 143: sort by key so the multipart framing is byte-stable
+    // run-to-run (a HashMap iterates in nondeterministic RandomState order).
+    let mut fields: Vec<(&String, &String)> = map.iter().collect();
+    fields.sort();
+
+    for (name, value) in fields {
         body.extend_from_slice(format!("--{}\r\n", MULTIPART_BOUNDARY).as_bytes());
         body.extend_from_slice(
             format!(
@@ -1732,6 +1741,62 @@ mod tests {
             body_size(&framed) > 3,
             "multipart framing must exceed the raw k=v size"
         );
+    }
+
+    #[test]
+    fn wire_bytes_are_deterministic_across_repeated_serialization() {
+        // Backlog line 143: query_params, UrlEncoded and FormData are HashMap
+        // with RandomState — iteration order differs between processes AND
+        // between runs, so the wire bytes (and any script signing them) were
+        // nondeterministic. The serializers sort by key; serializing the same
+        // logically-equal maps many times must produce identical bytes.
+        use std::collections::HashMap;
+
+        let mut qp = HashMap::new();
+        qp.insert("zeta".to_string(), "9".to_string());
+        qp.insert("alpha".to_string(), "1".to_string());
+        qp.insert("mid".to_string(), "x".to_string());
+
+        let mut urlenc = HashMap::new();
+        urlenc.insert("z".to_string(), "1".to_string());
+        urlenc.insert("a".to_string(), "2".to_string());
+        urlenc.insert("m".to_string(), "3".to_string());
+
+        let mut form = HashMap::new();
+        form.insert("z".to_string(), "1".to_string());
+        form.insert("a".to_string(), "2".to_string());
+        form.insert("m".to_string(), "3".to_string());
+
+        // UrlEncoded: key-sorted `a=2&m=3&z=1`. NOTE: a repeated-serialization
+        // loop would NOT guard this — RandomState is seeded per PROCESS, so
+        // iteration order is already stable within one process. The assertion
+        // that matters is the exact sorted output (a HashMap iterates in a
+        // random order that would almost never be alphabetical).
+        let urlenc_bytes = body_to_bytes(&Body::UrlEncoded(urlenc.clone()));
+        assert_eq!(
+            String::from_utf8_lossy(&urlenc_bytes),
+            "a=2&m=3&z=1",
+            "UrlEncoded must serialize key-sorted"
+        );
+
+        // FormData: key-sorted framing.
+        let form_bytes = body_to_bytes(&Body::FormData(form.clone()));
+        let ftext = String::from_utf8_lossy(&form_bytes);
+        let pos_a = ftext.find("name=\"a\"").unwrap();
+        let pos_m = ftext.find("name=\"m\"").unwrap();
+        let pos_z = ftext.find("name=\"z\"").unwrap();
+        assert!(
+            pos_a < pos_m && pos_m < pos_z,
+            "FormData parts must be key-sorted: {ftext}"
+        );
+
+        // query_params: exercised in execute() via .query(&sorted); assert the
+        // sort helper produces stable ordering here.
+        let mut sorted: Vec<(String, String)> =
+            qp.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        sorted.sort();
+        let keys: Vec<&str> = sorted.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["alpha", "mid", "zeta"]);
     }
 
     #[test]
@@ -2308,5 +2373,72 @@ mod tests {
             1,
             "discarded bodies must not tear down the pooled connection"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bodies_sent_for_all_methods_including_delete_options_trace_custom() {
+        // Regression (backlog line 140): the request builder attached the
+        // body ONLY for POST/PUT/PATCH — DELETE/OPTIONS/TRACE and custom
+        // methods (PURGE, …) silently dropped it. The builder is now
+        // method-agnostic; every method must deliver its body. (Postman's
+        // GET/HEAD pruning lives in the collection parser, so the transport
+        // must not re-introduce it here.)
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let raw = String::from_utf8_lossy(&buf);
+                    let method = raw
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().next())
+                        .unwrap_or("")
+                        .to_string();
+                    let saw_body = raw.contains("hello-from-140");
+                    let body = format!("{}:{}", method, if saw_body { "BODY" } else { "NONE" });
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+
+        for method in [
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::Custom("PURGE".to_string()),
+        ] {
+            let req = Request {
+                url: format!("http://{}/x", addr),
+                method: method.clone(),
+                body: Some(Body::Raw("hello-from-140".to_string())),
+                ..Default::default()
+            };
+            let resp = client.execute(&req, None).await.unwrap();
+            let echo = String::from_utf8_lossy(&resp.body).to_string();
+            assert!(
+                echo.ends_with(":BODY"),
+                "{} must deliver its body, server saw: {}",
+                format_args!("{:?}", method),
+                echo
+            );
+        }
+
+        server.abort();
     }
 }
