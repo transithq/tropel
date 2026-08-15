@@ -2171,7 +2171,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }));
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Windows timer granularity (~15.6ms) makes a fixed 20ms sleep racy:
+        // the 1ms tasks can still be pending when the reap runs (3 → 3, not
+        // 3 → 1). Wait deterministically for the two short tasks to finish
+        // (bounded), then reap.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handles[..handles.len() - 1]
+            .iter()
+            .any(|h| !h.is_finished())
+        {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("short-lived VU tasks did not finish within 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let before = handles.len();
         handles.retain(|h| !h.is_finished());
         assert_eq!(
