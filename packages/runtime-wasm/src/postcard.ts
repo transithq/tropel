@@ -312,6 +312,10 @@ function writeTimings(w: Writer, t: Timings): void {
   writeDurationMs(w, t.sendingMs);
   writeDurationMs(w, t.waitingMs);
   writeDurationMs(w, t.receivingMs);
+  // Backlog line 43: types.rs Timings has EIGHT fields — `total` is the last
+  // (after receiving). Omitting it made every response fail with
+  // Err(DeserializeUnexpectedEnd).
+  writeDurationMs(w, t.totalMs);
 }
 
 // Response wire (types.rs): url, status_code(u16), status_text, headers,
