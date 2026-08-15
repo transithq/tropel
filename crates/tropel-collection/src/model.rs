@@ -123,8 +123,34 @@ where
     })
 }
 
-/// Accept `response_time` as either a numeric milliseconds value (as
+/// Accept `responseTime` as either a numeric milliseconds value (as
 /// exported by Postman) or a string; normalize both to a string.
+/// Accept `code` as ANY JSON number (as exported by Postman) or a string
+/// (some exporters emit `"200"`); out-of-range, garbage, or missing → 0.
+/// Saved examples are never executed, so even a sloppy numeric code (e.g.
+/// `999999` or `-1`) must not sink the collection — the `Any(Value)`
+/// catch-all makes the untagged enum total for every JSON shape.
+fn de_opt_code<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CodeForm {
+        Any(serde_json::Value),
+    }
+    Ok(match Option::<CodeForm>::deserialize(deserializer)? {
+        Some(CodeForm::Any(v)) => match &v {
+            serde_json::Value::Number(n) => {
+                n.as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(0)
+            }
+            serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
+            _ => 0,
+        },
+        None => 0,
+    })
+}
+
 fn de_opt_response_time<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -443,35 +469,65 @@ pub struct AuthAttribute {
     pub attr_type: Option<String>,
 }
 
-/// Response detail.
+/// Response detail (a SAVED EXAMPLE — parsed but never executed).
+///
+/// Backlog line 145: saved examples are data the runner never sends, yet a
+/// malformed example (a cookie with a non-string value, a missing key, …)
+/// used to fail the WHOLE collection parse. Postman's schema types these
+/// loosely and doesn't require them — every field is defaulted so a weird
+/// example can never sink a run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseDetail {
     pub name: Option<String>,
     pub status: Option<String>,
-    // Missing `code` (or a numeric `response_time`) must not fail parsing —
+    // Missing `code` (or a numeric `responseTime`) must not fail parsing —
     // exports omit it; before the fix that silently dropped the request.
-    #[serde(default)]
+    // Saved examples are never executed, so even a string-form or
+    // out-of-range code must not sink the whole collection.
+    #[serde(default, deserialize_with = "de_opt_code")]
     pub code: u16,
     #[serde(default)]
     pub header: Vec<Header>,
     pub body: Option<String>,
+    // Postman exports camelCase — `contentType` / `responseTime` — and the
+    // old snake_case names never matched, so real exports were silently
+    // ignored as unknown fields (backlog line 145). `alias` keeps older
+    // snake_case exporters working too.
+    #[serde(default, rename = "contentType", alias = "content_type")]
     pub content_type: Option<String>,
-    #[serde(default, deserialize_with = "de_opt_response_time")]
+    #[serde(
+        default,
+        rename = "responseTime",
+        alias = "response_time",
+        deserialize_with = "de_opt_response_time"
+    )]
     pub response_time: Option<String>,
     #[serde(default)]
     pub cookie: Vec<ResponseCookie>,
 }
 
-/// Response cookie.
+/// Response cookie (saved-example data — parsed, never executed).
+///
+/// Postman exports cookies as key/value with a mix of optional attrs; some
+/// exporters emit non-string values or omit `key`. Since this is example
+/// data only, all fields are defaulted/optional so any shape parses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseCookie {
-    pub key: String,
-    pub value: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+    #[serde(default)]
     pub domain: Option<String>,
+    #[serde(default)]
     pub path: Option<String>,
+    #[serde(default, rename = "httpOnly", alias = "http_only")]
     pub http_only: Option<bool>,
+    #[serde(default)]
     pub secure: Option<bool>,
+    #[serde(default, rename = "sameSite", alias = "same_site")]
     pub same_site: Option<String>,
+    #[serde(default)]
     pub expires: Option<String>,
 }
 
@@ -602,14 +658,16 @@ mod tests {
 
     #[test]
     fn response_time_accepts_number_and_string() {
-        // Postman exports `response_time` as a NUMBER (ms); some exporters
-        // emit a string. Both normalize to a string.
+        // Postman exports `responseTime` (camelCase) as a NUMBER (ms); some
+        // exporters emit a string. Both normalize to a string. (Backlog line
+        // 145: the old snake_case `response_time` never matched Postman's
+        // camelCase export — the field was silently ignored as unknown.)
         let col = parse_collection(json!({
             "info": minimal_info(),
             "item": [{
                 "name": "r",
                 "request": { "method": "GET", "url": "https://x.test/" },
-                "response": [{ "name": "saved", "code": 200, "response_time": 123 }]
+                "response": [{ "name": "saved", "code": 200, "responseTime": 123 }]
             }]
         }));
         if let CollectionItem::Request(r) = &col.item[0] {
@@ -624,12 +682,70 @@ mod tests {
             "item": [{
                 "name": "r",
                 "request": { "method": "GET", "url": "https://x.test/" },
-                "response": [{ "name": "saved", "response_time": "456" }]
+                "response": [{ "name": "saved", "responseTime": "456" }]
             }]
         }));
         if let CollectionItem::Request(r) = &col2.item[0] {
             assert_eq!(r.response[0].response_time.as_deref(), Some("456"));
             assert_eq!(r.response[0].code, 0, "missing code defaults to 0");
+        } else {
+            panic!("expected request");
+        }
+    }
+
+    #[test]
+    fn malformed_example_cookie_does_not_fail_collection() {
+        // Regression (backlog line 145): saved examples are data the runner
+        // never executes, yet a cookie with a non-string value, a missing
+        // key, or a camelCase attr used to fail the WHOLE collection parse.
+        // Every ResponseDetail/ResponseCookie field is defaulted/optional so
+        // any example shape parses.
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": { "method": "GET", "url": "https://x.test/" },
+                "response": [{
+                    "name": "saved",
+                    "code": "200",
+                    "contentType": "application/json",
+                    "responseTime": 42,
+                    "cookie": [
+                        {"value": 12345, "httpOnly": true},
+                        {"key": "sid", "value": {"nested": true}, "sameSite": "Strict"}
+                    ]
+                }, {
+                    // Out-of-range numeric code must degrade to 0, not sink
+                    // the whole collection (de_opt_code Any(Value) catch-all).
+                    "name": "sloppy",
+                    "code": 999999,
+                    "responseTime": 7
+                }]
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col.item[0] {
+            assert_eq!(r.response[0].code, 200, "string-form code must parse");
+            assert_eq!(
+                r.response[1].code, 0,
+                "out-of-range numeric code must degrade to 0"
+            );
+            assert_eq!(r.response[1].response_time.as_deref(), Some("7"));
+            assert_eq!(
+                r.response[0].content_type.as_deref(),
+                Some("application/json")
+            );
+            assert_eq!(r.response[0].response_time.as_deref(), Some("42"));
+            assert_eq!(r.response[0].cookie.len(), 2);
+            // First cookie: no key, numeric value, camelCase httpOnly.
+            assert!(r.response[0].cookie[0].key.is_none());
+            assert_eq!(
+                r.response[0].cookie[0].value,
+                Some(serde_json::json!(12345))
+            );
+            assert_eq!(r.response[0].cookie[0].http_only, Some(true));
+            // Second cookie: object value + camelCase sameSite.
+            assert_eq!(r.response[0].cookie[1].key.as_deref(), Some("sid"));
+            assert_eq!(r.response[0].cookie[1].same_site.as_deref(), Some("Strict"));
         } else {
             panic!("expected request");
         }
