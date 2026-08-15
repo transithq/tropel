@@ -1265,11 +1265,7 @@ impl DriverInstance for K6DriverInstance {
 /// fallback's field contract is unit-testable without forcing the real
 /// (soft — GC-trigger only) QuickJS memory limit to hard-fail.
 #[cfg(test)] // master's inline pre-guard owns the production degradation path
-fn degrade_to_status0_error<'js>(
-    obj: &rquickjs::Object<'js>,
-    ctx: &rquickjs::Ctx<'js>,
-    msg: &str,
-) {
+fn degrade_to_status0_error<'js>(obj: &rquickjs::Object<'js>, ctx: &rquickjs::Ctx<'js>, msg: &str) {
     let _ = obj.set("code", 0);
     let _ = obj.set("status", 0);
     let _ = obj.set("status_text", msg);
