@@ -690,6 +690,19 @@ impl Aggregator {
             SampleType::Trend => MetricType::Trend,
         };
 
+        // Update the name-keyed totals map FIRST — every sample, including
+        // dropped series, so headline counters keep accumulating under
+        // cardinality pressure (the map is keyed by metric NAME, not tags,
+        // so the cap does not bound it).
+        if let Some(total) = self.totals.get_mut(sample.metric.as_ref()) {
+            *total += sample.value;
+        } else {
+            // to_string(), not into_owned(): the sample is still borrowed
+            // later (headline accumulators), so the metric name must not be
+            // moved out of it.
+            self.totals.insert(sample.metric.to_string(), sample.value);
+        }
+
         // Incremental http_req_failed counters — BEFORE the cardinality guard
         // so samples dropped for new series still count toward the headline
         // failure rate (backlog line 59: the old per-series sum in
@@ -710,7 +723,8 @@ impl Aggregator {
         // (per-URL/per-group) are bounded by the same cap and are correctly
         // skipped — but the SINGLE headline accumulators (merged_http_dur /
         // merged_iter_dur) are NOT tag-keyed, so they must keep recording or
-        // the headline percentiles freeze while `http_reqs` keeps climbing.
+        // the headline percentiles freeze while `http_reqs` keeps climbing
+        // (backlog line 53).
         if !self.data.contains_key(&key) && self.data.len() >= self.max_series {
             self.series_dropped += 1;
             if self.series_dropped == 1 {
@@ -720,21 +734,7 @@ impl Aggregator {
                     self.max_series
                 );
             }
-            let hmax = self.histogram_max_ms;
-            if sample.metric.as_ref() == "http_req_duration" {
-                self.merged_http_dur
-                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
-                    .record(sample.value, &sample.sample_type);
-            } else if sample.metric.as_ref() == "iteration_duration" {
-                self.merged_iter_dur
-                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
-                    .record(sample.value, &sample.sample_type);
-            }
-            if let Some(total) = self.totals.get_mut(sample.metric.as_ref()) {
-                *total += sample.value;
-            } else {
-                self.totals.insert(sample.metric.into_owned(), sample.value);
-            }
+            self.record_headline_accumulators(&sample);
             return;
         }
 
@@ -752,12 +752,8 @@ impl Aggregator {
         // series per tick (the O(N)-per-2s cost that filled the bounded
         // channel and blocked `record_batch().await`).
         let hmax = self.histogram_max_ms;
+        self.record_headline_accumulators(&sample);
         if sample.metric.as_ref() == "http_req_duration" {
-            let merged = self
-                .merged_http_dur
-                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
-            merged.record(sample.value, &sample.sample_type);
-
             // Exact per-URL merge (url tag, falling back to name). The
             // TagMap is FxHashMap-backed with nondeterministic iteration
             // order, so pin `url` FIRST explicitly — a bare
@@ -775,11 +771,6 @@ impl Aggregator {
                     .or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
                     .record(sample.value, &sample.sample_type);
             }
-        } else if sample.metric.as_ref() == "iteration_duration" {
-            let merged = self
-                .merged_iter_dur
-                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
-            merged.record(sample.value, &sample.sample_type);
         }
 
         // Per-group merge: any series carrying a `group` tag (the runner
@@ -793,14 +784,24 @@ impl Aggregator {
                 .or_insert_with(|| MetricSet::new(metric_type, hmax))
                 .record(sample.value, &sample.sample_type);
         }
+    }
 
-        // Update totals — zero-alloc on the hot path: `get_mut` with a &str
-        // borrow (String: Borrow<str>), only allocating on first sight of a
-        // metric name.
-        if let Some(total) = self.totals.get_mut(sample.metric.as_ref()) {
-            *total += sample.value;
-        } else {
-            self.totals.insert(sample.metric.into_owned(), sample.value);
+    /// Record a sample into the SINGLE headline accumulators
+    /// (`merged_http_dur` / `merged_iter_dur`). These are not tag-keyed, so
+    /// the cardinality cap does not bound them — they must reflect EVERY
+    /// sample, including ones dropped from the per-series map, or headline
+    /// percentiles freeze under high cardinality while `http_reqs` keeps
+    /// climbing (backlog line 53).
+    fn record_headline_accumulators(&mut self, sample: &Sample) {
+        let hmax = self.histogram_max_ms;
+        if sample.metric.as_ref() == "http_req_duration" {
+            self.merged_http_dur
+                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                .record(sample.value, &sample.sample_type);
+        } else if sample.metric.as_ref() == "iteration_duration" {
+            self.merged_iter_dur
+                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                .record(sample.value, &sample.sample_type);
         }
     }
 
@@ -1122,6 +1123,11 @@ impl Aggregator {
             ));
         }
 
+        // http_req_failed rate: the incremental counters (http_req_failed_sum
+        // / http_req_failed_requests, maintained in `record()` on EVERY
+        // sample incl. cardinality-dropped ones) are the single source —
+        // see backlog lines 53/59.
+
         // Headline counters: take the MAX of the surviving series and the
         // totals map. `totals` is keyed by metric NAME and accumulates EVERY
         // sample — including series dropped by the `max_series` cardinality
@@ -1146,6 +1152,7 @@ impl Aggregator {
             data_received,
             data_sent,
             errors,
+            series_dropped: self.series_dropped,
             dropped_iterations: self
                 .totals
                 .get("dropped_iterations")
@@ -1162,7 +1169,6 @@ impl Aggregator {
             // every rate/avg threshold compute 0.0 and abortOnFail killed
             // healthy runs (the engine stamps the final value post-run).
             run_duration: self.started.elapsed(),
-            series_dropped: self.series_dropped,
             summary_trend_stats: self.summary_trend_stats.clone(),
             effective_thresholds: self.effective_thresholds.clone(),
         }
@@ -1533,6 +1539,10 @@ pub struct MetricsResult {
     pub data_received: f64,
     pub data_sent: f64,
     pub errors: u64,
+    /// Samples dropped because the `max_series` cardinality cap was reached
+    /// (backlog line 53: previously counted and read nowhere — now surfaced
+    /// so reporters can warn on truncated per-URL stats).
+    pub series_dropped: u64,
     /// Iterations dropped because the VU pool was saturated (arrival-rate mode).
     pub dropped_iterations: u64,
     /// HTTP request failure rate (0.0 - 1.0).
@@ -1545,10 +1555,6 @@ pub struct MetricsResult {
     /// finishes). Reporters use it for k6-style per-second rates
     /// (`http_reqs: 136 13.56/s`) and `handleSummary` state.
     pub run_duration: Duration,
-    /// Samples dropped by the `max_series` cardinality cap (backlog line 59:
-    /// previously incremented and read nowhere). Surfaced so high-cardinality
-    /// url/name tags are observable in summaries/reports.
-    pub series_dropped: u64,
     /// Trend statistics to show in the summary, k6 `summaryTrendStats`
     /// semantics (e.g. `["avg","min","med","max","p(90)","p(95)","p(99)"]`).
     /// Defaults to the k6 set. Reporters must honor this list.
@@ -1574,12 +1580,12 @@ impl Default for MetricsResult {
             data_received: 0.0,
             data_sent: 0.0,
             errors: 0,
+            series_dropped: 0,
             dropped_iterations: 0,
             http_req_failed: 0.0,
             iterations: 0,
             vus_max: 0,
             run_duration: Duration::ZERO,
-            series_dropped: 0,
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),
         }
@@ -2860,6 +2866,65 @@ mod tests {
             .find(|u| u.key.contains("/a"))
             .expect("/a per-url series kept recording");
         assert_eq!(a.count, 2, "existing /a series records both samples");
+    }
+
+    #[test]
+    fn test_cardinality_cap_keeps_feeding_headline_percentiles() {
+        // Regression (backlog line 53): the cardinality guard used to
+        // early-return BEFORE the SINGLE headline accumulators
+        // (merged_http_dur / merged_iter_dur) were fed, so past the cap
+        // http_req_duration p50/p95/avg froze while http_reqs kept climbing
+        // from `totals`. The single accumulators are not tag-keyed — the cap
+        // does not bound them — so every sample must land there, and the drop
+        // count must surface on MetricsResult.
+        let mut agg = Aggregator::new();
+        agg.max_series = 2;
+        let ts = std::time::SystemTime::now();
+
+        for url in ["/a", "/b"] {
+            let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
+                ("url", url),
+                ("name", url),
+            ]));
+            agg.record(Sample {
+                metric: "http_req_duration".into(),
+                value: 10.0,
+                tags,
+                timestamp: ts,
+                sample_type: SampleType::Trend,
+            });
+        }
+        // A third distinct URL is dropped from the series map — but its
+        // latency must still reach the headline accumulator (the old
+        // early-return silently lost it).
+        let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
+            ("url", "/c"),
+            ("name", "/c"),
+        ]));
+        agg.record(Sample {
+            metric: "http_req_duration".into(),
+            value: 100.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Trend,
+        });
+        assert_eq!(agg.data.len(), 2, "series map must stay at max_series");
+        assert_eq!(agg.series_dropped, 1, "dropped series must be counted");
+
+        let res = agg.build_results();
+        assert_eq!(res.series_dropped, 1, "drop count surfaces on results");
+        let dur = res
+            .http_req_duration
+            .as_ref()
+            .expect("headline http_req_duration present");
+        assert_eq!(
+            dur.count, 3,
+            "headline includes the dropped series' sample (was 2 — frozen)"
+        );
+        assert_eq!(
+            dur.max, 100.0,
+            "headline max reflects the dropped 100 ms sample (was 10 — frozen)"
+        );
     }
 
     #[test]
