@@ -1,5 +1,6 @@
 ---
 source: crates/tropel-report/tests/reporters.rs
+assertion_line: 147
 expression: rendered
 ---
 
