@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(merged.iterations, 4, "merged iterations = 4");
         let dur = merged.http_req_duration.expect("merged http_req_duration");
         assert_eq!(dur.count, 4);
-        assert!(dur.max > 0);
+        assert!(dur.max > 0.0);
 
         let _ = std::fs::remove_file(&coll);
         Ok(())

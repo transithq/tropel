@@ -192,7 +192,7 @@ struct LiveState {
     last_print: Instant,
     rolling_count: u64,
     rolling_max: f64,
-    /// Rolling window of `http_req_duration` (μs) for the live p95. A
+    /// Rolling window of `http_req_duration` (ms) for the live p95. A
     /// `VecDeque` so evicting the oldest sample is O(1) — the previous `Vec`
     /// did `remove(0)`, shifting up to 5000 elements per sample on the hot
     /// path (~4 GB/s of memmove at 100k samples/s).

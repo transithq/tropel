@@ -51,7 +51,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tropel_js::JsContext;
 use tropel_sdk::{
-    AuthConfig, Body, Method, Request, Response, Sample, SampleType, TagMap, Timings,
+    AuthConfig, Body, Cookie, Method, Request, Response, Sample, SampleType, TagMap, Timings,
 };
 use tropel_sdk::{
     Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
@@ -1299,6 +1299,7 @@ fn build_k6_response_object<'js>(
     error: &str,
     error_code: i32,
     response_type: &str,
+    cookies: &[Cookie],
 ) -> rquickjs::Result<rquickjs::Object<'js>> {
     // Backlog line 46 (P0): allocation failures must NOT `.expect()`-panic
     // across the QuickJS FFI boundary — a server-controlled binary body can
@@ -1319,6 +1320,48 @@ fn build_k6_response_object<'js>(
     }
     let _ = obj.set("headers", headers_obj);
     let _ = obj.set("response_time", response_time_ms);
+    // Backlog line 102: res.cookies was absent (res.cookies['sid'] threw).
+    // k6 shape: { name: [{name, value, domain, path, httpOnly, secure,
+    // maxAge, expires, sameSite}] } — an object keyed by cookie name with
+    // an ARRAY of cookie objects per name.
+    let cookies_obj = rquickjs::Object::new(ctx.clone())?;
+    for c in cookies {
+        let entry = rquickjs::Object::new(ctx.clone())?;
+        let _ = entry.set("name", c.name.as_str());
+        let _ = entry.set("value", c.value.as_str());
+        if let Some(d) = &c.domain {
+            let _ = entry.set("domain", d.as_str());
+        }
+        if let Some(p) = &c.path {
+            let _ = entry.set("path", p.as_str());
+        }
+        if let Some(v) = c.http_only {
+            let _ = entry.set("httpOnly", v);
+        }
+        if let Some(v) = c.secure {
+            let _ = entry.set("secure", v);
+        }
+        if let Some(e) = &c.expires {
+            let _ = entry.set("expires", e.as_str());
+        }
+        if let Some(s) = &c.same_site {
+            let _ = entry.set("sameSite", s.as_str());
+        }
+        match cookies_obj.get::<_, rquickjs::Value>(c.name.as_str()) {
+            Ok(v) if v.is_array() => {
+                let _ = v.as_array().map(|a| {
+                    let idx = a.len();
+                    let _ = a.set(idx, entry);
+                });
+            }
+            _ => {
+                let arr = rquickjs::Array::new(ctx.clone())?;
+                let _ = arr.set(0, entry);
+                let _ = cookies_obj.set(c.name.as_str(), arr);
+            }
+        }
+    }
+    let _ = obj.set("cookies", cookies_obj);
     // Real connection-phase timings (k6 keys + Tropel's extra `dns`).
     if let Some(t) = timings {
         let timings_obj = rquickjs::Object::new(ctx.clone())?;
@@ -1557,6 +1600,7 @@ fn register_http_bridges<'js>(
                         &format!("invalid HTTP method {}", method),
                         1000,
                         &response_type,
+                        &[],
                     );
                 };
                 let req = Request {
@@ -1641,6 +1685,7 @@ fn register_http_bridges<'js>(
                             "",
                             0,
                             &response_type,
+                            &resp.cookies,
                         )
                     }
                     Err(e) => {
@@ -1665,6 +1710,7 @@ fn register_http_bridges<'js>(
                             &err,
                             k6_error_code(&err),
                             &response_type,
+                            &[],
                         )
                     }
                 }
@@ -1883,6 +1929,29 @@ fn register_http_bridges<'js>(
                                 "error": "",
                                 "error_code": 0,
                             });
+                            // Backlog line 102: batch responses carry cookies
+                            // too (k6 shape: name -> [cookie objects]).
+                            let mut cookies_map = serde_json::Map::new();
+                            for c in &resp.cookies {
+                                let entry = serde_json::json!({
+                                    "name": c.name,
+                                    "value": c.value,
+                                    "domain": c.domain,
+                                    "path": c.path,
+                                    "httpOnly": c.http_only,
+                                    "secure": c.secure,
+                                    "expires": c.expires,
+                                    "sameSite": c.same_site,
+                                });
+                                if let Some(arr) = cookies_map
+                                    .entry(c.name.clone())
+                                    .or_insert_with(|| serde_json::json!([]))
+                                    .as_array_mut()
+                                {
+                                    arr.push(entry);
+                                }
+                            }
+                            resp_json["cookies"] = serde_json::Value::Object(cookies_map);
                             if let Some(t) = &resp.timings {
                                 resp_json["timings"] = serde_json::json!({
                                     "blocked": t.blocked.as_secs_f64() * 1000.0,
@@ -4066,6 +4135,64 @@ mod tests {
     }
 
     #[test]
+    fn test_k6_response_cookies_request_proto_remote_ip_html() {
+        // Backlog line 102: res.cookies / res.request / proto / remote_ip /
+        // html() were absent — `res.cookies['sid']` threw TypeError. The
+        // shim must surface all five from the native bridge result: cookies
+        // in k6's shape (name -> array of {name,value,...}), the REQUEST
+        // that produced the response (headers/body, not the response's),
+        // best-effort proto/remote_ip, and a jQuery-like html() selection.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body) {
+                    return {
+                        code: 200, status: 200,
+                        body: '<html><body><h1 class="title">Hello</h1><p id="sub">World</p></body></html>',
+                        headers: { 'Content-Type': 'text/html' },
+                        responseTime: 5,
+                        cookies: {
+                            sid: [{ name: 'sid', value: 'abc123', domain: 'example.com', path: '/', httpOnly: true, secure: true }]
+                        }
+                    };
+                };
+            "#,
+            )
+            .expect("stub should eval");
+            ctx.eval::<(), _>(
+                r#"
+                var res = http.get('https://example.com/', { headers: { 'X-Request-Id': 'req-7' } });
+                globalThis.__out = JSON.stringify([
+                    res.cookies.sid ? res.cookies.sid[0].value : null,
+                    res.cookies.sid ? res.cookies.sid[0].httpOnly : null,
+                    res.request.method,
+                    res.request.url,
+                    res.request.headers['X-Request-Id'],
+                    res.proto,
+                    typeof res.remote_ip,
+                    res.html().find('.title').text(),
+                    res.html().find('#sub').text()
+                ]);
+            "#,
+            )
+            .expect("script should eval");
+            let out: String = ctx.eval("__out").expect("read __out");
+            assert_eq!(
+                out,
+                concat!(
+                    "[\"abc123\",true,\"GET\",\"https://example.com/\",",
+                    "\"req-7\",\"HTTP/1.1\",\"string\",\"Hello\",\"World\"]"
+                ),
+                "res.cookies/request/proto/remote_ip/html() mismatch: {out}"
+            );
+        });
+    }
+
+    #[test]
     fn test_response_headers_keep_canonical_case() {
         // Backlog line 139: the shim force-lowercased response header keys
         // (hk.toLowerCase()), so `res.headers['Content-Type']` — every k6
@@ -6206,6 +6333,98 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_test_async_body_records_on_settlement() {
+        // Backlog line 84: pm.test(name, asyncFn) always passed — the body's
+        // Promise is never `=== false`, so the check recorded GREEN before the
+        // async body settled; a rejected body ALSO passed. The check must be
+        // recorded at settlement time: rejected async body → FAILED check
+        // (mirrors the sync throw path), resolved body → value !== false.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Bare Context::full has no console global; pm.test's error
+                // paths call console.error, so stub it (real k6/sandbox
+                // contexts install one during bootstrap).
+                globalThis.console = {
+                    error: function () {},
+                    log: function () {},
+                    warn: function () {}
+                };
+                globalThis.__recorded = [];
+                globalThis.__tropel_pm_test = function (name, passed, tagsJson) {
+                    globalThis.__recorded.push({
+                        name: name,
+                        passed: passed,
+                        tags: tagsJson ? JSON.parse(tagsJson) : null
+                    });
+                };
+                globalThis.__run = (async function () {
+                    // Rejected async body (stand-in for a failing pm.expect
+                    // inside an async fn): must record FAILED, not PASS.
+                    await pm.test('async-fail', async function () {
+                        throw new Error('boom');
+                    });
+                    // Body returning a rejected promise: same.
+                    await pm.test('async-reject', function () {
+                        return Promise.reject(new Error('nope'));
+                    });
+                    // Resolved async body: value semantics (true → PASS).
+                    await pm.test('async-pass', async function () { return true; });
+                    // Sync paths unchanged.
+                    pm.test('sync-pass', function () { return true; });
+                    pm.test('sync-fail', function () { throw new Error('sync'); });
+                })();
+            "#,
+            )
+            .expect("async pm.test driver script should eval");
+
+            let run: rquickjs::Promise = ctx
+                .eval("globalThis.__run")
+                .expect("read the async driver promise");
+            run.finish::<()>()
+                .expect("async pm.test bodies must settle (job pump)");
+
+            let by_name = |name: &str| -> (String, bool) {
+                let q = format!(
+                    "(function(){{ var r = __recorded.find(x => x.name === '{}'); return r ? [r.name, r.passed] : null; }})()",
+                    name
+                );
+                // rquickjs 0.12 `eval` takes `Into<Vec<u8>>` — `&String`
+                // doesn't impl it, so eval the `&str`.
+                let v: rquickjs::Value = ctx.eval(q.as_str()).unwrap_or_else(|e| {
+                    panic!("find {}: {}", name, e)
+                });
+                if v.is_null() {
+                    panic!("no recorded check named {}", name);
+                }
+                // `Value::as_array` here returns `Option<&Array>` (not Cow),
+                // so `.clone()` yields an owned Array.
+                let arr = v.as_array().expect("recorded entry array").clone();
+                let n: String = arr.get(0).expect("name");
+                let p: bool = arr.get(1).expect("passed");
+                (n, p)
+            };
+
+            let (n, p) = by_name("async-fail (error)");
+            assert_eq!(n, "async-fail (error)", "rejected async body name");
+            assert!(!p, "rejected async body must record a FAILED check, not PASS");
+            let (_n, p) = by_name("async-reject (error)");
+            assert!(!p, "Promise.reject body must record a FAILED check");
+            let (n, p) = by_name("async-pass");
+            assert_eq!(n, "async-pass");
+            assert!(p, "resolved async body returning true must PASS");
+            let (_n, p) = by_name("sync-pass");
+            assert!(p, "sync true body must still PASS");
+            let (_n, p) = by_name("sync-fail (error)");
+            assert!(!p, "sync throwing body must still FAIL");
+        });
+    }
+
+    #[test]
     fn test_timings_error_binary_and_http_file() {
         // Backlog line 150: the k6 path emitted no sub-timing samples, res.
         // timings.* were 0 except waiting/duration, res.error/error_code did
@@ -6480,6 +6699,29 @@ mod tests {
                 globalThis.__be_json = String((function () {
                     try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
                 })());
+                // Backlog line 42 (P0): Postman snippets read `to.be.json;` as a
+                // PROPERTY (no parens). A bare function value used to read as
+                // truthy → silent PASS; the getter must run the check on the read.
+                globalThis.__be_json_prop = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // Backlog line 41 (P0): the specific chai-postman status helpers
+                // used to be absent → undefined → silent PASS. Now real getters.
+                globalThis.__be_not_found = String((function () {
+                    try { pm.response.to.be.notFound; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__be_unauthorized = String((function () {
+                    try { pm.response.to.be.unauthorized; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__be_with_body = String((function () {
+                    try { pm.response.to.be.withBody; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // Backlog line 41 (P0): the guardChain Proxy — ANY unknown
+                // assertion name must THROW (failed check), never read as
+                // undefined and record green.
+                globalThis.__be_unknown = String((function () {
+                    try { pm.response.to.be.nonexistentAssertion; return 'passed'; } catch (e) { return 'threw'; }
+                })());
                 globalThis.__have_hdr = String((function () {
                     try { pm.response.to.have.header('Content-Type', 'application/json'); return 'passed'; } catch (e) { return 'threw'; }
                 })());
@@ -6498,9 +6740,161 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__be_server_error").unwrap(), "threw", "404 must NOT be serverError");
             assert_eq!(ctx.eval::<String, _>("__be_error").unwrap(), "passed", "404 must be error (>=400)");
             assert_eq!(ctx.eval::<String, _>("__be_json").unwrap(), "passed", "content-type json + valid body must pass to.be.json()");
+            assert_eq!(ctx.eval::<String, _>("__be_json_prop").unwrap(), "passed", "property read to.be.json must run the check (valid JSON body)");
+            assert_eq!(ctx.eval::<String, _>("__be_not_found").unwrap(), "passed", "404 must be notFound");
+            assert_eq!(ctx.eval::<String, _>("__be_unauthorized").unwrap(), "threw", "404 must NOT be unauthorized (401)");
+            assert_eq!(ctx.eval::<String, _>("__be_with_body").unwrap(), "passed", "non-empty body must pass to.be.withBody");
+            assert_eq!(ctx.eval::<String, _>("__be_unknown").unwrap(), "threw", "unknown to.be.<name> must throw, not silently pass");
             assert_eq!(ctx.eval::<String, _>("__have_hdr").unwrap(), "passed", "to.have.header must pass when header matches");
             assert_eq!(ctx.eval::<String, _>("__have_body").unwrap(), "passed", "to.have.body must pass when substring present");
             assert_eq!(ctx.eval::<String, _>("__have_json_body").unwrap(), "passed", "to.have.jsonBody must deep-compare");
+
+            // The EXACT silent-pass the backlog verified (line 42): a bare
+            // PROPERTY read `pm.response.to.be.json;` on a non-JSON body used
+            // to record PASS (truthy function). With the getter form it must
+            // throw — re-point the json bridge at a throwing body.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_json = function () { throw new Error('body is not JSON'); };
+                globalThis.__be_json_prop_bad = String((function () {
+                    try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("second eval should succeed");
+            assert_eq!(
+                ctx.eval::<String, _>("__be_json_prop_bad").unwrap(),
+                "threw",
+                "bare to.be.json property read on a non-JSON body must throw (line 42 silent pass)"
+            );
+        });
+    }
+
+    #[test]
+    fn oversized_binary_body_degrades_to_status0_envelope_not_panic() {
+        // Backlog line 46 (P0): a server-controlled binary response body at/over
+        // the per-VU heap cap used to `.expect()`-panic ACROSS the QuickJS FFI
+        // boundary. build_k6_response_object must return the status-0 error
+        // envelope (same shape as the invalid-method path) instead.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let obj = build_k6_response_object(
+                &ctx,
+                200,
+                "OK".into(),
+                vec![0u8; K6_VU_HEAP_BYTES], // >= cap → guaranteed-OOM pre-check
+                &HashMap::new(),
+                5.0,
+                None,
+                "",
+                0,
+                "binary",
+                &[],
+            )
+            .expect("status-0 envelope build must succeed");
+            let code: i32 = obj.get("code").expect("code field");
+            assert_eq!(
+                code, 0,
+                "oversized binary body must degrade to status 0, got {code}"
+            );
+            let err: String = obj.get("error").expect("error field");
+            assert!(!err.is_empty(), "envelope must carry an error message");
+        });
+    }
+
+    #[test]
+    fn test_pm_response_to_be_guarded_status_assertions() {
+        // Backlog line 41: pm.response.to.be.* was a bare object literal, so
+        // .notFound/.unauthorized/.forbidden/.badRequest/.accepted/.rateLimited
+        // /.withBody/.teapot all read as `undefined` and recorded PASS on any
+        // response. The tree is now guardChain-wrapped: exact-status getters
+        // THROW on mismatch, and ANY unknown assertion name throws too.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 404; };
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_pm_response_body = function () { return 'not found'; };
+
+                // Exact-status getters: only notFound passes on 404.
+                globalThis.__b_not_found = String((function () {
+                    try { pm.response.to.be.notFound; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_unauthorized = String((function () {
+                    try { pm.response.to.be.unauthorized; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_forbidden = String((function () {
+                    try { pm.response.to.be.forbidden; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_bad_request = String((function () {
+                    try { pm.response.to.be.badRequest; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_accepted = String((function () {
+                    try { pm.response.to.be.accepted; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_rate_limited = String((function () {
+                    try { pm.response.to.be.rateLimited; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_teapot = String((function () {
+                    try { pm.response.to.be.teapot; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__b_with_body = String((function () {
+                    try { pm.response.to.be.withBody; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+
+                // guardChain: a name that is not implemented ANYWHERE must
+                // throw, not silently pass.
+                globalThis.__b_unknown = String((function () {
+                    try { pm.response.to.be.nonexistentAssertion; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+
+                // withBody/withoutBody respond to the actual body.
+                globalThis.__b_without_body = String((function () {
+                    try { pm.response.to.be.withoutBody; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__b_not_found").unwrap(), "passed", "404 must pass notFound");
+            assert_eq!(ctx.eval::<String, _>("__b_unauthorized").unwrap(), "threw", "404 must NOT be unauthorized");
+            assert_eq!(ctx.eval::<String, _>("__b_forbidden").unwrap(), "threw", "404 must NOT be forbidden");
+            assert_eq!(ctx.eval::<String, _>("__b_bad_request").unwrap(), "threw", "404 must NOT be badRequest");
+            assert_eq!(ctx.eval::<String, _>("__b_accepted").unwrap(), "threw", "404 must NOT be accepted");
+            assert_eq!(ctx.eval::<String, _>("__b_rate_limited").unwrap(), "threw", "404 must NOT be rateLimited");
+            assert_eq!(ctx.eval::<String, _>("__b_teapot").unwrap(), "threw", "404 must NOT be teapot");
+            assert_eq!(ctx.eval::<String, _>("__b_with_body").unwrap(), "passed", "non-empty body must pass withBody");
+            assert_eq!(ctx.eval::<String, _>("__b_unknown").unwrap(), "threw", "unknown assertion must throw (no silent PASS)");
+            assert_eq!(ctx.eval::<String, _>("__b_without_body").unwrap(), "threw", "non-empty body must NOT pass withoutBody");
+
+            // The original silent-PASS probe from the backlog: on a 200,
+            // .notFound must now FAIL instead of recording PASS.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__b_not_found_200 = String((function () {
+                    try { pm.response.to.be.notFound; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+            assert_eq!(
+                ctx.eval::<String, _>("__b_not_found_200").unwrap(),
+                "threw",
+                "200 must FAIL notFound (the silent-PASS bug)"
+            );
         });
     }
 

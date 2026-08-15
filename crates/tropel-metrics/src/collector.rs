@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc};
 use tropel_sdk::types::{Sample, SampleType};
@@ -204,14 +204,22 @@ impl MetricSet {
                 // count/sum covered everything → arithmetically impossible
                 // results like `min > avg` and wrong p-values.
                 //
-                // Values are rounded (not truncated) because `value as u64`
-                // silently dropped sub-µs samples: `myTrend.add(0.25)` (ms)
-                // became 0 µs → p(95)=0, max=0. Rounding keeps fractional
-                // µs values ≥ 0.5 in the distribution.
+                // Sub-ms samples are preserved end-to-end (backlog line 57):
+                // `record_ms` converts fractional ms to μs internally, so a
+                // 0.3 ms p50 lands in its true bucket instead of being
+                // quantized to 1 ms. Raw min/max are tracked as exact f64 so
+                // `min ≤ avg` always holds even when every sample is 0
+                // (histogram clamps 0 to its 1 μs low bound).
                 let h = self
                     .histogram
                     .get_or_insert_with(|| LatencyHistogram::with_max(self.histogram_max_ms));
-                h.record_ms(value.max(0.0).round() as u64);
+                h.record_ms(value.max(0.0));
+                if value < self.min {
+                    self.min = value;
+                }
+                if value > self.max {
+                    self.max = value;
+                }
                 self.count += 1.0;
                 self.sum += value;
             }
@@ -244,14 +252,16 @@ impl MetricSet {
                 mine.merge(h);
             }
         }
-        if self.metric_type == MetricType::Gauge {
+        if self.metric_type == MetricType::Gauge || self.metric_type == MetricType::Trend {
             if other.min < self.min {
                 self.min = other.min;
             }
             if other.max > self.max {
                 self.max = other.max;
             }
-            self.last = other.last;
+            if self.metric_type == MetricType::Gauge {
+                self.last = other.last;
+            }
         }
     }
 
@@ -573,6 +583,16 @@ struct Aggregator {
     /// Cardinality cap for the series map (see [`MAX_SERIES`]). A field so
     /// tests can shrink it; production uses the const default.
     max_series: usize,
+    /// When the aggregator came to life. `build_results` reports
+    /// `started.elapsed()` as `run_duration` — backlog line 45 (P0): the old
+    /// hardcoded `Duration::ZERO` made every MID-RUN rate/avg threshold
+    /// evaluation (the ~2 s abortOnFail tick) compute 0.0 per second, so
+    /// `http_reqs: ['rate>100', abortOnFail]` aborted healthy runs at t=2 s
+    /// and marked them tainted even without abortOnFail. The engine still
+    /// stamps the authoritative post-run duration over the result. (Rate over
+    /// a tiny early-run elapsed can spike — inherent k6-style rate semantics,
+    /// and the abort tick only fires after ~2 s.)
+    started: Instant,
     /// Incremental merged http_req_duration headline (Trend). Maintained on
     /// every recorded sample so `build_results` (the ~2 s abort-path tick)
     /// reads PRE-MERGED stats instead of re-cloning/re-merging every full
@@ -588,6 +608,15 @@ struct Aggregator {
     merged_per_group: std::collections::BTreeMap<(String, String), MetricSet>,
     /// Samples dropped because the `max_series` cardinality cap was reached.
     series_dropped: u64,
+    /// Incremental http_req_failed counters — request count (total) and
+    /// value sum (failed) — maintained on EVERY sample, including ones
+    /// dropped by the cardinality guard, so the headline failure rate covers
+    /// the whole run (backlog line 59: the per-series sum covered only
+    /// surviving series). NOTE: distributed snapshots carry only `self.data`
+    /// series, so worker-side dropped failures can't be recovered by the
+    /// controller's rebuild_merged — same gap as the old per-series loop.
+    http_req_failed_requests: u64,
+    http_req_failed_sum: f64,
 }
 
 impl Aggregator {
@@ -600,11 +629,14 @@ impl Aggregator {
             histogram_max_ms: None,
             retain_histograms: false,
             max_series: MAX_SERIES,
+            started: Instant::now(),
             merged_http_dur: None,
             merged_iter_dur: None,
             merged_per_url: std::collections::BTreeMap::new(),
             merged_per_group: std::collections::BTreeMap::new(),
             series_dropped: 0,
+            http_req_failed_requests: 0,
+            http_req_failed_sum: 0.0,
         }
     }
 
@@ -658,15 +690,27 @@ impl Aggregator {
             SampleType::Trend => MetricType::Trend,
         };
 
+        // Incremental http_req_failed counters — BEFORE the cardinality guard
+        // so samples dropped for new series still count toward the headline
+        // failure rate (backlog line 59: the old per-series sum in
+        // `build_results` covered only surviving series while `http_reqs`
+        // kept climbing from `totals`, so the rate silently shrank).
+        if sample.metric.as_ref() == "http_req_failed" {
+            self.http_req_failed_requests += 1;
+            self.http_req_failed_sum += sample.value;
+        }
+
         // Cardinality guard: never let the series map grow past `max_series`.
         // The runner tags every request with the full URL in BOTH `url` and
         // `name`, so a high-cardinality input (unique URL per request) must
         // not OOM the aggregator. New series beyond the cap are dropped
         // (counted, not stored) — existing series keep recording, and the
         // name-keyed `totals` map stays complete so headline counters keep
-        // accumulating under pressure. The incremental accumulators are also
-        // skipped: they are keyed by the same tags, so they are bounded by
-        // the same cap.
+        // accumulating under pressure. The tag-keyed incremental maps
+        // (per-URL/per-group) are bounded by the same cap and are correctly
+        // skipped — but the SINGLE headline accumulators (merged_http_dur /
+        // merged_iter_dur) are NOT tag-keyed, so they must keep recording or
+        // the headline percentiles freeze while `http_reqs` keeps climbing.
         if !self.data.contains_key(&key) && self.data.len() >= self.max_series {
             self.series_dropped += 1;
             if self.series_dropped == 1 {
@@ -675,6 +719,16 @@ impl Aggregator {
                      series (check for a high-cardinality url/name tag)",
                     self.max_series
                 );
+            }
+            let hmax = self.histogram_max_ms;
+            if sample.metric.as_ref() == "http_req_duration" {
+                self.merged_http_dur
+                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                    .record(sample.value, &sample.sample_type);
+            } else if sample.metric.as_ref() == "iteration_duration" {
+                self.merged_iter_dur
+                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                    .record(sample.value, &sample.sample_type);
             }
             if let Some(total) = self.totals.get_mut(sample.metric.as_ref()) {
                 *total += sample.value;
@@ -754,8 +808,11 @@ impl Aggregator {
         let mut metrics = Vec::new();
         let mut http_reqs: u64 = 0;
         let mut http_req_duration: Option<MetricSummary> = None;
-        let mut http_req_failed_count: f64 = 0.0;
-        let mut http_req_failed_total: f64 = 0.0;
+        // Incremental counters maintained in `record()` on EVERY sample
+        // (incl. cardinality-dropped ones) — see `Aggregator`. The old
+        // per-series loop sum here covered only surviving series.
+        let http_req_failed_count: f64 = self.http_req_failed_sum;
+        let http_req_failed_total: f64 = self.http_req_failed_requests as f64;
         let mut errors: u64 = 0;
         let mut checks_total: u64 = 0;
         let mut checks_passed: u64 = 0;
@@ -806,12 +863,12 @@ impl Aggregator {
                     count: set.sum as u64,
                     sum: set.sum,
                     mean: set.mean(),
-                    min: 0,
-                    max: 0,
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: 0.0,
+                    max: 0.0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: 0.0,
                     rate: 0.0,
                     histogram: None,
@@ -823,12 +880,12 @@ impl Aggregator {
                     count: set.count as u64,
                     sum: set.sum,
                     mean: set.mean(),
-                    min: 0,
-                    max: 0,
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: 0.0,
+                    max: 0.0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: 0.0,
                     rate: set.rate(),
                     histogram: None,
@@ -840,20 +897,12 @@ impl Aggregator {
                     count: set.count as u64,
                     sum: set.sum,
                     mean: set.mean(),
-                    min: if set.min == f64::MAX {
-                        0
-                    } else {
-                        set.min as u64
-                    },
-                    max: if set.max == f64::MIN {
-                        0
-                    } else {
-                        set.max as u64
-                    },
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: if set.min == f64::MAX { 0.0 } else { set.min },
+                    max: if set.max == f64::MIN { 0.0 } else { set.max },
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: set.last,
                     rate: 0.0,
                     histogram: None,
@@ -864,6 +913,8 @@ impl Aggregator {
                     set.count as u64,
                     set.sum,
                     set.mean(),
+                    set.min,
+                    set.max,
                     &set.trend_stats(),
                     retain_histograms.then(|| set.histogram.clone()).flatten(),
                 ),
@@ -905,9 +956,6 @@ impl Aggregator {
                 data_received += set.sum;
             } else if key.metric.as_ref() == "data_sent" {
                 data_sent += set.sum;
-            } else if key.metric.as_ref() == "http_req_failed" {
-                http_req_failed_total += set.count;
-                http_req_failed_count += set.sum;
             } else if key.metric.as_ref() == "iterations" {
                 iterations += set.sum as u64;
             } else if key.metric.as_ref() == "iteration_duration" {
@@ -948,6 +996,8 @@ impl Aggregator {
                 merged.count as u64,
                 merged.sum,
                 merged.mean(),
+                merged.min,
+                merged.max,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -967,6 +1017,8 @@ impl Aggregator {
                     merged.count as u64,
                     merged.sum,
                     merged.mean(),
+                    merged.min,
+                    merged.max,
                     &merged.trend_stats(),
                     retain_histograms
                         .then(|| merged.histogram.clone())
@@ -980,12 +1032,12 @@ impl Aggregator {
                     count: merged.sum as u64,
                     sum: merged.sum,
                     mean: merged.mean(),
-                    min: 0,
-                    max: 0,
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: 0.0,
+                    max: 0.0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: 0.0,
                     rate: 0.0,
                     histogram: None,
@@ -997,12 +1049,12 @@ impl Aggregator {
                     count: merged.count as u64,
                     sum: merged.sum,
                     mean: merged.mean(),
-                    min: 0,
-                    max: 0,
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    min: 0.0,
+                    max: 0.0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: 0.0,
                     rate: merged.rate(),
                     histogram: None,
@@ -1015,19 +1067,19 @@ impl Aggregator {
                     sum: merged.sum,
                     mean: merged.mean(),
                     min: if merged.min == f64::MAX {
-                        0
+                        0.0
                     } else {
-                        merged.min as u64
+                        merged.min
                     },
                     max: if merged.max == f64::MIN {
-                        0
+                        0.0
                     } else {
-                        merged.max as u64
+                        merged.max
                     },
-                    p50: 0,
-                    p90: 0,
-                    p95: 0,
-                    p99: 0,
+                    p50: 0.0,
+                    p90: 0.0,
+                    p95: 0.0,
+                    p99: 0.0,
                     last: merged.last,
                     rate: 0.0,
                     histogram: None,
@@ -1044,6 +1096,8 @@ impl Aggregator {
                 merged.count as u64,
                 merged.sum,
                 merged.mean(),
+                merged.min,
+                merged.max,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -1059,6 +1113,8 @@ impl Aggregator {
                 merged.count as u64,
                 merged.sum,
                 merged.mean(),
+                merged.min,
+                merged.max,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -1102,7 +1158,11 @@ impl Aggregator {
             },
             iterations,
             vus_max,
-            run_duration: Duration::ZERO,
+            // Backlog line 45 (P0): REAL mid-run elapsed — a ZERO here made
+            // every rate/avg threshold compute 0.0 and abortOnFail killed
+            // healthy runs (the engine stamps the final value post-run).
+            run_duration: self.started.elapsed(),
+            series_dropped: self.series_dropped,
             summary_trend_stats: self.summary_trend_stats.clone(),
             effective_thresholds: self.effective_thresholds.clone(),
         }
@@ -1253,6 +1313,11 @@ impl Aggregator {
         self.merged_iter_dur = None;
         self.merged_per_url.clear();
         self.merged_per_group.clear();
+        // Recompute the incremental http_req_failed counters from the merged
+        // series map (distributed path adds series directly to `self.data`,
+        // bypassing `record()`).
+        self.http_req_failed_requests = 0;
+        self.http_req_failed_sum = 0.0;
         let hmax = self.histogram_max_ms;
         for (key, set) in &self.data {
             if key.metric.as_ref() == "http_req_duration" {
@@ -1277,6 +1342,9 @@ impl Aggregator {
                     .merged_iter_dur
                     .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
                 merged.merge_from(set);
+            } else if key.metric.as_ref() == "http_req_failed" {
+                self.http_req_failed_requests += set.count as u64;
+                self.http_req_failed_sum += set.sum;
             }
             if let Some(group) = key.tags.iter().find(|(k, _)| k.as_ref() == "group") {
                 self.merged_per_group
@@ -1364,12 +1432,15 @@ pub fn merge_snapshots(
 /// iteration_duration headline, http_req_duration headline). Trend is the
 /// only type that reads histogram-derived percentiles, so the other four
 /// `MetricSummary` constructions stay inline.
+#[allow(clippy::too_many_arguments)] // key/tags/count/sum/mean/raw min/max/stats/histogram mirror MetricSummary's shape
 fn trend_summary(
     key: String,
     tags: Vec<(String, String)>,
     count: u64,
     sum: f64,
     mean: f64,
+    raw_min: f64,
+    raw_max: f64,
     stats: &HistogramStats,
     histogram: Option<LatencyHistogram>,
 ) -> MetricSummary {
@@ -1380,8 +1451,12 @@ fn trend_summary(
         count,
         sum,
         mean,
-        min: stats.min,
-        max: stats.max,
+        // Raw observed min/max (exact f64). The histogram's own min is
+        // clamped to its 1 µs low bound, so an all-zero series would report
+        // min=0.001 ms while avg=0 (backlog line 57: min > avg). Raw values
+        // keep `min ≤ avg` true for every distribution.
+        min: if raw_min == f64::MAX { 0.0 } else { raw_min },
+        max: if raw_max == f64::MIN { 0.0 } else { raw_max },
         p50: stats.p50,
         p90: stats.p90,
         p95: stats.p95,
@@ -1412,18 +1487,18 @@ pub struct MetricSummary {
     pub sum: f64,
     /// Mean value (sum / count).
     pub mean: f64,
-    /// Minimum value (Trend/Gauge only).
-    pub min: u64,
-    /// Maximum value (Trend/Gauge only).
-    pub max: u64,
-    /// p50 / median (Trend only).
-    pub p50: u64,
-    /// p90 (Trend only).
-    pub p90: u64,
-    /// p95 (Trend only).
-    pub p95: u64,
-    /// p99 (Trend only).
-    pub p99: u64,
+    /// Minimum value (Trend/Gauge only, fractional ms for Trend).
+    pub min: f64,
+    /// Maximum value (Trend/Gauge only, fractional ms for Trend).
+    pub max: f64,
+    /// p50 / median (Trend only, fractional ms).
+    pub p50: f64,
+    /// p90 (Trend only, fractional ms).
+    pub p90: f64,
+    /// p95 (Trend only, fractional ms).
+    pub p95: f64,
+    /// p99 (Trend only, fractional ms).
+    pub p99: f64,
     /// Last/gauge value (Gauge only).
     pub last: f64,
     /// Rate (Rate only: sum/count).
@@ -1470,6 +1545,10 @@ pub struct MetricsResult {
     /// finishes). Reporters use it for k6-style per-second rates
     /// (`http_reqs: 136 13.56/s`) and `handleSummary` state.
     pub run_duration: Duration,
+    /// Samples dropped by the `max_series` cardinality cap (backlog line 59:
+    /// previously incremented and read nowhere). Surfaced so high-cardinality
+    /// url/name tags are observable in summaries/reports.
+    pub series_dropped: u64,
     /// Trend statistics to show in the summary, k6 `summaryTrendStats`
     /// semantics (e.g. `["avg","min","med","max","p(90)","p(95)","p(99)"]`).
     /// Defaults to the k6 set. Reporters must honor this list.
@@ -1500,6 +1579,7 @@ impl Default for MetricsResult {
             iterations: 0,
             vus_max: 0,
             run_duration: Duration::ZERO,
+            series_dropped: 0,
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),
         }
@@ -1519,9 +1599,9 @@ pub fn k6_default_trend_stats() -> Vec<String> {
 pub fn trend_stat_value(stat: &str, m: &MetricSummary) -> Option<f64> {
     match stat.trim() {
         "avg" | "mean" => Some(m.mean),
-        "min" => Some(m.min as f64),
-        "med" | "median" => Some(m.p50 as f64),
-        "max" => Some(m.max as f64),
+        "min" => Some(m.min),
+        "med" | "median" => Some(m.p50),
+        "max" => Some(m.max),
         "count" => Some(m.count as f64),
         "sum" => Some(m.sum),
         "rate" => Some(m.rate),
@@ -1625,13 +1705,13 @@ pub fn parse_percentile(stat: &str) -> Option<f64> {
 /// summaries.
 pub fn percentile_value(m: &MetricSummary, pct: f64) -> f64 {
     if let Some(h) = &m.histogram {
-        h.percentile(pct) as f64
+        h.percentile(pct)
     } else {
         match pct {
-            x if x <= 50.0 => m.p50 as f64,
-            x if x <= 90.0 => m.p90 as f64,
-            x if x <= 95.0 => m.p95 as f64,
-            _ => m.p99 as f64,
+            x if x <= 50.0 => m.p50,
+            x if x <= 90.0 => m.p90,
+            x if x <= 95.0 => m.p95,
+            _ => m.p99,
         }
     }
 }
@@ -1908,15 +1988,55 @@ mod tests {
         );
         let mean = set.mean();
         assert!(
-            (stats.min as f64) <= mean,
+            stats.min <= mean,
             "min ({}) must be <= avg ({}) — the old bug produced min > avg",
             stats.min,
             mean
         );
-        // With 9990/10000 zeros, even p99 sits in the zero bucket.
-        assert_eq!(
-            stats.p99, 1,
-            "p99 should reflect the zero-majority population"
+        // With 9990/10000 zeros, even p99 sits in the zero bucket (1 µs
+        // clamp = 0.001 ms).
+        assert!(
+            (stats.p99 - 0.001).abs() < 1e-9,
+            "p99 should reflect the zero-majority population (p99={})",
+            stats.p99
+        );
+    }
+
+    #[test]
+    fn test_trend_sub_ms_values_keep_true_bucket() {
+        // Backlog line 57 headline: a localhost service with true p50 = 0.3 ms
+        // used to report min=1 max=1 med=1 p(95)=1 (integer-ms floor) while
+        // avg=0.34 — impossible, and `p(95) < 1` could never pass. Sub-ms
+        // samples must land in their true µs bucket and surface as f64 ms.
+        let mut set = MetricSet::new(MetricType::Trend, None);
+        let trend = SampleType::Trend;
+        for _ in 0..1000 {
+            set.record(0.3, &trend); // 300 µs
+        }
+
+        assert_eq!(set.count, 1000.0);
+        let stats = set.trend_stats();
+        assert_eq!(stats.count, 1000);
+        assert!(
+            (stats.min - 0.3).abs() < 0.001,
+            "min must be ~0.3 ms, not the old 1 ms floor (min={})",
+            stats.min
+        );
+        assert!(
+            (stats.p50 - 0.3).abs() < 0.001,
+            "p50 must be ~0.3 ms (p50={})",
+            stats.p50
+        );
+        assert!(
+            (stats.p95 - 0.3).abs() < 0.001,
+            "p95 must be ~0.3 ms — a p(95) < 1 threshold can now pass (p95={})",
+            stats.p95
+        );
+        assert!(
+            stats.min <= stats.max,
+            "min ({}) <= max ({})",
+            stats.min,
+            stats.max
         );
     }
 
@@ -1930,20 +2050,20 @@ mod tests {
         let trend = SampleType::Trend;
 
         set.record(0.25, &trend); // truncation would drop this to 0
-        set.record(0.6, &trend); // rounds to 1 µs
+        set.record(0.6, &trend); // 600 µs
         set.record(2_500.0, &trend); // 2.5 ms
 
         assert_eq!(set.count, 3.0);
         let stats = set.trend_stats();
         assert_eq!(stats.count, 3, "all samples must be in the histogram");
         assert!(
-            stats.max >= 2_500,
+            stats.max >= 2_500.0,
             "2.5 ms sample must be recorded (max={})",
             stats.max
         );
         assert!(
-            stats.min >= 1,
-            "0.25/0.6 are clamped to the 1 µs floor (min={}) — not dropped to 0",
+            stats.min >= 0.25,
+            "0.25/0.6 ms are preserved sub-ms (min={}) — not dropped to 0",
             stats.min
         );
     }
@@ -1951,9 +2071,10 @@ mod tests {
     #[test]
     fn test_trend_all_zero_samples_stay_in_population() {
         // Direct pin of the clamp path: an all-zero trend (every sub-timing
-        // 0 on pooled reuse) must still record every sample — min == max == 1
-        // µs (hdrhistogram floor), count fully populated. (min <= avg cannot
-        // hold here: the 1 µs clamp makes min == 1 while the mean is 0 µs.)
+        // 0 on pooled reuse) must still record every sample — clamped to the
+        // 1 µs (= 0.001 ms) hdrhistogram floor, count fully populated. The
+        // RAW min/max tracking (backlog line 57) keeps `min ≤ avg` true even
+        // though the histogram's own min is 0.001 ms.
         let mut set = MetricSet::new(MetricType::Trend, None);
         let trend = SampleType::Trend;
         for _ in 0..100 {
@@ -1963,9 +2084,12 @@ mod tests {
         assert_eq!(set.count, 100.0);
         let stats = set.trend_stats();
         assert_eq!(stats.count, 100, "all 100 zeros must be recorded");
-        assert_eq!(stats.min, 1);
-        assert_eq!(stats.max, 1);
+        assert!((stats.min - 0.001).abs() < 1e-9);
+        assert!((stats.max - 0.001).abs() < 1e-9);
         assert_eq!(set.sum, 0.0);
+        // Raw min/max stay exact (0.0) — the summary min is 0, so min <= avg.
+        assert_eq!(set.min, 0.0);
+        assert_eq!(set.max, 0.0);
     }
 
     #[test]
@@ -2011,6 +2135,33 @@ mod tests {
         assert_eq!(res.checks_failed, 1);
         // The custom metric still exists as its own series.
         assert!(res.metrics.iter().any(|m| m.key == "checks_latency"));
+    }
+
+    #[test]
+    fn mid_run_results_report_real_elapsed_duration() {
+        // Backlog line 45 (P0): build_results hardcoded run_duration to ZERO,
+        // so the ~2 s abortOnFail tick evaluated `rate`/`avg` as 0.0 per
+        // second — `http_reqs: ['rate>100', abortOnFail]` aborted healthy
+        // runs at t=2 s and marked runs tainted even without abortOnFail.
+        // The aggregator's own clock must yield a REAL mid-run duration.
+        let ts = std::time::SystemTime::now();
+        let mut agg = Aggregator::new();
+        let mut t = tropel_sdk::types::TagMap::new();
+        t.insert("url", "https://x.test/");
+        agg.record(Sample {
+            metric: "http_reqs".to_string().into(),
+            value: 1.0,
+            tags: Arc::new(t),
+            timestamp: ts,
+            sample_type: SampleType::Counter,
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let res = agg.build_results();
+        assert!(
+            res.run_duration >= Duration::from_millis(15),
+            "mid-run run_duration must be real elapsed (>= sleep), got {:?}",
+            res.run_duration
+        );
     }
 
     #[test]
@@ -2144,16 +2295,15 @@ mod tests {
         assert_eq!(dur.count, 8);
         assert_eq!(dur.sum, 52_000.0); // 1k+2k+4k+8k+3k+6k+12k+16k
         assert_eq!(dur.mean, 6500.0);
-        // min/max come from hdr-histogram, whose max() reports the bucket
-        // UPPER EDGE (16007 for 16000 at sigfig 3), so assert coverage not
-        // exact equality — the sample must never be excluded.
+        // min/max are raw observed values (backlog line 57) so exact
+        // coverage holds; percentiles stay histogram-bucket-quantized.
         assert!(
-            dur.min <= 1000 && dur.min >= 990,
+            dur.min <= 1000.0 && dur.min >= 990.0,
             "min={} covers 1000",
             dur.min
         );
         assert!(
-            dur.max >= 16000 && dur.max <= 16150,
+            dur.max >= 16000.0 && dur.max <= 16150.0,
             "max={} covers 16000",
             dur.max
         );
@@ -2197,15 +2347,16 @@ mod tests {
                 .1
                 .as_str();
             let (want_min, want_max) = expect_min_max[&(url, status)];
-            // Bucket-quantized min/max: assert coverage, not exact equality.
+            let (wmin, wmax) = (want_min as f64, want_max as f64);
+            // Raw min/max (backlog line 57): assert coverage with tolerance.
             assert!(
-                s.min <= want_min && s.min >= want_min.saturating_sub(want_min / 100),
-                "min {} covers {want_min} for {url} {status}",
+                s.min <= wmin && s.min >= wmin - wmin / 100.0,
+                "min {} covers {wmin} for {url} {status}",
                 s.min
             );
             assert!(
-                s.max >= want_max && s.max <= want_max + want_max / 100 + 1,
-                "max {} covers {want_max} for {url} {status}",
+                s.max >= wmax && s.max <= wmax + wmax / 100.0 + 1.0,
+                "max {} covers {wmax} for {url} {status}",
                 s.max
             );
         }
@@ -2589,7 +2740,7 @@ mod tests {
             merge_snapshots(vec![snap_a, snap_b], std::collections::HashMap::new()).unwrap();
         let m = merged.http_req_duration.expect("merged duration");
         assert_eq!(m.count, 5, "all 5 samples must merge");
-        assert!(m.max >= 100_000, "max must reflect the merged buckets");
+        assert!(m.max >= 100_000.0, "max must reflect the merged buckets");
     }
 
     #[test]
@@ -2672,6 +2823,23 @@ mod tests {
         assert_eq!(agg.data.len(), 2, "series map must stay at max_series");
         assert_eq!(agg.series_dropped, 1, "dropped series must be counted");
 
+        // The dropped /c sample still feeds the SINGLE headline accumulator
+        // (backlog line 59: merged_http_dur is NOT tag-keyed, so the guard
+        // must not skip it — the old code froze the headline percentiles
+        // while http_reqs kept climbing from `totals`).
+        let res = agg.build_results();
+        let merged = res
+            .http_req_duration
+            .expect("headline http_req_duration must exist");
+        assert_eq!(
+            merged.count, 3,
+            "dropped-series samples must reach merged_http_dur"
+        );
+        assert_eq!(
+            res.series_dropped, 1,
+            "series_dropped must surface on the result"
+        );
+
         // Existing series still record.
         let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
             ("url", "/a"),
@@ -2692,6 +2860,51 @@ mod tests {
             .find(|u| u.key.contains("/a"))
             .expect("/a per-url series kept recording");
         assert_eq!(a.count, 2, "existing /a series records both samples");
+    }
+
+    #[test]
+    fn test_cardinality_cap_http_req_failed_rate_covers_dropped_series() {
+        // Regression (backlog line 59): http_req_failed was summed inside the
+        // per-series loop, so the failure RATE covered only surviving series
+        // while http_reqs was complete. The incremental counters must include
+        // samples dropped by the cardinality guard.
+        let mut agg = Aggregator::new();
+        agg.max_series = 1;
+        let ts = std::time::SystemTime::now();
+
+        // One surviving FAILED series + one DROPPED PASSED series. This shape
+        // is what distinguishes the paths: the old per-series sum over the
+        // surviving series only would report 1/1 = 1.0; the incremental
+        // counters must report 1/2 = 0.5.
+        let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
+            ("url", "/a"),
+            ("name", "/a"),
+        ]));
+        agg.record(Sample {
+            metric: "http_req_failed".into(),
+            value: 1.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Rate,
+        });
+        let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
+            ("url", "/b"),
+            ("name", "/b"),
+        ]));
+        agg.record(Sample {
+            metric: "http_req_failed".into(),
+            value: 0.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Rate,
+        });
+        assert_eq!(agg.series_dropped, 1, "second series must be dropped");
+
+        let res = agg.build_results();
+        assert_eq!(
+            res.http_req_failed, 0.5,
+            "rate must cover the dropped-series PASS too (1 failed / 2 total)"
+        );
     }
 
     #[test]
@@ -2740,7 +2953,7 @@ mod tests {
         // rounding lands on the bucket edge (30015), never below the true
         // value — assert within tolerance, not exact.
         assert!(
-            hd.p95 >= 30_000 && hd.p95 <= 30_100,
+            hd.p95 >= 30_000.0 && hd.p95 <= 30_100.0,
             "p95 over 10/20/30 x2 must be ~30ms, got {}",
             hd.p95
         );
