@@ -1912,14 +1912,15 @@ fn register_http_bridges<'js>(
                                     "expires": c.expires,
                                     "sameSite": c.same_site,
                                 });
-                                cookies_map
+                                if let Some(arr) = cookies_map
                                     .entry(c.name.clone())
                                     .or_insert_with(|| serde_json::json!([]))
                                     .as_array_mut()
-                                    .map(|a| a.push(entry));
+                                {
+                                    arr.push(entry);
+                                }
                             }
-                            resp_json["cookies"] =
-                                serde_json::Value::Object(cookies_map);
+                            resp_json["cookies"] = serde_json::Value::Object(cookies_map);
                             if let Some(t) = &resp.timings {
                                 resp_json["timings"] = serde_json::json!({
                                     "blocked": t.blocked.as_secs_f64() * 1000.0,
@@ -6758,6 +6759,7 @@ mod tests {
                 "",
                 0,
                 "binary",
+                &[],
             )
             .expect("status-0 envelope build must succeed");
             let code: i32 = obj.get("code").expect("code field");
