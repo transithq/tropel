@@ -87,6 +87,12 @@ enum Slot {
     /// Past the hard cap — co-scheduled on a busy worker (isolation
     /// traded away at extreme VU counts, as documented).
     Wrapped(usize),
+    /// Growth failed (runtime/thread creation error) and the pool has NO
+    /// worker to wrap onto — run the VU on the caller's runtime instead of
+    /// panicking (backlog line 163). Isolation is traded away entirely; this
+    /// only occurs under resource exhaustion, and it beats aborting the
+    /// scenario task mid-ramp and orphaning every VU already spawned.
+    Inline,
 }
 
 /// Clears a worker's busy flag on drop. The VU task's completion (or panic)
@@ -113,10 +119,19 @@ impl VUWorkerPool {
     fn with_join_bound(count: usize, join_bound: Duration) -> Self {
         assert!(count > 0, "VUWorkerPool requires at least 1 worker");
 
-        let workers = (0..count).map(Self::make_worker).collect();
-        let busy = (0..count)
-            .map(|_| Arc::new(AtomicBool::new(false)))
-            .collect();
+        // `make_worker` degrades (returns `None`) instead of panicking on
+        // runtime/thread creation failure (backlog line 163) — a skipped
+        // worker must not shift the busy-flag indices, so build both vecs in
+        // lockstep: only successful workers get a busy flag, and the busy
+        // index always equals the worker index.
+        let mut workers = Vec::with_capacity(count);
+        let mut busy = Vec::with_capacity(count);
+        for i in 0..count {
+            if let Some(w) = Self::make_worker(i) {
+                workers.push(w);
+                busy.push(Arc::new(AtomicBool::new(false)));
+            }
+        }
         Self {
             workers: Mutex::new(workers),
             busy: Mutex::new(busy),
@@ -126,18 +141,44 @@ impl VUWorkerPool {
     }
 
     /// Create a single worker (current-thread runtime + pinned OS thread).
-    fn make_worker(i: usize) -> WorkerInner {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    ///
+    /// Returns `None` (with a logged warning) instead of panicking when the
+    /// runtime or thread cannot be created (e.g. fd/thread exhaustion). A
+    /// panic here would unwind through `acquire_slot` → `spawn_vu` → the
+    /// ramp loop → out of `executor.run`, aborting the scenario task
+    /// mid-ramp and ORPHANING the VUs already spawned (they'd keep emitting
+    /// while the engine computed `results()` — backlog line 163). Callers
+    /// degrade instead: reuse an existing worker, or run the VU inline on
+    /// the caller's runtime.
+    fn make_worker(i: usize) -> Option<WorkerInner> {
+        // Test-only hook: forces this call to fail, exercising the graceful
+        // degradation paths deterministically (thread-local, so parallel
+        // tests can't steal the flag).
+        #[cfg(test)]
+        if FAIL_NEXT_WORKER_BUILD.with(|f| f.replace(false)) {
+            return None;
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("Failed to create current-thread tokio runtime");
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "VUWorkerPool: failed to create worker runtime {} ({}); degrading",
+                    i,
+                    e
+                );
+                return None;
+            }
+        };
 
         let handle = runtime.handle().clone();
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let sig = shutdown.clone();
         let (exited_tx, exited_rx) = mpsc::channel::<()>();
 
-        let thread = thread::Builder::new()
+        let thread = match thread::Builder::new()
             .name(format!("tropel-worker-{}", i))
             .spawn(move || {
                 // Block on the runtime, waiting for shutdown signal.
@@ -149,15 +190,24 @@ impl VUWorkerPool {
                 // it within the join bound. If the pool is gone (detached),
                 // the send fails silently.
                 let _ = exited_tx.send(());
-            })
-            .expect("Failed to spawn worker thread");
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "VUWorkerPool: failed to spawn worker thread {} ({}); degrading",
+                    i,
+                    e
+                );
+                return None;
+            }
+        };
 
-        WorkerInner {
+        Some(WorkerInner {
             handle,
             shutdown,
             thread: Some(thread),
             exited: Some(exited_rx),
-        }
+        })
     }
 
     /// Find a worker slot with no live VU (its flag is false) and mark it
@@ -195,7 +245,18 @@ impl VUWorkerPool {
                 return Slot::Wrapped((vu_id as usize) % current);
             }
             // Build the worker outside the lock (runtime + thread creation).
-            let worker = Self::make_worker(current);
+            // A failed build degrades (backlog line 163): wrap onto an
+            // existing worker if the pool has one, else run the VU inline on
+            // the caller's runtime — never panic and abort the ramp.
+            let worker = match Self::make_worker(current) {
+                Some(w) => w,
+                None => {
+                    if current > 0 {
+                        return Slot::Wrapped((vu_id as usize) % current);
+                    }
+                    return Slot::Inline;
+                }
+            };
             let flag = Arc::new(AtomicBool::new(true)); // busy from birth
             let mut workers = self.workers.lock().unwrap();
             if workers.len() == current {
@@ -276,6 +337,10 @@ impl VUWorkerPool {
                 future.await
             }),
             Slot::Wrapped(idx) => self.spawn_on(idx, future),
+            // No worker available (resource exhaustion during growth): run on
+            // the CALLER's runtime. `tokio::spawn` requires a runtime context;
+            // `spawn_vu` is only reachable from inside one (the ramp loops).
+            Slot::Inline => tokio::spawn(future),
         }
     }
 
@@ -287,6 +352,11 @@ impl VUWorkerPool {
         F::Output: Send + 'static,
     {
         let len = self.worker_count();
+        if len == 0 {
+            // Every construction-time build failed (backlog line 163): run
+            // on the caller's runtime rather than modulo-dividing by zero.
+            return (0, tokio::spawn(future));
+        }
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % len;
         let handle = self.spawn_on(idx, future);
         (idx, handle)
@@ -352,6 +422,16 @@ impl Drop for VUWorkerPool {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only hook: forces the next `make_worker` call on THIS thread to
+    /// fail, exercising the graceful-degradation paths deterministically.
+    /// `thread_local` (not a shared static) because pool tests run in
+    /// parallel threads in the same binary — a shared flag would let one
+    /// test's forced failure bleed into another test's pool construction.
+    static FAIL_NEXT_WORKER_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -529,5 +609,55 @@ mod tests {
             "healthy teardown took {:?}",
             start.elapsed()
         );
+    }
+
+    /// Backlog line 163: a worker-runtime build failure must NEVER panic out
+    /// of `spawn_vu` (a panic would unwind through the ramp loop, abort the
+    /// scenario task mid-ramp, and orphan the VUs already spawned). It must
+    /// degrade instead: wrap onto an existing worker (pool non-empty) and
+    /// still run the VU to completion.
+    #[tokio::test]
+    async fn spawn_vu_degrades_to_wrapped_when_worker_build_fails() {
+        let pool = VUWorkerPool::new(1);
+        // Occupy the one worker so `acquire_slot` is forced onto the growth
+        // path, then force that growth to fail.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let hold = pool.spawn_vu(0, async move {
+            let _ = rx.await;
+            "held"
+        });
+        FAIL_NEXT_WORKER_BUILD.with(|f| f.set(true));
+        let wrapped = pool.spawn_vu(1, async { "wrapped" });
+        FAIL_NEXT_WORKER_BUILD.with(|f| f.set(false));
+
+        // Must complete on the existing worker — not panic, not hang.
+        assert_eq!(wrapped.await.expect("wrapped VU panicked"), "wrapped");
+        let _ = tx.send(());
+        assert_eq!(hold.await.expect("held VU panicked"), "held");
+    }
+
+    /// Backlog line 163: when EVERY worker build fails (pool has zero
+    /// workers), `spawn_vu` must degrade to running the VU inline on the
+    /// caller's runtime — the last-resort path that keeps the ramp alive.
+    #[tokio::test]
+    async fn spawn_vu_degrades_to_inline_when_pool_is_empty() {
+        // Force the construction-time build to fail → zero-worker pool.
+        FAIL_NEXT_WORKER_BUILD.with(|f| f.set(true));
+        let pool = VUWorkerPool::new(1);
+        assert_eq!(
+            pool.worker_count(),
+            0,
+            "forced build failure must yield an empty pool"
+        );
+        // Re-arm the hook so the spawn-time growth call ALSO fails — the
+        // swap-once flag was already consumed by construction, and without
+        // re-arming, spawn would grow the pool (Slot::Grown) instead of
+        // exercising the Slot::Inline degradation.
+        FAIL_NEXT_WORKER_BUILD.with(|f| f.set(true));
+        let h = pool.spawn_vu(7, async { 42u32 });
+        FAIL_NEXT_WORKER_BUILD.with(|f| f.set(false));
+        assert_eq!(h.await.expect("inline VU panicked"), 42);
+        // No worker was grown — the VU truly ran inline on the caller runtime.
+        assert_eq!(pool.worker_count(), 0, "inline VU must not grow the pool");
     }
 }
