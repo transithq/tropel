@@ -1,5 +1,8 @@
 use rand::RngExt;
 use regex::Regex;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+use tracing::warn;
 
 /// Compile a regex ONCE per process (lazily) and return a reference to the
 /// cached instance. The old code called `Regex::new` on EVERY `resolve` for
@@ -22,6 +25,11 @@ macro_rules! cached_re {
 /// this cap keeps resolution bounded (and the substitution complete) instead
 /// of killing the run.
 const MAX_DYNAMIC_LENGTH: usize = 10_000;
+
+/// Names of Postman dynamic variables that are NOT in the catalog — used to
+/// warn ONCE per distinct name (backlog line 141). Never cleared: a catalog
+/// miss is a static property of the code, not of the run.
+static UNKNOWN_DYNAMIC_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// Parse a `:length` / `:count` capture, clamping to [`MAX_DYNAMIC_LENGTH`].
 /// Unparseable or missing captures fall back to `default` (the variable's
@@ -160,6 +168,18 @@ impl DynamicCatalog {
             result = self.replace_with_func(&result, re, |_| rng.random_bool(0.5).to_string());
         }
 
+        // {{$randomHexColor}} — a `#rrggbb` hex colour (Postman:
+        // faker.internet.color). Distinct from {{$randomHex}}, which is a bare
+        // hex NUMBER with no `#`. Placed BEFORE the {{$randomHex}} block
+        // because that handler's `contains("{{$randomHex")` gate would fire
+        // on this prefix and run a wasted regex pass for every occurrence.
+        if result.contains("{{$randomHexColor}}") {
+            let re = cached_re!(RE_RANDOM_HEX_COLOR, r"\{\{\$randomHexColor\}\}");
+            result = self.replace_with_func(&result, re, |_| {
+                format!("#{:06x}", rng.random::<u32>() & 0xFFFFFF)
+            });
+        }
+
         // {{$randomHex[:length]}}
         if result.contains("{{$randomHex") {
             let re = cached_re!(RE_RANDOM_HEX, r"\{\{\$randomHex(?::(\d+))?\}\}");
@@ -279,9 +299,36 @@ impl DynamicCatalog {
             let re = cached_re!(RE_RANDOM_NAME_LAST, r"\{\{\$randomNameLastName\}\}");
             result = self.replace_with_func(&result, re, |_| random_last_name(&mut rng));
         }
+        // {{$randomColor}} — a colour WORD (Postman: faker.commerce.color), NOT
+        // a bare hex string.
         if result.contains("{{$randomColor}}") {
             let re = cached_re!(RE_RANDOM_COLOR, r"\{\{\$randomColor\}\}");
             result = self.replace_with_func(&result, re, |_| random_color(&mut rng));
+        }
+
+        // Backlog line 141: any dynamic variable that is NOT in the catalog
+        // ({{$randomUserName}}, …) survives resolution and is sent to the
+        // server as the literal placeholder — silently, with no warning. Warn
+        // ONCE per distinct name so a multi-million-iteration load run spams
+        // the log exactly N times, not once per request. The cheap `{{$`
+        // gate means the regex pass only runs for inputs that actually
+        // contain an unresolved dynamic variable.
+        if result.contains("{{$") {
+            let re = cached_re!(
+                RE_UNRESOLVED_DYNAMIC,
+                r"\{\{\$([A-Za-z][A-Za-z0-9_]*)(?::[^}]*)?\}\}"
+            );
+            for caps in re.captures_iter(&result) {
+                let name = caps.get(1).unwrap().as_str().to_string();
+                let warned = UNKNOWN_DYNAMIC_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+                let mut warned = warned.lock().unwrap();
+                if warned.insert(name.clone()) {
+                    warn!(
+                        variable = %name,
+                        "unimplemented Postman dynamic variable — sent verbatim as the literal placeholder"
+                    );
+                }
+            }
         }
         if result.contains("{{$randomMAC}}") {
             let re = cached_re!(RE_RANDOM_MAC, r"\{\{\$randomMAC\}\}");
@@ -609,8 +656,63 @@ fn random_last_name<R: RngExt>(rng: &mut R) -> String {
     random_choice(rng, LAST_NAMES).to_string()
 }
 
+/// Colour names for {{$randomColor}} (Postman: faker.commerce.color returns a
+/// colour WORD like "red" / "gold", never a hex string).
+const COLOR_NAMES: &[&str] = &[
+    "red",
+    "green",
+    "blue",
+    "yellow",
+    "purple",
+    "mint green",
+    "teal",
+    "white",
+    "black",
+    "orange",
+    "pink",
+    "grey",
+    "maroon",
+    "violet",
+    "turquoise",
+    "tan",
+    "sky blue",
+    "salmon",
+    "plum",
+    "orchid",
+    "olive",
+    "magenta",
+    "lime",
+    "ivory",
+    "indigo",
+    "gold",
+    "fuchsia",
+    "cyan",
+    "azure",
+    "beige",
+    "brown",
+    "crimson",
+    "lavender",
+    "silver",
+    "wheat",
+    "coral",
+    "navy",
+    "khaki",
+    "aqua",
+    "chocolate",
+    "dark blue",
+    "light green",
+    "peach",
+    "peru",
+    "sienna",
+    "tomato",
+    "violet red",
+    "spring green",
+    "royal blue",
+    "rebecca purple",
+];
+
 fn random_color<R: RngExt>(rng: &mut R) -> String {
-    format!("{:06x}", rng.random::<u32>() & 0xFFFFFF)
+    random_choice(rng, COLOR_NAMES).to_string()
 }
 
 fn random_date<R: RngExt>(rng: &mut R) -> String {
@@ -903,5 +1005,61 @@ mod tests {
         let s = random_string(&mut rng, 5, "ab");
         assert_eq!(s.len(), 5);
         assert!(s.chars().all(|c| c == 'a' || c == 'b'));
+    }
+
+    #[test]
+    fn random_color_returns_a_word_not_hex() {
+        // Backlog line 141: {{$randomColor}} returned a bare hex string
+        // (`1a2b3c`) instead of a colour WORD. Must be one of COLOR_NAMES.
+        let catalog = DynamicCatalog::new();
+        for _ in 0..50 {
+            let c = catalog.resolve("{{$randomColor}}");
+            assert!(
+                COLOR_NAMES.contains(&c.as_str()),
+                "randomColor must be a colour word, got {:?}",
+                c
+            );
+            assert!(
+                !c.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "no bare hex: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn random_hex_color_is_prefixed_hash() {
+        // Backlog line 141: {{$randomHexColor}} was unimplemented (sent
+        // verbatim). Postman's faker.internet.color emits `#rrggbb`.
+        let catalog = DynamicCatalog::new();
+        for _ in 0..50 {
+            let c = catalog.resolve("{{$randomHexColor}}");
+            assert_eq!(c.len(), 7, "hex color is #rrggbb, got {c}");
+            assert!(c.starts_with('#'), "hex color must start with #, got {c}");
+            assert!(c[1..].chars().all(|ch| ch.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn unknown_dynamic_variable_stays_literal_and_warns_once() {
+        // Backlog line 141: a {{$randomUserName}}-style variable that is NOT
+        // in the catalog must NOT be silently dropped nor crash — it stays as
+        // the literal placeholder, and the resolver warns once per name (the
+        // warn itself is fire-and-forget; the literal is the observable part).
+        let catalog = DynamicCatalog::new();
+        let out = catalog.resolve("user={{$randomUserName}}");
+        assert_eq!(out, "user={{$randomUserName}}", "unknown var stays literal");
+        // Resolving twice must be idempotent and not panic.
+        let out2 = catalog.resolve("user={{$randomUserName}}");
+        assert_eq!(out2, "user={{$randomUserName}}");
+        // A known var in the same string still resolves.
+        let mixed = catalog.resolve("u={{$randomUserName}} id={{$randomInt}}");
+        assert!(
+            mixed.contains("id="),
+            "known var resolves beside unknown: {mixed}"
+        );
+        assert!(
+            mixed.contains("{{$randomUserName}}"),
+            "unknown stays literal: {mixed}"
+        );
     }
 }
