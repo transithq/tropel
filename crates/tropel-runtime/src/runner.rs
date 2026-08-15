@@ -942,8 +942,8 @@ mod tests {
 
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
-            id: None,
             name: name.to_string(),
+            id: None,
             request: Some(tropel_sdk::types::Request {
                 url: format!("http://example.com/{name}"),
                 method: Method::GET,
@@ -965,8 +965,8 @@ mod tests {
 
     fn folder(name: &str, items: Vec<ScenarioItem>) -> ScenarioItem {
         ScenarioItem {
-            id: None,
             name: name.to_string(),
+            id: None,
             request: None,
             prerequest: vec![],
             test: vec![],
@@ -1048,8 +1048,8 @@ mod tests {
         // A leaf with no request and no scripts is not executable; it must
         // not appear in the run order.
         let inert = ScenarioItem {
-            id: None,
             name: "inert".into(),
+            id: None,
             request: None,
             prerequest: vec![],
             test: vec![],
@@ -1179,8 +1179,8 @@ mod tests {
             auth: None,
             items: vec![
                 ScenarioItem {
-                    id: None,
                     name: "item-a".into(),
+                    id: None,
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/a".into(),
                         method: Method::GET,
@@ -1199,8 +1199,8 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
-                    id: None,
                     name: "item-b".into(),
+                    id: None,
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/b".into(),
                         method: Method::GET,
@@ -1271,8 +1271,8 @@ mod tests {
             // forever. Both items are script-only — no network traffic.
             items: vec![
                 ScenarioItem {
-                    id: None,
                     name: "self".into(),
+                    id: None,
                     request: None,
                     prerequest: vec!["postman.setNextRequest('self');".into()],
                     test: vec![],
@@ -1280,8 +1280,8 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
-                    id: None,
                     name: "after".into(),
+                    id: None,
                     request: None,
                     prerequest: vec!["// inert".into()],
                     test: vec![],
@@ -1368,8 +1368,8 @@ mod tests {
             items: vec![folder(
                 "Folder",
                 vec![ScenarioItem {
-                    id: None,
                     name: "inner".into(),
+                    id: None,
                     request: None,
                     prerequest: vec![
                         "pm.environment.set('token', 'tok-42'); // COLLECTION; FOLDER; REQUEST"
@@ -1482,8 +1482,8 @@ mod tests {
             //      string would throw here) AND returns early
             //   2: request — must STILL run (return only exits script 1)
             items: vec![ScenarioItem {
-                id: None,
                 name: "scoped".into(),
+                id: None,
                 request: None,
                 prerequest: vec![
                     "const baseUrl = 'https://api.example.com'; // COLLECTION".into(),
@@ -1617,7 +1617,7 @@ mod tests {
         let state = runner.pm_state().lock().unwrap();
         assert_eq!(state.environment.get("saw0").map(String::as_str), Some("1"));
         assert!(
-            state.environment.get("saw1").is_none(),
+            !state.environment.contains_key("saw1"),
             "setNextRequest(null) must end the iteration — item 1 must not run"
         );
     }
@@ -1639,7 +1639,7 @@ mod tests {
         let state = runner.pm_state().lock().unwrap();
         assert_eq!(state.environment.get("saw0").map(String::as_str), Some("1"));
         assert!(
-            state.environment.get("saw1").is_none(),
+            !state.environment.contains_key("saw1"),
             "unknown setNextRequest target must end the iteration"
         );
     }
@@ -1683,11 +1683,11 @@ mod tests {
         assert_eq!(result.script_failures, 0);
         let state = runner.pm_state().lock().unwrap();
         assert!(
-            state.environment.get("saw2").is_some(),
+            state.environment.contains_key("saw2"),
             "the LAST duplicate must win (saw2 set)"
         );
         assert!(
-            state.environment.get("saw1").is_none(),
+            !state.environment.contains_key("saw1"),
             "the FIRST duplicate must NOT run (saw1 unset)"
         );
     }
@@ -1723,7 +1723,7 @@ mod tests {
             "item id must win over the same-named item"
         );
         assert!(
-            state.environment.get("sawName").is_none(),
+            !state.environment.contains_key("sawName"),
             "the same-named item must NOT run (id resolved first)"
         );
     }

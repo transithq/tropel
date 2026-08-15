@@ -471,9 +471,36 @@ pm.response.to = guardChain({
 });
 
 // ── pm.test ──
+// Backlog line 84: an async body (fn returning a Promise) used to record
+// GREEN synchronously — a Promise is never `=== false`, so `pm.test(name,
+// async () => { pm.expect(1).to.eql(2); })` passed before the body settled,
+// and a rejected body ALSO passed (the rejection surfaced only as a side
+// error). The check is now recorded at settlement time: a rejection records
+// a FAILED check, matching the sync throw path below.
+// NOTE: a body that fails AFTER an await (e.g. `await fetch(); pm.expect(...)`)
+// settles after run_iteration drains the sample sink — it lands in the next
+// iteration or is lost on the last (same class as backlog line 94, timers).
 pm.test = function (name, fn) {
     try {
         var result = fn();
+        if (result && typeof result.then === 'function') {
+            return result.then(
+                function (v) {
+                    var passed = v !== false;
+                    if (typeof __tropel_pm_test === 'function') {
+                        __tropel_pm_test(name, passed, '');
+                    }
+                    return passed;
+                },
+                function (e) {
+                    if (typeof __tropel_pm_test === 'function') {
+                        __tropel_pm_test(name + ' (error)', false, '');
+                    }
+                    console.error(__ns + '.test error:', e);
+                    return false;
+                }
+            );
+        }
         var passed = result !== false;
         if (typeof __tropel_pm_test === 'function') {
             // 3rd arg (tags) always passed — rquickjs enforces arity, so a
