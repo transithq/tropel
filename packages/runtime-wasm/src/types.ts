@@ -49,6 +49,9 @@ export interface Timings {
   sendingMs: number;
   waitingMs: number;
   receivingMs: number;
+  /** Backlog line 43: types.rs Timings has EIGHT fields — total is the last.
+   * Postcard is positional; omitting it made every response fail to decode. */
+  totalMs: number;
 }
 
 /**
