@@ -144,6 +144,9 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestItem {
+    /// Postman item id — resolves `setNextRequest` BEFORE names (backlog §4).
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub request: RequestDetail,
     #[serde(default)]
@@ -156,6 +159,9 @@ pub struct RequestItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderItem {
+    /// Postman item id — resolves `setNextRequest` BEFORE names (backlog §4).
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub item: Vec<CollectionItem>,
@@ -184,6 +190,20 @@ pub struct RequestDetail {
     pub auth: Option<CollectionAuth>,
     #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
+    #[serde(default, rename = "protocolProfileBehavior")]
+    pub protocol_profile_behavior: Option<ProtocolProfileBehavior>,
+}
+
+/// Postman `protocolProfileBehavior` — per-request protocol tweaks.
+///
+/// Backlog line 140: only `disableBodyPruning` is modeled; unknown keys are
+/// ignored by serde.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProtocolProfileBehavior {
+    /// Postman prunes the request body from GET/HEAD requests unless this is
+    /// set to `true`.
+    #[serde(default, rename = "disableBodyPruning")]
+    pub disable_body_pruning: bool,
 }
 
 /// URL detail.

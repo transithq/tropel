@@ -60,12 +60,19 @@ fn decode_json_value(s: &str) -> Value {
 /// is unit-testable without a live JS context.
 fn variables_lookup(
     key: &str,
+    local_vars: &HashMap<String, Value>,
     iteration_data: Option<&HashMap<String, Value>>,
     environment: &HashMap<String, String>,
     collection_vars: &HashMap<String, Value>,
     globals: &HashMap<String, Value>,
 ) -> Option<String> {
-    // Postman precedence: data (iteration) > env > collection > globals.
+    // Postman precedence: local (pm.variables) > data (iteration) > env >
+    // collection > globals. Backlog line 137: pm.variables.set wrote to
+    // collection while get read data first — set-then-get disagreed when a
+    // data row had the same key. Local is its own store now, checked first.
+    if let Some(val) = local_vars.get(key) {
+        return Some(variable_value_to_string(val));
+    }
     // Backlog line 145: iteration data used to be ignored entirely, so a CSV
     // row could never override an environment/collection value.
     if let Some(val) = iteration_data.and_then(|d| d.get(key)) {
@@ -132,6 +139,7 @@ fn response_json_string(body: &[u8]) -> Option<String> {
 #[cfg(feature = "send-request")]
 fn resolve_vars(
     url: &str,
+    local_vars: &HashMap<String, serde_json::Value>,
     environment: &HashMap<String, String>,
     collection_vars: &HashMap<String, serde_json::Value>,
     globals: &HashMap<String, serde_json::Value>,
@@ -159,10 +167,16 @@ fn resolve_vars(
                 // Extract and normalize the key — trim whitespace
                 let key = url[key_start..key_end].trim();
 
-                // Try to resolve from scopes in order: env → collection → globals
-                let resolved = environment
+                // Try to resolve from scopes in order: local → env →
+                // collection → globals (backlog line 137: pm.variables is
+                // the LOCAL scope — sendRequest must see script-set values).
+                let resolved = local_vars
                     .get(key)
-                    .cloned()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .or_else(|| environment.get(key).cloned())
                     .or_else(|| {
                         collection_vars.get(key).map(|v| match v {
                             serde_json::Value::String(s) => s.clone(),
@@ -211,17 +225,18 @@ fn resolve_send_request(
     url: &str,
     headers_json: &str,
     body: &str,
+    local_vars: &HashMap<String, serde_json::Value>,
     environment: &HashMap<String, String>,
     collection_vars: &HashMap<String, serde_json::Value>,
     globals: &HashMap<String, serde_json::Value>,
 ) -> (String, HashMap<String, String>, Option<Body>) {
-    let resolved_url = resolve_vars(url, environment, collection_vars, globals);
+    let resolved_url = resolve_vars(url, local_vars, environment, collection_vars, globals);
     let headers: HashMap<String, String> = parse_headers(headers_json)
         .into_iter()
         .map(|(k, v)| {
             (
                 k.clone(),
-                resolve_vars(&v, environment, collection_vars, globals),
+                resolve_vars(&v, local_vars, environment, collection_vars, globals),
             )
         })
         .collect();
@@ -230,6 +245,7 @@ fn resolve_send_request(
     } else {
         Some(Body::Raw(resolve_vars(
             body,
+            local_vars,
             environment,
             collection_vars,
             globals,
@@ -417,6 +433,7 @@ impl TrpBridge {
                     let st = state_clone.lock().unwrap();
                     variables_lookup(
                         &key,
+                        &st.local_vars,
                         st.iteration_data.as_ref(),
                         &st.environment,
                         &st.collection_vars,
@@ -430,7 +447,9 @@ impl TrpBridge {
                 "__tropel_pm_variables_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars.insert(key, decode_json_value(&value));
+                    // Backlog line 137: pm.variables is the LOCAL scope —
+                    // writes land here (highest priority), not in collection.
+                    st.local_vars.insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -439,6 +458,7 @@ impl TrpBridge {
                 "__tropel_pm_variables_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
+                    st.local_vars.remove(&key);
                     st.collection_vars.remove(&key);
                     st.environment.remove(&key);
                     st.globals.remove(&key);
@@ -966,38 +986,63 @@ impl TrpBridge {
             );
 
             // ── Flow Control ──
-            // setNextRequest accepts either a numeric index (legacy) or a
-            // request name. If the argument parses as usize, use it as an
-            // index directly. Otherwise, look up the name in request_names
-            // (populated from scenario items by the runner).
+            // setNextRequest resolution order (backlog §4):
+            //   1. null / empty / "null"  → END the iteration (the runner
+            //      breaks when the pending index is out of range; usize::MAX
+            //      is the sentinel for "stop walking this iteration"). The
+            //      old code treated null as a NO-OP, so a collection whose
+            //      last item jumped to an earlier one never consumed the
+            //      jump, leaked it into the next iteration, and ran one
+            //      request forever.
+            //   2. item ID  → Postman resolves ids FIRST (the v2.1 schema
+            //      keys items by id; name is the fallback).
+            //   3. item NAME → LAST match wins (Postman is last-wins on
+            //      duplicate names; the old first-wins position() jumped the
+            //      wrong item).
+            //   4. numeric index (legacy, LAST) — only when no id/name
+            //      matches, so a request literally named "2" is resolved by
+            //      name, not hijacked by the numeric parse.
+            //   5. anything else → END the iteration (Postman: an unknown
+            //      name stops the flow rather than silently continuing).
+            // Sentinel: an out-of-range jump target means "end the current
+            // iteration" — the runner breaks on any target >= item_count.
+            const END_ITERATION: usize = usize::MAX;
             let state_clone = state.clone();
             set_global!(
                 "__tropel_pm_set_next_request",
                 Func::from(move |request_id: Option<String>| {
                     let mut st = state_clone.lock().unwrap();
 
-                    // skipRequest passes null — clear any pending jump.
-                    // Backlog line 146: the old `request_id: String` param
-                    // threw on JS null; Option<String> accepts it as None.
                     let Some(request_id) = request_id else {
-                        st.next_request = None;
+                        st.next_request = Some(END_ITERATION);
                         return;
                     };
                     if request_id == "null" || request_id.is_empty() {
-                        st.next_request = None;
+                        st.next_request = Some(END_ITERATION);
                         return;
                     }
 
-                    // Try numeric index first (backward compat)
+                    // 1. Item id first (Postman resolves ids before names).
+                    if let Some(pos) = st.request_ids.iter().position(|i| i == &request_id) {
+                        st.next_request = Some(pos);
+                        return;
+                    }
+
+                    // 2. Name — last-wins on duplicates (Postman).
+                    if let Some(pos) = st.request_names.iter().rposition(|n| n == &request_id) {
+                        st.next_request = Some(pos);
+                        return;
+                    }
+
+                    // 3. Legacy numeric index — only after id/name miss, so a
+                    //    request named "2" is not hijacked by the parse.
                     if let Ok(index) = request_id.parse::<usize>() {
                         st.next_request = Some(index);
                         return;
                     }
 
-                    // Look up by name in the request list
-                    if let Some(pos) = st.request_names.iter().position(|n| n == &request_id) {
-                        st.next_request = Some(pos);
-                    }
+                    // 4. Unknown → end the iteration (Postman semantics).
+                    st.next_request = Some(usize::MAX);
                 }),
             );
 
@@ -1274,6 +1319,7 @@ impl TrpBridge {
                                     &url,
                                     &headers_json,
                                     &body,
+                                    &st.local_vars,
                                     &st.environment,
                                     &st.collection_vars,
                                     &st.globals,
@@ -1494,7 +1540,14 @@ mod tests {
         let globals = HashMap::from([("k".to_string(), Value::String("from-globals".into()))]);
 
         // Full shadow chain: data wins.
-        let got = variables_lookup("k", Some(&data), &env, &collection, &globals);
+        let got = variables_lookup(
+            "k",
+            &HashMap::new(),
+            Some(&data),
+            &env,
+            &collection,
+            &globals,
+        );
         assert_eq!(
             got.as_deref(),
             Some("\"from-data\""),
@@ -1502,7 +1555,7 @@ mod tests {
         );
 
         // No data: env wins.
-        let got = variables_lookup("k", None, &env, &collection, &globals);
+        let got = variables_lookup("k", &HashMap::new(), None, &env, &collection, &globals);
         assert_eq!(
             got.as_deref(),
             Some("\"from-env\""),
@@ -1510,7 +1563,14 @@ mod tests {
         );
 
         // No data, no env: collection wins.
-        let got = variables_lookup("k", None, &HashMap::new(), &collection, &globals);
+        let got = variables_lookup(
+            "k",
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            &collection,
+            &globals,
+        );
         assert_eq!(
             got.as_deref(),
             Some("\"from-collection\""),
@@ -1518,7 +1578,14 @@ mod tests {
         );
 
         // Only globals.
-        let got = variables_lookup("k", None, &HashMap::new(), &HashMap::new(), &globals);
+        let got = variables_lookup(
+            "k",
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &globals,
+        );
         assert_eq!(
             got.as_deref(),
             Some("\"from-globals\""),
@@ -1526,7 +1593,14 @@ mod tests {
         );
 
         // No scope has it.
-        let got = variables_lookup("missing", Some(&data), &env, &collection, &globals);
+        let got = variables_lookup(
+            "missing",
+            &HashMap::new(),
+            Some(&data),
+            &env,
+            &collection,
+            &globals,
+        );
         assert_eq!(got, None, "unknown key resolves to None");
     }
 
@@ -1545,6 +1619,7 @@ mod tests {
             "https://api.example.com/v1?key={{token}}",
             "{\"Authorization\":\"Bearer {{token}}\",\"X-Static\":\"v\"}",
             "{\"token\":\"{{token}}\"}",
+            &HashMap::new(),
             &env,
             &collection,
             &globals,
@@ -1553,6 +1628,31 @@ mod tests {
         assert_eq!(
             url, "https://api.example.com/v1?key=s3cret",
             "URL must resolve"
+        );
+
+        // Backlog line 137: pm.variables is the LOCAL scope — sendRequest
+        // must resolve a script-set value, and it must beat environment.
+        let local = HashMap::from([("token".to_string(), Value::String("local-tok".into()))]);
+        let (url_local, headers_local, body_local) = resolve_send_request(
+            "https://api.example.com/v1?key={{token}}",
+            "{\"Authorization\":\"Bearer {{token}}\"}",
+            "{\"token\":\"{{token}}\"}",
+            &local,
+            &env,
+            &collection,
+            &globals,
+        );
+        assert_eq!(url_local, "https://api.example.com/v1?key=local-tok");
+        assert_eq!(
+            headers_local.get("Authorization").map(String::as_str),
+            Some("Bearer local-tok")
+        );
+        assert_eq!(
+            body_local.map(|b| match b {
+                Body::Raw(s) => s,
+                _ => String::new(),
+            }),
+            Some("{\"token\":\"local-tok\"}".to_string())
         );
         assert_eq!(
             headers.get("Authorization").map(String::as_str),
@@ -1574,7 +1674,8 @@ mod tests {
         );
 
         // Empty body stays None.
-        let (_, _, body) = resolve_send_request("u", "{}", "", &env, &collection, &globals);
+        let (_, _, body) =
+            resolve_send_request("u", "{}", "", &HashMap::new(), &env, &collection, &globals);
         assert!(body.is_none(), "empty body must stay None");
     }
 

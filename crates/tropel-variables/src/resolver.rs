@@ -5,7 +5,10 @@ use std::collections::HashMap;
 /// Variable scope.
 #[derive(Debug, Clone, Default)]
 pub struct VariableScope {
-    /// Iteration data (highest priority).
+    /// Local variables (pm.variables) — HIGHEST priority, Postman's local
+    /// scope (backlog line 137). Script-set values here shadow data/env.
+    pub local: HashMap<String, serde_json::Value>,
+    /// Iteration data.
     pub data: HashMap<String, serde_json::Value>,
     /// Environment variables.
     pub env: HashMap<String, String>,
@@ -22,7 +25,13 @@ pub struct VariableScope {
 static VAR_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
 fn var_re() -> &'static Regex {
-    VAR_RE.get_or_init(|| Regex::new(r"\{\{([^}]+)\}\}").expect("valid variable regex"))
+    // `[^{}]+` matches only the INNERMOST placeholder: a variable name
+    // contains no braces, so a name with `{`/`}` inside cannot be a valid
+    // reference. `{{host_{{suffix}}}}` therefore resolves `{{suffix}}`
+    // first, then `{{host_dev}}` on the next deep pass — the greedy
+    // `[^}]+` matched `host_{{suffix` (the OUTER span) and could never
+    // recurse inward (backlog line 135).
+    VAR_RE.get_or_init(|| Regex::new(r"\{\{([^{}]+)\}\}").expect("valid variable regex"))
 }
 
 /// Resolves {{variable}} references with scope precedence.
@@ -53,10 +62,12 @@ impl VariableResolver {
         self.resolve_with(input, scope, EscapeMode::Json)
     }
 
-    /// Resolve variable references, percent-encoding each substituted value
-    /// so `&` `=` `#` etc. inside a data value cannot split a query string
-    /// into extra parameters (backlog line 96: a value with `&` or `=`
-    /// silently became extra params).
+    /// Resolve variable references for a URL. Postman-compatible: substituted
+    /// values are inserted RAW with no percent-encoding, so `{{endpoint}}` =
+    /// `https://api.test/search?a=1` survives intact (backlog line 136 — the
+    /// old behavior percent-encoded `?` `&` `=` `#` in every value and
+    /// destroyed structural URLs). Data values that need encoding are the
+    /// caller's job, exactly as in Postman/k6.
     pub fn resolve_url(&self, input: &str, scope: &VariableScope) -> String {
         self.resolve_with(input, scope, EscapeMode::Url)
     }
@@ -83,14 +94,30 @@ impl VariableResolver {
             }
 
             let value = self.resolve_variable(var_name, scope);
-            if value.starts_with("{{") && value.ends_with("}}") {
-                // Unresolved — keep the literal placeholder.
+            if value.contains("{{") {
+                // The value is an unresolved placeholder (keep it literal)
+                // OR a nested template that later passes must resolve —
+                // `{{base_url}}` → `https://{{host}}`. Escaping it NOW
+                // would corrupt the inner placeholder (`{` → `%7B`), so it
+                // is inserted raw; the destination-context escape applies
+                // only once the value is fully resolved (backlog line 135).
                 value
             } else {
                 match mode {
                     EscapeMode::None => value,
-                    EscapeMode::Json => json_escape(&value),
-                    EscapeMode::Url => url_escape(&value),
+                    EscapeMode::Json => {
+                        if placeholder_in_json_string(&after_dynamic, caps.get(0).unwrap().range())
+                        {
+                            json_escape(&value)
+                        } else {
+                            // A bare JSON-fragment variable —
+                            // `"filter": {{filterJson}}` — must stay RAW:
+                            // escaping it turns `{"a":1}` into `{\"a\":1}`
+                            // and corrupts the document (backlog line 135).
+                            value
+                        }
+                    }
+                    EscapeMode::Url => value,
                 }
             }
         });
@@ -100,7 +127,15 @@ impl VariableResolver {
 
     /// Resolve a single variable name against the scope.
     pub fn resolve_variable(&self, var_name: &str, scope: &VariableScope) -> String {
-        // Priority: data > env > collection > globals
+        // Postman scope priority: local (pm.variables) > data > env >
+        // collection > globals.
+
+        // Local variables first — pm.variables is the highest-priority scope
+        // (backlog line 137: set-then-get must be consistent, so a local
+        // value shadows same-named iteration data).
+        if let Some(val) = scope.local.get(var_name) {
+            return value_to_string(val);
+        }
 
         // Check iteration data
         if let Some(val) = scope.data.get(var_name) {
@@ -142,7 +177,8 @@ impl VariableResolver {
         self.resolve_deep_with(input, scope, max_passes, EscapeMode::Json)
     }
 
-    /// [`resolve_deep`] with URL percent-encoding of substituted values.
+    /// [`resolve_deep`] with Postman-compatible URL semantics: substituted
+    /// values are inserted RAW (no percent-encoding — see [`resolve_url`]).
     pub fn resolve_url_deep(
         &self,
         input: &str,
@@ -184,7 +220,9 @@ enum EscapeMode {
     None,
     /// Escape for embedding inside a JSON string literal.
     Json,
-    /// Percent-encode for a URL / query string.
+    /// URL context — Postman-compatible RAW insertion: no percent-encoding
+    /// (backlog line 136: Postman does no encoding at all), so structural
+    /// URLs inside substituted values survive resolution.
     Url,
 }
 
@@ -211,30 +249,29 @@ fn json_escape(value: &str) -> String {
     out
 }
 
-/// Percent-encode a value for safe insertion into a URL / query string: the
-/// reserved and unsafe characters (`&` `=` `?` `#` `%` `+` space, non-ASCII)
-/// are encoded so a data value cannot split a query into extra params or
-/// inject fragments. Bytes in the unreserved set (A-Z a-z 0-9 - _ . ~) and
-/// the URL-structural `/` `:` `@` are left as-is so paths and hosts stay
-/// readable.
-///
-/// Values are assumed RAW, not pre-encoded: an already-percent-encoded value
-/// (e.g. `caf%C3%A9`) double-encodes. That is the safe default — encoding a
-/// `%` that turns out to be literal `%` is harmless, while leaving one
-/// unencoded could let a crafted value smuggle reserved characters through.
-fn url_escape(value: &str) -> String {
-    const UNRESERVED: &str =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/:@";
-    let mut out = String::with_capacity(value.len() + 8);
-    for b in value.bytes() {
-        if UNRESERVED.contains(b as char) {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{:02X}", b));
+/// Is the placeholder at `range` inside a JSON string literal? A template
+/// has an ODD number of unescaped `"` before a placeholder that sits inside
+/// a string (each pair of quotes opens+closes a string literal, so an odd
+/// count means the last `"` was an opening one). Escaped quotes (`\"`) are
+/// skipped so `{"a":"say \"hi\" {{name}}"}` still counts correctly. This is
+/// what lets `"{{name}}"` get value-escaped while a bare JSON fragment —
+/// `"filter": {{filterJson}}` — stays raw (backlog line 135).
+fn placeholder_in_json_string(template: &str, range: std::ops::Range<usize>) -> bool {
+    let before = &template[..range.start];
+    let bytes = before.as_bytes();
+    let mut quote_count = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2, // skip the escaped character (e.g. \")
+            b'"' => {
+                quote_count += 1;
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
-    out
+    quote_count % 2 == 1
 }
 
 impl Default for VariableResolver {
@@ -288,6 +325,7 @@ mod tests {
     fn test_scope_priority() {
         let resolver = VariableResolver::new();
         let scope = VariableScope {
+            local: HashMap::new(),
             data: HashMap::from([("key".into(), serde_json::Value::String("data-value".into()))]),
             env: HashMap::from([("key".into(), "env-value".into())]),
             collection: HashMap::from([(
@@ -303,6 +341,22 @@ mod tests {
         // Data takes priority
         let result = resolver.resolve("{{key}}", &scope);
         assert_eq!(result, "data-value");
+    }
+
+    #[test]
+    fn test_local_variable_highest_priority() {
+        // Backlog line 137: pm.variables is the LOCAL scope — Postman's
+        // highest priority. A local value must shadow iteration data, env,
+        // collection and globals for {{var}} substitution.
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            local: HashMap::from([("key".into(), serde_json::Value::String("local".into()))]),
+            data: HashMap::from([("key".into(), serde_json::Value::String("data".into()))]),
+            env: HashMap::from([("key".into(), "env".into())]),
+            collection: HashMap::from([("key".into(), serde_json::Value::String("col".into()))]),
+            globals: HashMap::from([("key".into(), serde_json::Value::String("global".into()))]),
+        };
+        assert_eq!(resolver.resolve("{{key}}", &scope), "local");
     }
 
     #[test]
@@ -466,9 +520,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_url_encodes_query_splitters() {
-        // Backlog line 96: a data value containing `&` or `=` silently split
-        // the query into extra params. The value must be percent-encoded.
+    fn test_resolve_url_inserts_values_raw_postman_style() {
+        // Backlog line 136: Postman does no percent-encoding — substituted
+        // values are inserted RAW. (The old behavior encoded `?`/`&`/`=`/`#`
+        // in every value to stop query splitting, but that destroyed
+        // structural URLs; Postman/k6 parity means the caller controls
+        // encoding.)
         let resolver = VariableResolver::new();
         let scope = VariableScope {
             env: HashMap::from([("q".into(), "a&b=c".into())]),
@@ -476,26 +533,113 @@ mod tests {
         };
 
         let result = resolver.resolve_url("/search?q={{q}}", &scope);
-        assert_eq!(result, "/search?q=a%26b%3Dc");
+        assert_eq!(result, "/search?q=a&b=c");
     }
 
     #[test]
-    fn test_resolve_url_keeps_path_and_safe_chars() {
-        // URL-structural chars and the unreserved set stay readable; only
-        // reserved/unsafe chars are encoded.
+    fn test_resolve_url_leaves_structural_urls_intact() {
+        // The item-136 symptom: `{{endpoint}}` holding a full URL with a
+        // query string + fragment must survive resolution unmodified.
         let resolver = VariableResolver::new();
         let scope = VariableScope {
-            env: HashMap::from([
-                ("id".into(), "u/42".into()),
-                ("token".into(), "tok+1 #2".into()),
-            ]),
+            env: HashMap::from([(
+                "endpoint".into(),
+                "https://api.test/search?a=1&b=2#frag".into(),
+            )]),
             ..Default::default()
         };
 
-        // Slash is left as-is (paths stay readable), `+` and space encode.
-        let result = resolver.resolve_url("/users/{{id}}", &scope);
-        assert_eq!(result, "/users/u/42");
-        let result = resolver.resolve_url("?t={{token}}", &scope);
-        assert_eq!(result, "?t=tok%2B1%20%232");
+        let result = resolver.resolve_url("{{endpoint}}", &scope);
+        assert_eq!(result, "https://api.test/search?a=1&b=2#frag");
+
+        // `+`, space and `#` in a value stay raw too (Postman semantics).
+        let scope2 = VariableScope {
+            env: HashMap::from([("token".into(), "tok+1 #2".into())]),
+            ..Default::default()
+        };
+        assert_eq!(resolver.resolve_url("?t={{token}}", &scope2), "?t=tok+1 #2");
+    }
+
+    #[test]
+    fn test_nested_innermost_first() {
+        // Backlog line 135: the greedy `[^}]+` matched `host_{{suffix` (the
+        // OUTER span) and could never recurse inward, so `{{host_{{suffix}}}}`
+        // never resolved. The innermost `{{suffix}}` must resolve first,
+        // then `{{host_dev}}` on the next deep pass.
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            env: HashMap::from([
+                ("suffix".into(), "dev".into()),
+                ("host_dev".into(), "api-dev.example.com".into()),
+            ]),
+            ..Default::default()
+        };
+        let result = resolver.resolve_deep("https://{{host_{{suffix}}}}/v1", &scope, 5);
+        assert_eq!(result, "https://api-dev.example.com/v1");
+    }
+
+    #[test]
+    fn test_url_deep_no_escape_of_nested_template() {
+        // Backlog line 135: URL escaping applied on EVERY deep pass turned
+        // `https://{{host}}` into `https://%7B%7Bhost%7D%7D` before the inner
+        // placeholder could resolve. A value that is itself a template must
+        // be inserted raw; only the FINAL resolved value is escaped.
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            env: HashMap::from([
+                ("base_url".into(), "https://{{host}}".into()),
+                ("host".into(), "api.example.com".into()),
+            ]),
+            ..Default::default()
+        };
+        let result = resolver.resolve_url_deep("{{base_url}}/users?x=1", &scope, 5);
+        assert_eq!(result, "https://api.example.com/users?x=1");
+    }
+
+    #[test]
+    fn test_url_deep_keeps_structural_urls() {
+        // Backlog line 136 via the deep path: `{{endpoint}}` resolving to a
+        // full URL keeps its query string instead of `search%3Fa%3D1`.
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            env: HashMap::from([("endpoint".into(), "https://api.test/search?a=1".into())]),
+            ..Default::default()
+        };
+        let result = resolver.resolve_url_deep("{{endpoint}}", &scope, 5);
+        assert_eq!(result, "https://api.test/search?a=1");
+    }
+
+    #[test]
+    fn test_json_fragment_variable_stays_raw() {
+        // Backlog line 135: blanket JSON escaping corrupted bare JSON
+        // fragments — `{"filter": {{filterJson}}}` became invalid JSON. A
+        // placeholder OUTSIDE a string literal must be inserted raw; only
+        // placeholders INSIDE a string get value-escaped.
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            env: HashMap::from([(
+                "filterJson".into(),
+                r#"{"status": 200, "tags": ["a"]}"#.into(),
+            )]),
+            ..Default::default()
+        };
+        let result = resolver.resolve_json_deep(r#"{"filter": {{filterJson}}}"#, &scope, 5);
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed["filter"]["status"], 200);
+    }
+
+    #[test]
+    fn test_json_escape_still_applies_inside_string() {
+        // The string-context escape must survive the fix: a value with a
+        // quote substituted INSIDE a JSON string literal is still escaped
+        // (three quotes precede the placeholder → inside a string).
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            env: HashMap::from([("name".into(), "he said \"hi\"".into())]),
+            ..Default::default()
+        };
+        let result = resolver.resolve_json_deep(r#"{"s":"{{name}}"}"#, &scope, 5);
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed["s"], "he said \"hi\"");
     }
 }

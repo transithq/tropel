@@ -1,6 +1,5 @@
 ---
 source: crates/tropel-report/tests/reporters.rs
-assertion_line: 146
 expression: rendered
 ---
 
@@ -19,10 +18,10 @@ expression: rendered
     Data sent     2.00 MB
 
   HTTP request duration:
-    avg=250.00ms  min=10.00ms  med=180.00ms  max=950.00ms  p(90)=420.00ms  p(95)=620.00ms  p(99)=900.00ms
+    avg=250.00ms  min=10ms  med=180ms  max=950ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
 
   Iteration duration:
-    avg=250.00ms  min=10.00ms  med=180.00ms  max=1100.00ms  p(90)=420.00ms  p(95)=620.00ms  p(99)=900.00ms
+    avg=250.00ms  min=10ms  med=180ms  max=1100ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
 
   Checks:
     Total:  2000
@@ -35,13 +34,13 @@ expression: rendered
 
   Per-URL (http_req_duration):
     /api/a  (reqs: 600)
-      avg=250.00ms  min=10.00ms  med=180.00ms  max=800.00ms  p(90)=420.00ms  p(95)=620.00ms  p(99)=900.00ms
+      avg=250.00ms  min=10ms  med=180ms  max=800ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
     /api/b  (reqs: 400)
-      avg=250.00ms  min=10.00ms  med=180.00ms  max=950.00ms  p(90)=420.00ms  p(95)=620.00ms  p(99)=900.00ms
+      avg=250.00ms  min=10ms  med=180ms  max=950ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
 
   Per-group breakdown:
     group_duration  [group=checkout]
-          avg=250.00ms  min=10.00ms  med=180.00ms  max=700.00ms  p(90)=420.00ms  p(95)=620.00ms  p(99)=900.00ms
+          avg=250.00ms  min=10ms  med=180ms  max=700ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
 
   ── Thresholds ──────────────────────────────────────────
     ✓ checks: 1.00 > 0.99 (PASS)

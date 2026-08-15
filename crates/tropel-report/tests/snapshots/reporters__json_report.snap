@@ -1,6 +1,5 @@
 ---
 source: crates/tropel-report/tests/reporters.rs
-assertion_line: 152
 expression: rendered
 ---
 {
@@ -16,46 +15,46 @@ expression: rendered
   "metrics": {
     "custom_counter": {
       "count": 42,
-      "max": 1.0,
+      "max": 1,
       "mean": 1.0,
-      "min": 1.0,
-      "p50": 1.0,
-      "p90": 1.0,
-      "p95": 1.0,
-      "p99": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p95": 1,
+      "p99": 1,
       "sum": 42.0
     },
     "custom_gauge": {
       "count": 9,
-      "max": 9.0,
+      "max": 9,
       "mean": 5.0,
-      "min": 1.0,
-      "p50": 5.0,
-      "p90": 9.0,
-      "p95": 9.0,
-      "p99": 9.0,
+      "min": 1,
+      "p50": 5,
+      "p90": 9,
+      "p95": 9,
+      "p99": 9,
       "sum": 45.0
     },
     "http_req_duration{url=/api/a}": {
       "count": 600,
-      "max": 800.0,
+      "max": 800,
       "mean": 250.0,
-      "min": 10.0,
-      "p50": 180.0,
-      "p90": 420.0,
-      "p95": 620.0,
-      "p99": 900.0,
+      "min": 10,
+      "p50": 180,
+      "p90": 420,
+      "p95": 620,
+      "p99": 900,
       "sum": 250000.0
     },
     "http_req_duration{url=/api/b}": {
       "count": 400,
-      "max": 950.0,
+      "max": 950,
       "mean": 250.0,
-      "min": 10.0,
-      "p50": 180.0,
-      "p90": 420.0,
-      "p95": 620.0,
-      "p99": 900.0,
+      "min": 10,
+      "p50": 180,
+      "p90": 420,
+      "p95": 620,
+      "p99": 900,
       "sum": 250000.0
     }
   }

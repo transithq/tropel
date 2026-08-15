@@ -1,6 +1,7 @@
 use crate::collector::{
     parse_percentile, percentile_value, MetricSummary, MetricType, MetricsResult,
 };
+use crate::histogram::LatencyHistogram;
 use std::collections::HashMap;
 use std::time::Duration;
 use tropel_core::config::ThresholdConfig;
@@ -407,6 +408,38 @@ fn metric_base_name(key: &str) -> &str {
     }
 }
 
+/// Can this series supply a truthful value for the given percentile-style
+/// stat (`p50`/`p90`/`p95`/`p99`/arbitrary `pNN`, plus `min`/`max` which the
+/// tracked buckets fold in)? Only Trend tracks a real distribution; Gauge
+/// tracks real min/max from its samples. Counter and Rate summaries hardcode
+/// p50..p99 (and Rate also min/max) to 0 — reading them would let a
+/// `p(95)<0.01` gate pass on a 100%-failure run (backlog line 60).
+fn series_supports_percentile(m: &MetricSummary, stat: &str) -> bool {
+    match stat {
+        "min" | "max" => matches!(m.metric_type, MetricType::Trend | MetricType::Gauge),
+        _ => m.metric_type == MetricType::Trend,
+    }
+}
+
+/// Does a percentile-style stat on this match set require fail-closed
+/// handling? `percentile_stat` is true for `min`/`max`/`p50`/`p90`/`p95`/
+/// `p99`/`median`/`med` and any arbitrary `pNN`/`p(NN)`; the guard then
+/// returns `true` (caller must fail closed) unless EVERY matched series can
+/// supply a truthful value for that stat. Shared by the tag-scoped and
+/// unscoped custom-metric paths so the two can never drift (backlog line 60).
+fn percentile_guard_fails(matched: &[&MetricSummary], stat: Option<&str>) -> bool {
+    let percentile_stat = matches!(
+        stat,
+        Some("min" | "max" | "p50" | "median" | "med" | "p90" | "p95" | "p99")
+    ) || stat.is_some_and(|s| parse_percentile(s).is_some());
+    if !percentile_stat {
+        return false;
+    }
+    !matched
+        .iter()
+        .all(|m| series_supports_percentile(m, stat.expect("percentile_stat implies a stat")))
+}
+
 /// Get a metric value for a tag-scoped threshold by searching the metrics list.
 /// Looks for entries whose BASE name equals the metric name and that carry
 /// all the specified tag key=value pairs (matched STRUCTURALLY against each
@@ -464,12 +497,15 @@ fn get_tag_scoped_metric_value(
     // accumulated value would masquerade as every percentile, so `errors.p95`
     // (or any custom counter like `data_received.p95`) must FAIL CLOSED, not
     // resolve to the counter's 1.0 bucket and pass a `> 0.5` gate.
-    let all_counter = matched.iter().all(|m| m.metric_type == MetricType::Counter);
-    let percentile_stat = matches!(
-        stat,
-        Some("min" | "max" | "p50" | "median" | "med" | "p90" | "p95" | "p99")
-    ) || stat.is_some_and(|s| parse_percentile(s).is_some());
-    if all_counter && percentile_stat {
+    // Backlog §1 + line 60: percentile/min/max stats are only meaningful on
+    // series that actually track a distribution or real extremes. The old
+    // guard checked `all(Counter)` only, so a **Rate** summary (p50..p99
+    // hardcoded 0) let `http_req_failed: ['p(95)<0.01']` PASS on a
+    // 100%-failure run, and a **Gauge** (p50..p99 hardcoded 0) passed
+    // `queue_depth.p95 < 10` trivially. Fail closed unless EVERY matched
+    // series supports the stat (Trend for percentiles; Trend/Gauge for
+    // min/max — Gauge tracks real extremes from its samples).
+    if percentile_guard_fails(&matched, stat) {
         return None;
     }
 
@@ -481,27 +517,25 @@ fn get_tag_scoped_metric_value(
         }
         Some("min") => {
             // Return the MINIMUM min across all matches
-            matched.iter().map(|m| m.min).fold(f64::MAX, f64::min)
+            matched
+                .iter()
+                .map(|m| m.min as f64)
+                .fold(f64::MAX, f64::min)
         }
         Some("max") => {
             // Return the MAXIMUM max across all matches
-            matched.iter().map(|m| m.max).fold(0.0_f64, f64::max)
+            matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max)
         }
-        Some("p50") | Some("median") | Some("med") => {
-            matched.iter().map(|m| m.p50).fold(0.0_f64, f64::max)
-        }
-        Some("p90") => matched.iter().map(|m| m.p90).fold(0.0_f64, f64::max),
-        Some("p95") => matched.iter().map(|m| m.p95).fold(0.0_f64, f64::max),
-        Some("p99") => matched.iter().map(|m| m.p99).fold(0.0_f64, f64::max),
+        Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
+        Some("p90") => merged_percentile(&matched, 90.0),
+        Some("p95") => merged_percentile(&matched, 95.0),
+        Some("p99") => merged_percentile(&matched, 99.0),
         // Any other pNN / p(NN) percentile — exact from the retained
-        // histogram of each matching series; worst (highest) wins across
-        // matches (consistent with the tracked buckets above).
+        // histogram of each matching series; merged-population when all
+        // retained, worst (highest) fallback otherwise.
         Some(s) if parse_percentile(s).is_some() => {
             let pct = parse_percentile(s).expect("guarded");
-            matched
-                .iter()
-                .map(|m| percentile_value(m, pct))
-                .fold(0.0_f64, f64::max)
+            merged_percentile(&matched, pct)
         }
         Some("count") => matched.iter().map(|m| m.count as f64).sum(),
         Some("rate") => {
@@ -548,6 +582,34 @@ fn counter_rate(metrics: &MetricsResult, matched: &[&MetricSummary]) -> f64 {
 /// `login_errors` / `login_duration`.
 /// Returns `None` when no series match, so callers can fall back to a
 /// top-level field or 0.0.
+/// Compute a percentile over the MERGED population of every matching series
+/// (k6 semantics: an unscoped or tag-scoped threshold like `http_req_waiting.p95`
+/// is the p95 of ALL samples across the matching series, not the worst
+/// sub-series). When every matched Trend retains its exact histogram, merge
+/// them losslessly and read the percentile from the merged distribution;
+/// otherwise (pre-config window / synthetic summaries with no retained
+/// histograms) fall back to the worst (highest) value across matches — the
+/// old fold behavior.
+fn merged_percentile(matched: &[&MetricSummary], pct: f64) -> f64 {
+    let all_retained = !matched.is_empty()
+        && matched
+            .iter()
+            .all(|m| m.metric_type == MetricType::Trend && m.histogram.is_some());
+    if all_retained {
+        let mut merged = LatencyHistogram::new();
+        for m in matched {
+            if let Some(h) = &m.histogram {
+                merged.merge(h);
+            }
+        }
+        return merged.percentile(pct) as f64;
+    }
+    matched
+        .iter()
+        .map(|m| percentile_value(m, pct))
+        .fold(0.0_f64, f64::max)
+}
+
 fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
     let matched: Vec<&MetricSummary> = metrics
         .metrics
@@ -557,34 +619,32 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
     if matched.is_empty() {
         return None;
     }
-    // Backlog §1: percentile/min/max stats on a Counter are meaningless — fail
-    // closed, mirroring the tag-scoped path (a custom counter's p95 bucket is
-    // 1.0 and must not pass a `> 0.5` gate).
-    let all_counter = matched.iter().all(|m| m.metric_type == MetricType::Counter);
-    let percentile_stat = matches!(
-        stat,
-        Some("min" | "max" | "p50" | "median" | "med" | "p90" | "p95" | "p99")
-    ) || stat.is_some_and(|s| parse_percentile(s).is_some());
-    if all_counter && percentile_stat {
+    // Backlog §1 + line 60: percentile/min/max stats are only meaningful on
+    // series that actually track a distribution or real extremes. The old
+    // guard checked `all(Counter)` only, so a **Rate** summary (p50..p99
+    // hardcoded 0) let `http_req_failed: ['p(95)<0.01']` PASS on a
+    // 100%-failure run, and a **Gauge** (p50..p99 hardcoded 0) passed
+    // `queue_depth.p95 < 10` trivially. Fail closed unless EVERY matched
+    // series supports the stat (Trend for percentiles; Trend/Gauge for
+    // min/max — Gauge tracks real extremes from its samples).
+    if percentile_guard_fails(&matched, stat) {
         return None;
     }
     Some(match stat {
-        // Percentiles: worst (highest) across matched series, mirroring
-        // the tag-scoped path.
-        Some("min") => matched.iter().map(|m| m.min).fold(f64::MAX, f64::min),
-        Some("max") => matched.iter().map(|m| m.max).fold(0.0_f64, f64::max),
-        Some("p50") | Some("median") | Some("med") => {
-            matched.iter().map(|m| m.p50).fold(0.0_f64, f64::max)
-        }
-        Some("p90") => matched.iter().map(|m| m.p90).fold(0.0_f64, f64::max),
-        Some("p95") => matched.iter().map(|m| m.p95).fold(0.0_f64, f64::max),
-        Some("p99") => matched.iter().map(|m| m.p99).fold(0.0_f64, f64::max),
+        // Percentiles: merged-population (k6 semantics) when the exact
+        // per-series histograms are retained; worst (highest) fallback.
+        Some("min") => matched
+            .iter()
+            .map(|m| m.min as f64)
+            .fold(f64::MAX, f64::min),
+        Some("max") => matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max),
+        Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
+        Some("p90") => merged_percentile(&matched, 90.0),
+        Some("p95") => merged_percentile(&matched, 95.0),
+        Some("p99") => merged_percentile(&matched, 99.0),
         Some(s) if parse_percentile(s).is_some() => {
             let pct = parse_percentile(s).expect("guarded");
-            matched
-                .iter()
-                .map(|m| percentile_value(m, pct))
-                .fold(0.0_f64, f64::max)
+            merged_percentile(&matched, pct)
         }
         // Rate = total sum / total count across ALL series (k6 merges tagged
         // sub-series for the unscoped metric).
@@ -704,12 +764,12 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         "http_req_duration" => metrics.http_req_duration.as_ref().and_then(|d| {
             match stat {
                 Some("avg") => Some(d.mean),
-                Some("min") => Some(d.min),
-                Some("max") => Some(d.max),
-                Some("p50") | Some("median") | Some("med") => Some(d.p50),
-                Some("p90") => Some(d.p90),
-                Some("p95") => Some(d.p95),
-                Some("p99") => Some(d.p99),
+                Some("min") => Some(d.min as f64),
+                Some("max") => Some(d.max as f64),
+                Some("p50") | Some("median") | Some("med") => Some(d.p50 as f64),
+                Some("p90") => Some(d.p90 as f64),
+                Some("p95") => Some(d.p95 as f64),
+                Some("p99") => Some(d.p99 as f64),
                 Some("count") => Some(d.count as f64),
                 // k6's `value` stat on a trend = the most recent sample.
                 Some("value") | Some("last") => Some(d.last),
@@ -766,12 +826,12 @@ mod tests {
                 count: 100,
                 sum: 50000.0,
                 mean: 500.0,
-                min: 50.0,
-                max: 2000.0,
-                p50: 450.0,
-                p90: 900.0,
-                p95: 1200.0,
-                p99: 1800.0,
+                min: 50,
+                max: 2000,
+                p50: 450,
+                p90: 900,
+                p95: 1200,
+                p99: 1800,
                 last: 0.0,
                 rate: 0.0,
                 histogram: None,
@@ -796,6 +856,174 @@ mod tests {
         assert!(!result.0, "p95 1200 should NOT be < 1000");
         assert_eq!(result.1, 1200.0);
         assert_eq!(result.2, 1000.0);
+    }
+
+    // ── merged-population percentiles (backlog line 58) ──
+
+    /// Build a Trend series carrying an exact retained histogram: `pairs` of
+    /// (ms value, count) recorded into a fresh LatencyHistogram.
+    fn trend_series_with_hist(
+        name: &str,
+        tags: Vec<(&str, &str)>,
+        pairs: &[(u64, usize)],
+    ) -> MetricSummary {
+        let mut h = LatencyHistogram::new();
+        for (ms, n) in pairs {
+            for _ in 0..*n {
+                h.record_ms(*ms);
+            }
+        }
+        let stats = h.stats();
+        MetricSummary {
+            key: name.to_string(),
+            tags: tags
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            metric_type: MetricType::Trend,
+            count: stats.count,
+            sum: pairs.iter().map(|(ms, n)| (*ms as f64) * (*n as f64)).sum(),
+            mean: stats.mean,
+            min: stats.min,
+            max: stats.max,
+            p50: stats.p50,
+            p90: stats.p90,
+            p95: stats.p95,
+            p99: stats.p99,
+            last: 0.0,
+            rate: 0.0,
+            histogram: Some(h),
+        }
+    }
+
+    #[test]
+    fn unscoped_percentile_is_merged_population_not_worst_series() {
+        // Two http_req_waiting series: a fast majority (1000 × 10 ms) and a
+        // slow minority (10 × 2000 ms). k6's unscoped p95 is the p95 of the
+        // MERGED population (~10 ms — the fast majority dominates), NOT the
+        // worst sub-series (2000 ms). The old fold(f64::max) reported 2000 ms.
+        let metrics = MetricsResult {
+            http_reqs: 0,
+            errors: 0,
+            series_dropped: 0,
+            checks_total: 0,
+            checks_passed: 0,
+            checks_failed: 0,
+            http_req_duration: None,
+            iteration_duration: None,
+            data_received: 0.0,
+            data_sent: 0.0,
+            dropped_iterations: 0,
+            http_req_failed: 0.0,
+            iterations: 0,
+            vus_max: 0,
+            run_duration: Duration::from_secs(10),
+            metrics: vec![
+                trend_series_with_hist(
+                    "http_req_waiting{url=/fast}",
+                    vec![("url", "/fast")],
+                    &[(10, 1000)],
+                ),
+                trend_series_with_hist(
+                    "http_req_waiting{url=/slow}",
+                    vec![("url", "/slow")],
+                    &[(2000, 10)],
+                ),
+            ],
+            per_url: vec![],
+            per_group: vec![],
+            summary_trend_stats: vec![],
+            effective_thresholds: HashMap::new(),
+        };
+
+        // Unscoped: merged population p95 ≈ 10 ms → threshold passes.
+        let result = evaluate_single_threshold("http_req_waiting.p95 < 100", &metrics);
+        assert!(
+            result.0,
+            "merged p95 (~10 ms) must pass < 100, got {}",
+            result.1
+        );
+        assert!(
+            result.1 < 100.0,
+            "actual {} must be the merged p95, not the 2000 ms worst series",
+            result.1
+        );
+
+        // Sanity: tag-scoped to the SLOW series alone must still fail closed
+        // to its own 2000 ms — merging must not leak across scopes.
+        let slow = evaluate_single_threshold("http_req_waiting{url=/slow}.p95 < 100", &metrics);
+        assert!(
+            !slow.0,
+            "slow series alone must stay at ~2000 ms and fail, got {}",
+            slow.1
+        );
+    }
+
+    #[test]
+    fn tag_scoped_percentile_merges_matching_population() {
+        // Two series both matching {status=200} (distinct urls): 1000 × 10 ms
+        // and 20 × 100 ms (the fast majority is 98% of the merged population,
+        // so the merged p95 index 969 lands in the fast region → ~10 ms). k6
+        // evaluates `{status=200}` over the MERGED population of every
+        // matching series — p95 ≈ 10 ms, not the worst (100 ms). Tag-scoped
+        // was *always* max-folded before this fix.
+        let metrics = MetricsResult {
+            metrics: vec![
+                trend_series_with_hist(
+                    "http_req_waiting{status=200,url=/a}",
+                    vec![("status", "200"), ("url", "/a")],
+                    &[(10, 1000)],
+                ),
+                trend_series_with_hist(
+                    "http_req_waiting{status=200,url=/b}",
+                    vec![("status", "200"), ("url", "/b")],
+                    &[(100, 20)],
+                ),
+            ],
+            ..make_metrics()
+        };
+
+        let result = evaluate_single_threshold("http_req_waiting{status=200}.p95 < 50", &metrics);
+        assert!(
+            result.0,
+            "merged p95 (~10 ms) must pass < 50, got {} — the old max-fold gave 100 ms",
+            result.1
+        );
+
+        // A more selective scope must still isolate its own population.
+        let only_b =
+            evaluate_single_threshold("http_req_waiting{status=200,url=/b}.p95 < 50", &metrics);
+        assert!(
+            !only_b.0,
+            "url=/b alone is ~100 ms and must fail, got {}",
+            only_b.1
+        );
+    }
+
+    #[test]
+    fn merged_percentile_falls_back_to_worst_without_histograms() {
+        // No retained histograms (pre-config window / synthetic summaries):
+        // the fallback keeps the old worst-of behavior so a missing histogram
+        // can never false-PASS a threshold.
+        let mut m1 =
+            trend_series_with_hist("http_req_waiting{url=/a}", vec![("url", "/a")], &[(10, 10)]);
+        let mut m2 = trend_series_with_hist(
+            "http_req_waiting{url=/b}",
+            vec![("url", "/b")],
+            &[(2000, 10)],
+        );
+        m1.histogram = None;
+        m2.histogram = None;
+        let metrics = MetricsResult {
+            metrics: vec![m1, m2],
+            ..make_metrics()
+        };
+        let result = evaluate_single_threshold("http_req_waiting.p95 < 500", &metrics);
+        assert!(
+            !result.0,
+            "no histograms → worst-of fallback (2000 ms) must fail < 500, got {}",
+            result.1
+        );
     }
 
     // ── compound && / || (backlog line 154) ──
@@ -943,6 +1171,159 @@ mod tests {
         assert!(!result.0, "p95 on a Counter must fail closed");
     }
 
+    // ── Backlog line 60: Rate/Gauge percentile stats fail closed ──
+
+    /// Build a MetricsResult whose `metrics` list carries the given custom
+    /// series (used to simulate `http_req_failed` as a Rate and
+    /// `queue_depth` as a Gauge without driving a full run).
+    fn make_metrics_with(series: MetricSummary) -> MetricsResult {
+        let mut m = make_metrics();
+        m.metrics.push(series);
+        m
+    }
+
+    #[test]
+    fn rate_percentile_stat_fails_closed() {
+        // THE regression (backlog line 60): `http_req_failed` is a **Rate**;
+        // its summary hardcodes p50..p99 = 0. The OLD guard only checked
+        // `all(Counter)`, so `http_req_failed: ['p(95)<0.01']` on a
+        // 100%-failure run read p95 = 0 < 0.01 and PASSED. It must fail
+        // closed instead — a Rate has no distribution to percentile.
+        let series = MetricSummary {
+            key: "http_req_failed".into(),
+            tags: vec![],
+            metric_type: MetricType::Rate,
+            count: 100,
+            sum: 100.0, // every request failed → rate = 1.0
+            mean: 1.0,
+            min: 0,
+            max: 0,
+            p50: 0,
+            p90: 0,
+            p95: 0,
+            p99: 0,
+            last: 0.0,
+            rate: 1.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(series);
+        // p95 on a Rate must NOT evaluate to the hardcoded 0 (which would
+        // pass `p(95) < 0.01`) — it must fail closed.
+        let result = evaluate_single_threshold("http_req_failed.p95 < 0.01", &metrics);
+        assert!(
+            !result.0,
+            "p95 on a Rate must fail closed, not read the hardcoded 0"
+        );
+        let result = evaluate_single_threshold("http_req_failed.p(90) < 0.01", &metrics);
+        assert!(!result.0, "p(90) on a Rate must fail closed too");
+        let result = evaluate_single_threshold("http_req_failed.max < 0.01", &metrics);
+        assert!(
+            !result.0,
+            "max on a Rate must fail closed (Rate hardcodes min/max = 0)"
+        );
+        // Sanity: a MEANINGFUL Rate stat still resolves — `rate` is the
+        // failure ratio (1.0 on an all-failed run) and must breach `> 0.5`.
+        let result = evaluate_single_threshold("http_req_failed.rate > 0.5", &metrics);
+        assert!(result.0, "rate 1.0 should be > 0.5");
+        let result = evaluate_single_threshold("http_req_failed.avg > 0.5", &metrics);
+        assert!(result.0, "avg 1.0 should be > 0.5");
+    }
+
+    #[test]
+    fn gauge_percentile_stat_fails_closed_but_min_max_resolve() {
+        // Same class (backlog line 60): a `new Gauge('queue_depth')` summary
+        // hardcodes p50..p99 = 0, so `queue_depth: ['p(95)<10']` passed
+        // trivially. Percentiles must fail closed — but Gauge tracks REAL
+        // min/max from its samples, so those two stats must still resolve.
+        let series = MetricSummary {
+            key: "queue_depth".into(),
+            tags: vec![],
+            metric_type: MetricType::Gauge,
+            count: 100,
+            sum: 5000.0,
+            mean: 50.0,
+            min: 5,
+            max: 200,
+            p50: 0,
+            p90: 0,
+            p95: 0,
+            p99: 0,
+            last: 75.0,
+            rate: 0.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(series);
+        // Percentiles must fail closed, not read the hardcoded 0.
+        let result = evaluate_single_threshold("queue_depth.p95 < 10", &metrics);
+        assert!(
+            !result.0,
+            "p95 on a Gauge must fail closed, not read the hardcoded 0"
+        );
+        let result = evaluate_single_threshold("queue_depth.p(99.9) < 10", &metrics);
+        assert!(!result.0, "arbitrary p(99.9) on a Gauge must fail closed");
+        // But the real extremes resolve: max 200 > 100, min 5 < 10.
+        let result = evaluate_single_threshold("queue_depth.max > 100", &metrics);
+        assert!(result.0, "Gauge max 200 should be > 100");
+        let result = evaluate_single_threshold("queue_depth.min < 10", &metrics);
+        assert!(result.0, "Gauge min 5 should be < 10");
+        // And the tracked avg resolves too.
+        let result = evaluate_single_threshold("queue_depth.avg > 40", &metrics);
+        assert!(result.0, "Gauge avg 50 should be > 40");
+    }
+
+    #[test]
+    fn trend_percentile_stats_still_resolve() {
+        // Sanity: the broader guard must not break real Trend percentiles
+        // (the ONLY type with a genuine distribution).
+        let metrics = make_metrics();
+        let result = evaluate_single_threshold("http_req_duration.p95 < 5000", &metrics);
+        assert!(result.0, "Trend p95 1200 should be < 5000");
+        let result = evaluate_single_threshold("http_req_duration.p(75) < 5000", &metrics);
+        assert!(
+            result.0,
+            "arbitrary p(75) on a Trend (retained histogram) should resolve"
+        );
+        let result = evaluate_single_threshold("http_req_duration.min > 10", &metrics);
+        assert!(result.0, "Trend min 50 should be > 10");
+        let result = evaluate_single_threshold("http_req_duration.max > 1000", &metrics);
+        assert!(result.0, "Trend max 2000 should be > 1000");
+    }
+
+    #[test]
+    fn tag_scoped_rate_percentile_fails_closed() {
+        // The tag-scoped path (get_tag_scoped_metric_value) had the same
+        // `all(Counter)`-only guard — a tag-scoped Rate percentile must fail
+        // closed there too (backlog line 60). The tag value is colon-free
+        // (`/a`) because parse_metric_ref's `:`-vs-`=` separator heuristic
+        // would mis-split a value containing `://`.
+        let series = MetricSummary {
+            key: "http_req_failed{url=/a}".into(),
+            tags: vec![("url".into(), "/a".into())],
+            metric_type: MetricType::Rate,
+            count: 50,
+            sum: 50.0,
+            mean: 1.0,
+            min: 0,
+            max: 0,
+            p50: 0,
+            p90: 0,
+            p95: 0,
+            p99: 0,
+            last: 0.0,
+            rate: 1.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(series);
+        let result = evaluate_single_threshold("http_req_failed{url=/a}.p95 < 0.01", &metrics);
+        assert!(
+            !result.0,
+            "tag-scoped p95 on a Rate must fail closed, not read the hardcoded 0"
+        );
+        // The real rate on that tag still resolves.
+        let result = evaluate_single_threshold("http_req_failed{url=/a}.rate > 0.5", &metrics);
+        assert!(result.0, "tag-scoped rate 1.0 should be > 0.5");
+    }
+
     #[test]
     fn unknown_trend_stat_fails_closed() {
         // `http_req_duration.p95th` (typo): mean = 500, p95 = 1200. The OLD
@@ -968,12 +1349,12 @@ mod tests {
             count: 1500,
             sum: 1500.0,
             mean: 1.0,
-            min: 1.0,
-            max: 1.0,
-            p50: 1.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 1.0,
             rate: 0.0,
             histogram: None,
@@ -1003,12 +1384,12 @@ mod tests {
             count: 3_000_000,
             sum: 3_000_000.0,
             mean: 1.0,
-            min: 1.0,
-            max: 1.0,
-            p50: 1.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 1.0,
             rate: 0.0,
             histogram: None,
@@ -1077,12 +1458,12 @@ mod tests {
             count: 3_000_000,
             sum: 3_000_000.0,
             mean: 1.0,
-            min: 1.0,
-            max: 1.0,
-            p50: 1.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 1.0,
             rate: 0.0,
             histogram: None,
@@ -1113,7 +1494,7 @@ mod tests {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_ms((i * 100) as f64);
+            h.record_ms(i * 100);
         }
         MetricsResult {
             http_req_duration: Some(MetricSummary {
@@ -1123,67 +1504,24 @@ mod tests {
                 count: 10,
                 sum: 5500.0,
                 mean: 550.0,
-                min: 100.0,
-                max: 1000.0,
-                p50: 500.0,
-                p90: 900.0,
-                p95: 950.0,
-                p99: 990.0,
+                min: 100,
+                max: 1000,
+                p50: 500,
+                p90: 900,
+                p95: 950,
+                p99: 990,
                 last: 0.0,
                 rate: 0.0,
                 histogram: Some(h),
             }),
             ..Default::default()
         }
-    }
-
-    /// Backlog line 57 headline: a 0.3 ms p95 was quantized to 1 ms, so a
-    /// `p(95) < 1` threshold could never pass on a healthy sub-ms localhost
-    /// service. With µs-precision histograms and f64-ms stats it must.
-    #[test]
-    fn test_threshold_p95_sub_ms_can_pass() {
-        use crate::histogram::LatencyHistogram;
-        let mut h = LatencyHistogram::new();
-        for _ in 0..1000 {
-            h.record_ms(0.3);
-        }
-        let metrics = MetricsResult {
-            http_req_duration: Some(MetricSummary {
-                key: "http_req_duration".into(),
-                tags: vec![],
-                metric_type: MetricType::Trend,
-                count: 1000,
-                sum: 300.0,
-                mean: 0.3,
-                min: 0.3,
-                max: 0.3,
-                p50: 0.3,
-                p90: 0.3,
-                p95: 0.3,
-                p99: 0.3,
-                last: 0.0,
-                rate: 0.0,
-                histogram: Some(h),
-            }),
-            ..Default::default()
-        };
-        let result = evaluate_single_threshold("http_req_duration.p95 < 1", &metrics);
-        assert!(
-            result.0,
-            "p(95) < 1 must PASS on a 0.3 ms service (got {})",
-            result.1
-        );
-        assert!(
-            (result.1 - 0.3).abs() < 0.01,
-            "p95 should be ~0.3 ms, not 1 (got {})",
-            result.1
-        );
     }
 
     #[test]
     fn test_arbitrary_percentile_exact_not_mean() {
         let metrics = make_histogram_metrics();
-        // p75 of 100..1000 (10 values) is ~775-800 ms. The mean is 550.
+        // p75 of 100..1000 (10 values) is ~775-800 µs. The mean is 550.
         let result = evaluate_single_threshold("http_req_duration.p75 < 600", &metrics);
         assert!(
             !result.0,
@@ -1231,7 +1569,7 @@ mod tests {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_ms((i * 100) as f64);
+            h.record_ms(i * 100);
         }
         let mut m = MetricsResult::default();
         m.metrics.push(MetricSummary {
@@ -1241,12 +1579,12 @@ mod tests {
             count: 10,
             sum: 5500.0,
             mean: 550.0,
-            min: 100.0,
-            max: 1000.0,
-            p50: 500.0,
-            p90: 900.0,
-            p95: 950.0,
-            p99: 990.0,
+            min: 100,
+            max: 1000,
+            p50: 500,
+            p90: 900,
+            p95: 950,
+            p99: 990,
             last: 0.0,
             rate: 0.0,
             histogram: Some(h),
@@ -1267,7 +1605,7 @@ mod tests {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_ms((i * 100) as f64);
+            h.record_ms(i * 100);
         }
         let mut metrics = MetricsResult::default();
         metrics.metrics.push(MetricSummary {
@@ -1277,12 +1615,12 @@ mod tests {
             count: 10,
             sum: 5500.0,
             mean: 550.0,
-            min: 100.0,
-            max: 1000.0,
-            p50: 500.0,
-            p90: 900.0,
-            p95: 950.0,
-            p99: 990.0,
+            min: 100,
+            max: 1000,
+            p50: 500,
+            p90: 900,
+            p95: 950,
+            p99: 990,
             last: 0.0,
             rate: 0.0,
             histogram: Some(h),
@@ -1304,12 +1642,12 @@ mod tests {
             count: 80,
             sum: 32000.0,
             mean: 400.0,
-            min: 50.0,
-            max: 1500.0,
-            p50: 350.0,
-            p90: 700.0,
-            p95: 900.0,
-            p99: 1400.0,
+            min: 50,
+            max: 1500,
+            p50: 350,
+            p90: 700,
+            p95: 900,
+            p99: 1400,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1321,12 +1659,12 @@ mod tests {
             count: 10,
             sum: 15000.0,
             mean: 1500.0,
-            min: 500.0,
-            max: 3000.0,
-            p50: 1200.0,
-            p90: 2500.0,
-            p95: 2800.0,
-            p99: 3000.0,
+            min: 500,
+            max: 3000,
+            p50: 1200,
+            p90: 2500,
+            p95: 2800,
+            p99: 3000,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1408,12 +1746,12 @@ mod tests {
             count: 100,
             sum: 20.0, // 20% failed
             mean: 0.2,
-            min: 0.0,
-            max: 1.0,
-            p50: 0.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 0,
+            max: 1,
+            p50: 0,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 0.0,
             rate: 0.2,
             histogram: None,
@@ -1425,12 +1763,12 @@ mod tests {
             count: 100,
             sum: 100.0, // 100% failed
             mean: 1.0,
-            min: 0.0,
-            max: 1.0,
-            p50: 1.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 0,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 0.0,
             rate: 1.0,
             histogram: None,
@@ -1458,12 +1796,12 @@ mod tests {
             count: 7,
             sum: 7.0,
             mean: 1.0,
-            min: 0.0,
-            max: 1.0,
-            p50: 0.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 0,
+            max: 1,
+            p50: 0,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1475,12 +1813,12 @@ mod tests {
             count: 3,
             sum: 3.0,
             mean: 1.0,
-            min: 0.0,
-            max: 1.0,
-            p50: 0.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 0,
+            max: 1,
+            p50: 0,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1502,12 +1840,12 @@ mod tests {
             count: 5,
             sum: 1000.0,
             mean: 200.0,
-            min: 50.0,
-            max: 400.0,
-            p50: 200.0,
-            p90: 300.0,
-            p95: 350.0,
-            p99: 390.0,
+            min: 50,
+            max: 400,
+            p50: 200,
+            p90: 300,
+            p95: 350,
+            p99: 390,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1519,12 +1857,12 @@ mod tests {
             count: 500, // high count — would swamp `login` if prefix-folded
             sum: 1.0,
             mean: 1.0,
-            min: 1.0,
-            max: 1.0,
-            p50: 1.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1536,12 +1874,12 @@ mod tests {
             count: 500,
             sum: 1.0,
             mean: 1.0,
-            min: 1.0,
-            max: 1.0,
-            p50: 1.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1574,12 +1912,12 @@ mod tests {
             count: 2,
             sum: 400.0,
             mean: 200.0,
-            min: 100.0,
-            max: 300.0,
-            p50: 200.0,
-            p90: 250.0,
-            p95: 280.0,
-            p99: 290.0,
+            min: 100,
+            max: 300,
+            p50: 200,
+            p90: 250,
+            p95: 280,
+            p99: 290,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1591,12 +1929,12 @@ mod tests {
             count: 900,
             sum: 1.0,
             mean: 1.0,
-            min: 1.0,
-            max: 1.0,
-            p50: 1.0,
-            p90: 1.0,
-            p95: 1.0,
-            p99: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
             last: 0.0,
             rate: 0.0,
             histogram: None,
@@ -1630,12 +1968,12 @@ mod tests {
             count: 80,
             sum: 32000.0,
             mean: 400.0,
-            min: 50.0,
-            max: 1500.0,
-            p50: 350.0,
-            p90: 700.0,
-            p95: 900.0,
-            p99: 1400.0,
+            min: 50,
+            max: 1500,
+            p50: 350,
+            p90: 700,
+            p95: 900,
+            p99: 1400,
             last: 0.0,
             rate: 0.0,
             histogram: None,

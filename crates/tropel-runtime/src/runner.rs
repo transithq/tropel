@@ -103,6 +103,15 @@ impl ScenarioRunner {
         {
             let mut state = pm_state.lock().unwrap();
             state.set_request_names(execution_names);
+            // Postman item ids for setNextRequest id-first resolution
+            // (backlog §4): derived from the SAME flattened execution list,
+            // one entry per item, empty string when an item has no id.
+            state.set_request_ids(Arc::new(
+                execution_items
+                    .iter()
+                    .map(|i| i.id.clone().unwrap_or_default())
+                    .collect(),
+            ));
             state.vu_id = vu_id;
             state.scenario_name = scenario_name.clone();
             // Seed collection variables from the scenario (the Postman
@@ -210,6 +219,13 @@ impl ScenarioRunner {
             let mut state = self.pm_state.lock().unwrap();
             state.set_iteration_data(data_row.clone());
             state.iteration_index = iteration_index;
+            // Backlog §4: a setNextRequest jump set by the LAST item of the
+            // previous iteration was never consumed (the loop already exited)
+            // and leaked into this iteration — iteration 2 started
+            // mid-collection, re-armed the jump, and every subsequent
+            // iteration ran exactly one request. Jumps are per-iteration in
+            // Postman; clear any stale pending jump at iteration start.
+            state.next_request = None;
         }
 
         // Walk through the flattened execution list (folders descended).
@@ -266,7 +282,7 @@ impl ScenarioRunner {
             // Items without a request (e.g. transpiled TS/ES module scripts) still
             // execute their prerequest and test scripts.
             if item.items.is_empty()
-                && (item.request.is_some() || item.prerequest.is_some() || item.test.is_some())
+                && (item.request.is_some() || !item.prerequest.is_empty() || !item.test.is_empty())
             {
                 // Set request info in PM state
                 {
@@ -277,12 +293,25 @@ impl ScenarioRunner {
                     state.current_request_name = item.name.clone();
                 }
 
-                // Run prerequest script
-                if let Some(script) = &item.prerequest {
-                    // Backlog line 101: pm.info.eventName must name the
-                    // running script phase, not a hardcoded "test".
+                // Run prerequest scripts — EACH in its own lexical scope
+                // (backlog §4): Postman compiles every script separately, so
+                // a `const baseUrl` at collection level and at request level
+                // must NOT collide, a top-level `return` only exits its own
+                // script, and each script hits the compiled-function cache
+                // independently (the old single joined string shared one
+                // scope and one cache entry). An error in one script stops
+                // the rest of the chain (Postman behavior) but still counts
+                // as a failure.
+                //
+                // Backlog line 101: pm.info.eventName must name the running
+                // script phase, not a hardcoded "test". Set only when a
+                // prerequest script actually runs (an empty vec must not
+                // leave event_name stale while the request executes).
+                if !item.prerequest.is_empty() {
                     self.pm_state.lock().unwrap().event_name = "prerequest".to_string();
-                    let source_url = Some(format!("{}.prerequest.js", item.name));
+                }
+                for (script_idx, script) in item.prerequest.iter().enumerate() {
+                    let source_url = Some(format!("{}.prerequest#{}.js", item.name, script_idx));
                     if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await {
                         if self.force_stop.load(Ordering::Acquire) {
                             // A deliberate force-stop interrupted the eval —
@@ -304,6 +333,7 @@ impl ScenarioRunner {
                                 &format!("{}.prerequest", item.name),
                             );
                         }
+                        break;
                     }
                 }
 
@@ -572,7 +602,7 @@ impl ScenarioRunner {
                                     });
 
                                     // ═══════════════════════════════════════
-                                    // HTTP sub-timing metrics (Trend, all in ms)
+                                    // HTTP sub-timing metrics (Trend, all in μs)
                                     // ═══════════════════════════════════════
                                     // These match k6's http_req_* sub-timing
                                     // metrics. http_req_dns is a Tropel extra (k6
@@ -655,13 +685,18 @@ impl ScenarioRunner {
                     }
                 }
 
-                // Run test script (skipped when pm.execution.skipRequest() ran)
+                // Run test scripts (skipped when pm.execution.skipRequest()
+                // ran) — EACH in its own lexical scope (backlog §4, same as
+                // the prerequest chain).
                 if !skip_item {
-                    if let Some(script) = &item.test {
-                        // Backlog line 101: pm.info.eventName names the
-                        // running phase — "test" here, "prerequest" above.
+                    // Backlog line 101: pm.info.eventName names the running
+                    // phase — "test" here, "prerequest" above. Set only when
+                    // a test script actually runs.
+                    if !item.test.is_empty() {
                         self.pm_state.lock().unwrap().event_name = "test".to_string();
-                        let source_url = Some(format!("{}.test.js", item.name));
+                    }
+                    for (script_idx, script) in item.test.iter().enumerate() {
+                        let source_url = Some(format!("{}.test#{}.js", item.name, script_idx));
                         if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await
                         {
                             if self.force_stop.load(Ordering::Acquire) {
@@ -679,6 +714,7 @@ impl ScenarioRunner {
                                 // failure is visible and drives a non-zero exit.
                                 record_script_failure(&mut result, &format!("{}.test", item.name));
                             }
+                            break;
                         }
                     }
                 }
@@ -718,6 +754,10 @@ impl ScenarioRunner {
             env.insert(k.clone(), v.clone());
         }
         tropel_variables::VariableScope {
+            // pm.variables is the LOCAL scope — Postman's highest priority
+            // (backlog line 137): script-set values must win over data/env
+            // for {{var}} substitution in later requests.
+            local: state.local_vars.clone(),
             data,
             env,
             collection: state.collection_vars.clone(),
@@ -797,7 +837,7 @@ pub fn flatten_execution_items(items: &[ScenarioItem]) -> Vec<ScenarioItem> {
     let mut out = Vec::new();
     for item in items {
         if item.items.is_empty() {
-            if item.request.is_some() || item.prerequest.is_some() || item.test.is_some() {
+            if item.request.is_some() || !item.prerequest.is_empty() || !item.test.is_empty() {
                 out.push(item.clone());
             }
         } else {
@@ -903,6 +943,7 @@ mod tests {
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
             name: name.to_string(),
+            id: None,
             request: Some(tropel_sdk::types::Request {
                 url: format!("http://example.com/{name}"),
                 method: Method::GET,
@@ -915,8 +956,8 @@ mod tests {
                 timeout: None,
                 response_type: ResponseType::None,
             }),
-            prerequest: None,
-            test: None,
+            prerequest: vec![],
+            test: vec![],
             assertions: vec![],
             items: vec![],
         }
@@ -925,9 +966,10 @@ mod tests {
     fn folder(name: &str, items: Vec<ScenarioItem>) -> ScenarioItem {
         ScenarioItem {
             name: name.to_string(),
+            id: None,
             request: None,
-            prerequest: None,
-            test: None,
+            prerequest: vec![],
+            test: vec![],
             assertions: vec![],
             items,
         }
@@ -1007,9 +1049,10 @@ mod tests {
         // not appear in the run order.
         let inert = ScenarioItem {
             name: "inert".into(),
+            id: None,
             request: None,
-            prerequest: None,
-            test: None,
+            prerequest: vec![],
+            test: vec![],
             assertions: vec![],
             items: vec![],
         };
@@ -1137,6 +1180,7 @@ mod tests {
             items: vec![
                 ScenarioItem {
                     name: "item-a".into(),
+                    id: None,
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/a".into(),
                         method: Method::GET,
@@ -1149,13 +1193,14 @@ mod tests {
                         timeout: None,
                         response_type: Default::default(),
                     }),
-                    prerequest: None,
-                    test: None,
+                    prerequest: vec![],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 },
                 ScenarioItem {
                     name: "item-b".into(),
+                    id: None,
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/b".into(),
                         method: Method::GET,
@@ -1168,8 +1213,8 @@ mod tests {
                         timeout: None,
                         response_type: Default::default(),
                     }),
-                    prerequest: None,
-                    test: None,
+                    prerequest: vec![],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 },
@@ -1227,17 +1272,19 @@ mod tests {
             items: vec![
                 ScenarioItem {
                     name: "self".into(),
+                    id: None,
                     request: None,
-                    prerequest: Some("postman.setNextRequest('self');".into()),
-                    test: None,
+                    prerequest: vec!["postman.setNextRequest('self');".into()],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 },
                 ScenarioItem {
                     name: "after".into(),
+                    id: None,
                     request: None,
-                    prerequest: Some("// inert".into()),
-                    test: None,
+                    prerequest: vec!["// inert".into()],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 },
@@ -1322,12 +1369,13 @@ mod tests {
                 "Folder",
                 vec![ScenarioItem {
                     name: "inner".into(),
+                    id: None,
                     request: None,
-                    prerequest: Some(
+                    prerequest: vec![
                         "pm.environment.set('token', 'tok-42'); // COLLECTION; FOLDER; REQUEST"
                             .into(),
-                    ),
-                    test: None,
+                    ],
+                    test: vec![],
                     assertions: vec![],
                     items: vec![],
                 }],
@@ -1344,9 +1392,8 @@ mod tests {
         assert!(
             execution_items[0]
                 .prerequest
-                .as_deref()
-                .unwrap_or("")
-                .contains("pm.environment.set"),
+                .iter()
+                .any(|s| s.contains("pm.environment.set")),
             "the folded collection/folder prerequest must ride on the leaf"
         );
         let names: Arc<Vec<String>> =
@@ -1408,6 +1455,333 @@ mod tests {
             resolver.resolve("{{token}}", &scope),
             "tok-42",
             "folded prerequest-set value must resolve in later requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_script_runs_in_its_own_lexical_scope() {
+        // Backlog §4: scripts were joined with "\n;\n" into ONE string that
+        // compiled into a single `(async function ...)` — one lexical scope.
+        // A `const baseUrl` at collection level AND at request level threw
+        // `SyntaxError: Identifier 'baseUrl' has already been declared` and
+        // killed the WHOLE chain (collection token-minting never ran); a
+        // top-level `return` skipped every downstream script. Postman runs
+        // each script as a separate compilation: this pins the runner-level
+        // symptom — a redeclared const must not collide, and a `return` must
+        // only exit its own script.
+        let scenario = Arc::new(Scenario {
+            info: tropel_sdk::scenario::ScenarioInfo {
+                name: "scopes".into(),
+                description: None,
+                schema: None,
+            },
+            // Three separate prerequest scripts on one leaf (the parser now
+            // emits a LIST, one element per level):
+            //   0: collection — declares `const baseUrl`
+            //   1: folder — REDECLARES `const baseUrl` (the old joined
+            //      string would throw here) AND returns early
+            //   2: request — must STILL run (return only exits script 1)
+            items: vec![ScenarioItem {
+                name: "scoped".into(),
+                id: None,
+                request: None,
+                prerequest: vec![
+                    "const baseUrl = 'https://api.example.com'; // COLLECTION".into(),
+                    "const baseUrl = 'https://api.example.com/v2'; if (true) { return; } // FOLDER"
+                        .into(),
+                    "pm.environment.set('token', 'tok-42'); // REQUEST".into(),
+                ],
+                test: vec![],
+                assertions: vec![],
+                items: vec![],
+            }],
+            variables: HashMap::new(),
+            auth: None,
+        });
+        let execution_items = Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
+        let mut runner =
+            ScenarioRunner::new(scenario, execution_items, names, client, 0, "scopes".into());
+
+        let mut js_ctx = Box::new(
+            JsContext::new(None, None)
+                .await
+                .expect("js context should construct"),
+        );
+        js_ctx
+            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .await
+            .expect("pm shim should eval");
+        let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("bridge http client should construct"),
+        ));
+        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(
+            runner.pm_state().clone(),
+            bridge_client,
+        )
+        .install(&mut js_ctx)
+        .expect("pm bridge should install");
+        runner = runner.with_js_context(js_ctx);
+
+        let env = HashMap::new();
+        let result = runner.run_iteration(0, None, &env).await;
+        assert_eq!(
+            result.script_failures, 0,
+            "redeclared const must not kill the chain; the request script must still run"
+        );
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("token").map(String::as_str),
+            Some("tok-42"),
+            "script 2 must still run after script 1's early return"
+        );
+    }
+
+    /// Wire a runner over the given items with a REAL JS context (pm shim +
+    /// bridge) so setNextRequest tests exercise the full flow-control path.
+    async fn runner_with_scripts(items: Vec<ScenarioItem>) -> ScenarioRunner {
+        let scenario = Arc::new(Scenario {
+            info: tropel_sdk::scenario::ScenarioInfo {
+                name: "jumps".into(),
+                description: None,
+                schema: None,
+            },
+            items,
+            variables: HashMap::new(),
+            auth: None,
+        });
+        let execution_items = Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
+        let runner =
+            ScenarioRunner::new(scenario, execution_items, names, client, 0, "jumps".into());
+        let mut js_ctx = Box::new(
+            JsContext::new(None, None)
+                .await
+                .expect("js context should construct"),
+        );
+        js_ctx
+            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .await
+            .expect("pm shim should eval");
+        let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("bridge http client should construct"),
+        ));
+        tropel_sandbox::bindings::trp::TrpBridge::with_http_client(
+            runner.pm_state().clone(),
+            bridge_client,
+        )
+        .install(&mut js_ctx)
+        .expect("pm bridge should install");
+        runner.with_js_context(js_ctx)
+    }
+
+    fn script_item(name: &str, script: &str) -> ScenarioItem {
+        ScenarioItem {
+            id: None,
+            name: name.into(),
+            request: None,
+            prerequest: vec![script.into()],
+            test: vec![],
+            assertions: vec![],
+            items: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn set_next_request_null_ends_the_iteration() {
+        // Backlog §4: setNextRequest(null) was a NO-OP — the runner kept
+        // walking the collection. Postman semantics: null ends the current
+        // ITERATION (nothing after the jump runs).
+        let mut runner = runner_with_scripts(vec![
+            script_item(
+                "first",
+                "pm.environment.set('saw0', '1'); postman.setNextRequest(null);",
+            ),
+            script_item("second", "pm.environment.set('saw1', '1');"),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(state.environment.get("saw0").map(String::as_str), Some("1"));
+        assert!(
+            !state.environment.contains_key("saw1"),
+            "setNextRequest(null) must end the iteration — item 1 must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_unknown_name_ends_the_iteration() {
+        // Backlog §4: an unknown request name was a silent no-op (runner kept
+        // walking). Postman stops the flow — the iteration ends.
+        let mut runner = runner_with_scripts(vec![
+            script_item(
+                "first",
+                "pm.environment.set('saw0', '1'); postman.setNextRequest('no-such-item');",
+            ),
+            script_item("second", "pm.environment.set('saw1', '1');"),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(state.environment.get("saw0").map(String::as_str), Some("1"));
+        assert!(
+            !state.environment.contains_key("saw1"),
+            "unknown setNextRequest target must end the iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_jump_does_not_leak_into_next_iteration() {
+        // Backlog §4: a jump set by the LAST item was never consumed within
+        // the iteration (the loop had already exited), leaked into iteration
+        // 2, and re-armed — every subsequent iteration started mid-collection
+        // and ran exactly one request. Jumps are per-iteration in Postman;
+        // iteration 2 must start at item 0 again.
+        let mut runner = runner_with_scripts(vec![
+            script_item("a", "pm.environment.set('sawA', '1');"),
+            script_item("b", "pm.environment.set('sawB', '1');"),
+            script_item("c", "postman.setNextRequest('b');"),
+        ])
+        .await;
+        let _ = runner.run_iteration(0, None, &HashMap::new()).await;
+        // Iteration 2: the stale jump to 'b' must be cleared — item A runs.
+        let result = runner.run_iteration(1, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("sawA").map(String::as_str),
+            Some("1"),
+            "iteration 2 must start at the first item — the previous jump leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_duplicate_name_is_last_wins() {
+        // Backlog §4: the old first-wins position() jumped to the FIRST item
+        // with a duplicate name. Postman is last-wins.
+        let mut runner = runner_with_scripts(vec![
+            script_item("start", "postman.setNextRequest('dup');"),
+            script_item("dup", "pm.environment.set('saw1', '1');"),
+            script_item("dup", "pm.environment.set('saw2', '1');"),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert!(
+            state.environment.contains_key("saw2"),
+            "the LAST duplicate must win (saw2 set)"
+        );
+        assert!(
+            !state.environment.contains_key("saw1"),
+            "the FIRST duplicate must NOT run (saw1 unset)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_resolves_id_before_name() {
+        // Backlog §4: Postman resolves item ids FIRST — a request id shadows
+        // a same-named item. The named item sits BEFORE the id-carrying item:
+        // if the name won, the jump would land on it first (and the id item
+        // would still run after); if the id wins, execution jumps PAST the
+        // named item directly to the id item (Postman continues from the
+        // target to the end of the collection, so ordering isolates the win).
+        let mut runner = runner_with_scripts(vec![
+            script_item("start", "postman.setNextRequest('t1');"),
+            script_item("t1", "pm.environment.set('sawName', '1');"),
+            ScenarioItem {
+                id: Some("t1".into()),
+                name: "by-id".into(),
+                request: None,
+                prerequest: vec!["pm.environment.set('sawId', '1');".into()],
+                test: vec![],
+                assertions: vec![],
+                items: vec![],
+            },
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("sawId").map(String::as_str),
+            Some("1"),
+            "item id must win over the same-named item"
+        );
+        assert!(
+            !state.environment.contains_key("sawName"),
+            "the same-named item must NOT run (id resolved first)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_numeric_like_name_is_not_hijacked() {
+        // Backlog §4: a request literally named "2" was hijacked by the
+        // numeric-index parse (jumped to INDEX 2). The name lookup must
+        // precede the legacy numeric fallback. (Postman continues from the
+        // jump target to the end, so the later "third" item still runs — the
+        // discriminator is that the item NAMED '2' runs at all.)
+        let mut runner = runner_with_scripts(vec![
+            script_item("start", "postman.setNextRequest('2');"),
+            script_item("2", "pm.environment.set('sawName2', '1');"),
+            script_item("third", "pm.environment.set('sawIdx2', '1');"),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("sawName2").map(String::as_str),
+            Some("1"),
+            "a request named '2' must resolve by NAME, not index"
+        );
+        // Under the old numeric-first parse, '2' jumped to INDEX 2 ("third")
+        // and the item named "2" never ran — sawIdx2 would be set and
+        // sawName2 absent. The name lookup winning is what this pins.
+        assert_eq!(
+            state.environment.get("sawIdx2").map(String::as_str),
+            Some("1"),
+            "execution continues past the jump target (Postman flow)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pm_variables_local_scope_shadows_iteration_data() {
+        // Backlog line 137: pm.variables.set wrote to COLLECTION scope while
+        // get read data > env > collection — set-then-get disagreed when
+        // iteration data had the same key. pm.variables is Postman's LOCAL
+        // (highest-priority) scope: the set value must win, both for
+        // pm.variables.get and for {{var}} substitution in later requests.
+        let mut runner = runner_with_scripts(vec![
+            script_item("first", "pm.variables.set('token', 'local-tok');"),
+            script_item(
+                "second",
+                "pm.environment.set('saw', pm.variables.get('token'));",
+            ),
+        ])
+        .await;
+        let data: HashMap<String, serde_json::Value> =
+            HashMap::from([("token".into(), serde_json::Value::String("data-tok".into()))]);
+        let _ = runner.run_iteration(0, Some(data), &HashMap::new()).await;
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("saw").map(String::as_str),
+            Some("local-tok"),
+            "pm.variables (local scope) must win over iteration data"
         );
     }
 }
