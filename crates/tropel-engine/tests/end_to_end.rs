@@ -346,7 +346,7 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
         .expect("http_req_duration summary present");
     assert!(dur.count > 0, "http_req_duration has samples");
     assert!(
-        dur.max > 0,
+        dur.max > 0.0,
         "http_req_duration max > 0 (real latency measured)"
     );
 
@@ -538,12 +538,11 @@ async fn non_tracked_percentile_threshold_completes_healthy_run() -> Result<()> 
     // ~500ms and the rest ~10ms, the tracked p95 lands in the slow region
     // (~500ms) while p75 stays fast. If the latency-tail server silently
     // broke (all-fast), this fails loudly instead of passing vacuously — the
-    // old code would also have completed an all-fast run. (p95 is the u64
-    // tracked bucket in ms on this branch.)
+    // old code would also have completed an all-fast run.
     assert!(m.http_reqs > 0, "requests fired, got {}", m.http_reqs);
     if let Some(hd) = &m.http_req_duration {
         assert!(
-            hd.p95 >= 200,
+            hd.p95 >= 200.0,
             "latency tail must be present: p95 = {}, want >= 200ms",
             hd.p95
         );

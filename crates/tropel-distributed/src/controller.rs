@@ -346,7 +346,7 @@ mod tests {
         );
         let dur = merged.http_req_duration.expect("merged http_req_duration");
         assert_eq!(dur.count, 4, "merged histogram count = 4");
-        assert!(dur.max > 0, "merged max latency recorded");
+        assert!(dur.max > 0.0, "merged max latency recorded");
         assert_eq!(merged.iterations, 4, "merged iterations = 4");
 
         let _ = std::fs::remove_file(&coll);
