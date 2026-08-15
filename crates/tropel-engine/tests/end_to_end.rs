@@ -437,9 +437,17 @@ async fn prerequest_pm_request_header_reaches_the_wire() -> Result<()> {
     let config = JobConfig {
         input: coll.clone(),
         input_type: Some("postman".to_string()),
-        execution: ExecutionConfig::ConstantVus {
+        // SharedIterations (not ConstantVus): a bounded iteration count
+        // completes cleanly before the engine stops, so no in-flight request
+        // is clipped by a wall-clock stop boundary. The old 3s ConstantVus
+        // could abort exactly one in-flight request at t=3s on a loaded CI
+        // runner (ubuntu) → 1 failed check of ~5473 → flaky.
+        execution: ExecutionConfig::SharedIterations {
+            iterations: 1000,
+            // Safety net: fail fast if the capture server ever stalls
+            // (matches the file's other SharedIterations tests).
+            max_duration: Some("30s".to_string()),
             vus: 2,
-            duration: "3s".to_string(),
             graceful_stop: Some("10s".to_string()),
             think_time: ThinkTimeConfig::default(),
         },

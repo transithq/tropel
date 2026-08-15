@@ -4505,6 +4505,7 @@ name = "tropel-input-postman"
 version = "0.1.0"
 dependencies = [
  "inventory",
+ "serde",
  "serde_json",
  "tropel-collection",
  "tropel-sdk",
