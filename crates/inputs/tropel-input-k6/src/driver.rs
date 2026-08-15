@@ -670,6 +670,10 @@ struct WsSession {
     bytes_sent: AtomicU64,
     msgs_received: AtomicU64,
     bytes_received: AtomicU64,
+    /// Backlog line 62: whether the session ended abnormally — an `Error`
+    /// event, a close code other than 1000/1001, or the reader dropping
+    /// without a close frame (1006). `ws_req_failed` is 1.0 iff this is set.
+    failed: AtomicBool,
 }
 
 /// A single WebSocket event delivered to JS via `__tropel_k6_ws_step`.
@@ -2252,6 +2256,10 @@ impl K6DriverInstance {
             let next_id_conn = next_id.clone();
             let deadline_conn = deadline.clone();
             let max_exec_conn = max_exec;
+            // Backlog line 62: a failed handshake must still emit ws_* metrics
+            // (ws_connecting + ws_req_failed=1.0), so the failed request is
+            // visible to thresholds instead of vanishing.
+            let sink_conn = sink.clone();
             let _ = globals.set(
                 "__tropel_k6_ws_connect",
                 Func::from(
@@ -2421,15 +2429,47 @@ impl K6DriverInstance {
                                         bytes_sent: AtomicU64::new(0),
                                         msgs_received: AtomicU64::new(0),
                                         bytes_received: AtomicU64::new(0),
+                                        failed: AtomicBool::new(false),
                                     }),
                                 );
                                 serde_json::json!({ "id": id, "error": null }).to_string()
                             }
-                            Err(e) => serde_json::json!({
-                                "id": 0,
-                                "error": e.to_string(),
-                            })
-                            .to_string(),
+                            Err(e) => {
+                                // Backlog line 62: a failed handshake emitted
+                                // ZERO ws metrics. k6 parity: emit
+                                // ws_connecting (time to failure) + a
+                                // ws_req_failed=1.0 Rate sample so the failed
+                                // request shows up in summary/thresholds.
+                                let elapsed = connect_start.elapsed();
+                                let now = tropel_js::clock::monotonic_wall_now();
+                                let mut tags = TagMap::with_capacity(5);
+                                tags.insert("url", url.clone());
+                                tags.insert("method", String::from("GET"));
+                                tags.insert("status", String::from("0"));
+                                tags.insert("name", url.clone());
+                                tags.insert("group", String::from("ws"));
+                                let tags = Arc::new(tags);
+                                let mut v = sink_conn.lock().unwrap();
+                                v.push(Sample {
+                                    metric: "ws_connecting".into(),
+                                    value: elapsed.as_secs_f64() * 1000.0,
+                                    tags: tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Trend,
+                                });
+                                v.push(Sample {
+                                    metric: "ws_req_failed".into(),
+                                    value: 1.0,
+                                    tags,
+                                    timestamp: now,
+                                    sample_type: SampleType::Rate,
+                                });
+                                serde_json::json!({
+                                    "id": 0,
+                                    "error": e.to_string(),
+                                })
+                                .to_string()
+                            }
                         }
                     },
                 ),
@@ -2485,26 +2525,43 @@ impl K6DriverInstance {
                             Ok(WsEvent::Pong) => {
                                 serde_json::json!({"type": "pong"}).to_string()
                             }
-                            Ok(WsEvent::Close { code, reason }) => serde_json::json!({
-                                "type": "close",
-                                "code": code,
-                                "reason": reason,
-                            })
-                            .to_string(),
-                            Ok(WsEvent::Error(m)) => serde_json::json!({
-                                "type": "error",
-                                "message": m,
-                            })
-                            .to_string(),
+                            Ok(WsEvent::Close { code, reason }) => {
+                                // Backlog line 62: close codes 1000 (normal)
+                                // and 1001 (going away) are clean; everything
+                                // else (1006 abnormal, 1002 protocol, 4000+ app
+                                // codes) marks the request failed (k6 parity).
+                                if code != 1000 && code != 1001 {
+                                    session.failed.store(true, Ordering::Relaxed);
+                                }
+                                serde_json::json!({
+                                    "type": "close",
+                                    "code": code,
+                                    "reason": reason,
+                                })
+                                .to_string()
+                            }
+                            Ok(WsEvent::Error(m)) => {
+                                session.failed.store(true, Ordering::Relaxed);
+                                serde_json::json!({
+                                    "type": "error",
+                                    "message": m,
+                                })
+                                .to_string()
+                            }
                             Err(RecvTimeoutError::Timeout) => {
                                 serde_json::json!({"type": "none"}).to_string()
                             }
-                            Err(RecvTimeoutError::Disconnected) => serde_json::json!({
-                                "type": "close",
-                                "code": 1006,
-                                "reason": "connection closed",
-                            })
-                            .to_string(),
+                            Err(RecvTimeoutError::Disconnected) => {
+                                // Reader dropped without a close frame →
+                                // abnormal closure (1006), k6 marks it failed.
+                                session.failed.store(true, Ordering::Relaxed);
+                                serde_json::json!({
+                                    "type": "close",
+                                    "code": 1006,
+                                    "reason": "connection closed",
+                                })
+                                .to_string()
+                            }
                         }
                     },
                 ),
@@ -2646,9 +2703,14 @@ impl K6DriverInstance {
                             timestamp: now,
                             sample_type: SampleType::Trend,
                         });
+                        // Backlog line 62: ws_req_failed was hardcoded 0.0 —
+                        // it ignored Error events and abnormal close codes.
+                        // k6 parity: 1.0 iff the session saw an error or an
+                        // abnormal closure (1000/1001 are clean).
+                        let failed = session.failed.load(Ordering::Relaxed);
                         v.push(Sample {
                             metric: "ws_req_failed".into(),
-                            value: 0.0,
+                            value: if failed { 1.0 } else { 0.0 },
                             tags: tags.clone(),
                             timestamp: now,
                             sample_type: SampleType::Rate,
@@ -6152,6 +6214,139 @@ mod tests {
                 "server close must dispatch once even with a defensive user close(): {close2_events}"
             );
         });
+    }
+
+    /// Backlog line 62: ws_req_failed was hardcoded 0.0 and a failed
+    /// ws.connect handshake emitted ZERO ws metrics. k6 parity: a refused
+    /// connection must emit ws_connecting (time to failure) AND a
+    /// ws_req_failed=1.0 Rate sample, so thresholds see the failure instead
+    /// of the request silently vanishing.
+    #[tokio::test]
+    async fn test_ws_failed_handshake_emits_failed_metrics() {
+        let driver = K6Driver;
+        // Port 1 is not listening on any CI/local box → immediate
+        // ECONNREFUSED, no server needed.
+        let script = br#"
+            export default function () {
+                ws.connect('ws://127.0.0.1:1/', {}, function (socket) {});
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        // The shim throws 'ws.connect failed: …' — the iteration errors, but
+        // the connect bridge pushed its failure samples BEFORE returning the
+        // error JSON, and run_iteration drains the sink unconditionally.
+        let _ = inst.run_iteration(&mut ctx).await;
+        let failed: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "ws_req_failed")
+            .collect();
+        assert!(
+            !failed.is_empty(),
+            "failed handshake must emit ws_req_failed, got: {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            failed[0].value, 1.0,
+            "ws_req_failed must be 1.0 on a refused connection"
+        );
+        assert!(
+            ctx.samples.iter().any(|s| s.metric == "ws_connecting"),
+            "failed handshake must still emit ws_connecting"
+        );
+    }
+
+    /// Backlog line 62: an abnormal closure (server drops without a close
+    /// frame → 1006) must mark the session failed, so finish() emits
+    /// ws_req_failed=1.0 — previously hardcoded 0.0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ws_abnormal_close_marks_req_failed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Complete the WebSocket handshake, then drop the connection
+            // WITHOUT a close frame → the client reader sees EOF and emits
+            // Close{1006} (abnormal closure).
+            let _ = tokio_tungstenite::accept_async(stream).await;
+            // ws dropped here
+        });
+
+        let driver = K6Driver;
+        let script = format!(
+            "export default function () {{ ws.connect('ws://127.0.0.1:{port}/', {{}}, function (socket) {{ socket.on('open', function () {{}}); }}); }}"
+        );
+        let mut inst = driver.init(script.as_bytes(), None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must complete after the abnormal close");
+        let failed: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "ws_req_failed")
+            .collect();
+        assert!(
+            !failed.is_empty(),
+            "finish() must emit ws_req_failed, got: {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            failed[0].value, 1.0,
+            "abnormal close (1006) must set ws_req_failed=1.0"
+        );
+    }
+
+    /// Backlog line 62: a NORMAL close (1000) must keep ws_req_failed=0.0 —
+    /// only errors and abnormal closures are failures.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ws_normal_close_stays_not_failed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "bye".into(),
+                })))
+                .await;
+        });
+
+        let driver = K6Driver;
+        let script = format!(
+            "export default function () {{ ws.connect('ws://127.0.0.1:{port}/', {{}}, function (socket) {{ socket.on('open', function () {{}}); }}); }}"
+        );
+        let mut inst = driver.init(script.as_bytes(), None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must complete after the normal close");
+        let failed: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "ws_req_failed")
+            .collect();
+        assert!(
+            !failed.is_empty(),
+            "finish() must emit ws_req_failed, got: {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            failed[0].value, 0.0,
+            "normal close (1000) must keep ws_req_failed=0.0"
+        );
     }
 
     /// Backlog line 63: group() tagged samples with the INNERMOST raw name
