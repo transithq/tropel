@@ -186,6 +186,25 @@ if (outcome.iterations[1].scriptFailures !== 0) fail("scripts must pass on the s
 const checks = first.samples.filter((s) => s.metric === "checks");
 if (checks.length < 2) fail(`expected 2 checks samples, got ${checks.length}`);
 
+// W1-A wire-P0 regression: a decode failure still emits http_reqs and
+// pm.test swallows the assertion into a 0.0 check, so COUNTING checks can
+// never catch it. Every check must have PASSED — value === 1 (a 0.0 check
+// means the assertion body threw or the wire decoded a failure as pass).
+const failedChecks = checks.filter((s) => s.value !== 1);
+if (failedChecks.length > 0)
+  fail(`all checks must PASS (value === 1), got ${failedChecks.length} failing`);
+
+// W1-A wire-P0 regression: http_req_failed (Rate) must be 0 for every
+// request — the fixture transport answers 200. A re-introduced wire P0
+// that mis-decodes the failure flag (or drops it) surfaces here even
+// though http_reqs/checks still emit.
+const reqFailed = first.samples.filter((s) => s.metric === "http_req_failed");
+if (reqFailed.length === 0)
+  fail(`expected http_req_failed samples, got none (wire P0: failure flag missing)`);
+const failedReqs = reqFailed.filter((s) => s.value !== 0);
+if (failedReqs.length > 0)
+  fail(`all requests must succeed (http_req_failed === 0), got ${failedReqs.length} failed`);
+
 const expectedSeen = [
   "https://fixture.test/first",
   "https://fixture.test/second",
