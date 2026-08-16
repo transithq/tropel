@@ -316,18 +316,46 @@ var chai = chai || {};
         return this;
     };
 
-    // .include(value)
+    // .include(value) — deep-aware (W1-B: `.deep.include({name:"x"})` must
+    // deep-include; previously the deep flag was ignored and only the
+    // shallow `value in obj` / indexOf paths existed).
     Assertion.prototype.include = function (value) {
         var obj = this._obj;
         var negate = !!(this.__flags && this.__flags.negate);
+        var deep = !!(this.__flags && this.__flags.deep);
         var passed;
 
         if (typeof obj === 'string') {
             passed = (obj.indexOf(value) !== -1) !== negate;
         } else if (Array.isArray(obj)) {
-            passed = (obj.indexOf(value) !== -1) !== negate;
+            if (deep) {
+                var found = false;
+                for (var i = 0; i < obj.length; i++) {
+                    if (nativeDeepEqual(obj[i], value)) { found = true; break; }
+                }
+                passed = found !== negate;
+            } else {
+                passed = (obj.indexOf(value) !== -1) !== negate;
+            }
         } else if (typeof obj === 'object' && obj !== null) {
-            passed = (value in obj) !== negate;
+            if (deep) {
+                // chai subset semantics: every key of `value` must exist on
+                // `obj` with a deep-equal value (extra keys on obj allowed).
+                // Only valid when `value` is itself an object — a primitive
+                // has no keys, so Object.keys(5) = [] would vacuously pass
+                // (false-green; Object.keys(null) would throw). Fail instead.
+                if (value === null || typeof value !== 'object') {
+                    passed = false !== negate;
+                } else {
+                    var expKeys = Object.keys(value);
+                    var allMatch = expKeys.every(function (k) {
+                        return k in obj && nativeDeepEqual(obj[k], value[k]);
+                    });
+                    passed = allMatch !== negate;
+                }
+            } else {
+                passed = (value in obj) !== negate;
+            }
         } else {
             passed = false;
         }
@@ -336,7 +364,7 @@ var chai = chai || {};
             throw new Error(
                 (this._msg ? this._msg + ': ' : '') +
                 'expected ' + JSON.stringify(obj) +
-                (negate ? ' not' : '') + ' to include ' + JSON.stringify(value)
+                (negate ? ' not' : '') + (deep ? ' to deeply include ' : ' to include ') + JSON.stringify(value)
             );
         }
         return this;
@@ -589,6 +617,77 @@ var chai = chai || {};
     };
     Assertion.prototype.lte = Assertion.prototype.most;
 
+    // .within(start, finish) — start <= obj <= finish (chai inclusive)
+    Assertion.prototype.within = function (start, finish) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (this._obj >= start && this._obj <= finish) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) +
+                (negate ? ' not' : '') + ' to be within ' + start + '..' + finish
+            );
+        }
+        return this;
+    };
+
+    // .closeTo(expected, delta) — |obj - expected| <= delta (chai)
+    Assertion.prototype.closeTo = function (expected, delta) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (Math.abs(this._obj - expected) <= delta) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(this._obj) +
+                (negate ? ' not' : '') + ' to be close to ' + expected + ' +/- ' + delta
+            );
+        }
+        return this;
+    };
+
+    // .members(list) — chai's plain .members asserts the target array has
+    // the SAME members as list, order-insensitive (set equality: same size
+    // AND every element of list present in the target). The superset
+    // spelling is `.include.members`, which this shim does not split — a
+    // plain .members that only checked one direction would let
+    // `[1,2,3].members([1,2])` PASS (a false-green, the exact failure mode
+    // this project hunts). Deep-aware: with the deep flag, membership is by
+    // deep equality.
+    Assertion.prototype.members = function (list) {
+        var negate = !!(this.__flags && this.__flags.negate);
+        var deep = !!(this.__flags && this.__flags.deep);
+        var obj = this._obj;
+        var passed;
+        if (Array.isArray(obj) && Array.isArray(list)) {
+            // Multiset semantics (chai counts occurrences): same length AND
+            // each list element finds a distinct mate in the target — a naive
+            // length + every/some would let [1,1,2].members([1,2,2]) PASS
+            // (false-green). Deep flag compares by deep equality.
+            var used = [];
+            var all = obj.length === list.length && list.every(function (needle) {
+                for (var i = 0; i < obj.length; i++) {
+                    if (used[i]) continue;
+                    if (deep ? nativeDeepEqual(obj[i], needle) : obj[i] === needle) {
+                        used[i] = true;
+                        return true;
+                    }
+                }
+                return false;
+            });
+            passed = all !== negate;
+        } else {
+            passed = false;
+        }
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected ' + JSON.stringify(obj) +
+                (negate ? ' not' : '') + (deep ? ' to deeply ' : ' to ') + 'have members ' + JSON.stringify(list)
+            );
+        }
+        return this;
+    };
+
     // .contain(value) — alias of .include (chai exposes both)
     Assertion.prototype.contain = function (value) {
         return this.include(value);
@@ -742,6 +841,51 @@ var chai = chai || {};
     // ── chai.expect ──
     chai.expect = function (val, msg) {
         return guardAssertion(new Assertion(val, msg, chai.expect));
+    };
+
+    // ── Postman extensions (chai-postman parity) ──
+    // pm.expect delegates to chai's Assertion (W1-B), so the
+    // Postman-specific members status/header/jsonBody must live here too.
+    // They read pm.response, which exists at call time whenever pm.js is
+    // loaded (the runtime bundle always loads both; chai alone leaves them
+    // failing on an absent pm.response, which is correct — these are
+    // Postman members, not core chai).
+    Assertion.prototype.status = function (code) {
+        var actual = (typeof pm !== 'undefined' && pm.response) ? pm.response.code : undefined;
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (actual === code) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected response ' + (negate ? 'not ' : '') + 'to have status ' + code + ' but got ' + actual
+            );
+        }
+        return this;
+    };
+    Assertion.prototype.header = function (key, value) {
+        var header = (typeof pm !== 'undefined' && pm.response) ? pm.response.header(key) : undefined;
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = (header === value) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected header ' + key + ' ' + (negate ? 'not ' : '') +
+                'to be ' + JSON.stringify(value) + ', got ' + JSON.stringify(header)
+            );
+        }
+        return this;
+    };
+    Assertion.prototype.jsonBody = function (expected) {
+        var body = (typeof pm !== 'undefined' && pm.response) ? pm.response.json() : undefined;
+        var negate = !!(this.__flags && this.__flags.negate);
+        var passed = nativeDeepEqual(body, expected) !== negate;
+        if (!passed) {
+            throw new Error(
+                (this._msg ? this._msg + ': ' : '') +
+                'expected response body ' + (negate ? 'not ' : '') + 'to match'
+            );
+        }
+        return this;
     };
 
     // .empty
