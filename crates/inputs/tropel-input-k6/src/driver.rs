@@ -2068,6 +2068,9 @@ impl K6DriverInstance {
             // registry so json-stream stamps `contains: "time"` and stdout
             // renders it in ms (k6's `new Trend('x', true)` behavior).
             let sink_metric = sink.clone();
+            // W2 line 188: custom metrics recorded inside a group() must
+            // carry the full ::a::b path like checks (were untagged).
+            let group_metric = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_custom_metric_add",
                 Func::from(
@@ -2101,6 +2104,13 @@ impl K6DriverInstance {
                             // Backlog line 97: same lenient parse as check() —
                             // metric.add(1, {code: 200}) must not drop the map.
                             stringify_tag_map_into(&tags_json, &mut tags);
+                        }
+                        // W2 line 188: stamp the active group path unless the
+                        // script supplied its own `group` tag (user wins).
+                        if let Some(g) = group_metric.lock().unwrap().last() {
+                            if tags.get("group").is_none() {
+                                tags.insert("group", g.clone());
+                            }
                         }
                         let sample_type = match metric_type_str.as_str() {
                             "counter" => SampleType::Counter,
@@ -2252,6 +2262,10 @@ impl K6DriverInstance {
         let sessions = self.ws_sessions.clone();
         let next_id = self.ws_next_id.clone();
         let sink = self.sample_sink.clone();
+        // W2 line 188: ws_* metrics used to hardcode group="ws". Capture the
+        // group() stack so ws samples carry the full ::a::b path like
+        // http/checks (k6 parity).
+        let group_stack = self.group_stack.clone();
         let (deadline, max_exec) = self.js_ctx.interrupt_deadline_handle();
 
         self.js_ctx.with_ctx(|rq_ctx| {
@@ -2266,6 +2280,7 @@ impl K6DriverInstance {
             // (ws_connecting + ws_req_failed=1.0), so the failed request is
             // visible to thresholds instead of vanishing.
             let sink_conn = sink.clone();
+            let group_stack_conn = group_stack.clone();
             let _ = globals.set(
                 "__tropel_k6_ws_connect",
                 Func::from(
@@ -2453,7 +2468,17 @@ impl K6DriverInstance {
                                 tags.insert("method", String::from("GET"));
                                 tags.insert("status", String::from("0"));
                                 tags.insert("name", url.clone());
-                                tags.insert("group", String::from("ws"));
+                                // W2 line 188: the active group() path (full
+                                // ::a::b), not a hardcoded "ws".
+                                tags.insert(
+                                    "group",
+                                    group_stack_conn
+                                        .lock()
+                                        .unwrap()
+                                        .last()
+                                        .cloned()
+                                        .unwrap_or_else(|| "ws".to_string()),
+                                );
                                 let tags = Arc::new(tags);
                                 let mut v = sink_conn.lock().unwrap();
                                 v.push(Sample {
@@ -2636,6 +2661,7 @@ impl K6DriverInstance {
             // ── ws finish(id) -> teardown + ws_* metrics ──
             let sessions_finish = sessions.clone();
             let sink_finish = sink.clone();
+            let group_stack_fin = group_stack.clone();
             let _ = globals.set(
                 "__tropel_k6_ws_finish",
                 Func::from(
@@ -2651,7 +2677,17 @@ impl K6DriverInstance {
                         tags.insert("method", String::from("GET"));
                         tags.insert("status", String::from("101"));
                         tags.insert("name", session.url.clone());
-                        tags.insert("group", String::from("ws"));
+                        // W2 line 188: the active group() path (full ::a::b),
+                        // not a hardcoded "ws".
+                        tags.insert(
+                            "group",
+                            group_stack_fin
+                                .lock()
+                                .unwrap()
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| "ws".to_string()),
+                        );
                         let tags = Arc::new(tags);
 
                         let msgs_sent = session.msgs_sent.load(Ordering::Relaxed);
@@ -6794,6 +6830,84 @@ mod tests {
         assert!(
             ctx.samples.iter().any(|s| s.metric == "ws_connecting"),
             "failed handshake must still emit ws_connecting"
+        );
+    }
+
+    /// W2 line 188: ws_* metrics hardcoded group="ws" — the ws bridges never
+    /// captured the group stack. A failed handshake INSIDE group('g') must
+    /// carry group=::g on ws_req_failed/ws_connecting (k6 parity with
+    /// http/checks), not the literal "ws".
+    #[tokio::test]
+    async fn test_ws_failed_handshake_inside_group_carries_group_path() {
+        let driver = K6Driver;
+        // Port 1 is not listening on any CI/local box → immediate
+        // ECONNREFUSED, no server needed.
+        let script = br#"
+            export default function () {
+                group('g', function () {
+                    ws.connect('ws://127.0.0.1:1/', {}, function (socket) {});
+                });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        let _ = inst.run_iteration(&mut ctx).await;
+
+        let failed: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "ws_req_failed")
+            .collect();
+        assert!(
+            !failed.is_empty(),
+            "failed handshake must emit ws_req_failed, got: {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.as_ref())
+                .collect::<Vec<_>>()
+        );
+        let group = failed[0].tags.get("group");
+        assert_eq!(
+            group,
+            Some("::g"),
+            "ws inside group('g') must carry group=::g, got: {:?}",
+            group
+        );
+    }
+
+    /// W2 line 188: custom metrics recorded inside a group() carried NO
+    /// group tag at all — a Trend.add inside group('checkout') must stamp
+    /// group=::checkout like checks/group_duration, so group-filtered
+    /// thresholds can see it.
+    #[tokio::test]
+    async fn test_custom_metric_inside_group_carries_group_path() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    var t = new Trend('latency');
+                    t.add(42);
+                });
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration with grouped custom metric must succeed");
+
+        let latency: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "latency")
+            .collect();
+        assert_eq!(latency.len(), 1, "one Trend.add must be recorded");
+        let group = latency[0].tags.get("group");
+        assert_eq!(
+            group,
+            Some("::checkout"),
+            "custom metric inside group('checkout') must carry group=::checkout, got: {:?}",
+            group
         );
     }
 
