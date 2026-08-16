@@ -1363,12 +1363,12 @@ pm.execution = {
         if (typeof __tropel_pm_skip_request === 'function') {
             __tropel_pm_skip_request();
         }
-    },
-    stopOnError: function () {
-        if (typeof __tropel_pm_skip_tests === 'function') {
-            __tropel_pm_skip_tests();
-        }
     }
+    // W1-A: stopOnError deliberately ABSENT — Postman has no such method
+    // (only setNextRequest/skipRequest), and the old wired no-op set a
+    // skip_tests flag that nothing ever read. An invented method on a dead
+    // flag silently ignored the author's intent; being absent makes the
+    // call throw "is not a function", surfacing the error like real Postman.
 };
 
 // ── pm.info (live, backlog line 101) ──

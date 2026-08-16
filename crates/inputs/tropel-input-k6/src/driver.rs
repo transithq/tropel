@@ -6020,6 +6020,19 @@ mod tests {
                 // 4) setNextRequest(null) must not throw (null → Option<String>).
                 pm.execution.setNextRequest(null);
                 globalThis.__next_req_null = globalThis.__next_req === undefined || globalThis.__next_req === null ? 'null-or-unset' : String(globalThis.__next_req);
+
+                // 5) W1-A: stopOnError must be ABSENT — it was an invented
+                // method on a skip_tests flag that nothing ever read, so the
+                // author's intent was silently ignored. Real Postman has no
+                // stopOnError (only setNextRequest/skipRequest); being absent
+                // makes the call throw "is not a function" like real Postman.
+                globalThis.__stop_on_error_type = typeof pm.execution.stopOnError;
+                try {
+                    pm.execution.stopOnError();
+                    globalThis.__stop_on_error_call = 'no-throw';
+                } catch (e) {
+                    globalThis.__stop_on_error_call = e.name;
+                }
             "#,
             )
             .expect("script should eval");
@@ -6062,6 +6075,16 @@ mod tests {
                 ctx.eval::<String, _>("__next_req_null").unwrap(),
                 "null-or-unset",
                 "setNextRequest(null) must not throw (Option<String> bridge param)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__stop_on_error_type").unwrap(),
+                "undefined",
+                "pm.execution.stopOnError must be ABSENT so calling it throws like real Postman"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__stop_on_error_call").unwrap(),
+                "TypeError",
+                "calling pm.execution.stopOnError must throw like real Postman, never silently no-op"
             );
         });
     }

@@ -34,6 +34,7 @@ tropel-input-k6.workspace = true
 tropel-input-har.workspace = true
 tropel-input-openapi.workspace = true
 tropel-input-subprocess.workspace = true
+tropel-input-http.workspace = true
 tropel-wasm.workspace = true
 tropel-x-grpc.workspace = true
 tropel-x-websocket.workspace = true

@@ -1046,15 +1046,6 @@ impl TrpBridge {
                 }),
             );
 
-            let state_clone = state.clone();
-            set_global!(
-                "__tropel_pm_skip_tests",
-                Func::from(move || {
-                    let mut st = state_clone.lock().unwrap();
-                    st.skip_tests = true;
-                }),
-            );
-
             // ── skipRequest (backlog line 146) ──
             // pm.execution.skipRequest() must skip ONLY the current item and
             // move to the next — the old shim routed it through
