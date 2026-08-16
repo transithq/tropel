@@ -1315,8 +1315,16 @@ pm.sendRequest = function (options, callback) {
             (options && options.responseType) || 'text'
         );
 
-        // Fire callback with the response
+        // Fire callback with the response. The callback is invoked OUTSIDE
+        // the try: the old code called it INSIDE, so a throw from the user's
+        // callback (a failing pm.expect — the entire point of sendRequest)
+        // was caught by the sibling catch and the callback re-entered with a
+        // bogus "Failed to parse" error — running twice and replacing the
+        // real error (W1-B line 149). Parse/build here; call the user's code
+        // only once, after, so its exceptions propagate as-is.
         if (typeof callback === 'function') {
+            var cbErr = null;
+            var response = null;
             try {
                 var result = JSON.parse(resultJson);
                 // Backlog line 147: transport failures (DNS/conn refused/timeout)
@@ -1325,22 +1333,27 @@ pm.sendRequest = function (options, callback) {
                 // never fired. The bridge now stamps an `error` field; surface it
                 // as the first (err) argument so the canonical guard works.
                 if (result.error) {
-                    callback(new Error(result.error), null);
-                    return;
+                    cbErr = new Error(result.error);
+                } else {
+                    response = {
+                        code: result.code || 0,
+                        status: result.statusText || '',
+                        text: function () { return result.body || ''; },
+                        json: function () {
+                            try { return JSON.parse(result.body || '{}'); }
+                            catch (e) { return null; }
+                        },
+                        headers: function () { return result.headers || {}; },
+                        responseTime: result.responseTime || 0
+                    };
                 }
-                callback(null, {
-                    code: result.code || 0,
-                    status: result.statusText || '',
-                    text: function () { return result.body || ''; },
-                    json: function () {
-                        try { return JSON.parse(result.body || '{}'); }
-                        catch (e) { return null; }
-                    },
-                    headers: function () { return result.headers || {}; },
-                    responseTime: result.responseTime || 0
-                });
             } catch (e) {
-                callback(new Error('Failed to parse sendRequest response: ' + e.message), null);
+                cbErr = new Error('Failed to parse sendRequest response: ' + e.message);
+            }
+            if (cbErr) {
+                callback(cbErr, null);
+            } else {
+                callback(null, response);
             }
         }
         return;
