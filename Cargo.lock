@@ -4377,6 +4377,7 @@ dependencies = [
  "tropel-ext",
  "tropel-http",
  "tropel-input-har",
+ "tropel-input-http",
  "tropel-input-k6",
  "tropel-input-openapi",
  "tropel-input-postman",
@@ -4458,6 +4459,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "tropel-sdk",
+]
+
+[[package]]
+name = "tropel-input-http"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "serde_json",
  "tropel-sdk",
 ]
 
