@@ -5818,6 +5818,17 @@ mod tests {
                 trial('resp_status_real', function () { pm.response.to.have.status(200); });
                 trial('chai_real', function () { chai.expect({ a: 1 }).to.deep.equal({ a: 1 }); });
                 trial('chai_should_real', function () { (5).should.equal(5); });
+                // Line 146: .deep.equal must honor the deep flag (deep-equal by
+                // value, fail-closed on mismatch, .not.deep.equal inverts,
+                // .eql stays deep, and PLAIN .equal on distinct objects must
+                // still throw — chai parity on all five).
+                trial('chai_deep_equal_ok', function () {
+                    chai.expect({ a: 1, b: { c: [1, 2] } }).to.deep.equal({ a: 1, b: { c: [1, 2] } });
+                });
+                trial('chai_deep_equal_mismatch', function () { chai.expect({ a: 1 }).to.deep.equal({ a: 2 }); });
+                trial('chai_deep_equal_negated', function () { chai.expect({ a: 1 }).to.not.deep.equal({ a: 2 }); });
+                trial('chai_eql_still_deep', function () { chai.expect({ a: 1 }).to.eql({ a: 1 }); });
+                trial('chai_shallow_equal_throws', function () { chai.expect({ a: 1 }).to.equal({ a: 1 }); });
                 // Real typos still throw (guard parity).
                 trial('pm_typo', function () { pm.expect(1).to.be.tostring; });
                 trial('chai_typo', function () { chai.expect(1).to.be.tostring; });
@@ -5844,6 +5855,11 @@ mod tests {
                 ("resp_status_real", "true"),
                 ("chai_real", "true"),
                 ("chai_should_real", "true"),
+                ("chai_deep_equal_ok", "true"),
+                ("chai_deep_equal_mismatch", "threw"),
+                ("chai_deep_equal_negated", "true"),
+                ("chai_eql_still_deep", "true"),
+                ("chai_shallow_equal_throws", "threw"),
                 ("pm_typo", "threw"),
                 ("chai_typo", "threw"),
             ] {

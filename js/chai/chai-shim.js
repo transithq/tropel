@@ -293,18 +293,12 @@ var chai = chai || {};
         return this;
     };
 
-    // .eql(expected) — deep equality
+    // .eql(expected) — deep equality (chai's .eql is ALWAYS deep, so the
+    // deep flag is irrelevant here; the `if (deep || true)` dead branch is
+    // gone — line 146 of the master TODO).
     Assertion.prototype.eql = function (value) {
         var negate = !!(this.__flags && this.__flags.negate);
-        var deep = !!(this.__flags && this.__flags.deep);
-        var passed;
-
-        if (deep || true) {
-            // Always use deep comparison for .eql
-            passed = nativeDeepEqual(this._obj, value) !== negate;
-        } else {
-            passed = (this._obj === value) !== negate;
-        }
+        var passed = nativeDeepEqual(this._obj, value) !== negate;
 
         if (!passed) {
             throw new Error(
