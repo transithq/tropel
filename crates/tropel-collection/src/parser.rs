@@ -165,7 +165,12 @@ fn convert_request_item(
     // define, but legacy exports use it, so prefer the schema location and
     // fall back to the legacy one.
     let request_auth = req.request.auth.as_ref().or(req.auth.as_ref());
-    let request = convert_request(&req.request, request_auth, inherited_auth);
+    let request = convert_request(
+        &req.request,
+        request_auth,
+        inherited_auth,
+        req.protocol_profile_behavior.as_ref(),
+    );
 
     // P0 (backlog): request events were EITHER/OR with parent events — a
     // request with its own script dropped the collection/folder scripts
@@ -189,6 +194,7 @@ fn convert_request(
     detail: &RequestDetail,
     request_auth: Option<&CollectionAuth>,
     inherited_auth: Option<&CollectionAuth>,
+    protocol_profile_behavior: Option<&ProtocolProfileBehavior>,
 ) -> Request {
     // validate_methods() (called from parse_collection) rejects genuinely
     // invalid tokens at parse time. Direct callers of collection_to_scenario
@@ -218,9 +224,11 @@ fn convert_request(
     // now method-agnostic (it attaches whatever body it is given), so the
     // GET/HEAD pruning happens HERE — the Postman boundary — instead of in
     // the transport. DELETE/OPTIONS/TRACE and custom-method bodies are kept.
-    let disable_pruning = detail
-        .protocol_profile_behavior
-        .as_ref()
+    //
+    // Line 196: Postman emits `protocolProfileBehavior` at ITEM level (a
+    // sibling of `request`), not inside the request object — the flag comes
+    // in from [`RequestItem::protocol_profile_behavior`].
+    let disable_pruning = protocol_profile_behavior
         .map(|p| p.disable_body_pruning)
         .unwrap_or(false);
     if !disable_pruning && matches!(&method, Method::GET | Method::HEAD) {
@@ -1369,8 +1377,10 @@ mod tests {
         // client for DELETE/OPTIONS/TRACE and custom methods, and Postman's
         // GET/HEAD body pruning was absent repo-wide. The client is now
         // method-agnostic; the parser is the Postman boundary: GET/HEAD
-        // prune the body by default, `protocolProfileBehavior
-        // .disableBodyPruning` opts out, and DELETE/OPTIONS/TRACE keep it.
+        // prune the body by default, item-level `protocolProfileBehavior
+        // .disableBodyPruning` opts out (line 196: Postman emits it as a
+        // SIBLING of `request`, not inside the request object), and
+        // DELETE/OPTIONS/TRACE keep it.
         let json = r#"{
             "info": {"name": "Bodies", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
             "item": [{
@@ -1382,10 +1392,10 @@ mod tests {
                 }
             }, {
                 "name": "GetKept",
+                "protocolProfileBehavior": {"disableBodyPruning": true},
                 "request": {
                     "method": "GET",
                     "url": {"raw": "https://api.example.com/b"},
-                    "protocolProfileBehavior": {"disableBodyPruning": true},
                     "body": {"mode": "raw", "raw": "{\"kept\":true}"}
                 }
             }, {

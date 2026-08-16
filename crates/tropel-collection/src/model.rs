@@ -149,6 +149,11 @@ struct ItemUnion {
     event: Vec<Event>,
     #[serde(default)]
     auth: Option<CollectionAuth>,
+    /// Postman `protocolProfileBehavior` — item-level sibling of `request`.
+    /// The old model read it off `RequestDetail`, so the real key was
+    /// silently ignored and GET/HEAD bodies got pruned (line 196).
+    #[serde(default, rename = "protocolProfileBehavior")]
+    protocol_profile_behavior: Option<ProtocolProfileBehavior>,
 }
 
 impl<'de> Deserialize<'de> for CollectionItem {
@@ -188,6 +193,7 @@ impl<'de> Deserialize<'de> for CollectionItem {
                 event: u.event,
                 response: u.response,
                 auth: u.auth,
+                protocol_profile_behavior: u.protocol_profile_behavior,
             })),
             // `"request": null` (or a malformed object) without a folder —
             // same loud error the old RequestItem-from-null path produced.
@@ -300,6 +306,10 @@ pub struct RequestItem {
     pub id: Option<String>,
     pub name: String,
     pub request: RequestDetail,
+    /// Postman `protocolProfileBehavior` — emitted at ITEM level as a
+    /// sibling of `request` (line 196). Drives GET/HEAD body pruning.
+    #[serde(default, rename = "protocolProfileBehavior")]
+    pub protocol_profile_behavior: Option<ProtocolProfileBehavior>,
     #[serde(default)]
     pub event: Vec<Event>,
     #[serde(default)]
@@ -341,11 +351,12 @@ pub struct RequestDetail {
     pub auth: Option<CollectionAuth>,
     #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
-    #[serde(default, rename = "protocolProfileBehavior")]
-    pub protocol_profile_behavior: Option<ProtocolProfileBehavior>,
 }
 
 /// Postman `protocolProfileBehavior` — per-request protocol tweaks.
+///
+/// Postman emits it at ITEM level (a sibling of `request`), NOT inside the
+/// request object — see [`RequestItem::protocol_profile_behavior`] (line 196).
 ///
 /// Backlog line 140: only `disableBodyPruning` is modeled; unknown keys are
 /// ignored by serde.
