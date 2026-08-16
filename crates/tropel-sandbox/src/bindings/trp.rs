@@ -1138,10 +1138,23 @@ impl TrpBridge {
                         "rate" => tropel_sdk::types::SampleType::Rate,
                         _ => tropel_sdk::types::SampleType::Trend,
                     };
+                    // W2 line 188: custom metrics recorded inside a group()
+                    // must carry the group path like http/checks/group_duration
+                    // (they used to be UNTAGGED — invisible to group-filtered
+                    // thresholds). Mirrors the group_duration convention:
+                    // `group` = leaf name, `group_path` = full ::a::b path.
+                    let mut tags = tropel_sdk::types::TagMap::new();
+                    if let Some(ref path) = st.current_group {
+                        tags.insert(
+                            "group",
+                            path.rsplit("::").next().unwrap_or(path).to_string(),
+                        );
+                        tags.insert("group_path", path.clone());
+                    }
                     st.samples.push(tropel_sdk::types::Sample {
                         metric: name.into(),
                         value,
-                        tags: Arc::new(tropel_sdk::types::TagMap::new()),
+                        tags: Arc::new(tags),
                         timestamp: tropel_js::clock::monotonic_wall_now(),
                         sample_type,
                     });
@@ -1167,7 +1180,7 @@ impl TrpBridge {
                     move |name: String, value: f64, tags_json: String, metric_type_str: String| {
                         let mut st = state_clone.lock().unwrap();
                         // Parse tags from JSON string
-                        let tags = if tags_json.is_empty() || tags_json == "{}" {
+                        let mut tags = if tags_json.is_empty() || tags_json == "{}" {
                             tropel_sdk::types::TagMap::new()
                         } else {
                             let parsed: std::collections::HashMap<String, String> =
@@ -1185,6 +1198,22 @@ impl TrpBridge {
                             "rate" => tropel_sdk::types::SampleType::Rate,
                             _ => tropel_sdk::types::SampleType::Trend,
                         };
+
+                        // W2 line 188: custom metrics recorded inside a
+                        // group() must carry the group path like
+                        // http/checks/group_duration (were untagged). User-
+                        // supplied tags win; group/group_path only fill in.
+                        if let Some(ref path) = st.current_group {
+                            if tags.get("group").is_none() {
+                                tags.insert(
+                                    "group",
+                                    path.rsplit("::").next().unwrap_or(path).to_string(),
+                                );
+                            }
+                            if tags.get("group_path").is_none() {
+                                tags.insert("group_path", path.clone());
+                            }
+                        }
 
                         st.samples.push(tropel_sdk::types::Sample {
                             metric: name.into(),
