@@ -19,7 +19,14 @@
     // Environment
     bru.getEnvVar = function (key) {
         if (typeof __tropel_pm_environment_get === 'function') {
-            return __tropel_pm_environment_get(key);
+            // W2 line 182: the bridge returns the value JSON-encoded ("..."
+            // with literal quotes) so the correct JS type round-trips — the
+            // old raw return meant getEnvVar('baseUrl') came back WITH the
+            // quotes and every URL built from it was malformed. Parse like
+            // pm.environment.get (pm.js:26).
+            var raw = __tropel_pm_environment_get(key);
+            if (raw === null || raw === undefined) return null;
+            try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return null;
     };
@@ -58,24 +65,24 @@
             __tropel_pm_variables_unset(key);
         }
     };
-    // NOTE (deleteAllVars cascade): getAllVars reads the store that the
-    // runtime vars currently alias onto, and deleteVar → variables_unset
-    // removes from collection_vars + environment + globals — so on a key
-    // collision this also clears an env/global var of the same name. Bounded
-    // by the documented §2 aliasing caveat; a scoped runtime-only unset needs
-    // a bridge change (TROPEL_PARITY_BRUNO.md §7).
+    // NOTE (deleteAllVars cascade): deleteVar → variables_unset removes from
+    // local + collection + environment + globals, so on a key collision this
+    // also clears an env/global var of the same name. A scoped runtime-only
+    // unset needs a bridge change (TROPEL_PARITY_BRUNO.md §7).
     bru.deleteAllVars = function () {
         var all = bru.getAllVars();
         for (var k in all) {
             if (Object.prototype.hasOwnProperty.call(all, k)) bru.deleteVar(k);
         }
     };
-    // getAllVars: the runtime store currently aliases onto collection_vars at
-    // the Rust state level (documented in TROPEL_PARITY_BRUNO.md §2), so the
-    // to_object bridge of that store is the honest view of "all runtime vars".
+    // getAllVars: reads the LOCAL runtime store that setVar writes
+    // (__tropel_pm_variables_to_object). W2 line 182: it used to read
+    // collection_vars while setVar wrote local_vars — the aliasing comment
+    // claimed the stores alias at the Rust level; they don't, so a runtime
+    // var set via setVar never appeared in getAllVars.
     bru.getAllVars = function () {
-        if (typeof __tropel_pm_collection_vars_to_object === 'function') {
-            var map = __tropel_pm_collection_vars_to_object() || {};
+        if (typeof __tropel_pm_variables_to_object === 'function') {
+            var map = __tropel_pm_variables_to_object() || {};
             var out = {};
             for (var k in map) {
                 if (Object.prototype.hasOwnProperty.call(map, k)) {
@@ -199,9 +206,14 @@
             passed = !!expr;
         }
         if (typeof __tropel_pm_test === 'function') {
+            // W2 line 182: the bridge takes (name, passed: BOOL, tags) — an
+            // int 1/0 has NO bool coercion in rquickjs (pm.js:506-508 warns
+            // about exactly this rule), so `passed ? 1 : 0` threw on EVERY
+            // call. Pass a real bool + the empty tags string like pm.test.
             __tropel_pm_test(
                 'bru.assert: ' + (errorMessage || String(expr)),
-                passed ? 1 : 0
+                passed ? true : false,
+                ''
             );
         }
     };

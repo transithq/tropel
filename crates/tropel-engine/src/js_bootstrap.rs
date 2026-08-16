@@ -22,6 +22,13 @@ pub(crate) const SHIM_BUNDLE_VERSION: &str = "0.1.0";
 
 /// All shim libraries concatenated at COMPILE TIME (concat!) into a single
 /// `&'static str`, byte-identical for every VU and every scenario.
+///
+/// W2 line 182: this list MUST mirror [`ShimBundle::default`] exactly — it
+/// previously carried only 5 shims while the default bundle carried 6 (with
+/// bru), so the bytecode path short-circuited on `is_default()` and bru.js
+/// was compiled into the binary but NEVER evaluated (`typeof bru ===
+/// 'undefined'` in every engine VU). Keep the two in lockstep: same 6 shims,
+/// same order, same section headers.
 const JS_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: pm-shim ====\n",
     include_str!("../../../js/scripting-api/pm.js"),
@@ -37,6 +44,9 @@ const JS_SHIM_BUNDLE: &str = concat!(
     "\n",
     "// ==== shim: exec-shim ====\n",
     include_str!("../../../js/exec/exec.js"),
+    "\n",
+    "// ==== shim: bru-shim ====\n",
+    include_str!("../../../js/scripting-api/bru.js"),
 );
 
 /// One shim library: a name + its source text.
@@ -55,7 +65,8 @@ pub struct ShimBundle(pub Vec<ShimEntry>);
 impl ShimBundle {
     /// Render the bundle to source text, concatenated with section headers
     /// (byte-identical to the compile-time [`JS_SHIM_BUNDLE`] for the
-    /// default bundle).
+    /// default bundle — W2 line 182: both lists MUST enumerate the same 6
+    /// shims in the same order, or the bytecode path silently drops bru).
     pub fn render(&self) -> String {
         let mut out = String::new();
         for ShimEntry(name, src) in &self.0 {
@@ -342,6 +353,45 @@ mod tests {
     use tropel_sandbox::state::new_pm_state;
     use tropel_sdk::traits::DriverHttpClient;
 
+    /// W2 line 182: the TWO shim lists must stay in lockstep — JS_SHIM_BUNDLE
+    /// (the compile-time concat used by the bytecode path) used to carry 5
+    /// shims while ShimBundle::default() carried 6 (with bru), so bru.js was
+    /// compiled into the binary but NEVER evaluated (typeof bru ===
+    /// 'undefined' in every engine VU). Guard both invariants: the default
+    /// bundle must enumerate bru, and the bytecode source must embed the
+    /// same bru.js text.
+    #[test]
+    fn shim_lists_stay_in_lockstep_with_bru() {
+        let d = ShimBundle::default();
+        assert_eq!(
+            d.0.len(),
+            6,
+            "ShimBundle::default() must enumerate 6 shims (pm/chai/lodash/crypto/exec/bru)"
+        );
+        let bru_entry = d.0.iter().find(|e| e.0 == "bru-shim");
+        assert!(
+            bru_entry.is_some(),
+            "ShimBundle::default() must include the bru-shim entry"
+        );
+        let bru_src = bru_entry.expect("bru entry").1.as_ref();
+        assert!(
+            JS_SHIM_BUNDLE.contains(bru_src),
+            "JS_SHIM_BUNDLE must embed the same bru.js source as ShimBundle::default()"
+        );
+        assert_eq!(
+            d.0.iter().map(|e| e.0).collect::<Vec<_>>(),
+            vec![
+                "pm-shim",
+                "chai-shim",
+                "lodash-shim",
+                "cryptojs-shim",
+                "exec-shim",
+                "bru-shim"
+            ],
+            "shim order must match between JS_SHIM_BUNDLE and ShimBundle::default()"
+        );
+    }
+
     /// F1: `HttpClient` itself does not implement `DriverHttpClient` — the
     /// engine wraps it in `DriverHttpClientImpl` (vu_loop.rs). Reuse it here
     /// so the test builds the same trait object the VU loop passes.
@@ -383,13 +433,14 @@ mod tests {
             .eval(
                 "typeof acme === 'object' && typeof product === 'object' \
                  && product === acme && wire === acme && typeof pm === 'object' \
-                 && typeof trp === 'undefined' && typeof tropel === 'undefined'",
+                 && typeof bru === 'object' && typeof trp === 'undefined' \
+                 && typeof tropel === 'undefined'",
             )
             .await
             .expect("probe should eval");
         assert_eq!(
             check, "true",
-            "custom namespace/aliases must be installed via the preamble; default trp absent — got: {check}"
+            "custom namespace/aliases must be installed via the preamble; default trp absent; bru must be evaluated by the real bundle path — got: {check}"
         );
     }
 }
