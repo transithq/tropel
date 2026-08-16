@@ -161,16 +161,14 @@ impl MetricSet {
         }
     }
 
-    fn record(&mut self, value: f64, sample_type: &SampleType) {
-        // Derive MetricType from SampleType for the record action
-        let action_type = match sample_type {
-            SampleType::Counter => MetricType::Counter,
-            SampleType::Point => MetricType::Gauge,
-            SampleType::Rate => MetricType::Rate,
-            SampleType::Trend => MetricType::Trend,
-        };
-
-        match action_type {
+    fn record(&mut self, value: f64, _sample_type: &SampleType) {
+        // W1-B line 157: dispatch on the SET's metric_type, not the sample's
+        // type. A set created as Trend (`new Trend('latency')`) fed a
+        // Counter-typed sample used to take the Counter arm (count+=1,
+        // sum+=1000, no histogram, no min/max), producing arithmetically
+        // impossible `avg > max` and p95 from a partial population. The
+        // set's type is authoritative (set from the first sample recorded).
+        match self.metric_type {
             MetricType::Counter => {
                 // Counter: count events, track total sum
                 self.count += 1.0;
@@ -2039,6 +2037,33 @@ mod tests {
             "p99 should reflect the zero-majority population (p99={})",
             stats.p99
         );
+    }
+
+    #[test]
+    fn test_record_dispatches_on_set_type_not_sample_type() {
+        // W1-B line 157: MetricSet::record dispatched on the SAMPLE's type,
+        // so a set created as Trend fed a Counter-typed sample took the
+        // Counter arm (count+=1, sum+=1000, no histogram, no min/max) →
+        // avg > max and p95 from a partial population. The set's
+        // metric_type is authoritative.
+        let mut set = MetricSet::new(MetricType::Trend, None);
+        let trend = SampleType::Trend;
+        let counter = SampleType::Counter;
+        set.record(10.0, &trend);
+        // Same set, different-typed sample: must STILL take the Trend arm.
+        set.record(1000.0, &counter);
+
+        assert_eq!(set.count, 2.0, "both samples must be counted");
+        assert_eq!(set.sum, 1010.0);
+        let mean = set.mean();
+        assert!(
+            mean <= set.max,
+            "avg ({mean}) must be <= max ({}) — the old bug produced avg > max",
+            set.max
+        );
+        assert_eq!(set.max, 1000.0, "max must reflect the Counter-typed sample");
+        let stats = set.trend_stats();
+        assert_eq!(stats.count, 2, "both samples must be in the histogram");
     }
 
     #[test]
