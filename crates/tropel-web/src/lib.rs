@@ -14,6 +14,7 @@ pub mod wire;
 use std::sync::Arc;
 
 use tropel_runtime::{flatten_execution_items, ScenarioRunner};
+use tropel_sandbox::config::SandboxConfig;
 use tropel_sdk::scenario::Scenario;
 use tropel_sdk::traits::DriverHttpClient;
 
@@ -156,7 +157,14 @@ pub async fn run_request(req: RunRequest) -> RunOutcome {
     .with_expected_statuses(expected_statuses);
 
     let pm_state = runner.state_handle();
-    if let Some(ctx) = bootstrap::create_web_js_context(&pm_state).await {
+    // W2 line 181: the web context now takes the sandbox config (default
+    // here — the web ABI has no namespace/alias plumbing yet) and a
+    // caller-held force-stop flag, so the engine's force-stop checks are not
+    // dead in the web slice.
+    let force_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(ctx) =
+        bootstrap::create_web_js_context(&pm_state, &SandboxConfig::default(), force_stop).await
+    {
         runner = runner.with_js_context(Box::new(ctx));
     }
 
