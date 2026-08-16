@@ -7366,6 +7366,23 @@ mod tests {
                 globalThis.__have_json_body = String((function () {
                     try { pm.response.to.have.jsonBody({ a: 1 }); return 'passed'; } catch (e) { return 'threw'; }
                 })());
+                // W1-B line 153: a STRING arg is a KEY PATH (chai-postman
+                // semantics), not a deep-equal of the whole body — the old
+                // code `deepEqual(body, 'a')` always threw on an object body,
+                // so `to.have.jsonBody('key')` was a false failure.
+                globalThis.__have_json_body_key = String((function () {
+                    try { pm.response.to.have.jsonBody('a'); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__have_json_body_key_missing = String((function () {
+                    try { pm.response.to.have.jsonBody('b'); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // Two-arg form asserts the VALUE at the path too.
+                globalThis.__have_json_body_key_value_ok = String((function () {
+                    try { pm.response.to.have.jsonBody('a', 1); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__have_json_body_key_value_bad = String((function () {
+                    try { pm.response.to.have.jsonBody('a', 2); return 'passed'; } catch (e) { return 'threw'; }
+                })());
             "#,
             )
             .expect("script should eval");
@@ -7383,6 +7400,10 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__have_hdr").unwrap(), "passed", "to.have.header must pass when header matches");
             assert_eq!(ctx.eval::<String, _>("__have_body").unwrap(), "passed", "to.have.body must pass when substring present");
             assert_eq!(ctx.eval::<String, _>("__have_json_body").unwrap(), "passed", "to.have.jsonBody must deep-compare");
+            assert_eq!(ctx.eval::<String, _>("__have_json_body_key").unwrap(), "passed", "jsonBody('a') must pass when the key exists (string = key path)");
+            assert_eq!(ctx.eval::<String, _>("__have_json_body_key_missing").unwrap(), "threw", "jsonBody('b') must throw when the key is missing");
+            assert_eq!(ctx.eval::<String, _>("__have_json_body_key_value_ok").unwrap(), "passed", "jsonBody('a', 1) must pass when the value matches");
+            assert_eq!(ctx.eval::<String, _>("__have_json_body_key_value_bad").unwrap(), "threw", "jsonBody('a', 2) must throw when the value mismatches");
 
             // The EXACT silent-pass the backlog verified (line 42): a bare
             // PROPERTY read `pm.response.to.be.json;` on a non-JSON body used
@@ -7435,6 +7456,66 @@ mod tests {
             );
             let err: String = obj.get("error").expect("error field");
             assert!(!err.is_empty(), "envelope must carry an error message");
+        });
+    }
+
+    #[test]
+    fn test_pm_jsonbody_string_key_path_parity() {
+        // W1-B line 153: jsonBody("key") must be a KEY-PATH existence check
+        // (chai-postman), not a deep-equal of the whole body — the old code
+        // `deepEqual(body, 'a')` always threw on an object body. Also pins
+        // the lodash-`get` reached-tracking corners: a present-null key
+        // ({a: null}) passes jsonBody('a'), a null MID-path ({a:null}, 'a.b')
+        // is MISSING (so the negated form passes). Exercises BOTH
+        // implementations: pm.js's pm.response.to.have chain and chai-shim's
+        // Assertion (pm.expect delegates to chai when it is loaded).
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                // Present-NULL body: {a: null} — the key EXISTS with a null
+                // value, so jsonBody('a') must PASS (lodash get parity).
+                globalThis.__tropel_pm_response_json = function () { return '{"a":null}'; };
+                globalThis.__tropel_pm_response_body = function () { return '{"a":null}'; };
+
+                // pm.js chain: present-null key passes.
+                globalThis.__jb_null_key_pm = String((function () {
+                    try { pm.response.to.have.jsonBody('a'); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // pm.js chain: null MID-path is MISSING → throws.
+                globalThis.__jb_null_midpath_pm = String((function () {
+                    try { pm.response.to.have.jsonBody('a.b'); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // chai path (pm.expect delegates to chai): present-null passes.
+                globalThis.__jb_null_key_chai = String((function () {
+                    try { pm.expect(pm.response).to.have.jsonBody('a'); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                // chai path NEGATED: null mid-path is missing, so
+                // .not.jsonBody('a.b') must PASS (no TypeError).
+                globalThis.__jb_null_midpath_chai_not = String((function () {
+                    try { pm.expect(pm.response).to.not.have.jsonBody('a.b'); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__jb_null_key_pm").unwrap(), "passed", "jsonBody('a') on {{a:null}} must pass (present-null key, pm.js chain)");
+            assert_eq!(ctx.eval::<String, _>("__jb_null_midpath_pm").unwrap(), "threw", "jsonBody('a.b') on {{a:null}} must throw (null mid-path = missing)");
+            assert_eq!(ctx.eval::<String, _>("__jb_null_key_chai").unwrap(), "passed", "chai pm.expect jsonBody('a') on {{a:null}} must pass");
+            assert_eq!(ctx.eval::<String, _>("__jb_null_midpath_chai_not").unwrap(), "passed", "negated .not.jsonBody('a.b') on {{a:null}} must pass, not TypeError");
         });
     }
 
