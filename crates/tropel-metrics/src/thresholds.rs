@@ -218,8 +218,16 @@ pub(crate) fn parse_metric_ref(metric_ref: &str) -> (&str, Vec<(&str, &str)>, Op
                 if pair.is_empty() {
                     return None;
                 }
-                // Support both `:` and `=` as key=value separators
-                let sep = if pair.contains(':') { ':' } else { '=' };
+                // Support both `:` and `=` as key=value separators. Pick the
+                // one that occurs FIRST positionally — a naive
+                // `contains(':') ? ':' : '='` makes the scheme colon win in
+                // `url=https://…` and splits into key "url=https" (never
+                // matches, silent `✗ 0.00 FAIL` — W1-B line 147).
+                let eq = pair.find('=').unwrap_or(usize::MAX);
+                let colon = pair.find(':').unwrap_or(usize::MAX);
+                // Neither present → '=' yields split_once None → pair dropped
+                // (pre-existing behavior preserved).
+                let sep = if eq <= colon { '=' } else { ':' };
                 pair.split_once(sep).map(|(k, v)| (k.trim(), v.trim()))
             })
             .collect()
@@ -2409,6 +2417,27 @@ mod tests {
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0], ("status", "200"));
         assert_eq!(stat, Some("p95"));
+    }
+
+    #[test]
+    fn test_parse_metric_ref_url_scoped_splits_on_first_separator() {
+        // W1-B line 147: `url=https://…` — the scheme colon must NOT win the
+        // split, or the key becomes "url=https" and the threshold silently
+        // never matches. The separator that occurs FIRST positionally wins.
+        let (name, tags, stat) =
+            parse_metric_ref("http_req_duration{url=https://api.x.dev/a?b=1}.p95");
+        assert_eq!(name, "http_req_duration");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0], ("url", "https://api.x.dev/a?b=1"));
+        assert_eq!(stat, Some("p95"));
+
+        // Colon-scoped tags still split on the colon (no `=` present).
+        let (_, tags, _) = parse_metric_ref("http_req_duration{method:POST}.p95");
+        assert_eq!(tags, vec![("method", "POST")]);
+
+        // A key with an `=` BEFORE the scheme colon keeps the `=` split.
+        let (_, tags, _) = parse_metric_ref("http_req_duration{name=a=b}.p95");
+        assert_eq!(tags, vec![("name", "a=b")]);
     }
 
     #[test]
