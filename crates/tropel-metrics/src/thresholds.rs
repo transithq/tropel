@@ -554,8 +554,25 @@ fn get_tag_scoped_metric_value(
     // Aggregate all matching entries
     Some(match stat {
         Some("avg") => {
-            // Return the WORST (highest) mean across all matches
-            matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
+            // W1-B line 151: POOLED mean across all matches (k6 semantics),
+            // not the worst (highest) per-series mean — 1000 @10 ms on /a +
+            // 10 @2000 ms on /b must yield 29.7 ms, not max(10, 2000). The
+            // old worst-of fold made `{status=200}.avg < 100` FAIL with 2000
+            // while the unscoped `avg` PASSED with 29.7. Mirrors the
+            // unscoped aggregate_series arm (incl. the Counter special-case:
+            // count == accumulated value, so avg on a counter is the
+            // per-second rate, matching k6).
+            if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
+                counter_rate(metrics, &matched)
+            } else {
+                let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
+                let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
+                if total_count > 0.0 {
+                    total_sum / total_count
+                } else {
+                    0.0
+                }
+            }
         }
         Some("min") => {
             // Return the MINIMUM min across all matches
@@ -2189,6 +2206,60 @@ mod tests {
         let result = evaluate_single_threshold("http_req_duration{status=200}.avg < 500", &metrics);
         assert!(result.0, "mean 400 should be < 500");
         assert!((result.1 - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_tag_scoped_avg_pools_across_series_not_worst_of() {
+        // W1-B line 151: tag-scoped `avg` was worst-of (max per-series mean),
+        // so two matching series could NEVER pool — 1000 @10 ms on /a + 10
+        // @2000 ms on /b reported max(10, 2000) = 2000 and `{status=200}.avg
+        // < 100` FAILED while the unscoped `avg` (pooled 29.7) PASSED. Both
+        // series must contribute: pooled = (1000*10 + 10*2000)/1010 ≈ 29.70.
+        let mut metrics = MetricsResult::default();
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_duration{status=200,url=/a}".into(),
+            tags: vec![("status".into(), "200".into()), ("url".into(), "/a".into())],
+            metric_type: MetricType::Trend,
+            count: 1000,
+            sum: 10000.0,
+            mean: 10.0,
+            min: 10.0,
+            max: 10.0,
+            p50: 10.0,
+            p90: 10.0,
+            p95: 10.0,
+            p99: 10.0,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_duration{status=200,url=/b}".into(),
+            tags: vec![("status".into(), "200".into()), ("url".into(), "/b".into())],
+            metric_type: MetricType::Trend,
+            count: 10,
+            sum: 20000.0,
+            mean: 2000.0,
+            min: 2000.0,
+            max: 2000.0,
+            p50: 2000.0,
+            p90: 2000.0,
+            p95: 2000.0,
+            p99: 2000.0,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        let result = evaluate_single_threshold("http_req_duration{status=200}.avg < 100", &metrics);
+        assert!(
+            result.0,
+            "pooled avg ~29.7 should be < 100 (old code: 2000 worst-of FAIL)"
+        );
+        assert!(
+            (result.1 - (1000.0 * 10.0 + 10.0 * 2000.0) / 1010.0).abs() < 0.01,
+            "expected pooled avg, got {}",
+            result.1
+        );
     }
 
     #[test]
