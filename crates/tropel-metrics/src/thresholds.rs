@@ -549,8 +549,31 @@ fn get_tag_scoped_metric_value(
             }
         }
         Some("sum") => matched.iter().map(|m| m.sum).sum(),
-        // k6's `value` stat on a trend = the most recent sample.
-        Some("value") | Some("last") => matched.last().map(|m| m.last).unwrap_or(0.0),
+        // k6's `value`/`last` stat = the most recent sample. W1-A: the OLD
+        // code read an ARBITRARY `matched.last()` (iteration-order-dependent
+        // pick), and `last` was hardcoded 0.0 for Counter/Rate/Trend so the
+        // tag-scoped value always PASSED a `<` gate trivially. Now that
+        // Trend/Gauge track a real `last`, aggregate worst-of (max) across
+        // matches — consistent with the avg/min/max arms — so a failure on
+        // ANY matching series is visible.
+        // k6's `value`/`last` stat = the most recent sample. W1-A: the OLD
+        // code read an ARBITRARY `matched.last()` (iteration-order-dependent
+        // pick), and `last` was hardcoded 0.0 for Counter/Rate/Trend so the
+        // tag-scoped value always PASSED a `<` gate trivially. Trend/Gauge
+        // now track a real `last` (worst-of max across matches, consistent
+        // with the avg/min/max arms). Counter/Rate hardcode `last` 0.0, so
+        // they FAIL CLOSED (same guard as the percentile path):
+        // `http_req_failed.value < 0.01` must never pass against an invented
+        // 0.0 on a 100%-failure run.
+        Some("value") | Some("last") => {
+            if !matched
+                .iter()
+                .all(|m| matches!(m.metric_type, MetricType::Trend | MetricType::Gauge))
+            {
+                return None;
+            }
+            matched.iter().map(|m| m.last).fold(0.0_f64, f64::max)
+        }
         // Bare metric (no stat) → WORST mean across matches (documented
         // default). Backlog §1: an UNKNOWN/typo'd stat must FAIL CLOSED,
         // not silently gate on the mean like the old `_ =>` arm.
@@ -676,6 +699,30 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                     0.0
                 }
             }
+        }
+        // k6's `value`/`last` stat = the most recent sample. W1-A: the OLD
+        // code had NO value arm here — `Some(_) => return None` made every
+        // `.value` threshold on a custom series FAIL CLOSED forever (the
+        // `vus: ['value>10']` sub-item: the translator emitted `vus.value >
+        // 10` and the evaluator never resolved it). With Trend/Gauge now
+        // tracking a real `last`, worst-of (max) across matches.
+        // k6's `value`/`last` stat = the most recent sample. W1-A: the OLD
+        // code had NO value arm here — `Some(_) => return None` made every
+        // `.value` threshold on a custom series FAIL CLOSED forever (the
+        // `vus: ['value>10']` sub-item: the translator emitted `vus.value >
+        // 10` and the evaluator never resolved it). Trend/Gauge now track a
+        // real `last` (worst-of max across matches). Counter/Rate hardcode
+        // `last` 0.0, so they FAIL CLOSED (same guard as the tag-scoped
+        // path) — resolving them would re-open the always-pass hole on
+        // `http_req_failed.value`.
+        Some("value") | Some("last") => {
+            if !matched
+                .iter()
+                .all(|m| matches!(m.metric_type, MetricType::Trend | MetricType::Gauge))
+            {
+                return None;
+            }
+            matched.iter().map(|m| m.last).fold(0.0_f64, f64::max)
         }
         // Bare metric (no stat) → worst mean across matches.
         None => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
@@ -826,7 +873,10 @@ mod tests {
                 p90: 900.0,
                 p95: 1200.0,
                 p99: 1800.0,
-                last: 0.0,
+                // W1-A: a REAL last sample (2500 ms) — the old fixture carried
+                // 0.0, which made `.value` thresholds pass trivially AND let
+                // the bug-pinning test below assert the buggy behaviour.
+                last: 2500.0,
                 rate: 0.0,
                 histogram: None,
             }),
@@ -1470,11 +1520,181 @@ mod tests {
         assert!(!result.0, "tag-scoped p95 on a Counter must fail closed");
     }
 
+    // ── W1-A: `.value` / `.last` must resolve to the REAL last sample ──
+    // The OLD behaviour had THREE wrong answers: (1) the unscoped Trend arm
+    // read `d.last`, hardcoded 0.0 in trend_summary → always PASSED a `<`
+    // gate; (2) the tag-scoped arm read an arbitrary `matched.last()` with
+    // last=0.0 for Counter/Rate/Trend → always passed; (3) aggregate_series
+    // had NO value arm → `Some(_) => return None` → always FAILED closed
+    // (the `vus: ['value>10']` sub-item: translator built, evaluator never
+    // written). This test was INVERTED — it used to assert the buggy
+    // behaviour (`value maps to the last sample (0 < 500)`).
+
     #[test]
     fn trend_value_stat_resolves_to_last_sample() {
-        let metrics = make_metrics(); // fixture last = 0.0
+        let metrics = make_metrics(); // fixture last = 2500 ms
+                                      // The old pinned test asserted `value < 500` PASSES because last was
+                                      // hardcoded 0.0. With a real last, 2500 must FAIL a < 500 gate.
         let result = evaluate_single_threshold("http_req_duration.value < 500", &metrics);
-        assert!(result.0, "value maps to the last sample (0 < 500)");
+        assert!(
+            !result.0,
+            "value must resolve to the REAL last sample (2500), got {} — the old hardcoded 0 passed trivially",
+            result.1
+        );
+        assert_eq!(result.1, 2500.0, "actual must be the last sample");
+        // And pass a gate the real value satisfies.
+        let result = evaluate_single_threshold("http_req_duration.last > 2000", &metrics);
+        assert!(result.0, "last 2500 should be > 2000");
+    }
+
+    #[test]
+    fn tag_scoped_value_is_worst_of_not_arbitrary_or_hardcoded_zero() {
+        // Two http_req_duration series matching {status=200}: last 100 ms and
+        // last 2500 ms. The OLD tag-scoped arm read an ARBITRARY
+        // `matched.last()` (iteration-order dependent) with a hardcoded 0 for
+        // Trend — the value threshold could pass against 0. Now worst-of
+        // (max) across matches, so a failure on ANY series is visible.
+        let m1 = MetricSummary {
+            key: "http_req_duration{status=200,url=/a}".into(),
+            tags: vec![("status".into(), "200".into()), ("url".into(), "/a".into())],
+            metric_type: MetricType::Trend,
+            count: 1,
+            sum: 100.0,
+            mean: 100.0,
+            min: 100.0,
+            max: 100.0,
+            p50: 100.0,
+            p90: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+            last: 100.0,
+            rate: 0.0,
+            histogram: None,
+        };
+        let m2 = MetricSummary {
+            key: "http_req_duration{status=200,url=/b}".into(),
+            tags: vec![("status".into(), "200".into()), ("url".into(), "/b".into())],
+            metric_type: MetricType::Trend,
+            count: 1,
+            sum: 2500.0,
+            mean: 2500.0,
+            min: 2500.0,
+            max: 2500.0,
+            p50: 2500.0,
+            p90: 2500.0,
+            p95: 2500.0,
+            p99: 2500.0,
+            last: 2500.0,
+            rate: 0.0,
+            histogram: None,
+        };
+        let mut metrics = make_metrics();
+        metrics.metrics.push(m1);
+        metrics.metrics.push(m2);
+        let result =
+            evaluate_single_threshold("http_req_duration{status=200}.value < 500", &metrics);
+        assert!(
+            !result.0,
+            "worst-of value (2500) must fail < 500, got {} — the old arbitrary/hardcoded-0 passed",
+            result.1
+        );
+        assert_eq!(
+            result.1, 2500.0,
+            "actual must be the worst last across matches"
+        );
+    }
+
+    #[test]
+    fn custom_series_value_stat_resolves() {
+        // The `vus: ['value>10']` sub-item: the k6 translator emitted
+        // `vus.value > 10` (options.rs) but aggregate_series had NO value arm
+        // — `Some(_) => return None` made it FAIL CLOSED forever. A Gauge
+        // series (vus is a Gauge) carrying a real last must now resolve.
+        let series = MetricSummary {
+            key: "vus".into(),
+            tags: vec![],
+            metric_type: MetricType::Gauge,
+            count: 100,
+            sum: 5000.0,
+            mean: 50.0,
+            min: 5.0,
+            max: 200.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            p99: 0.0,
+            last: 42.0,
+            rate: 0.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(series);
+        let result = evaluate_single_threshold("vus.value > 10", &metrics);
+        assert!(
+            result.0,
+            "vus.value (42) must resolve and pass > 10, got {} — aggregate_series had no value arm",
+            result.1
+        );
+        assert_eq!(result.1, 42.0, "actual must be the Gauge's last sample");
+        let result = evaluate_single_threshold("vus.value < 10", &metrics);
+        assert!(!result.0, "vus.value 42 must fail < 10");
+        let result = evaluate_single_threshold("vus.last > 10", &metrics);
+        assert!(result.0, "vus.last must alias value");
+    }
+
+    #[test]
+    fn rate_counter_value_stat_fails_closed() {
+        // W1-A follow-up: Counter/Rate hardcode `last: 0.0`, so resolving
+        // `.value`/`.last` on them would re-open the always-pass hole —
+        // `http_req_failed.value < 0.01` must fail on a 100%-failure run,
+        // not read the invented 0.0. Same guard philosophy as the percentile
+        // path (backlog line 60).
+        let rate_series = MetricSummary {
+            key: "http_req_failed".into(),
+            tags: vec![],
+            metric_type: MetricType::Rate,
+            count: 100,
+            sum: 100.0, // every request failed → rate = 1.0
+            mean: 1.0,
+            min: 0.0,
+            max: 0.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            p99: 0.0,
+            last: 0.0,
+            rate: 1.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(rate_series);
+        let result = evaluate_single_threshold("http_req_failed.value < 0.01", &metrics);
+        assert!(
+            !result.0,
+            "value on a Rate must fail closed (hardcoded last 0.0), not pass"
+        );
+        let result = evaluate_single_threshold("http_req_failed.last < 0.01", &metrics);
+        assert!(!result.0, "last on a Rate must fail closed too");
+
+        // Tag-scoped variant: same guard.
+        let tagged = MetricSummary {
+            key: "http_req_failed{url=/a}".into(),
+            tags: vec![("url".into(), "/a".into())],
+            metric_type: MetricType::Rate,
+            count: 50,
+            sum: 50.0,
+            mean: 1.0,
+            min: 0.0,
+            max: 0.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            p99: 0.0,
+            last: 0.0,
+            rate: 1.0,
+            histogram: None,
+        };
+        let metrics = make_metrics_with(tagged);
+        let result = evaluate_single_threshold("http_req_failed{url=/a}.value < 0.01", &metrics);
+        assert!(!result.0, "tag-scoped value on a Rate must fail closed");
     }
 
     // ── Arbitrary-percentile tests ──

@@ -220,6 +220,11 @@ impl MetricSet {
                 if value > self.max {
                     self.max = value;
                 }
+                // W1-A: track the most recent sample so the `.value`/`.last`
+                // threshold stats resolve to a REAL number — the old
+                // hardcoded 0.0 made `http_req_duration.value < N` pass
+                // trivially.
+                self.last = value;
                 self.count += 1.0;
                 self.sum += value;
             }
@@ -259,9 +264,9 @@ impl MetricSet {
             if other.max > self.max {
                 self.max = other.max;
             }
-            if self.metric_type == MetricType::Gauge {
-                self.last = other.last;
-            }
+            // W1-A: fold `last` for Trend too (it feeds the `.value`/`.last`
+            // threshold stats) — the Gauge arm already did; Trend's stayed 0.
+            self.last = other.last;
         }
     }
 
@@ -916,6 +921,7 @@ impl Aggregator {
                     set.mean(),
                     set.min,
                     set.max,
+                    set.last,
                     &set.trend_stats(),
                     retain_histograms.then(|| set.histogram.clone()).flatten(),
                 ),
@@ -999,6 +1005,7 @@ impl Aggregator {
                 merged.mean(),
                 merged.min,
                 merged.max,
+                merged.last,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -1020,6 +1027,7 @@ impl Aggregator {
                     merged.mean(),
                     merged.min,
                     merged.max,
+                    merged.last,
                     &merged.trend_stats(),
                     retain_histograms
                         .then(|| merged.histogram.clone())
@@ -1099,6 +1107,7 @@ impl Aggregator {
                 merged.mean(),
                 merged.min,
                 merged.max,
+                merged.last,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -1116,6 +1125,7 @@ impl Aggregator {
                 merged.mean(),
                 merged.min,
                 merged.max,
+                merged.last,
                 &merged.trend_stats(),
                 retain_histograms
                     .then(|| merged.histogram.clone())
@@ -1461,6 +1471,7 @@ fn trend_summary(
     mean: f64,
     raw_min: f64,
     raw_max: f64,
+    last: f64,
     stats: &HistogramStats,
     histogram: Option<LatencyHistogram>,
 ) -> MetricSummary {
@@ -1481,7 +1492,10 @@ fn trend_summary(
         p90: stats.p90,
         p95: stats.p95,
         p99: stats.p99,
-        last: 0.0,
+        // W1-A: the most recent sample (tracked in `MetricSet::record`). The
+        // old hardcoded 0.0 made `.value`/`.last` thresholds pass trivially
+        // (and `aggregate_series` had no arm at all — always FAIL closed).
+        last,
         rate: 0.0,
         histogram,
     }
