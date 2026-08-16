@@ -5027,6 +5027,12 @@ mod tests {
                     throw new Error('setVar must not write collection vars');
                 };
                 globalThis.__tropel_pm_collection_vars_to_object = function () {
+                    throw new Error('getAllVars must not read collection vars');
+                };
+                // W2 line 182: getAllVars reads the LOCAL store setVar writes
+                // (the old code read collection_vars while setVar wrote
+                // local_vars — a runtime var never appeared in getAllVars).
+                globalThis.__tropel_pm_variables_to_object = function () {
                     return { userId: '42', token: '"abc"', flag: 'true' };
                 };
                 var v1 = bru.getVar('userId');
@@ -5077,6 +5083,111 @@ mod tests {
                 ctx.eval::<String, _>("__calls").unwrap(),
                 "get:userId|set:userId=42|get:userId|get:missing|unset:token|unset:userId|unset:token|unset:flag",
                 "getVar/setVar must hit the variables bridges (not collection), hasVar one lookup each, and deleteAllVars must unset every key"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bru_get_env_var_unquotes_json_encoded() {
+        // W2 line 182: the environment_get bridge returns values JSON-encoded
+        // ("https://api.x" WITH literal quotes) so the correct JS type
+        // round-trips — the old bru.getEnvVar returned the raw string, so
+        // every URL built from the var was malformed. It must JSON.parse like
+        // pm.environment.get.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_environment_get = function (key) {
+                    if (key === 'baseUrl') return '"https://api.example.com"';
+                    if (key === 'port') return '8080';
+                    return null;
+                };
+                globalThis.__base = bru.getEnvVar('baseUrl');
+                globalThis.__port = bru.getEnvVar('port');
+                globalThis.__missing_null = bru.getEnvVar('nope') === null;
+                // The canonical Bruno idiom: URL built from an unquoted var.
+                globalThis.__url = bru.getEnvVar('baseUrl') + '/users';
+                globalThis.__base_type = typeof bru.getEnvVar('baseUrl');
+            "#,
+            )
+            .expect("script should eval");
+            assert_eq!(
+                ctx.eval::<String, _>("__base").unwrap(),
+                "https://api.example.com",
+                "getEnvVar must strip the JSON quotes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__url").unwrap(),
+                "https://api.example.com/users",
+                "a URL built from getEnvVar must be well-formed (was malformed with literal quotes)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__base_type").unwrap(),
+                "string",
+                "getEnvVar must return a string, not a quoted JSON literal"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__port").unwrap(),
+                8080,
+                "JSON-encoded number restores as a number, like pm.environment.get"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__missing_null").unwrap(),
+                "getEnvVar must return null on a miss"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bru_assert_records_via_bool_bridge() {
+        // W2 line 182: bru.assert passed an INT (passed ? 1 : 0) where the
+        // __tropel_pm_test bridge takes a BOOL — rquickjs 0.12 has no bool
+        // coercion, so every call THREW (pm.js:506-508 warns about the rule).
+        // It also passed only 2 of the bridge's 3 args. It now passes a real
+        // bool + the empty tags string.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+                .expect("bru shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                var __calls = [];
+                globalThis.__tropel_pm_test = function (name, passed, tags) {
+                    __calls.push(name + '|' + passed + '|' + typeof passed + '|' + tags);
+                };
+                bru.assert('1 === 1', 'one equals one');
+                bru.assert('1 === 2', 'one equals two');
+                // String form: the expression text is the default name.
+                bru.assert('2 > 1');
+                globalThis.__calls = __calls.join('\n');
+                globalThis.__n = __calls.length;
+            "#,
+            )
+            .expect("script should eval");
+            let calls: String = ctx.eval("__calls").expect("read recorded calls");
+            let lines: Vec<&str> = calls.lines().collect();
+            assert_eq!(
+                lines.len(),
+                3,
+                "three bru.assert calls must record: {calls}"
+            );
+            // Bool, not int, and the 3rd (tags) arg present.
+            assert!(
+                lines[0].contains("|true|boolean|"),
+                "pass must be a real bool: {calls}"
+            );
+            assert!(
+                lines[1].contains("|false|boolean|"),
+                "fail must be a real bool: {calls}"
+            );
+            assert!(
+                lines[0].contains("one equals one") && lines[2].contains("2 > 1"),
+                "name must carry the message or the expression: {calls}"
             );
         });
     }

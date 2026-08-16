@@ -465,6 +465,24 @@ impl TrpBridge {
                 }),
             );
 
+            let state_clone = state.clone();
+            set_global!(
+                "__tropel_pm_variables_to_object",
+                // W2 line 182: the bru shim's getAllVars used to read the
+                // COLLECTION store while setVar writes LOCAL vars — a runtime
+                // var set via bru.setVar never appeared in getAllVars (the
+                // aliasing comment claimed the stores alias; they don't).
+                // Expose the LOCAL scope so the family is self-consistent:
+                // setVar → getAllVars round-trips.
+                Func::from(move || -> HashMap<String, String> {
+                    let st = state_clone.lock().unwrap();
+                    st.local_vars
+                        .iter()
+                        .map(|(k, v)| (k.clone(), variable_value_to_string(v)))
+                        .collect()
+                }),
+            );
+
             // ── Environment: has / toObject ──
             // Backlog line 145: Postman's pm.environment exposes has() and
             // toObject() alongside get/set/unset.
