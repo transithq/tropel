@@ -1402,9 +1402,16 @@ pub struct MetricsSnapshot {
 /// script-declared thresholds shipped in the snapshot (e.g. k6
 /// `options.thresholds`); the job config wins on key collisions. Trend stats
 /// are inherited from the workers.
+///
+/// `test_start` is the controller-side run start (the wall clock the CLI
+/// records before dispatching agents). The merged result's `run_duration` is
+/// stamped from it — W0 P0#2: a fresh `Aggregator::new()` here stamps
+/// `started = now` (the MERGE instant), so a 600s run used to report
+/// run_duration = the ~50ms merge time, computing ~20,000,000 req/s.
 pub fn merge_snapshots(
     snapshots: Vec<MetricsSnapshot>,
     thresholds: std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
+    test_start: Instant,
 ) -> Result<MetricsResult> {
     // Script-declared thresholds ride back in each worker's snapshot; overlay
     // them on the controller's job-level set so they are not discarded.
@@ -1430,7 +1437,14 @@ pub fn merge_snapshots(
     for snap in &snapshots {
         agg.absorb_snapshot(snap)?;
     }
-    Ok(agg.build_results())
+    let mut result = agg.build_results();
+    // W0 P0#2: the fresh Aggregator's `started` is the merge instant, so
+    // build_results stamps run_duration = merge time. Override with the
+    // true controller-side wall clock before any reporter or threshold sees
+    // it — otherwise a 600s distributed run reports ~50ms and every
+    // per-second rate / threshold is ~12,000× inflated.
+    result.run_duration = test_start.elapsed();
+    Ok(result)
 }
 
 /// Build the Trend-typed `MetricSummary` shared by all five construction
@@ -1939,7 +1953,8 @@ mod tests {
             summary_trend_stats: worker_stats.clone(),
             thresholds: snap_thresholds,
         };
-        let result = merge_snapshots(vec![snap], std::collections::HashMap::new()).expect("merge");
+        let result = merge_snapshots(vec![snap], std::collections::HashMap::new(), Instant::now())
+            .expect("merge");
         // The worker's declaration must be adopted, NOT the k6 defaults.
         assert_eq!(result.summary_trend_stats, worker_stats);
         // The p(75) declaration implies histograms are retained for exactness.
@@ -1959,8 +1974,12 @@ mod tests {
             summary_trend_stats: vec![],
             ..with_stats.clone()
         };
-        let result2 = merge_snapshots(vec![empty, with_stats], std::collections::HashMap::new())
-            .expect("merge");
+        let result2 = merge_snapshots(
+            vec![empty, with_stats],
+            std::collections::HashMap::new(),
+            Instant::now(),
+        )
+        .expect("merge");
         assert_eq!(result2.summary_trend_stats, vec!["p(99.9)".to_string()]);
     }
 
@@ -2583,7 +2602,8 @@ mod tests {
             summary_trend_stats: k6_default_trend_stats(),
             thresholds: HashMap::new(),
         };
-        let err = merge_snapshots(vec![snap], std::collections::HashMap::new()).unwrap_err();
+        let err = merge_snapshots(vec![snap], std::collections::HashMap::new(), Instant::now())
+            .unwrap_err();
         assert!(
             err.to_string().contains("http_req_duration"),
             "error must name the metric: {err}"
@@ -2616,7 +2636,8 @@ mod tests {
             summary_trend_stats: k6_default_trend_stats(),
             thresholds: HashMap::new(),
         };
-        let err = merge_snapshots(vec![snap], std::collections::HashMap::new()).unwrap_err();
+        let err = merge_snapshots(vec![snap], std::collections::HashMap::new(), Instant::now())
+            .unwrap_err();
         assert!(
             err.to_string().contains("iteration_duration"),
             "error must name the metric: {err}"
@@ -2673,7 +2694,7 @@ mod tests {
             },
         );
 
-        let result = merge_snapshots(vec![snap], job).expect("merge succeeds");
+        let result = merge_snapshots(vec![snap], job, Instant::now()).expect("merge succeeds");
         // Script-declared metric survives alongside the job's.
         assert!(result.effective_thresholds.contains_key("http_req_failed"));
         // Job config wins the collision, script-declared expression is dropped.
@@ -2704,11 +2725,41 @@ mod tests {
                 ..snap2
             }],
             std::collections::HashMap::new(),
+            Instant::now(),
         )
         .expect("merge succeeds");
         assert_eq!(
             result2.effective_thresholds["iterations"].expression,
             "iterations > 100"
+        );
+    }
+
+    /// W0 P0#2: the merged run_duration must come from the controller-side
+    /// `test_start`, NOT the merge instant. A fresh `Aggregator::new()`
+    /// stamps `started = now`, so a 600s distributed run used to report
+    /// run_duration ≈ the ~50ms merge time (every per-second rate / threshold
+    /// ~12,000× inflated). A test_start 10s in the past must yield a
+    /// run_duration ≈ 10s.
+    #[test]
+    fn merge_snapshots_stamps_test_start_not_merge_time() {
+        let snap = MetricsSnapshot {
+            series: vec![],
+            totals: HashMap::new(),
+            summary_trend_stats: k6_default_trend_stats(),
+            thresholds: HashMap::new(),
+        };
+        let test_start = Instant::now() - Duration::from_secs(10);
+        let result =
+            merge_snapshots(vec![snap], std::collections::HashMap::new(), test_start).unwrap();
+        assert!(
+            result.run_duration >= Duration::from_secs(9),
+            "run_duration must derive from test_start (>= 9s for a 10s-old start), got {:?}",
+            result.run_duration
+        );
+        assert!(
+            result.run_duration < Duration::from_secs(11),
+            "run_duration must not exceed test_start.elapsed() by more than real time, got {:?}",
+            result.run_duration
         );
     }
 
@@ -2742,8 +2793,12 @@ mod tests {
         }
         let snap_b = agg2.build_snapshot();
 
-        let merged =
-            merge_snapshots(vec![snap_a, snap_b], std::collections::HashMap::new()).unwrap();
+        let merged = merge_snapshots(
+            vec![snap_a, snap_b],
+            std::collections::HashMap::new(),
+            Instant::now(),
+        )
+        .unwrap();
         let m = merged.http_req_duration.expect("merged duration");
         assert_eq!(m.count, 5, "all 5 samples must merge");
         assert!(m.max >= 100_000.0, "max must reflect the merged buckets");
