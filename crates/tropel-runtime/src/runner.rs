@@ -248,33 +248,11 @@ impl ScenarioRunner {
             if self.force_stop.load(Ordering::Acquire) {
                 break;
             }
-            // Check for setNextRequest override
-            {
-                let mut state = self.pm_state.lock().unwrap();
-                if let Some(next) = state.next_request.take() {
-                    if next < item_count {
-                        jumps += 1;
-                        if jumps > MAX_SET_NEXT_REQUEST_JUMPS {
-                            tracing::warn!(
-                                "VU {}: setNextRequest loop exceeded {} jumps — aborting iteration",
-                                iteration_index,
-                                MAX_SET_NEXT_REQUEST_JUMPS
-                            );
-                            // Record a failed check so the runaway jump is
-                            // visible in the summary and drives a non-zero
-                            // exit, like any other script failure.
-                            record_script_failure(
-                                &mut result,
-                                "setNextRequest (loop limit exceeded)",
-                            );
-                            break;
-                        }
-                        current_index = next;
-                    } else {
-                        break;
-                    }
-                }
-            }
+            // W2 #197: setNextRequest jumps are consumed at the LOOP BOTTOM
+            // (below, after each item's scripts run) — the old top-of-loop
+            // check dropped a jump set by the LAST item, so the standard poll
+            // loop (`if (status !== 'done') setNextRequest('PollStatus')`)
+            // ran once, green, and never exercised the re-poll path.
 
             let item = &self.execution_items[current_index];
 
@@ -731,6 +709,39 @@ impl ScenarioRunner {
                 {
                     let mut state = self.pm_state.lock().unwrap();
                     result.samples.append(&mut state.samples);
+                }
+            }
+
+            // W2 #197: honor a setNextRequest set by THIS item's scripts.
+            // Placed at the loop bottom so a jump from the LAST item is
+            // re-consumed and the walk continues (Postman poll-loop
+            // semantics). The END_ITERATION sentinel (usize::MAX) or any
+            // out-of-range target ends the flow, like the old top check.
+            {
+                let mut state = self.pm_state.lock().unwrap();
+                if let Some(next) = state.next_request.take() {
+                    if next < item_count {
+                        jumps += 1;
+                        if jumps > MAX_SET_NEXT_REQUEST_JUMPS {
+                            tracing::warn!(
+                                "VU {}: setNextRequest loop exceeded {} jumps — aborting iteration",
+                                iteration_index,
+                                MAX_SET_NEXT_REQUEST_JUMPS
+                            );
+                            // Record a failed check so the runaway jump is
+                            // visible in the summary and drives a non-zero
+                            // exit, like any other script failure.
+                            record_script_failure(
+                                &mut result,
+                                "setNextRequest (loop limit exceeded)",
+                            );
+                            break;
+                        }
+                        // Re-walk from the target WITHOUT the natural +1.
+                        current_index = next;
+                        continue;
+                    }
+                    break;
                 }
             }
 
@@ -1271,12 +1282,10 @@ mod tests {
                 description: None,
                 schema: None,
             },
-            // Item 0's prerequest jumps back to itself every iteration. A
-            // SECOND item is required for the spin: with a single item the
-            // loop would exit after one pass (the jump is set during item
-            // processing and never re-consumed), but with item 1 still ahead,
-            // the jump-back re-runs item 0's script, which re-arms the jump
-            // forever. Both items are script-only — no network traffic.
+            // Item 0's prerequest jumps back to itself every iteration. The
+            // jump is re-consumed at the loop bottom (W2 #197), so a single
+            // item would spin too; item 1 just makes the runaway shape
+            // explicit. Both items are script-only — no network traffic.
             items: vec![
                 ScenarioItem {
                     name: "self".into(),
@@ -1670,26 +1679,69 @@ mod tests {
 
     #[tokio::test]
     async fn set_next_request_jump_does_not_leak_into_next_iteration() {
-        // Backlog §4: a jump set by the LAST item was never consumed within
-        // the iteration (the loop had already exited), leaked into iteration
-        // 2, and re-armed — every subsequent iteration started mid-collection
-        // and ran exactly one request. Jumps are per-iteration in Postman;
-        // iteration 2 must start at item 0 again.
+        // Backlog §4 + W2 #197: a jump set by the LAST item is now HONORED
+        // within the iteration (the loop re-checks after the final item) —
+        // guarded here so the poll loop terminates. It must still be cleared
+        // before the NEXT iteration: iteration 2 starts at item 0 again.
         let mut runner = runner_with_scripts(vec![
             script_item("a", "pm.environment.set('sawA', '1');"),
             script_item("b", "pm.environment.set('sawB', '1');"),
-            script_item("c", "postman.setNextRequest('b');"),
+            script_item(
+                "c",
+                "let n = Number(pm.environment.get('cjumps') || '0'); if (n < 1) { pm.environment.set('cjumps', String(n + 1)); postman.setNextRequest('b'); }",
+            ),
         ])
         .await;
-        let _ = runner.run_iteration(0, None, &HashMap::new()).await;
+        let result0 = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result0.script_failures, 0);
+        {
+            let state = runner.pm_state().lock().unwrap();
+            assert_eq!(
+                state.environment.get("cjumps").map(String::as_str),
+                Some("1"),
+                "the last item's jump must be honored within the iteration"
+            );
+        }
         // Iteration 2: the stale jump to 'b' must be cleared — item A runs.
         let result = runner.run_iteration(1, None, &HashMap::new()).await;
         assert_eq!(result.script_failures, 0);
+        {
+            let state = runner.pm_state().lock().unwrap();
+            assert_eq!(
+                state.environment.get("sawA").map(String::as_str),
+                Some("1"),
+                "iteration 2 must start at the first item — the previous jump leaked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_next_request_from_last_item_keeps_poll_loop_running() {
+        // W2 #197: the standard Postman poll loop — the LAST item
+        // conditionally jumps back to itself until the poll target is
+        // reached. Before the fix the jump was dropped (the loop only
+        // checked at the top), so the poll item ran ONCE, green, and the
+        // collection ended without ever re-polling. It must re-run within
+        // the SAME iteration.
+        let mut runner = runner_with_scripts(vec![
+            script_item("seed", "pm.environment.set('sawSeed', '1');"),
+            script_item(
+                "poll",
+                "let n = Number(pm.environment.get('polls') || '0') + 1; pm.environment.set('polls', String(n)); if (n < 3) { postman.setNextRequest('poll'); }",
+            ),
+        ])
+        .await;
+        let result = runner.run_iteration(0, None, &HashMap::new()).await;
+        assert_eq!(result.script_failures, 0);
         let state = runner.pm_state().lock().unwrap();
         assert_eq!(
-            state.environment.get("sawA").map(String::as_str),
-            Some("1"),
-            "iteration 2 must start at the first item — the previous jump leaked"
+            state.environment.get("polls").map(String::as_str),
+            Some("3"),
+            "the last-item poll jump must re-run the poll item 3 times in one iteration"
+        );
+        assert!(
+            state.environment.contains_key("sawSeed"),
+            "the seed item must run before the poll loop"
         );
     }
 
