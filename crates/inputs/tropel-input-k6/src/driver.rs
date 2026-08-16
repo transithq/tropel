@@ -1384,17 +1384,23 @@ fn build_k6_response_object<'js>(
     // REPRESENTATION fallback only — the metrics keep the true status, and
     // the envelope is the script-visible failure signal. Do NOT "fix" this
     // by also pushing failure samples (double-counted failures).
+    // W1-B line 160: a body at/over the WHOLE heap cap is guaranteed OOM
+    // (set_memory_limit is QuickJS's HARD limit) — degrade to the status-0
+    // envelope BEFORE attempting any allocation, so it can be built while
+    // headroom still exists. This guards BOTH the binary branch (ArrayBuffer)
+    // and the text branch (String::from_utf8_lossy): the old code only
+    // guarded the former, so an oversized TEXT body silently became
+    // `status:200, body:''` — `let _ =` swallowed the OOM and JSON.parse
+    // threw with no indication.
+    if body.len() >= K6_VU_HEAP_BYTES {
+        return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap") {
+            Some(e) => Ok(e),
+            None => Err(rquickjs::Error::Exception),
+        };
+    }
     if response_type.eq_ignore_ascii_case("binary") {
-        // A body at/over the WHOLE heap cap is guaranteed OOM — degrade to
-        // the status-0 envelope BEFORE attempting the allocation, so it can
-        // be built while headroom still exists. In-between sizes try the
-        // ArrayBuffer and fall back to the envelope on failure.
-        if body.len() >= K6_VU_HEAP_BYTES {
-            return match k6_error_envelope(ctx, "response body exceeds the per-VU JS heap cap") {
-                Some(e) => Ok(e),
-                None => Err(rquickjs::Error::Exception),
-            };
-        }
+        // In-between sizes (under the cap) try the ArrayBuffer and fall back
+        // to the envelope on failure.
         match rquickjs::ArrayBuffer::new(ctx.clone(), body) {
             Ok(ab) => {
                 let _ = obj.set("body", ab);
@@ -2080,6 +2086,20 @@ impl K6DriverInstance {
                           tags_json: String,
                           metric_type_str: String,
                           is_time: bool| {
+                        // W1-B line 159: refuse non-finite values on the
+                        // PRIMARY path. The wasm driver guards at the emitter
+                        // (crates/tropel-wasm/src/driver.rs) with the same
+                        // rule; the k6 bridge takes `value: f64` straight from
+                        // JS, so `myTrend.add(parseFloat(missingHeader))` →
+                        // NaN poisoned `sum` forever (avg=NaN → `avg < 500`
+                        // false forever) while `f64::NAN.max(0.0) == 0.0`
+                        // silently recorded a phantom 0 in the histogram.
+                        // Drop the sample — count and population stay
+                        // consistent and no aggregate/threshold can be
+                        // poisoned.
+                        if !value.is_finite() {
+                            return;
+                        }
                         if is_time {
                             tropel_metrics::time_metrics::register(
                                 &name,
@@ -6627,6 +6647,58 @@ mod tests {
         );
     }
 
+    /// W1-B line 159: a non-finite custom-metric value from JS must be
+    /// DROPPED at the bridge, not recorded. The wasm driver guards at the
+    /// emitter; the k6 bridge used to take `value: f64` straight from JS, so
+    /// `myTrend.add(parseFloat(missingHeader))` → NaN poisoned `sum` forever
+    /// (avg=NaN → `avg < 500` false forever) while `f64::NAN.max(0.0) == 0.0`
+    /// silently recorded a phantom 0 in the histogram.
+    #[tokio::test]
+    async fn test_custom_metric_add_drops_non_finite_values() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                var t = new Trend('latency', true);
+                t.add(parseFloat('not-a-number')); // NaN -> must be dropped
+                t.add(42);                          // valid -> must survive
+                var c = new Counter('events');
+                c.add(1);
+                c.add(Number('oops'));              // NaN -> must be dropped
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must complete");
+
+        let latency: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "latency")
+            .collect();
+        assert_eq!(
+            latency.len(),
+            1,
+            "NaN Trend.add must be dropped, got: {:?}",
+            latency.iter().map(|s| s.value).collect::<Vec<_>>()
+        );
+        assert_eq!(latency[0].value, 42.0, "valid Trend.add must survive");
+
+        let events: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "events")
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "NaN Counter.add must be dropped, got: {:?}",
+            events.iter().map(|s| s.value).collect::<Vec<_>>()
+        );
+        assert_eq!(events[0].value, 1.0, "valid Counter.add must survive");
+    }
+
     /// Backlog line 62: an abnormal closure (server drops without a close
     /// frame → 1006) must mark the session failed, so finish() emits
     /// ws_req_failed=1.0 — previously hardcoded 0.0.
@@ -7456,6 +7528,47 @@ mod tests {
             );
             let err: String = obj.get("error").expect("error field");
             assert!(!err.is_empty(), "envelope must carry an error message");
+        });
+    }
+
+    #[test]
+    fn oversized_text_body_degrades_to_status0_envelope_not_empty_string() {
+        // W1-B line 160: the binary branch got the heap-cap pre-guard, the
+        // TEXT branch didn't — `let _ = obj.set("body", String::from_utf8_lossy(
+        // &body))` swallowed the OOM, so an oversized text body silently
+        // became `status:200, body:''` (JSON.parse threw with no indication).
+        // The hoisted pre-guard must now degrade BOTH branches to the
+        // status-0 error envelope.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            // response_type "" → text branch (default k6 responseType).
+            let obj = build_k6_response_object(
+                &ctx,
+                200,
+                "OK".into(),
+                vec![b'x'; K6_VU_HEAP_BYTES], // >= cap → guaranteed-OOM pre-check
+                &HashMap::new(),
+                5.0,
+                None,
+                "",
+                0,
+                "",
+                &[],
+            )
+            .expect("status-0 envelope build must succeed");
+            let code: i32 = obj.get("code").expect("code field");
+            assert_eq!(
+                code, 0,
+                "oversized text body must degrade to status 0, got {code}"
+            );
+            let err: String = obj.get("error").expect("error field");
+            assert!(!err.is_empty(), "envelope must carry an error message");
+            let body: String = obj.get("body").unwrap_or_default();
+            assert!(
+                body.is_empty(),
+                "degraded envelope must not carry a partial/empty-string body"
+            );
         });
     }
 
