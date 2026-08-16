@@ -771,6 +771,17 @@ AssertChain.prototype.jsonBody = function (expected) {
 };
 
 pm.expect = function (actual) {
+    // W1-B: delegate to chai-shim's Assertion when it is loaded — its
+    // surface covers below/lengthOf/oneOf/above/least/most/lessThan/
+    // instanceOf/throw/keys/contain/members/closeTo/within and deep-aware
+    // include, which 6 of Postman's 17 stock snippets need (they failed
+    // with "unknown assertion property" against the AssertChain surface).
+    // chai-shim loads in the runtime bundle BEFORE any user script runs, so
+    // at call time it is always present there; standalone pm.js (driver
+    // tests, hosts that eval pm.js alone) falls back to AssertChain.
+    if (typeof chai !== 'undefined' && chai.expect) {
+        return chai.expect(actual);
+    }
     // One small instance + one proxy per call (backlog line 105). The whole
     // chain surface lives on AssertChain.prototype; `to`/`be`/`not` return
     // `this` (the proxy), so the unknown-name guard covers every position
