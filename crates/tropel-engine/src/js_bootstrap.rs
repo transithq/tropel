@@ -30,6 +30,9 @@ pub(crate) const SHIM_BUNDLE_VERSION: &str = "0.1.0";
 /// 'undefined'` in every engine VU). Keep the two in lockstep: same 6 shims,
 /// same order, same section headers.
 const JS_SHIM_BUNDLE: &str = concat!(
+    "// ==== shim: deep-equal-shim ====\n",
+    include_str!("../../../js/shared/deep-equal.js"),
+    "\n",
     "// ==== shim: pm-shim ====\n",
     include_str!("../../../js/scripting-api/pm.js"),
     "\n",
@@ -93,6 +96,10 @@ impl ShimBundle {
 impl Default for ShimBundle {
     fn default() -> Self {
         Self(vec![
+            ShimEntry(
+                "deep-equal-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/shared/deep-equal.js")),
+            ),
             ShimEntry(
                 "pm-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/scripting-api/pm.js")),
@@ -365,8 +372,8 @@ mod tests {
         let d = ShimBundle::default();
         assert_eq!(
             d.0.len(),
-            6,
-            "ShimBundle::default() must enumerate 6 shims (pm/chai/lodash/crypto/exec/bru)"
+            7,
+            "ShimBundle::default() must enumerate 7 shims (deep-equal/pm/chai/lodash/crypto/exec/bru)"
         );
         let bru_entry = d.0.iter().find(|e| e.0 == "bru-shim");
         assert!(
@@ -381,6 +388,7 @@ mod tests {
         assert_eq!(
             d.0.iter().map(|e| e.0).collect::<Vec<_>>(),
             vec![
+                "deep-equal-shim",
                 "pm-shim",
                 "chai-shim",
                 "lodash-shim",

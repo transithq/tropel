@@ -1040,133 +1040,14 @@ function shortJson(v) {
 }
 
 // Proper JS deep-equality (chai .eql semantics): handles NaN, undefined,
-// key order, nested arrays/objects. Mirrors the jsDeepEqual in
-// js/chai/chai-shim.js — the backlog fix for .eql must not depend on chai
-// being loaded first (pm.js is bundled standalone).
-//
-// Backlog line 85: Date/Set/Map/RegExp used to collapse to Object.keys()
-// = [] — ANY two instances compared equal (pm.expect(new Date(1))
-// .to.eql(new Date(999999)) passed). They now compare by VALUE (time for
-// Date, source+flags for RegExp, size + order-insensitive entries for
-// Map/Set). Circular structures no longer overflow the stack (a seen-pair
-// guard: revisiting the exact (a,b) pair mid-compare is assumed equal).
+// key order, nested arrays/objects. W2 line 190: the single canonical
+// implementation now lives in js/shared/deep-equal.js
+// (globalThis.__tropelDeepEqual), evaluated FIRST in every bundle. This
+// thin wrapper keeps pm.js's internal call sites (jsonPath, to.have.jsonBody,
+// pm.expect AssertChain) working — and, because chai-shim and lodash-shim
+// delegate to the SAME function, a fix here can no longer skew the others.
 function deepEqual(a, b, seen) {
-    if (a === b) return true;
-    if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
-    if (a === null || b === null || a === undefined || b === undefined) return a === b;
-    if (typeof a !== typeof b) return false;
-    // Date: compare by epoch time; two invalid dates compare equal.
-    if (a instanceof Date || b instanceof Date) {
-        if (!(b instanceof Date)) return false;
-        var ta = a.getTime(), tb = b.getTime();
-        return (isNaN(ta) && isNaN(tb)) || ta === tb;
-    }
-    // RegExp: canonical toString (normalizes flag order — /gi vs /ig are
-    // the same expression, matching chai's deep-eql).
-    if (a instanceof RegExp || b instanceof RegExp) {
-        if (!(b instanceof RegExp)) return false;
-        return String(a) === String(b);
-    }
-    if (Array.isArray(a)) {
-        if (!Array.isArray(b) || a.length !== b.length) return false;
-        seen = seen || [];
-        for (var s = 0; s < seen.length; s++) {
-            if (seen[s][0] === a && seen[s][1] === b) return true;
-        }
-        seen.push([a, b]);
-        for (var i = 0; i < a.length; i++) {
-            if (!deepEqual(a[i], b[i], seen)) {
-                seen.pop();
-                return false;
-            }
-        }
-        seen.pop();
-        return true;
-    }
-    if (typeof a === 'object') {
-        if (Array.isArray(b) || b === null || b === undefined) return false;
-        // Map: same size, each entry's key+value finds a deep-equal mate
-        // (order-insensitive).
-        if (a instanceof Map || b instanceof Map) {
-            if (!(b instanceof Map) || a.size !== b.size) return false;
-            // Cycle guard: Map nodes can be self-referential (a Map whose value
-            // is itself); revisiting the exact (a, b) pair mid-compare is
-            // assumed equal.
-            seen = seen || [];
-            for (var s = 0; s < seen.length; s++) {
-                if (seen[s][0] === a && seen[s][1] === b) return true;
-            }
-            seen.push([a, b]);
-            var aEntries = Array.from(a.entries());
-            var bEntries = Array.from(b.entries());
-            var usedB = [];
-            outer:
-            for (var mi = 0; mi < aEntries.length; mi++) {
-                for (var mj = 0; mj < bEntries.length; mj++) {
-                    if (usedB[mj]) continue;
-                    if (deepEqual(aEntries[mi][0], bEntries[mj][0], seen) &&
-                        deepEqual(aEntries[mi][1], bEntries[mj][1], seen)) {
-                        usedB[mj] = true;
-                        continue outer;
-                    }
-                }
-                seen.pop();
-                return false;
-            }
-            seen.pop();
-            return true;
-        }
-        // Set: same size, each member finds a deep-equal mate.
-        if (a instanceof Set || b instanceof Set) {
-            if (!(b instanceof Set) || a.size !== b.size) return false;
-            // Cycle guard: Set nodes can be self-referential (a Set containing
-            // itself); revisiting the exact (a, b) pair mid-compare is assumed
-            // equal.
-            seen = seen || [];
-            for (var s = 0; s < seen.length; s++) {
-                if (seen[s][0] === a && seen[s][1] === b) return true;
-            }
-            seen.push([a, b]);
-            var aMembers = Array.from(a);
-            var bMembers = Array.from(b);
-            var usedS = [];
-            outer2:
-            for (var si = 0; si < aMembers.length; si++) {
-                for (var sj = 0; sj < bMembers.length; sj++) {
-                    if (usedS[sj]) continue;
-                    if (deepEqual(aMembers[si], bMembers[sj], seen)) {
-                        usedS[sj] = true;
-                        continue outer2;
-                    }
-                }
-                seen.pop();
-                return false;
-            }
-            seen.pop();
-            return true;
-        }
-        // Plain object: key-set comparison with a cycle guard.
-        seen = seen || [];
-        for (var k = 0; k < seen.length; k++) {
-            if (seen[k][0] === a && seen[k][1] === b) return true;
-        }
-        seen.push([a, b]);
-        var keysA = Object.keys(a).sort();
-        var keysB = Object.keys(b).sort();
-        if (keysA.length !== keysB.length) {
-            seen.pop();
-            return false;
-        }
-        for (var j = 0; j < keysA.length; j++) {
-            if (keysA[j] !== keysB[j] || !deepEqual(a[keysA[j]], b[keysB[j]], seen)) {
-                seen.pop();
-                return false;
-            }
-        }
-        seen.pop();
-        return true;
-    }
-    return a === b;
+    return globalThis.__tropelDeepEqual(a, b, seen);
 }
 
 // Backlog line 88: chai's .include semantics — substring for strings,

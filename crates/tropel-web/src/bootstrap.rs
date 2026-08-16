@@ -18,7 +18,8 @@ use tropel_sandbox::state::SharedPmState;
 /// longer carries ~150–250 KB of uncompressed JS and a `pm.*` fix ships as a
 /// JS asset with the web app — no wasm rebuild, no release).
 #[cfg(not(target_arch = "wasm32"))]
-const SHIM_SOURCES: [&str; 6] = [
+const SHIM_SOURCES: [&str; 7] = [
+    include_str!("../../../js/shared/deep-equal.js"),
     include_str!("../../../js/scripting-api/pm.js"),
     include_str!("../../../js/chai/chai-shim.js"),
     include_str!("../../../js/lodash/lodash-shim.js"),
