@@ -73,8 +73,17 @@ async fn start_peak_server() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
                 // Hold the connection open so concurrent VUs overlap.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let body = r#"{"ok":true}"#;
+                // `Connection: close` is load-bearing: this server measures
+                // PEAK CONCURRENCY by counting open connections, so it must
+                // stay one-shot — but a one-shot server without the header
+                // races the client's HTTP/1.1 keep-alive pool (the client
+                // reuses a socket the server is closing → occasional pooled
+                // transport failures). W1-A made those failures COUNT as
+                // failed checks instead of being masked by the stale
+                // pm.response bug, so the header is what keeps the pool from
+                // reusing this connection at all.
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                     body.len(),
                     body
                 );
