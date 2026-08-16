@@ -677,44 +677,35 @@ http.batch = function (requests) {
         for (var bi = 0; bi < requests.length; bi++) {
             var e = normalizeBatchEntry(requests[bi], bi);
             entries.push(e);
-            keys.push(e.key != null ? e.key : bi);
+            // W2 line 169: array input keys by POSITION — the caller's key.
+            // k6 returns responses in order; req.name must never hijack the
+            // response key (that collision lost real responses to the map).
+            keys.push(bi);
         }
     } else if (typeof requests === 'object') {
         var names = Object.keys(requests);
         for (var ni = 0; ni < names.length; ni++) {
             var e = normalizeBatchEntry(requests[names[ni]], names[ni]);
             entries.push(e);
-            keys.push(e.key != null ? e.key : names[ni]);
+            // W2 line 169: object input keys by the CALLER's property name —
+            // res.front must resolve even when the request carries a `name`.
+            keys.push(names[ni]);
         }
     }
 
     var results = isArrayInput ? [] : {};
 
     if (typeof __tropel_k6_http_batch === 'function') {
-        // Backlog §3: two entries with the same `name` collided in the
-        // driver's response map (response_map.insert — the second overwrote
-        // the first and one real response was lost). Dedupe the round-trip
-        // keys BEFORE sending so every response survives; the read loop below
-        // looks up by the SAME deduped key.
+        // W2 line 169: batch keys are the CALLER's keys — array input →
+        // positional index, object input → property name — so `res.front`
+        // resolves even when a request carries a `name` (the old
+        // e.key/req.name fallback hijacked the response key, and colliding
+        // names lost real responses to the driver's last-write-wins map).
+        // Keys are unique by construction, so the name-based dedupe loop is
+        // gone entirely.
         var finalKeys = [];
-        var usedKeys = {};
         for (var dki = 0; dki < keys.length; dki++) {
-            var kCandidate = String(keys[dki]);
-            if (usedKeys[kCandidate] !== undefined) {
-                // Keep appending a numeric suffix until the candidate is
-                // free — a single #index retry could still collide when a
-                // user names a request 'dup#2' next to two 'dup' entries.
-                // First retry uses #<index> (matching the original naming),
-                // so the candidate is computed BEFORE the suffix increments.
-                var kBase = kCandidate;
-                var kSuffix = dki;
-                while (usedKeys[kCandidate] !== undefined) {
-                    kCandidate = kBase + '#' + kSuffix;
-                    kSuffix += 1;
-                }
-            }
-            usedKeys[kCandidate] = true;
-            finalKeys.push(kCandidate);
+            finalKeys.push(String(keys[dki]));
         }
         var normalized = [];
         for (var ei = 0; ei < entries.length; ei++) {
@@ -726,21 +717,30 @@ http.batch = function (requests) {
                 url: canonical.url,
                 headers_json: JSON.stringify(canonical.headers),
                 body: canonical.body,
-                timeout_ms: canonical.timeoutMs,
                 response_type: canonical.responseType,
-                // Backlog line 140: batch entries carry the same per-request
-                // params the single-request bridge consumes.
-                tags_json: JSON.stringify(canonical.tags),
-                auth_json: canonical.auth !== null ? JSON.stringify(canonical.auth) : 'null',
-                redirects: canonical.redirects,
-                compression: canonical.compression,
-                // Backlog line 150: binary batch bodies arrive base64.
-                body_b64: canonical.bodyB64,
+                // W2 line 169: ONE canonical extras wire shape shared with
+                // the single-request bridge (timeoutMs/tags/auth/redirects/
+                // compression/bodyB64) — the old timeout_ms/tags_json/
+                // auth_json/body_b64 variants diverged on four of seven
+                // fields and dropped the whole tag map on non-string values.
+                extras: JSON.stringify({
+                    timeoutMs: canonical.timeoutMs,
+                    tags: canonical.tags,
+                    auth: canonical.auth,
+                    redirects: canonical.redirects,
+                    compression: canonical.compression,
+                    bodyB64: canonical.bodyB64
+                })
             });
         }
 
-        var batchResultJson = __tropel_k6_http_batch(JSON.stringify(normalized));
-        var batchResult = JSON.parse(batchResultJson);
+        // W2 line 169: the native bridge returns a LIVE object (the
+        // escaped-JSON round trip is gone); legacy stubs / the PM fallback
+        // still return a JSON string.
+        var batchResult = __tropel_k6_http_batch(JSON.stringify(normalized));
+        if (typeof batchResult === 'string') {
+            batchResult = JSON.parse(batchResult);
+        }
         for (var ei = 0; ei < entries.length; ei++) {
             var entry = entries[ei];
             var key = String(finalKeys[ei]);
@@ -748,7 +748,10 @@ http.batch = function (requests) {
             // error:''} — and error==='' made `if (res.error)` miss it. The
             // driver inserts every sent key (incl. error envelopes), so a
             // missing one is a contract violation — fail loudly.
-            if (!(key in batchResult)) {
+            // W2 line 169: `in` walks the prototype chain — a caller key named
+            // 'constructor'/'toString' would pass the guard and read the
+            // inherited function instead of a response. Own-property check.
+            if (!Object.prototype.hasOwnProperty.call(batchResult, key)) {
                 throw new Error('http.batch: native bridge returned no response for key "' + key + '"');
             }
             // Wrap each entry as a K6Response so `.json()`, `.status`, `.body`
