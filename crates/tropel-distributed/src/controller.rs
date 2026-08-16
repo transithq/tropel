@@ -33,6 +33,7 @@ pub async fn run_controller(
     config: &JobConfig,
     num_agents: u32,
     token: &str,
+    test_start: std::time::Instant,
 ) -> Result<MetricsResult> {
     if num_agents == 0 {
         return Err(TropelError::Config("--agents must be >= 1".into()));
@@ -192,7 +193,10 @@ pub async fn run_controller(
     tracing::info!("Controller: all {num_agents} agents done — merging losslessly");
     // A corrupt histogram (bad base64 / truncated V2 bytes) fails the merge
     // loudly instead of silently fabricating results from a partial set.
-    merge_snapshots(snapshots, config.thresholds.clone())
+    // W0 P0#2: test_start is the controller-side wall clock recorded by the
+    // CLI before dispatch — merge_snapshots stamps run_duration from it so a
+    // distributed run reports the true duration, not the merge instant.
+    merge_snapshots(snapshots, config.thresholds.clone(), test_start)
 }
 
 /// Read an agent's snapshot frame (drain any prior frames defensively).
@@ -323,8 +327,9 @@ mod tests {
         let addr_str = addr.to_string();
         let cfg = config.clone();
 
-        let controller =
-            tokio::spawn(async move { run_controller(listener, &cfg, 2, "test-token").await });
+        let controller = tokio::spawn(async move {
+            run_controller(listener, &cfg, 2, "test-token", std::time::Instant::now()).await
+        });
         let mut agents = Vec::new();
         for _ in 0..2 {
             let a = addr_str.clone();
@@ -388,9 +393,15 @@ mod tests {
         };
         let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
         // 3 boundaries in the sequence vs --agents 2 → hard error, no hang.
-        let err = run_controller(listener, &config, 2, "test-token")
-            .await
-            .unwrap_err();
+        let err = run_controller(
+            listener,
+            &config,
+            2,
+            "test-token",
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("boundaries"));
     }
 
@@ -420,8 +431,9 @@ mod tests {
         let addr_str = listener.local_addr().unwrap().to_string();
         let cfg = config.clone();
 
-        let controller =
-            tokio::spawn(async move { run_controller(listener, &cfg, 1, "right-token").await });
+        let controller = tokio::spawn(async move {
+            run_controller(listener, &cfg, 1, "right-token", std::time::Instant::now()).await
+        });
         let agent =
             tokio::spawn(async move { crate::agent::run_agent(&addr_str, "wrong-token").await });
 

@@ -49,7 +49,12 @@ const JOB_BACKOFF_LIMIT: u64 = 3;
 /// This is the "cloud-run" mode: `tropel-cloud-run local --config job.json
 /// --agents N`. The caller (CLI) reports the merged result and evaluates
 /// thresholds, mirroring the controller binary's tail.
-pub async fn run_cloud(config: &JobConfig, agents: u32, token: &str) -> Result<MetricsResult> {
+pub async fn run_cloud(
+    config: &JobConfig,
+    agents: u32,
+    token: &str,
+    test_start: std::time::Instant,
+) -> Result<MetricsResult> {
     if agents == 0 {
         return Err(TropelError::Config("--agents must be >= 1".into()));
     }
@@ -75,7 +80,7 @@ pub async fn run_cloud(config: &JobConfig, agents: u32, token: &str) -> Result<M
     // with a job-bounded timeout — a hung agent fails the run, not the host.
     // On error, abort the in-process agents so no detached tasks keep running
     // the load engine in the background before propagating.
-    let merged = match run_controller(listener, config, agents, &token).await {
+    let merged = match run_controller(listener, config, agents, &token, test_start).await {
         Ok(m) => m,
         Err(e) => {
             for h in &handles {
@@ -402,7 +407,7 @@ mod tests {
             ..Default::default()
         };
 
-        let merged = run_cloud(&config, 2, "test-token").await?;
+        let merged = run_cloud(&config, 2, "test-token", std::time::Instant::now()).await?;
         assert_eq!(
             merged.http_reqs, 4,
             "merged http_reqs = 4: {}",

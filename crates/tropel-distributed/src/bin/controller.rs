@@ -71,7 +71,9 @@ async fn run(args: Args) -> Result<()> {
     );
 
     let test_start = std::time::Instant::now();
-    let result = tropel_distributed::run_controller(listener, &config, args.agents, &token).await?;
+    let result =
+        tropel_distributed::run_controller(listener, &config, args.agents, &token, test_start)
+            .await?;
 
     // Report through the configured reporters + evaluate thresholds
     // (exit-code contract shared with `tropel-cloud-run`).
