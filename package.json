@@ -1,0 +1,10 @@
+{
+  "name": "tropel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monorepo root — npm workspace so @tropel/runtime-wasm resolves @tropel/shims from packages/ instead of npmjs.org (W2 #186).",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "packages/*"
+  ]
+}
