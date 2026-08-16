@@ -136,6 +136,15 @@ pub async fn run_request(req: RunRequest) -> RunOutcome {
 
     let client: Arc<dyn DriverHttpClient> = Arc::new(http::WebHttpClient);
 
+    // W0 P0#3: a malformed expectedStatuses pattern is a hard request error
+    // (validated at load), not a silent all-match or a silent empty list.
+    let expected_statuses = match req.parsed_expected_statuses() {
+        Ok(s) => s,
+        Err(e) => {
+            return RunOutcome::failed(format!("tropel_run: invalid expectedStatuses: {e}"));
+        }
+    };
+
     let mut runner = ScenarioRunner::new(
         scenario,
         flattened,
@@ -144,7 +153,7 @@ pub async fn run_request(req: RunRequest) -> RunOutcome {
         req.vu_id,
         req.scenario_name.clone(),
     )
-    .with_expected_statuses(req.parsed_expected_statuses());
+    .with_expected_statuses(expected_statuses);
 
     let pm_state = runner.state_handle();
     if let Some(ctx) = bootstrap::create_web_js_context(&pm_state).await {
