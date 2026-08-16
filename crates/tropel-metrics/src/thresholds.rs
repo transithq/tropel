@@ -836,13 +836,57 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                 Some(_) => None,
             }
         }),
+        "http_req_failed" => {
+            // W1-A (capped vs totals): `metrics.http_req_failed` is the
+            // totals-repaired headline rate — `build_results` computes it
+            // from incremental counters maintained on EVERY sample, including
+            // cardinality-dropped series. The OLD code fell through to
+            // `aggregate_series`, which iterates the CAPPED per-series list:
+            // a series-dropped run evaluated a truncated total, and bare
+            // `http_req_failed < 0.01` read the WORST per-series mean (1.0
+            // when any URL all-failed) instead of the true merged ratio. The
+            // summary prints the headline rate; the threshold must evaluate
+            // the same number. `value`/`last` resolve the same merged ratio
+            // (k6 rate semantics) rather than failing closed on the invented
+            // `last: 0.0` (W1-A #3 tightened the invented-zero hole; the real
+            // headline makes the stat meaningful).
+            match stat {
+                None | Some("rate") | Some("avg") | Some("value") | Some("last") => {
+                    Some(metrics.http_req_failed)
+                }
+                // Percentiles/min/max on a Rate: no distribution (hardcoded
+                // zeros) — fail closed (backlog line 60).
+                _ => None,
+            }
+        }
+        "data_received" | "data_sent" => {
+            // W1-A (capped vs totals): the headline counters are repaired
+            // from the totals map (`build_results` max()es them over EVERY
+            // sample incl. cardinality-dropped series), so they are the exact
+            // totals even when the per-series list is capped. k6 counter
+            // semantics: bare/count/sum = accumulated bytes; rate/avg =
+            // accumulated / run_duration (per-second). Percentiles on a
+            // Counter: no distribution — fail closed (backlog line 60).
+            let total = if name == "data_received" {
+                metrics.data_received
+            } else {
+                metrics.data_sent
+            };
+            match stat {
+                None | Some("count") | Some("sum") => Some(total),
+                Some("rate") | Some("avg") => {
+                    let secs = metrics.run_duration.as_secs_f64();
+                    Some(if secs > 0.0 { total / secs } else { 0.0 })
+                }
+                _ => None,
+            }
+        }
         _ => {
-            // Custom metric (e.g. http_req_failed, user metrics): aggregate
-            // across ALL series whose key starts with the name. The naive
-            // first-match returned an arbitrary tagged series (e.g.
-            // http_req_failed{url=…} picked one URL's rate — 1.00 when that
-            // series was all-failed) instead of the merged value k6 reports
-            // for the unscoped metric. `None` = no series at all → no data.
+            // Custom metric (e.g. user metrics): aggregate across ALL series
+            // whose key starts with the name. The naive first-match returned
+            // an arbitrary tagged series instead of the merged value k6
+            // reports for the unscoped metric. `None` = no series at all → no
+            // data.
             aggregate_series(metrics, name, stat)
         }
     }
@@ -1250,7 +1294,12 @@ mod tests {
             rate: 1.0,
             histogram: None,
         };
-        let metrics = make_metrics_with(series);
+        // W1-A: `rate`/`avg`/bare on http_req_failed now read the FIRST-CLASS
+        // headline (`metrics.http_req_failed`, totals-repaired) — set it to
+        // what build_results would produce on an all-failed run (1.0). The
+        // pushed series is no longer consulted for the unscoped metric.
+        let mut metrics = make_metrics_with(series);
+        metrics.http_req_failed = 1.0;
         // p95 on a Rate must NOT evaluate to the hardcoded 0 (which would
         // pass `p(95) < 0.01`) — it must fail closed.
         let result = evaluate_single_threshold("http_req_failed.p95 < 0.01", &metrics);
@@ -1265,12 +1314,15 @@ mod tests {
             !result.0,
             "max on a Rate must fail closed (Rate hardcodes min/max = 0)"
         );
-        // Sanity: a MEANINGFUL Rate stat still resolves — `rate` is the
-        // failure ratio (1.0 on an all-failed run) and must breach `> 0.5`.
+        // Sanity: a MEANINGFUL Rate stat still resolves — the headline rate
+        // (1.0 on an all-failed run) must breach `> 0.5`.
         let result = evaluate_single_threshold("http_req_failed.rate > 0.5", &metrics);
         assert!(result.0, "rate 1.0 should be > 0.5");
         let result = evaluate_single_threshold("http_req_failed.avg > 0.5", &metrics);
         assert!(result.0, "avg 1.0 should be > 0.5");
+        // And it must FAIL against a real 1.0 ratio when the gate is tighter.
+        let result = evaluate_single_threshold("http_req_failed.rate < 0.5", &metrics);
+        assert!(!result.0, "rate 1.0 should fail < 0.5");
     }
 
     #[test]
@@ -1384,10 +1436,12 @@ mod tests {
     #[test]
     fn unknown_custom_metric_stat_fails_closed() {
         // Custom-metric path (aggregate_series): an unknown stat must fail
-        // closed there too — the OLD `_ =>` arm returned worst mean.
+        // closed there too — the OLD `_ =>` arm returned worst mean. Uses a
+        // genuinely custom metric (`custom_counter`) — `data_received` is a
+        // first-class headline metric since W1-A #5.
         let mut metrics = make_metrics();
         metrics.metrics.push(MetricSummary {
-            key: "data_received".into(),
+            key: "custom_counter".into(),
             tags: vec![],
             metric_type: MetricType::Counter,
             count: 1500,
@@ -1403,27 +1457,30 @@ mod tests {
             rate: 0.0,
             histogram: None,
         });
-        let result = evaluate_single_threshold("data_received.bogus > 0", &metrics);
+        let result = evaluate_single_threshold("custom_counter.bogus > 0", &metrics);
         assert!(
             !result.0,
             "unknown stat on a custom metric must fail closed"
         );
 
         // Sanity: a VALID stat still resolves.
-        let result = evaluate_single_threshold("data_received.count > 1000", &metrics);
+        let result = evaluate_single_threshold("custom_counter.count > 1000", &metrics);
         assert!(result.0, "count 1500 should be > 1000");
     }
 
     #[test]
     fn counter_rate_via_aggregate_is_per_second() {
         // `data_received: ['rate>1000000']` on a 60 s run receiving 3 MB →
-        // 50 000 B/s — the OLD aggregate path returned the per-series mean
-        // (~1500) → permanently red, and sum/count degenerates to 1.0.
+        // 50 000 B/s. W1-A #5: `data_received` is now a FIRST-CLASS headline
+        // arm reading `metrics.data_received` (the totals-repaired value)
+        // — set it to what `build_results` produces (3 MB received). The OLD
+        // path returned the per-series mean (~1500) → permanently red.
         let mut metrics = make_metrics();
         metrics.run_duration = Duration::from_secs(60);
+        metrics.data_received = 3_000_000.0;
         metrics.metrics.push(MetricSummary {
-            key: "data_received".into(),
-            tags: vec![],
+            key: "data_received{url=/a}".into(),
+            tags: vec![("url".into(), "/a".into())],
             metric_type: MetricType::Counter,
             count: 3_000_000,
             sum: 3_000_000.0,
@@ -1442,6 +1499,9 @@ mod tests {
         assert!(result.0, "50000 B/s should be > 10000");
         let result = evaluate_single_threshold("data_received.avg > 10000", &metrics);
         assert!(result.0, "avg on a counter is the per-second rate too");
+        // Tag-scoped still resolves via the per-series path.
+        let result = evaluate_single_threshold("data_received{url=/a}.count > 1000", &metrics);
+        assert!(result.0, "tag-scoped count 3000000 should be > 1000");
     }
 
     #[test]
@@ -1665,14 +1725,24 @@ mod tests {
             rate: 1.0,
             histogram: None,
         };
-        let metrics = make_metrics_with(rate_series);
+        // W1-A #5: `http_req_failed.value`/`.last` resolve the FIRST-CLASS
+        // headline (`metrics.http_req_failed`, totals-repaired) — on a real
+        // 100%-failure run that is 1.0, so the gate must still FAIL (not pass
+        // against an invented 0.0). Set the headline to the all-failed value.
+        let mut metrics = make_metrics_with(rate_series);
+        metrics.http_req_failed = 1.0;
         let result = evaluate_single_threshold("http_req_failed.value < 0.01", &metrics);
         assert!(
             !result.0,
-            "value on a Rate must fail closed (hardcoded last 0.0), not pass"
+            "value on a Rate must fail against the real 1.0 headline, not pass"
         );
         let result = evaluate_single_threshold("http_req_failed.last < 0.01", &metrics);
-        assert!(!result.0, "last on a Rate must fail closed too");
+        assert!(!result.0, "last on a Rate must fail against 1.0 too");
+        // And it must PASS against a healthy headline (bare `http_req_failed`
+        // is the summary's own number now).
+        metrics.http_req_failed = 0.0;
+        let result = evaluate_single_threshold("http_req_failed.value < 0.01", &metrics);
+        assert!(result.0, "value 0.0 (healthy) should pass < 0.01");
 
         // Tag-scoped variant: same guard.
         let tagged = MetricSummary {
@@ -1695,6 +1765,103 @@ mod tests {
         let metrics = make_metrics_with(tagged);
         let result = evaluate_single_threshold("http_req_failed{url=/a}.value < 0.01", &metrics);
         assert!(!result.0, "tag-scoped value on a Rate must fail closed");
+    }
+
+    // ── W1-A #5: capped series vs `totals` — thresholds read the totals ──
+    // `build_results` repairs the headline counters from the COMPLETE totals
+    // map (incl. cardinality-dropped series), but the OLD `aggregate_series`
+    // iterated the CAPPED per-series list — summary printed 1.20 GB while a
+    // threshold on the same quantity evaluated ~780 MB, and bare
+    // `http_req_failed < 0.01` read the worst per-series mean (1.0 when any
+    // URL all-failed). The first-class arms must make thresholds evaluate
+    // exactly the numbers the summary prints.
+
+    #[test]
+    fn headline_http_req_failed_matches_summary_not_worst_series() {
+        // Summary prints Failed: 1 (0.01 %); the OLD bare `http_req_failed`
+        // read the worst per-series mean → 1.0 → FAIL and non-zero exit on a
+        // healthy run. The threshold must evaluate `metrics.http_req_failed`.
+        let mut metrics = make_metrics();
+        metrics.http_req_failed = 0.01; // 1 failure per 100 requests
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_failed{url=/a}".into(),
+            tags: vec![("url".into(), "/a".into())],
+            metric_type: MetricType::Rate,
+            count: 100,
+            sum: 100.0, // this one URL failed 100%
+            mean: 1.0,
+            min: 0.0,
+            max: 0.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            p99: 0.0,
+            last: 0.0,
+            rate: 1.0,
+            histogram: None,
+        });
+        let result = evaluate_single_threshold("http_req_failed < 0.05", &metrics);
+        assert!(
+            result.0,
+            "bare http_req_failed must read the headline 0.01, not the worst series 1.0, got {}",
+            result.1
+        );
+        assert_eq!(result.1, 0.01, "actual must be the headline rate");
+        let result = evaluate_single_threshold("http_req_failed.rate < 0.05", &metrics);
+        assert!(result.0, ".rate must read the headline too");
+        // A genuinely failing run (1.0 headline) still fails the gate.
+        metrics.http_req_failed = 1.0;
+        let result = evaluate_single_threshold("http_req_failed < 0.05", &metrics);
+        assert!(!result.0, "headline 1.0 must fail < 0.05");
+    }
+
+    #[test]
+    fn data_received_threshold_reads_totals_not_capped_series() {
+        // `build_results` repairs `data_received` from the complete totals map
+        // (incl. cardinality-dropped series) → 1.20 GB, while the per-series
+        // list (what the OLD `aggregate_series` iterated) only saw 780 MB. A
+        // threshold on the same quantity must evaluate the totals number.
+        let mut metrics = make_metrics();
+        metrics.data_received = 1_200_000_000.0; // 1.20 GB — totals-repaired
+        metrics.metrics.push(MetricSummary {
+            key: "data_received".into(),
+            tags: vec![],
+            metric_type: MetricType::Counter,
+            count: 780_000_000,
+            sum: 780_000_000.0, // capped series list only saw ~780 MB
+            mean: 1.0,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p90: 1.0,
+            p95: 1.0,
+            p99: 1.0,
+            last: 1.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        // The threshold on the same quantity the summary prints must PASS.
+        // NOTE: the threshold expression parser does not accept underscore
+        // digit separators, so the literals below are plain digits.
+        let result = evaluate_single_threshold("data_received > 1000000000", &metrics);
+        assert!(
+            result.0,
+            "data_received must read the totals-repaired 1.20 GB, not the capped 780 MB, got {}",
+            result.1
+        );
+        let result = evaluate_single_threshold("data_received.count > 1000000000", &metrics);
+        assert!(result.0, ".count must read the headline total too");
+        // data_sent works the same way.
+        metrics.data_sent = 600_000_000.0;
+        let result = evaluate_single_threshold("data_sent > 500000000", &metrics);
+        assert!(result.0, "data_sent must read its headline total");
+        // And per-second rates come from the headline, not the capped list.
+        metrics.run_duration = Duration::from_secs(60);
+        let result = evaluate_single_threshold("data_received.rate > 1000000", &metrics);
+        assert!(
+            result.0,
+            "rate 20000000 B/s must read the headline, not the capped list"
+        );
     }
 
     // ── Arbitrary-percentile tests ──
@@ -1987,13 +2154,19 @@ mod tests {
             rate: 1.0,
             histogram: None,
         });
-        // Merged: 120 failures / 200 samples = 0.60 — not the 1.00 that a
-        // first-match lookup would have returned for series b.
+        // W1-A #5: the unscoped http_req_failed now reads the FIRST-CLASS
+        // headline (`metrics.http_req_failed`), which `build_results` computes
+        // from incremental counters on EVERY sample — the merged 120
+        // failures / 200 samples = 0.60. The per-series list may be CAPPED
+        // (cardinality drops), so it is no longer consulted for the unscoped
+        // metric; the headline is the single source (the summary prints it
+        // too, so thresholds and stdout always agree).
+        metrics.http_req_failed = 0.6;
         let (passed, actual, _) = evaluate_single_threshold("http_req_failed.rate < 0.5", &metrics);
         assert!(!passed, "merged rate 0.60 must not pass < 0.5");
         assert!(
             (actual - 0.6).abs() < 1e-9,
-            "merged rate should be 0.6, got {actual}"
+            "headline rate should be 0.6, got {actual}"
         );
 
         let (passed, _, _) = evaluate_single_threshold("http_req_failed.rate < 0.7", &metrics);
