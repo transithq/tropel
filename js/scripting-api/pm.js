@@ -461,8 +461,39 @@ pm.response.to = guardChain({
                 throw new Error('expected response body to contain ' + shortJson(substring));
             }
         },
-        jsonBody: function (expected) {
+        jsonBody: function (expected, expectedValue) {
             var body = pm.response.json();
+            if (typeof expected === 'string') {
+                // W1-B line 153: chai-postman treats a STRING as a KEY PATH,
+                // not a deep-equal of the whole body — the old code
+                // `deepEqual(body, 'key')` always threw on an object body, so
+                // the canonical `pm.response.to.have.jsonBody('key')` snippet
+                // was a false failure. `jsonBody('user.id')` asserts the
+                // path EXISTS; `jsonBody('user.id', 7)` asserts the value at
+                // that path too.
+                var parts = expected.split('.');
+                var node = body;
+                // lodash `get` parity: only `undefined` at the FINAL segment
+                // means MISSING (a present-null key like `{a: null}` passes
+                // `jsonBody('a')`), but a null MID-path stops the walk — so
+                // track `reached` to tell "final value is null" from
+                // "stopped mid-path" (the latter is a missing path, so a
+                // negated `.not.jsonBody('a.b')` on `{a:null}` must PASS).
+                var reached = 0;
+                for (; reached < parts.length && node !== undefined && node !== null; reached++) {
+                    node = node[parts[reached]];
+                }
+                if (reached !== parts.length || node === undefined) {
+                    throw new Error('expected response JSON body to have key ' + expected);
+                }
+                if (expectedValue !== undefined && !deepEqual(node, expectedValue)) {
+                    throw new Error(
+                        'expected ' + expected + ' to equal ' + shortJson(expectedValue) +
+                        ', got ' + shortJson(node)
+                    );
+                }
+                return;
+            }
             if (!deepEqual(body, expected)) {
                 throw new Error('expected response JSON body to match');
             }

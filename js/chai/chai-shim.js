@@ -869,10 +869,38 @@ var chai = chai || {};
         }
         return this;
     };
-    Assertion.prototype.jsonBody = function (expected) {
+    Assertion.prototype.jsonBody = function (expected, expectedValue) {
         var body = (typeof pm !== 'undefined' && pm.response) ? pm.response.json() : undefined;
         var negate = !!(this.__flags && this.__flags.negate);
-        var passed = nativeDeepEqual(body, expected) !== negate;
+        var passed;
+        if (typeof expected === 'string') {
+            // W1-B line 153: chai-postman treats a STRING as a KEY PATH, not
+            // a deep-equal of the whole body — the old code deep-equal'd
+            // `body` against the string, so `to.have.jsonBody('key')` always
+            // threw on an object body (false failure). `jsonBody('a.b')`
+            // asserts the path EXISTS; `jsonBody('a.b', 7)` asserts the
+            // value at that path.
+            var parts = expected.split('.');
+            var node = body;
+            // lodash `get` parity: only `undefined` at the FINAL segment
+            // means MISSING (a present-null key like `{a: null}` passes
+            // `jsonBody('a')`), but a null MID-path stops the walk — so
+            // track `reached` to tell "final value is null" from "stopped
+            // mid-path" (the latter is a missing path, so a negated
+            // `.not.jsonBody('a.b')` on `{a:null}` must PASS).
+            var reached = 0;
+            for (; reached < parts.length && node !== undefined && node !== null; reached++) {
+                node = node[parts[reached]];
+            }
+            var hasKey = reached === parts.length && node !== undefined;
+            if (expectedValue !== undefined) {
+                passed = (hasKey && nativeDeepEqual(node, expectedValue)) !== negate;
+            } else {
+                passed = hasKey !== negate;
+            }
+        } else {
+            passed = nativeDeepEqual(body, expected) !== negate;
+        }
         if (!passed) {
             throw new Error(
                 (this._msg ? this._msg + ': ' : '') +
