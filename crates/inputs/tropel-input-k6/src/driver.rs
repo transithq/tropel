@@ -6481,21 +6481,21 @@ mod tests {
                 (name, s.value)
             })
             .collect();
-        // The merged canonical pm.js fix (backlog line 74) records rejections
-        // under `name + ' (error)'` — matching the sync catch path — so the
-        // failing-expect and rejecting bodies land under the suffixed names.
+        // W1-A: failures record under the ORIGINAL name (Postman/k6 parity) —
+        // renaming to `name + ' (error)'` minted a second series that a CI
+        // gate on `checks{check:...}` never read (100% pass by construction).
         assert!(
             checks
                 .iter()
-                .any(|(n, v)| n == "async failing expect (error)" && *v == 0.0),
-            "failing async expect must record FAIL, got: {:?}",
+                .any(|(n, v)| n == "async failing expect" && *v == 0.0),
+            "failing async expect must record FAIL under its own name, got: {:?}",
             checks
         );
         assert!(
             checks
                 .iter()
-                .any(|(n, v)| n == "async rejecting (error)" && *v == 0.0),
-            "Promise.reject body must record FAIL, got: {:?}",
+                .any(|(n, v)| n == "async rejecting" && *v == 0.0),
+            "Promise.reject body must record FAIL under its own name, got: {:?}",
             checks
         );
         assert!(
@@ -6670,18 +6670,21 @@ mod tests {
                 (n, p)
             };
 
-            let (n, p) = by_name("async-fail (error)");
-            assert_eq!(n, "async-fail (error)", "rejected async body name");
+            // W1-A: failures record under the ORIGINAL name — a gate on
+            // `checks{check:...}` must see the failures, not a derived
+            // ` (error)` series that is pass-by-construction.
+            let (n, p) = by_name("async-fail");
+            assert_eq!(n, "async-fail", "rejected async body name");
             assert!(!p, "rejected async body must record a FAILED check, not PASS");
-            let (_n, p) = by_name("async-reject (error)");
+            let (_n, p) = by_name("async-reject");
             assert!(!p, "Promise.reject body must record a FAILED check");
             let (n, p) = by_name("async-pass");
             assert_eq!(n, "async-pass");
             assert!(p, "resolved async body returning true must PASS");
             let (_n, p) = by_name("sync-pass");
             assert!(p, "sync true body must still PASS");
-            let (_n, p) = by_name("sync-fail (error)");
-            assert!(!p, "sync throwing body must still FAIL");
+            let (_n, p) = by_name("sync-fail");
+            assert!(!p, "sync throwing body must still FAIL under its own name");
         });
     }
 
