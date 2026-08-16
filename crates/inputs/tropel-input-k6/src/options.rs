@@ -715,6 +715,36 @@ mod tests {
     }
 
     #[test]
+    fn test_arrival_rate_non_identity_time_unit_is_carried() {
+        // W0 P0#1: `timeUnit` was parsed and copied but never divided by —
+        // `{rate:50, timeUnit:"1m"}` ran at 50/s instead of 50 per minute.
+        // All fixtures used "1s" (the identity case), so the suite passed
+        // with or without the fix. This non-identity fixture pins the
+        // carried value; the scheduler divides by it.
+        let opts = parse(
+            r#"{
+                "scenarios": {
+                    "spam": { "executor": "constant-arrival-rate", "rate": 50, "timeUnit": "1m", "duration": "30s", "preAllocatedVUs": 5, "maxVUs": 20 }
+                }
+            }"#,
+        );
+        let decl = opts.to_declared().unwrap();
+        let sc = decl.scenarios.unwrap().remove("spam").unwrap();
+        match sc.execution {
+            ExecutionConfig::ConstantArrivalRate {
+                rate, time_unit, ..
+            } => {
+                assert_eq!(rate, 50.0);
+                assert_eq!(
+                    time_unit, "1m",
+                    "non-identity timeUnit must be carried, not flattened to 1s"
+                );
+            }
+            other => panic!("expected ConstantArrivalRate, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_arrival_rate_max_vus_defaults_and_clamps() {
         // Backlog line 152: maxVUs previously defaulted to an invented 10 and
         // could be BELOW preAllocatedVUs. k6 defaults maxVUs to
