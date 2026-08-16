@@ -1054,17 +1054,35 @@ fn try_send_cmd(tx: &tokio::sync::mpsc::Sender<WsCommand>, mut cmd: WsCommand) -
 /// connection refused, …). Failed requests must still appear in the summary:
 /// `http_reqs` increments and `http_req_failed` (Rate) becomes 1.0 — matching
 /// the declarative runner's error branch and k6 semantics.
+///
+/// W1-B line 161: k6 also records the TIME-TO-FAILURE as an
+/// `http_req_duration` (Trend) sample and the request body as `data_sent`.
+/// The old code emitted neither, so a target that went fully down let
+/// `p(95) < 500` PASS on the handful of pre-outage successes — the failure
+/// durations simply never entered the distribution. The caller measures the
+/// elapsed time-to-failure around the execute call and passes it here.
 fn push_http_failure(
     sink: &Mutex<Vec<Sample>>,
     req: &Request,
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    elapsed: Duration,
+    sent: usize,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
     let tags = Arc::new(http_tags(req, "0", scenario, extra_tags, group));
 
     let mut v = sink.lock().unwrap();
+    // Time-to-failure in ms (same Trend series the success path feeds), so
+    // duration thresholds see the outage.
+    v.push(Sample {
+        metric: "http_req_duration".into(),
+        value: elapsed.as_secs_f64() * 1000.0,
+        tags: tags.clone(),
+        timestamp: now,
+        sample_type: SampleType::Trend,
+    });
     v.push(Sample {
         metric: "http_reqs".into(),
         value: 1.0,
@@ -1075,9 +1093,17 @@ fn push_http_failure(
     v.push(Sample {
         metric: "http_req_failed".into(),
         value: 1.0,
-        tags,
+        tags: tags.clone(),
         timestamp: now,
         sample_type: SampleType::Rate,
+    });
+    // Request-body bytes (same wire-size computation as the success path).
+    v.push(Sample {
+        metric: "data_sent".into(),
+        value: sent as f64,
+        tags,
+        timestamp: now,
+        sample_type: SampleType::Counter,
     });
 }
 
@@ -1638,6 +1664,10 @@ fn register_http_bridges<'js>(
                 // original stays alive for sample-tag construction.
                 let req_for_io = req.clone();
                 let http_for_io = http_client_request.clone();
+                // W1-B line 161: the failure path needs a start instant so
+                // http_req_duration can record the time-to-failure (k6
+                // records it; the success path reads resp.response_time).
+                let start = std::time::Instant::now();
                 let result = tropel_http::blocking::execute_blocking(async move {
                     http_for_io.execute(&req_for_io).await
                 });
@@ -1698,12 +1728,16 @@ fn register_http_bridges<'js>(
                     Err(e) => {
                         tracing::debug!("k6 http request failed: {}", e);
                         let group = group_stack_req.lock().unwrap().last().cloned();
+                        // Same wire-size computation as the success path.
+                        let sent = req.body.as_ref().map(tropel_http::body_size).unwrap_or(0);
                         push_http_failure(
                             &sink_req,
                             &req,
                             &scenario_req,
                             Some(&extra_tags),
                             group.as_deref(),
+                            start.elapsed(),
+                            sent,
                         );
                         let err = e.to_string();
                         build_k6_response_object(
@@ -1861,6 +1895,7 @@ fn register_http_bridges<'js>(
                 };
                 let http_client = http_for_io.clone();
                 async move {
+                    let start = std::time::Instant::now();
                     let resp = match parsed_method {
                         Some(_) => http_client.execute(&req).await,
                         None => Err(TropelError::Other(format!(
@@ -1868,7 +1903,7 @@ fn register_http_bridges<'js>(
                             method
                         ))),
                     };
-                    (key, req, resp, extra_tags)
+                    (key, req, resp, extra_tags, start)
                 }
             });
 
@@ -1882,7 +1917,7 @@ fn register_http_bridges<'js>(
 
             let mut response_map = serde_json::Map::new();
             if let Ok(results) = responses {
-                for (key, req, result, extra_tags) in results {
+                for (key, req, result, extra_tags, start) in results {
                     let key_str = match key {
                         serde_json::Value::String(s) => s,
                         serde_json::Value::Number(n) => n.to_string(),
@@ -1991,12 +2026,15 @@ fn register_http_bridges<'js>(
                         Err(e) => {
                             tracing::debug!("k6 batch request failed: {}", e);
                             let group = group_stack_batch.lock().unwrap().last().cloned();
+                            let sent = req.body.as_ref().map(tropel_http::body_size).unwrap_or(0);
                             push_http_failure(
                                 &batch_sink,
                                 &req,
                                 &scenario_batch,
                                 Some(&extra_tags),
                                 group.as_deref(),
+                                start.elapsed(),
+                                sent,
                             );
                             let err = e.to_string();
                             serde_json::json!({
@@ -7366,6 +7404,72 @@ mod tests {
             .unwrap();
         assert_eq!(blocked.value, 0.1, "blocked must carry the pool-wait in ms");
         assert_eq!(samples.len(), 12, "5 base + 7 sub-timing samples");
+    }
+
+    #[test]
+    fn test_push_http_failure_emits_duration_and_data_sent() {
+        // W1-B line 161: transport failures emitted ONLY http_reqs +
+        // http_req_failed — no http_req_duration (time-to-failure) or
+        // data_sent, so a fully-down target let p(95)<500 pass on the
+        // pre-outage successes and the failure's wire size vanished. The
+        // failure path now records the same four samples as the success
+        // path (duration as the elapsed time-to-failure).
+        let sink = std::sync::Mutex::new(Vec::<Sample>::new());
+        let scenario: Arc<str> = Arc::from("s");
+        let req = Request {
+            url: "http://down:9/".into(),
+            method: Method::GET,
+            headers: HashMap::new(),
+            query_params: HashMap::new(),
+            body: Some(Body::Raw("payload".to_string())),
+            auth: None,
+            certificate: None,
+            follow_redirects: true,
+            timeout: None,
+            response_type: tropel_sdk::ResponseType::Text,
+        };
+        push_http_failure(
+            &sink,
+            &req,
+            &scenario,
+            None,
+            None,
+            Duration::from_millis(1500),
+            7,
+        );
+        let samples = sink.lock().unwrap();
+        let duration = samples
+            .iter()
+            .find(|s| s.metric == "http_req_duration")
+            .expect("failure must emit http_req_duration (time-to-failure)");
+        assert_eq!(
+            duration.value, 1500.0,
+            "http_req_duration must carry the elapsed ms"
+        );
+        assert_eq!(
+            duration.sample_type,
+            SampleType::Trend,
+            "same Trend series as the success path"
+        );
+        let reqs = samples
+            .iter()
+            .find(|s| s.metric == "http_reqs")
+            .expect("failure must emit http_reqs");
+        assert_eq!(reqs.value, 1.0);
+        let failed = samples
+            .iter()
+            .find(|s| s.metric == "http_req_failed")
+            .expect("failure must emit http_req_failed");
+        assert_eq!(failed.value, 1.0);
+        let sent = samples
+            .iter()
+            .find(|s| s.metric == "data_sent")
+            .expect("failure must emit data_sent (wire size)");
+        assert_eq!(
+            sent.value, 7.0,
+            "data_sent must carry the request-body bytes"
+        );
+        assert_eq!(samples.len(), 4, "duration + reqs + failed + data_sent");
     }
 
     #[test]
