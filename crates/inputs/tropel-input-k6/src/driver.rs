@@ -2080,6 +2080,20 @@ impl K6DriverInstance {
                           tags_json: String,
                           metric_type_str: String,
                           is_time: bool| {
+                        // W1-B line 159: refuse non-finite values on the
+                        // PRIMARY path. The wasm driver guards at the emitter
+                        // (crates/tropel-wasm/src/driver.rs) with the same
+                        // rule; the k6 bridge takes `value: f64` straight from
+                        // JS, so `myTrend.add(parseFloat(missingHeader))` →
+                        // NaN poisoned `sum` forever (avg=NaN → `avg < 500`
+                        // false forever) while `f64::NAN.max(0.0) == 0.0`
+                        // silently recorded a phantom 0 in the histogram.
+                        // Drop the sample — count and population stay
+                        // consistent and no aggregate/threshold can be
+                        // poisoned.
+                        if !value.is_finite() {
+                            return;
+                        }
                         if is_time {
                             tropel_metrics::time_metrics::register(
                                 &name,
@@ -6625,6 +6639,58 @@ mod tests {
             ctx.samples.iter().any(|s| s.metric == "ws_connecting"),
             "failed handshake must still emit ws_connecting"
         );
+    }
+
+    /// W1-B line 159: a non-finite custom-metric value from JS must be
+    /// DROPPED at the bridge, not recorded. The wasm driver guards at the
+    /// emitter; the k6 bridge used to take `value: f64` straight from JS, so
+    /// `myTrend.add(parseFloat(missingHeader))` → NaN poisoned `sum` forever
+    /// (avg=NaN → `avg < 500` false forever) while `f64::NAN.max(0.0) == 0.0`
+    /// silently recorded a phantom 0 in the histogram.
+    #[tokio::test]
+    async fn test_custom_metric_add_drops_non_finite_values() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                var t = new Trend('latency', true);
+                t.add(parseFloat('not-a-number')); // NaN -> must be dropped
+                t.add(42);                          // valid -> must survive
+                var c = new Counter('events');
+                c.add(1);
+                c.add(Number('oops'));              // NaN -> must be dropped
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must complete");
+
+        let latency: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "latency")
+            .collect();
+        assert_eq!(
+            latency.len(),
+            1,
+            "NaN Trend.add must be dropped, got: {:?}",
+            latency.iter().map(|s| s.value).collect::<Vec<_>>()
+        );
+        assert_eq!(latency[0].value, 42.0, "valid Trend.add must survive");
+
+        let events: Vec<&Sample> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "events")
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "NaN Counter.add must be dropped, got: {:?}",
+            events.iter().map(|s| s.value).collect::<Vec<_>>()
+        );
+        assert_eq!(events[0].value, 1.0, "valid Counter.add must survive");
     }
 
     /// Backlog line 62: an abnormal closure (server drops without a close
