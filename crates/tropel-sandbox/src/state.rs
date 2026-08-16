@@ -45,8 +45,6 @@ pub struct PmState {
     pub request_ids: Arc<Vec<String>>,
     /// Iteration data (from CSV/JSON data file), set per-iteration.
     pub iteration_data: Option<HashMap<String, Value>>,
-    /// Whether to skip the remaining tests.
-    pub skip_tests: bool,
     /// Backlog line 146: pm.execution.skipRequest() — skip the CURRENT item
     /// (no request send, no test script) and move to the next one.
     pub skip_request: bool,
@@ -119,7 +117,6 @@ impl PmState {
             request_names: Arc::new(Vec::new()),
             request_ids: Arc::new(Vec::new()),
             iteration_data: None,
-            skip_tests: false,
             skip_request: false,
             group_stack: Vec::new(),
             current_group: None,

@@ -297,7 +297,6 @@ impl ScenarioRunner {
                     // Reset here, at the top of every item, alongside `request`;
                     // the success path re-populates it after the request runs.
                     state.response = None;
-                    state.skip_tests = false;
                     state.skip_request = false;
                     state.current_request_name = item.name.clone();
                 }
