@@ -92,8 +92,8 @@ impl InputAdapter for HttpFileAdapter {
 
         for line in text.lines() {
             let t = line.trim();
-            if t.starts_with("###") {
-                let name = t[3..].trim();
+            if let Some(rest) = t.strip_prefix("###") {
+                let name = rest.trim();
                 blocks.push(((!name.is_empty()).then(|| name.to_string()), Vec::new()));
                 continue;
             }
