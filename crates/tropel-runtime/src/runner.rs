@@ -288,6 +288,15 @@ impl ScenarioRunner {
                 {
                     let mut state = self.pm_state.lock().unwrap();
                     state.request = item.request.clone();
+                    // W1-A: `pm.response` must never leak the PREVIOUS item's
+                    // response. It is assigned only on request success, so a
+                    // transport error / skipped-scheme / skipped item leaves it
+                    // pointing at the prior request's 200 — `pm.test(...to.have
+                    // .status(200))` then passes against stale data, and
+                    // `pm.response.json().id` propagates a wrong id downstream.
+                    // Reset here, at the top of every item, alongside `request`;
+                    // the success path re-populates it after the request runs.
+                    state.response = None;
                     state.skip_tests = false;
                     state.skip_request = false;
                     state.current_request_name = item.name.clone();
@@ -1782,6 +1791,83 @@ mod tests {
             state.environment.get("saw").map(String::as_str),
             Some("local-tok"),
             "pm.variables (local scope) must win over iteration data"
+        );
+    }
+
+    /// Scripted mock: the first call succeeds (200), every later call fails
+    /// with a transport error — the exact shape of "request 1 succeeds, then
+    /// the server/target dies" that W1-A exercises.
+    struct FlakyClient {
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl DriverHttpClient for FlakyClient {
+        async fn execute(
+            &self,
+            _req: &tropel_sdk::types::Request,
+        ) -> Result<tropel_sdk::types::Response> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(tropel_sdk::types::Response {
+                    url: "http://example.com/ok".into(),
+                    status_code: 200,
+                    status_text: "OK".into(),
+                    headers: HashMap::new(),
+                    body: br#"{"id":1}"#.to_vec(),
+                    text_cache: std::cell::OnceCell::new(),
+                    json_cache: std::cell::OnceCell::new(),
+                    response_time: Duration::from_millis(1),
+                    timings: None,
+                    cookies: vec![],
+                    size: 0,
+                    request_body_size: 0,
+                    redirects: vec![],
+                })
+            } else {
+                Err(tropel_sdk::TropelError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "connection refused (simulated transport failure)",
+                )))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_request_clears_stale_pm_response() {
+        // W1-A: `pm.response` must never leak the PREVIOUS item's response.
+        // The loop previously assigned only on success and never reset, so a
+        // transport error on item 2 left `pm.response` pointing at item 1's
+        // 200 — `pm.test(..., to.have.status(200))` PASSED against stale
+        // data, and `pm.response.json().id` propagated a wrong id downstream.
+        // Worst exactly at saturation, when http_req_failed climbs while
+        // checks stay green.
+        let scenario = Arc::new(Scenario {
+            info: tropel_sdk::scenario::ScenarioInfo {
+                name: "stale".into(),
+                description: None,
+                schema: None,
+            },
+            variables: HashMap::new(),
+            auth: None,
+            items: vec![leaf("ok-item"), leaf("dead-item")],
+        });
+        let execution_items: Arc<Vec<ScenarioItem>> =
+            Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
+        let client: Arc<dyn DriverHttpClient> = Arc::new(FlakyClient {
+            calls: Arc::new(AtomicU32::new(0)),
+        });
+        let mut runner =
+            ScenarioRunner::new(scenario, execution_items, names, client, 0, "stale".into());
+
+        let _ = runner.run_iteration(0, None, &HashMap::new()).await;
+
+        let state = runner.pm_state().lock().unwrap();
+        assert!(
+            state.response.is_none(),
+            "pm.response must be None after a failed request — got {:?} (stale from item 1)",
+            state.response.as_ref().map(|r| r.status_code)
         );
     }
 }
