@@ -590,6 +590,7 @@ impl VUScheduler {
             }
             ExecutionConfig::ConstantArrivalRate {
                 rate,
+                time_unit,
                 duration,
                 pre_alloc_vus,
                 max_vus,
@@ -598,9 +599,24 @@ impl VUScheduler {
             } => {
                 let duration = parse_duration(duration)?;
                 let grace = graceful_stop_duration(graceful_stop);
+                // W0 P0#1: k6 `rate` is expressed PER timeUnit, not per
+                // second. `{rate:100, timeUnit:"1m"}` is 100 iterations per
+                // MINUTE (~1.67/s), not 100/s — the old code parsed and
+                // copied `time_unit` but never divided by it, a 60× overload.
+                // The token bucket is wall-clock per-second, so convert here
+                // (covers options.rs, segment.rs and direct SDK consumers in
+                // one place).
+                let rate_per_sec = rate_per_second(*rate, time_unit)?;
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
-                self.run_arrival_rate(*rate, *pre_alloc_vus, *max_vus, duration, grace, &run_vu)
-                    .await;
+                self.run_arrival_rate(
+                    rate_per_sec,
+                    *pre_alloc_vus,
+                    *max_vus,
+                    duration,
+                    grace,
+                    &run_vu,
+                )
+                .await;
                 Ok(())
             }
             ExecutionConfig::PerVUIterations {
@@ -626,15 +642,28 @@ impl VUScheduler {
             ExecutionConfig::RampingArrivalRate {
                 start_rate,
                 stages,
+                time_unit,
                 pre_alloc_vus,
                 max_vus,
                 graceful_stop,
                 ..
             } => {
                 let grace = graceful_stop_duration(graceful_stop);
+                // W0 P0#1: same per-timeUnit → per-second conversion as
+                // constant-arrival-rate; `start_rate` AND every stage target
+                // are expressed per timeUnit.
+                let scale = time_unit_seconds(time_unit)?;
+                let start_rate = *start_rate / scale;
+                let stages: Vec<tropel_core::config::ArrivalRateStage> = stages
+                    .iter()
+                    .map(|s| tropel_core::config::ArrivalRateStage {
+                        duration: s.duration.clone(),
+                        target: s.target / scale,
+                    })
+                    .collect();
                 self.run_ramping_arrival_rate(
-                    *start_rate,
-                    stages,
+                    start_rate,
+                    &stages,
                     *pre_alloc_vus,
                     *max_vus,
                     grace,
@@ -1818,6 +1847,27 @@ fn parse_duration(s: &str) -> Result<Duration> {
     tropel_sdk::parse_duration(s)
 }
 
+/// W0 P0#1: length of a k6 `timeUnit` string in seconds (`"1s"` → 1.0,
+/// `"1m"` → 60.0, `"30s"` → 30.0). A k6 arrival-rate `rate` is expressed
+/// PER `timeUnit`, not per second, and the token bucket is wall-clock
+/// per-second — so the rate must be divided by this before the bucket sees
+/// it. `{rate:100, timeUnit:"1m"}` must fire ~1.67 iterations/s, not 100/s.
+fn time_unit_seconds(time_unit: &str) -> Result<f64> {
+    let d = parse_duration(time_unit)?;
+    let secs = d.as_secs_f64();
+    if secs <= 0.0 {
+        return Err(tropel_sdk::TropelError::Config(format!(
+            "timeUnit must be a positive duration, got '{time_unit}'"
+        )));
+    }
+    Ok(secs)
+}
+
+/// W0 P0#1: convert a per-`timeUnit` rate into a per-second rate.
+fn rate_per_second(rate: f64, time_unit: &str) -> Result<f64> {
+    Ok(rate / time_unit_seconds(time_unit)?)
+}
+
 /// Backlog line 53: validate every duration string in an `ExecutionConfig`
 /// BEFORE any VU dispatch, so a malformed `duration` / stage duration /
 /// `max_duration` fails the run loudly instead of a zero-VU green run.
@@ -1829,19 +1879,31 @@ fn parse_duration(s: &str) -> Result<Duration> {
 /// even constructs a scheduler (same backlog line 53 guarantee).
 pub fn validate_execution_config(config: &ExecutionConfig) -> Result<()> {
     match config {
-        ExecutionConfig::ConstantVus { duration, .. }
-        | ExecutionConfig::ConstantArrivalRate { duration, .. } => {
+        ExecutionConfig::ConstantVus { duration, .. } => {
             parse_duration(duration)?;
+        }
+        ExecutionConfig::ConstantArrivalRate {
+            duration,
+            time_unit,
+            ..
+        } => {
+            parse_duration(duration)?;
+            // W0 P0#1: a malformed timeUnit must fail the run loudly, not
+            // silently default the rate to per-second.
+            time_unit_seconds(time_unit)?;
         }
         ExecutionConfig::RampingVus { stages, .. } => {
             for stage in stages {
                 parse_duration(&stage.duration)?;
             }
         }
-        ExecutionConfig::RampingArrivalRate { stages, .. } => {
+        ExecutionConfig::RampingArrivalRate {
+            stages, time_unit, ..
+        } => {
             for stage in stages {
                 parse_duration(&stage.duration)?;
             }
+            time_unit_seconds(time_unit)?;
         }
         ExecutionConfig::SharedIterations { max_duration, .. }
         | ExecutionConfig::PerVUIterations { max_duration, .. } => {
@@ -2381,6 +2443,151 @@ mod tests {
                 tokio::time::sleep(latency).await;
             }
         })
+    }
+
+    /// W0 P0#1: a non-identity `timeUnit` must divide the rate —
+    /// `{rate:100, timeUnit:"1m"}` is 100 iterations per MINUTE (~1.67/s),
+    /// not 100/s (the 60× overload). Runs the PUBLIC `run()` dispatch (not
+    /// the internal run_arrival_rate) so the conversion is exercised.
+    /// `start_paused` runs the wall-clock token bucket on VIRTUAL time, so
+    /// the token count is deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn time_unit_1m_scales_rate_to_per_second() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
+            rate: 100.0,
+            time_unit: "1m".to_string(),
+            duration: "5s".to_string(),
+            pre_alloc_vus: 50,
+            max_vus: 100,
+            graceful_stop: Some("1s".to_string()),
+            think_time: Default::default(),
+        });
+        let acquired = Arc::new(AtomicU64::new(0));
+        let acquired2 = acquired.clone();
+        let run_vu = move |sched: Arc<VUScheduler>, _vu_id: u32| {
+            let acquired = acquired2.clone();
+            tokio::spawn(async move {
+                let arrival_notify = sched.arrival_notify();
+                let stop = sched.stop_signal();
+                loop {
+                    if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                        break;
+                    }
+                    let mut got = false;
+                    {
+                        let _idle_guard = sched.idle_guard();
+                        loop {
+                            if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                                break;
+                            }
+                            if sched.try_acquire_arrival_token() {
+                                got = true;
+                                break;
+                            }
+                            tokio::select! {
+                                _ = arrival_notify.notified() => {}
+                                _ = stop.notified() => {}
+                            }
+                        }
+                    }
+                    if got {
+                        acquired.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            })
+        };
+        sched.run(run_vu).await.expect("run must not error");
+        let got = acquired.load(Ordering::Relaxed);
+        // 100/60 per second over 5 virtual seconds ≈ 8.3 tokens. The bug
+        // (100/s) would fire ~500. Tolerate ±40% for virtual-time rounding.
+        assert!(
+            (5..=12).contains(&got),
+            "rate:100 timeUnit:1m over 5s must fire ~8 tokens, got {got} (60× overload = ~500)"
+        );
+    }
+
+    /// W0 P0#1: the RAMPING path has its own timeUnit scaling (start_rate
+    /// AND every stage target are per-timeUnit) — the constant path alone
+    /// doesn't cover it. Assert the dispatch produces a per-second stage
+    /// curve via the public `run()` (virtual time): 1m unit with target
+    /// 60/1m → 1/s; a 5s stage yields ~5 tokens total.
+    #[tokio::test(start_paused = true)]
+    async fn time_unit_1m_scales_ramping_stages_to_per_second() {
+        let sched = VUScheduler::new(&ExecutionConfig::RampingArrivalRate {
+            start_rate: 60.0,
+            stages: vec![tropel_core::config::ArrivalRateStage {
+                duration: "5s".to_string(),
+                target: 60.0,
+            }],
+            time_unit: "1m".to_string(),
+            pre_alloc_vus: 50,
+            max_vus: 100,
+            graceful_stop: Some("1s".to_string()),
+            think_time: Default::default(),
+        });
+        let acquired = Arc::new(AtomicU64::new(0));
+        let acquired2 = acquired.clone();
+        let run_vu = move |sched: Arc<VUScheduler>, _vu_id: u32| {
+            let acquired = acquired2.clone();
+            tokio::spawn(async move {
+                let arrival_notify = sched.arrival_notify();
+                let stop = sched.stop_signal();
+                loop {
+                    if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                        break;
+                    }
+                    let mut got = false;
+                    {
+                        let _idle_guard = sched.idle_guard();
+                        loop {
+                            if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                                break;
+                            }
+                            if sched.try_acquire_arrival_token() {
+                                got = true;
+                                break;
+                            }
+                            tokio::select! {
+                                _ = arrival_notify.notified() => {}
+                                _ = stop.notified() => {}
+                            }
+                        }
+                    }
+                    if got {
+                        acquired.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            })
+        };
+        sched.run(run_vu).await.expect("run must not error");
+        let got = acquired.load(Ordering::Relaxed);
+        // start 60/min → 1/s ramping to target 60/min → 1/s: ~5 tokens over
+        // the 5s virtual stage. The bug (60/s) would fire ~300.
+        assert!(
+            (2..=10).contains(&got),
+            "ramping rate:60 timeUnit:1m over 5s must fire ~5 tokens, got {got} (60× overload = ~300)"
+        );
+    }
+
+    /// W0 P0#1: a malformed timeUnit must fail loudly via
+    /// validate_execution_config, not silently default to per-second.
+    #[test]
+    fn malformed_time_unit_fails_validation() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
+            rate: 100.0,
+            time_unit: "5x".to_string(),
+            duration: "5s".to_string(),
+            pre_alloc_vus: 10,
+            max_vus: 20,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        assert!(
+            validate_execution_config(&sched.config.clone()).is_err(),
+            "malformed timeUnit must fail validation"
+        );
     }
 
     /// Locked: 20/s with 10 pre-allocated VUs at 300ms latency must NEVER
