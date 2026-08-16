@@ -494,7 +494,12 @@ pm.test = function (name, fn) {
                 },
                 function (e) {
                     if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name + ' (error)', false, '');
+                        // W1-A: record under the ORIGINAL name — Postman/k6
+                        // record failures under the check's own name, and a
+                        // CI gate on `checks{check:...}` must see the failures
+                        // (renaming produced a second series that was 100%
+                        // pass by construction).
+                        __tropel_pm_test(name, false, '');
                     }
                     console.error(__ns + '.test error:', e);
                     return false;
@@ -510,7 +515,10 @@ pm.test = function (name, fn) {
         return passed;
     } catch (e) {
         if (typeof __tropel_pm_test === 'function') {
-            __tropel_pm_test(name + ' (error)', false, '');
+            // W1-A: see the async rejection path above — failures must be
+            // recorded under the original name, not a derived ` (error)`
+            // series that a check-name gate never reads.
+            __tropel_pm_test(name, false, '');
         }
         console.error(__ns + '.test error:', e);
         return false;
