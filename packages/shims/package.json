@@ -1,7 +1,7 @@
 {
   "name": "@tropel/shims",
-  "version": "0.1.0",
-  "description": "The tropel JS shim bundle — pm/bru scripting API, chai, lodash, CryptoJS, exec, and the k6 family. The same sources the tropel runtime embeds (ShimBundle::default()), published for embedders.",
+  "version": "0.1.1",
+  "description": "The tropel JS shim bundle \u2014 pm/bru scripting API, chai, lodash, CryptoJS, exec, and the k6 family. The same sources the tropel runtime embeds (ShimBundle::default()), published for embedders.",
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,
