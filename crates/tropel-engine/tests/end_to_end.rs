@@ -178,38 +178,58 @@ async fn start_auth_capture_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::S
             };
             let seen = seen.clone();
             tokio::spawn(async move {
-                let mut head = Vec::new();
-                let mut buf = [0u8; 4096];
+                // Keep-alive loop (same shape as start_echo_server): the
+                // client pools HTTP/1.1 connections, and a server that drops
+                // the socket after ONE response races the client's reuse —
+                // occasionally failing a pooled request. W1-A made those
+                // transport failures COUNT as failed checks (the stale
+                // pm.response bug used to mask them by passing the check
+                // against the previous request's 200), so this server MUST
+                // serve multiple requests per connection or the run reports
+                // hundreds of real failures.
                 loop {
-                    let n = match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
+                    // Read until the request-head terminator. A fresh head
+                    // per request so a split packet never loses the header
+                    // across requests.
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let read_ok = loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break false,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break true;
+                        }
                     };
-                    head.extend_from_slice(&buf[..n]);
-                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    if !read_ok {
+                        break;
+                    }
+                    let text = String::from_utf8_lossy(&head).to_string();
+                    for line in text.lines() {
+                        // Match the header name case-insensitively but capture
+                        // the VALUE in its ORIGINAL case (lowercasing the
+                        // whole line would corrupt "Bearer s3cret" into
+                        // "bearer s3cret").
+                        if line.to_ascii_lowercase().starts_with("authorization:") {
+                            if let Some(idx) = line.find(':') {
+                                seen.lock()
+                                    .unwrap()
+                                    .push(line[idx + 1..].trim().to_string());
+                            }
+                        }
+                    }
+                    let body = r#"{"ok":true}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
                         break;
                     }
                 }
-                let text = String::from_utf8_lossy(&head).to_string();
-                for line in text.lines() {
-                    // Match the header name case-insensitively but capture the
-                    // VALUE in its ORIGINAL case (lowercasing the whole line
-                    // would corrupt "Bearer s3cret" into "bearer s3cret").
-                    if line.to_ascii_lowercase().starts_with("authorization:") {
-                        if let Some(idx) = line.find(':') {
-                            seen.lock()
-                                .unwrap()
-                                .push(line[idx + 1..].trim().to_string());
-                        }
-                    }
-                }
-                let body = r#"{"ok":true}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
             });
         }
     });
