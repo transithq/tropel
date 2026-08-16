@@ -877,15 +877,26 @@ fn push_redirect_hops(
 fn stringify_tag_map_into(j: &str, tags: &mut TagMap) {
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(j) {
         for (k, val) in map {
-            let s = match val {
-                serde_json::Value::String(s) => s,
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Bool(b) => b.to_string(),
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            };
-            tags.insert(k, s);
+            tags.insert(k, coerce_tag_value(&val));
         }
+    }
+}
+
+/// Coerce a single JSON tag value to its k6 string form. Shared by
+/// [`stringify_tag_map_into`] (check()/custom metrics) and
+/// [`parse_k6_extras`] (HTTP request tags) so every path behaves
+/// identically — W2 line 180: `parse_k6_extras` used `v.as_str()` with
+/// `filter_map`, so `http.get(url, {tags: {code: 200}})` silently dropped
+/// EVERY non-string tag (the canonical `{status: res.status}` idiom lost
+/// the whole map), while `check()` already coerced. k6 `ToString`s every
+/// tag value: numbers → digits, bools → true/false, null → "".
+fn coerce_tag_value(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -1513,12 +1524,15 @@ fn parse_k6_extras(extras: &serde_json::Value) -> K6RequestExtras {
             .get("timeoutMs")
             .and_then(|t| t.as_f64())
             .unwrap_or(0.0),
+        // W2 line 180: the HTTP paths must coerce non-string tag values the
+        // same way check()/custom metrics do — the old v.as_str() filter
+        // silently dropped {code: 200} / {status: res.status} maps.
         tags: extras
             .get("tags")
             .and_then(|t| t.as_object())
             .map(|o| {
                 o.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .map(|(k, v)| (k.clone(), coerce_tag_value(v)))
                     .collect()
             })
             .unwrap_or_default(),
@@ -4364,6 +4378,51 @@ mod tests {
                 .expect("read second captured extras");
             assert!(second.contains("\"auth\":null"), "auth not null when absent: {second}");
         });
+    }
+
+    #[test]
+    fn test_parse_k6_extras_coerces_non_string_tag_values() {
+        // W2 line 180: parse_k6_extras used v.as_str() with filter_map, so
+        // HTTP-path tags silently dropped EVERY non-string value — the
+        // canonical k6 idiom http.get(url, {tags: {status: res.status}})
+        // lost the whole map while check()/custom metrics coerced. The HTTP
+        // paths now share coerce_tag_value with stringify_tag_map_into.
+        let extras: serde_json::Value = serde_json::json!({
+            "timeoutMs": 1000,
+            "tags": {
+                "kind": "a",
+                "code": 200,
+                "ok": true,
+                "nil": null
+            },
+            "auth": null,
+            "redirects": 0,
+            "compression": "",
+            "bodyB64": false
+        });
+        let p = parse_k6_extras(&extras);
+        assert_eq!(
+            p.tags.get("kind").map(String::as_str),
+            Some("a"),
+            "string tag dropped"
+        );
+        assert_eq!(
+            p.tags.get("code").map(String::as_str),
+            Some("200"),
+            "numeric tag dropped — the {{code: 200}} idiom"
+        );
+        assert_eq!(
+            p.tags.get("ok").map(String::as_str),
+            Some("true"),
+            "bool tag dropped"
+        );
+        assert_eq!(
+            p.tags.get("nil").map(String::as_str),
+            Some(""),
+            "null tag must coerce to empty string, not vanish"
+        );
+        // The whole map must survive — no wholesale drop on first non-string.
+        assert_eq!(p.tags.len(), 4, "tag map partially dropped: {:?}", p.tags);
     }
 
     #[test]
