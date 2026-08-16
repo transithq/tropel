@@ -312,22 +312,56 @@ fn evaluate_single_threshold_opt(
             })
             .filter(|g: &Vec<&str>| !g.is_empty())
             .collect();
-        let mut last_pair = (0.0f64, 0.0f64);
+        // W1-B line 150: a NO-DATA clause must not abort the whole compound.
+        // The old `evaluate_single_threshold_opt(clause, metrics)?` propagated
+        // `None` out of the entire expression, so `rate<0.01 || count<10`
+        // false-reds even when the rate clause passed and only count had no
+        // samples. A no-data clause now just fails its AND-group (it cannot
+        // prove the group) while the other groups still get evaluated — an OR
+        // sibling with real data can still decide the compound.
+        let mut deciding_pair = (0.0f64, 0.0f64);
         let mut any_group_passed = false;
+        let mut any_clause_had_data = false;
         for group in groups {
             let mut group_passed = true;
+            let mut group_had_data = false;
+            let mut group_pair = (0.0f64, 0.0f64);
             for clause in group {
-                let (passed, actual, threshold) = evaluate_single_threshold_opt(clause, metrics)?;
-                last_pair = (actual, threshold);
-                if !passed {
-                    group_passed = false;
+                match evaluate_single_threshold_opt(clause, metrics) {
+                    Some((passed, actual, threshold)) => {
+                        any_clause_had_data = true;
+                        group_had_data = true;
+                        group_pair = (actual, threshold);
+                        if !passed {
+                            group_passed = false;
+                        }
+                    }
+                    None => {
+                        // No data for this clause — it cannot pass its group.
+                        group_passed = false;
+                    }
                 }
             }
             if group_passed {
+                // First passing group DECIDES the OR — its last clause's
+                // (actual, threshold) is what the summary reports, not a
+                // later no-data clause's fabricated 0.0.
+                if !any_group_passed {
+                    deciding_pair = group_pair;
+                }
                 any_group_passed = true;
+            } else if group_had_data && !any_group_passed {
+                // A failing group only supplies the reported pair when it
+                // actually carried data — a trailing all-no-data group must
+                // not clobber the meaningful actual with (0.0, 0.0).
+                deciding_pair = group_pair;
             }
         }
-        return Some((any_group_passed, last_pair.0, last_pair.1));
+        if any_clause_had_data {
+            return Some((any_group_passed, deciding_pair.0, deciding_pair.1));
+        }
+        // Every clause had no data → the compound as a whole has no data.
+        return None;
     }
 
     // Fail CLOSED: any parse error or unknown operator must FAIL the
@@ -1265,6 +1299,71 @@ mod tests {
         let metrics = make_metrics();
         let result = evaluate_single_threshold("http_reqs.p95 < 1", &metrics);
         assert!(!result.0, "p95 on a Counter must fail closed");
+    }
+
+    #[test]
+    fn compound_or_passes_when_deciding_clause_has_data_but_sibling_no_data() {
+        // W1-B line 150: a NO-DATA clause must not fail the whole compound.
+        // `rate<0.01 || count<10` false-reds even when the rate clause passed
+        // and only the sibling had no samples — the old code propagated
+        // `None` out of the entire expression via `?`.
+        let mut metrics = make_metrics();
+        // http_req_duration has real data (mean 500); http_reqs has real
+        // data (100). A THIRD metric with no samples at all:
+        metrics.http_req_duration = Some(MetricSummary {
+            key: "http_req_duration".into(),
+            tags: vec![],
+            metric_type: MetricType::Trend,
+            count: 100,
+            sum: 50000.0,
+            mean: 500.0,
+            min: 50.0,
+            max: 2000.0,
+            p50: 450.0,
+            p90: 900.0,
+            p95: 1200.0,
+            p99: 1800.0,
+            last: 2500.0,
+            rate: 0.0,
+            histogram: None,
+        });
+
+        // OR: deciding clause (http_req_duration.mean < 1000) has data and
+        // PASSES; sibling (http_reqs.rate < 0.5) also has data. Both true.
+        let (passed, actual, threshold) =
+            evaluate_single_threshold("http_req_duration < 1000 || http_reqs.rate < 0.5", &metrics);
+        assert!(passed, "OR with both clauses having data must pass");
+        assert_eq!(actual, 500.0, "deciding clause actual must be reported");
+        assert_eq!(threshold, 1000.0);
+
+        // OR where the FIRST clause has no data (custom metric absent) but
+        // the second has data and passes → must still PASS.
+        let result =
+            evaluate_single_threshold("nonexistent_metric < 1 || http_reqs.count > 10", &metrics);
+        assert!(
+            result.0,
+            "no-data first clause must not fail the OR when the second decides"
+        );
+
+        // OR where the deciding (second) clause has data and passes while the
+        // first is no-data — actual must be the DECIDING clause's, not 0.0.
+        let result = evaluate_single_threshold(
+            "nonexistent_metric < 1 || http_req_duration < 1000",
+            &metrics,
+        );
+        assert!(result.0, "second clause with data decides the OR");
+        assert_eq!(
+            result.1, 500.0,
+            "deciding actual must not be the no-data 0.0"
+        );
+
+        // AND: a no-data clause still fails the group (cannot prove it) —
+        // fail closed, matching the single-clause no-data policy.
+        let result = evaluate_single_threshold(
+            "nonexistent_metric < 1 && http_req_duration < 1000",
+            &metrics,
+        );
+        assert!(!result.0, "AND with a no-data clause must fail closed");
     }
 
     // ── Backlog line 60: Rate/Gauge percentile stats fail closed ──
