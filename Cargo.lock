@@ -4380,6 +4380,7 @@ dependencies = [
  "tropel-input-curl",
  "tropel-input-har",
  "tropel-input-http",
+ "tropel-input-insomnia",
  "tropel-input-k6",
  "tropel-input-openapi",
  "tropel-input-postman",
@@ -4488,6 +4489,16 @@ name = "tropel-input-http"
 version = "0.1.0"
 dependencies = [
  "inventory",
+ "serde_json",
+ "tropel-sdk",
+]
+
+[[package]]
+name = "tropel-input-insomnia"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "serde",
  "serde_json",
  "tropel-sdk",
 ]

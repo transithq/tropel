@@ -37,6 +37,7 @@ tropel-input-subprocess.workspace = true
 tropel-input-http.workspace = true
 tropel-input-curl.workspace = true
 tropel-input-bru.workspace = true
+tropel-input-insomnia.workspace = true
 tropel-wasm.workspace = true
 tropel-x-grpc.workspace = true
 tropel-x-websocket.workspace = true
