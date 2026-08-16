@@ -254,28 +254,33 @@ jobs:
           TROPEL_REQUIRE_WASM: "1"
         run: cargo test -p tropel-web --test native_vs_wasm
 
+      # P6 (@tropel/shims): the js/ shim bundle as an npm package. The smoke
+      # asserts the built bundle is byte-identical to the repo's js/ sources
+      # in the engine's ShimBundle::default() order — the single source of
+      # truth — so a stale copy fails the gate. MUST run BEFORE the
+      # runtime-wasm smoke (W2 #186): the root npm workspace resolves
+      # @tropel/shims to THIS local package, and runtime-wasm's tsc needs
+      # packages/shims/dist (gitignored) to exist.
+      - name: P6 shims npm smoke (@tropel/shims)
+        run: |
+          cd packages/shims
+          npm install --no-audit --no-fund
+          npm run build
+          node smoke.mjs
+
       # P6 (TROPEL_MODULARIZATION_TODO.md): @tropel/runtime-wasm — the npm host
       # that ships the wasm slice. Build the TS wrapper, copy the artifact
       # into the package (build.sh), and drive the same F3 fixture through
       # node:wasi from OUTSIDE Rust — proving the published package works.
       # TROPEL_REQUIRE_WASM=1 turns a missing artifact into a hard failure
-      # (same gate as the F3 harness).
+      # (same gate as the F3 harness). W2 #186: the root package.json
+      # workspace makes @tropel/shims resolve to packages/shims (NOT the
+      # npmjs.org copy), so a local js/ edit flows into this smoke too.
       - name: P6 npm smoke (@tropel/runtime-wasm)
         env:
           TROPEL_REQUIRE_WASM: "1"
         run: |
           cd packages/runtime-wasm
-          npm install --no-audit --no-fund
-          npm run build
-          node smoke.mjs
-
-      # P6 (@tropel/shims): the js/ shim bundle as an npm package. The smoke
-      # asserts the built bundle is byte-identical to the repo's js/ sources
-      # in the engine's ShimBundle::default() order — the single source of
-      # truth — so a stale copy fails the gate.
-      - name: P6 shims npm smoke (@tropel/shims)
-        run: |
-          cd packages/shims
           npm install --no-audit --no-fund
           npm run build
           node smoke.mjs

@@ -89,25 +89,18 @@ fn variables_lookup(
     globals.get(key).map(variable_value_to_string)
 }
 
-/// Parse an HTTP method string (case-insensitive) into a `Method`.
-/// Falls back to `Custom` for non-standard tokens (PURGE, LINK, …).
+/// Parse an HTTP method string for the `pm.request.method` setter.
+///
+/// TROPEL_MASTER_TODO line 187: this file used to carry a SECOND, lenient
+/// parser (empty→GET, no RFC 7230 tchar validation, uppercased `Custom`)
+/// while `sendRequest` used the canonical [`Method::parse`] — so a token
+/// like `'GE T'` set via `pm.request.method` shipped an INVALID method on
+/// the wire. Delegate to the canonical parser: standard verbs map to their
+/// variants, valid-but-uncommon tokens (PURGE/LINK/…) stay `Custom` with
+/// case preserved, and empty/whitespace input falls back to `GET` (the
+/// Postman default when no method is set).
 fn parse_method(s: &str) -> Method {
-    let t = s.trim();
-    if t.is_empty() {
-        return Method::GET;
-    }
-    match t.to_uppercase().as_str() {
-        "GET" => Method::GET,
-        "HEAD" => Method::HEAD,
-        "POST" => Method::POST,
-        "PUT" => Method::PUT,
-        "PATCH" => Method::PATCH,
-        "DELETE" => Method::DELETE,
-        "OPTIONS" => Method::OPTIONS,
-        "TRACE" => Method::TRACE,
-        "CONNECT" => Method::CONNECT,
-        other => Method::Custom(other.to_string()),
-    }
+    Method::parse(s).unwrap_or(Method::GET)
 }
 
 /// Return the response body as a JSON string for the `pm.response.json()`
@@ -1611,6 +1604,37 @@ mod tests {
             &globals,
         );
         assert_eq!(got, None, "unknown key resolves to None");
+    }
+
+    /// Regression (TROPEL_MASTER_TODO line 187): `pm.request.method` used
+    /// a SECOND, lenient parser (empty→GET, no tchar validation, uppercased
+    /// `Custom`) while `sendRequest` used the canonical [`Method::parse`] —
+    /// so `'GE T'` set via the setter shipped an INVALID HTTP method token
+    /// on the wire. The setter now delegates to the canonical parser.
+    #[test]
+    fn test_parse_method_delegates_to_canonical_parser() {
+        // Standard verbs, case-insensitive (trimmed).
+        assert_eq!(parse_method("GET"), Method::GET);
+        assert_eq!(parse_method("get"), Method::GET);
+        assert_eq!(parse_method(" POST "), Method::POST);
+        assert_eq!(parse_method("DELETE"), Method::DELETE);
+
+        // Valid-but-uncommon tokens stay Custom with case preserved
+        // (the old parser uppercased them).
+        assert_eq!(parse_method("PURGE"), Method::Custom("PURGE".into()));
+        assert_eq!(parse_method("purge"), Method::Custom("purge".into()));
+        assert_eq!(parse_method("LINK"), Method::Custom("LINK".into()));
+
+        // Empty → GET (Postman default when no method is set).
+        assert_eq!(parse_method(""), Method::GET);
+        assert_eq!(parse_method("   "), Method::GET);
+
+        // Genuinely invalid tokens (whitespace inside, non-tchar) must NOT
+        // ship as Custom — the old parser turned 'GE T' into
+        // Custom("GE T"), which failed later at the reqwest layer.
+        assert_eq!(parse_method("GE T"), Method::GET);
+        assert_eq!(parse_method("GE\nT"), Method::GET);
+        assert_eq!(parse_method("PO TS"), Method::GET);
     }
 
     /// Regression (backlog line 147): `pm.sendRequest` must resolve
