@@ -98,7 +98,7 @@ impl LatencyHistogram {
 
     /// Record a duration value (in microseconds).
     pub fn record(&mut self, duration: Duration) {
-        self.inner.record(duration.as_micros().max(1) as u64).ok();
+        self.record_us(duration.as_micros().max(1) as u64);
     }
 
     /// Record a value in milliseconds (fractional ms preserved).
@@ -114,7 +114,38 @@ impl LatencyHistogram {
     /// population-mismatch bug.
     pub fn record_ms(&mut self, ms: f64) {
         let us = (ms.max(0.0) * 1000.0).round().max(1.0) as u64;
-        self.inner.record(us).ok();
+        self.record_us(us);
+    }
+
+    /// Record a raw μs value, upgrading to an auto-resizing histogram when
+    /// the value exceeds the fixed ceiling instead of silently dropping it.
+    ///
+    /// W1-A: the old `self.inner.record(us).ok()` dropped out-of-range
+    /// samples while the collector's `count`/`sum` still incremented, so
+    /// `histogramMaxMs` truncated the percentile population. 90 % of
+    /// samples at 200 ms plus 10 % at 5 s with a 1 s ceiling gave
+    /// `count=10000 avg=680ms max=5000ms` and `p95≈200ms`, so `p(95) <
+    /// 1000` passed against a tail it never saw. The ceiling is a sizing
+    /// hint, not a data-loss contract — the first out-of-range sample
+    /// rebuilds losslessly into an auto-resizing histogram (identical to
+    /// `merge`'s fallback), so the distribution and every percentile read
+    /// from it stay truthful.
+    fn record_us(&mut self, us: u64) {
+        if self.inner.record(us).is_ok() {
+            return;
+        }
+        // Out of range: upgrade in place, lossless (bin iteration yields the
+        // exact value + count at every populated bucket).
+        let mut grown = auto_resizing_histogram();
+        for v in self.inner.iter_recorded() {
+            grown
+                .record_n(v.value_iterated_to(), v.count_at_value())
+                .ok();
+        }
+        // The fresh auto-resizing histogram accepts any value, so this cannot
+        // fail; defensive `.ok()` mirrors the `merge` fallback.
+        grown.record(us).ok();
+        self.inner = grown;
     }
 
     /// Get the total count of recorded values.
@@ -344,6 +375,47 @@ mod tests {
             h2.max() >= 1.0,
             "max={} must cover the recorded value",
             h2.max()
+        );
+    }
+
+    #[test]
+    fn out_of_range_samples_upgrade_instead_of_truncating_population() {
+        // W1-A: `histogramMaxMs` used to silently truncate the percentile
+        // population. 90 % of samples at 200 ms + 10 % at 5 s with a 1 s
+        // ceiling → the OLD histogram dropped the 5 s tail and reported
+        // `p95 ≈ 200 ms`, so `p(95) < 1000` PASSED against a distribution it
+        // never saw, while count/sum (incremented by the collector) said
+        // 10 000 samples with avg 680 ms. The ceiling is a sizing hint, not a
+        // data-loss contract: the first out-of-range sample must upgrade the
+        // histogram to auto-resize so every percentile stays truthful.
+        let mut h = LatencyHistogram::with_max(Some(1000)); // 1 s ceiling
+        for _ in 0..90 {
+            h.record_ms(200.0);
+        }
+        for _ in 0..10 {
+            h.record_ms(5_000.0); // 5 s — above the 1 s ceiling
+        }
+
+        // Population must be complete: all 100 samples recorded.
+        assert_eq!(h.count(), 100, "no sample may be silently dropped");
+        // The 10 % tail must be VISIBLE in the percentiles: p95 of 100
+        // samples with 10 at 5 s sits in the 5 s region, far above 200 ms.
+        assert!(
+            h.p95() >= 4_000.0,
+            "p95={} must reflect the 10% tail at 5 s, not the truncated 200 ms",
+            h.p95()
+        );
+        // p50 (the 200 ms majority) is unaffected — the upgrade is lossless.
+        assert!(
+            h.p50() < 1_000.0,
+            "p50={} must stay at the 200 ms majority",
+            h.p50()
+        );
+        // max sees the 5 s sample too.
+        assert!(
+            h.max() >= 5_000.0,
+            "max={} must cover the 5 s sample",
+            h.max()
         );
     }
 
