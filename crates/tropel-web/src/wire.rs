@@ -53,13 +53,17 @@ impl RunRequest {
     /// Parse the postcard-safe spec strings into `ExpectedStatus` values
     /// (numeric → `Single`, everything else → `Range`, mirroring
     /// [`ExpectedStatus::matches`]'s parsing).
-    pub fn parsed_expected_statuses(&self) -> Vec<ExpectedStatus> {
+    pub fn parsed_expected_statuses(&self) -> Result<Vec<ExpectedStatus>, String> {
         self.expected_statuses
             .iter()
-            .map(|spec| match spec.trim().parse::<u16>() {
-                Ok(code) => ExpectedStatus::Single(code),
-                Err(_) => ExpectedStatus::Range(spec.clone()),
-            })
+            // W0 P0#3: use the SDK's strict parse (fail-closed on malformed
+            // patterns) instead of hand-rolling an untagged u16-or-String
+            // match — the old code turned a typo like "200-" into a Range
+            // that matched every code, greening a run against all-500s. The
+            // error is PROPAGATED, not filtered: a malformed pattern must
+            // fail the run loudly, not silently become an empty expected
+            // list (which would fail every request without a message).
+            .map(|spec| ExpectedStatus::parse(spec))
             .collect()
     }
 }
