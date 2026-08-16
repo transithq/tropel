@@ -5284,6 +5284,164 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_expect_delegates_to_chai_assertion_surface() {
+        // W1-B: 6 of Postman's 17 stock snippets FAILED against the old
+        // AssertChain surface — pm.expect(...).to.be.below(200),
+        // .to.have.lengthOf(3), .to.be.oneOf([200,201]),
+        // .to.deep.include({name:"x"}) all read "unknown assertion
+        // property". pm.expect now delegates to chai-shim's Assertion when
+        // chai is loaded (the runtime bundle always loads both), so the
+        // full chai surface works through pm.expect: below/above/least/
+        // most/lessThan/lengthOf/oneOf/instanceOf/throw/keys/contain/
+        // members/closeTo/within and deep-aware include. The Postman
+        // extensions status/header/jsonBody live on the chai Assertion too
+        // (chai-postman parity), so pm.expect(pm.response).to.have.status
+        // (200) still works after delegation.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__r = {};
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                // Stub the response bridges for the Postman extensions.
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
+                globalThis.__tropel_pm_response_time = function () { return 42.5; };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_header = function (key) {
+                    if (String(key).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_cookies = function () { return {}; };
+                globalThis.__tropel_pm_response_body = function () { return '{}'; };
+                globalThis.__tropel_pm_response_json = function () { return {}; };
+
+                // name: 'x' at the TOP LEVEL — chai's deep.include checks the
+                // expected object's keys directly against the target (no
+                // recursive search), so the stock-snippet fixture must carry
+                // the asserted key as a top-level member.
+                var json = { name: 'x', items: [{ name: 'a' }, { name: 'b' }, { name: 'c' }] };
+
+                // The 6 failing stock snippets (W1-B EXEC list).
+                trial('below_ok', function () { pm.expect(pm.response.responseTime).to.be.below(200); });
+                trial('below_bad', function () { pm.expect(pm.response.responseTime).to.be.below(10); });
+                trial('lengthOf_ok', function () { pm.expect(json.items).to.have.lengthOf(3); });
+                trial('lengthOf_bad', function () { pm.expect(json.items).to.have.lengthOf(2); });
+                trial('oneOf_ok', function () { pm.expect(pm.response.code).to.be.oneOf([200, 201]); });
+                trial('oneOf_bad', function () { pm.expect(pm.response.code).to.be.oneOf([404, 500]); });
+                trial('deep_include_ok', function () { pm.expect(json).to.deep.include({ name: 'x' }); });
+                trial('deep_include_bad', function () { pm.expect(json).to.deep.include({ name: 'zzz' }); });
+                // Deep-include of a NON-OBJECT must fail — Object.keys(5)=[]
+                // would vacuously pass (false-green guard).
+                trial('deep_include_primitive', function () { pm.expect({ a: 1 }).to.deep.include(5); });
+
+                // The rest of the formerly-absent surface.
+                trial('above_ok', function () { pm.expect(5).to.be.above(4); });
+                trial('above_bad', function () { pm.expect(5).to.be.above(6); });
+                trial('least_ok', function () { pm.expect(5).to.be.at.least(5); });
+                trial('least_bad', function () { pm.expect(5).to.be.at.least(6); });
+                trial('most_ok', function () { pm.expect(5).to.be.at.most(5); });
+                trial('most_bad', function () { pm.expect(5).to.be.at.most(4); });
+                trial('lessThan_ok', function () { pm.expect(5).to.be.lessThan(6); });
+                trial('lessThan_bad', function () { pm.expect(5).to.be.lessThan(4); });
+                trial('within_ok', function () { pm.expect(5).to.be.within(4, 6); });
+                trial('within_bad', function () { pm.expect(5).to.be.within(6, 7); });
+                trial('closeTo_ok', function () { pm.expect(5).to.be.closeTo(5.1, 0.2); });
+                trial('closeTo_bad', function () { pm.expect(5).to.be.closeTo(5.1, 0.01); });
+                trial('instanceOf_ok', function () { pm.expect([]).to.be.instanceOf(Array); });
+                trial('instanceOf_bad', function () { pm.expect({}).to.be.instanceOf(Array); });
+                trial('keys_ok', function () { pm.expect({ a: 1, b: 2 }).to.have.keys('a', 'b'); });
+                trial('keys_bad', function () { pm.expect({ a: 1 }).to.have.keys('a', 'b'); });
+                trial('contain_ok', function () { pm.expect([1, 2, 3]).to.contain(2); });
+                trial('contain_bad', function () { pm.expect([1, 2, 3]).to.contain(9); });
+                trial('members_ok', function () { pm.expect([1, 2, 3]).to.have.members([3, 1, 2]); });
+                trial('members_bad', function () { pm.expect([1, 2, 3]).to.have.members([9]); });
+                // chai's plain .members is SAME-SET (order-insensitive, equal
+                // size) — a subset must NOT pass (false-green guard).
+                trial('members_subset', function () { pm.expect([1, 2, 3]).to.have.members([1, 2]); });
+                // Multiset semantics: same elements with different COUNTS must
+                // fail (naive length+every/some would pass this).
+                trial('members_multiset', function () { pm.expect([1, 1, 2]).to.have.members([1, 2, 2]); });
+                trial('throw_ok', function () {
+                    pm.expect(function () { throw new Error('boom'); }).to.throw(Error, 'boom');
+                });
+                trial('throw_bad', function () {
+                    pm.expect(function () {}).to.throw(Error);
+                });
+
+                // Postman extensions survive delegation.
+                trial('status_ok', function () { pm.expect(pm.response).to.have.status(200); });
+                trial('status_bad', function () { pm.expect(pm.response).to.have.status(404); });
+                trial('header_ok', function () {
+                    pm.expect(pm.response).to.have.header('Content-Type', 'application/json');
+                });
+                trial('header_bad', function () {
+                    pm.expect(pm.response).to.have.header('X-Missing', 'nope');
+                });
+
+                // The guard still trips on real typos through the delegated chain.
+                trial('typo', function () { pm.expect(1).to.be.tostring; });
+            "#,
+            )
+            .expect("script should eval");
+
+            let r = |k: &str| ctx.eval::<String, _>(format!("__r['{}']", k)).unwrap();
+            // 6 failing stock snippets now pass; each also fails closed when
+            // the assertion does not hold.
+            assert_eq!(r("below_ok"), "true", "pm.expect(...).to.be.below must pass (stock snippet)");
+            assert_eq!(r("below_bad"), "threw", "below must fail closed on a bad bound");
+            assert_eq!(r("lengthOf_ok"), "true", "pm.expect(...).to.have.lengthOf must pass (stock snippet)");
+            assert_eq!(r("lengthOf_bad"), "threw", "lengthOf must fail closed");
+            assert_eq!(r("oneOf_ok"), "true", "pm.expect(...).to.be.oneOf must pass (stock snippet)");
+            assert_eq!(r("oneOf_bad"), "threw", "oneOf must fail closed");
+            assert_eq!(r("deep_include_ok"), "true", "pm.expect(...).to.deep.include must pass (stock snippet)");
+            assert_eq!(r("deep_include_bad"), "threw", "deep.include must fail closed");
+            assert_eq!(r("deep_include_primitive"), "threw", "deep.include of a non-object must fail (Object.keys(5)=[] false-green guard)");
+            assert_eq!(r("above_ok"), "true", "above must pass");
+            assert_eq!(r("above_bad"), "threw", "above must fail closed");
+            assert_eq!(r("least_ok"), "true", "at.least must pass");
+            assert_eq!(r("least_bad"), "threw", "at.least must fail closed");
+            assert_eq!(r("most_ok"), "true", "at.most must pass");
+            assert_eq!(r("most_bad"), "threw", "at.most must fail closed");
+            assert_eq!(r("lessThan_ok"), "true", "lessThan must pass");
+            assert_eq!(r("lessThan_bad"), "threw", "lessThan must fail closed");
+            assert_eq!(r("within_ok"), "true", "within must pass");
+            assert_eq!(r("within_bad"), "threw", "within must fail closed");
+            assert_eq!(r("closeTo_ok"), "true", "closeTo must pass");
+            assert_eq!(r("closeTo_bad"), "threw", "closeTo must fail closed");
+            assert_eq!(r("instanceOf_ok"), "true", "instanceOf must pass");
+            assert_eq!(r("instanceOf_bad"), "threw", "instanceOf must fail closed");
+            assert_eq!(r("keys_ok"), "true", "keys must pass");
+            assert_eq!(r("keys_bad"), "threw", "keys must fail closed");
+            assert_eq!(r("contain_ok"), "true", "contain must pass");
+            assert_eq!(r("contain_bad"), "threw", "contain must fail closed");
+            assert_eq!(r("members_ok"), "true", "members must pass on an equal set");
+            assert_eq!(r("members_bad"), "threw", "members must fail closed");
+            assert_eq!(r("members_subset"), "threw", "plain .members is SAME-SET — a subset must not pass (false-green guard)");
+            assert_eq!(r("members_multiset"), "threw", "members is MULTISET — differing element counts must not pass (false-green guard)");
+            assert_eq!(r("throw_ok"), "true", "throw must pass on a matching error");
+            assert_eq!(r("throw_bad"), "threw", "throw must fail closed when nothing throws");
+            assert_eq!(r("status_ok"), "true", "pm.expect(pm.response).to.have.status must survive delegation");
+            assert_eq!(r("status_bad"), "threw", "status must fail closed");
+            assert_eq!(r("header_ok"), "true", "header must survive delegation");
+            assert_eq!(r("header_bad"), "threw", "header must fail closed");
+            assert_eq!(r("typo"), "threw", "the guard must still trip on real typos through the delegated chain");
+        });
+    }
+
+    #[test]
     fn test_include_uses_chai_value_semantics() {
         // Backlog line 88: pm.expect(arr).to.include(v) was a SUBSTRING test
         // (String(arr).indexOf) — [11,22].include(1) passed and
@@ -5733,10 +5891,13 @@ mod tests {
                     return new __realProxy(arguments[0], arguments[1]);
                 };
 
-                // Warm-up + behaviour must be unchanged. (above/below etc.
-                // are chai-shim assertions — the pm chain's surface is
-                // eql/equal/include/match/an/a/property/status/header/
-                // jsonBody, and the guard must still throw on anything else.)
+                // Warm-up + behaviour must be unchanged. This test evals
+                // ONLY pm.js (no chai), so pm.expect takes the AssertChain
+                // fallback (W1-B: when chai IS loaded, pm.expect delegates
+                // to chai's Assertion and gains the full chai surface). The
+                // fallback chain's surface is eql/equal/include/match/an/a/
+                // property/status/header/jsonBody, and the guard must still
+                // throw on anything else.)
                 pm.expect('x').to.be.an('string').and.to.equal('x');
                 pm.expect(5).not.to.be.a('string');
                 pm.expect([1, 2]).to.include(2);
