@@ -3,10 +3,13 @@
 //! self-contained, because tropel-web cannot depend on tropel-engine (the
 //! engine drags reqwest/tokio-net into the wasm graph; P5b gate).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tropel_js::JsContext;
 use tropel_sandbox::bindings::trp::TrpBridge;
+use tropel_sandbox::config::SandboxConfig;
 use tropel_sandbox::state::SharedPmState;
 
 /// The embedded shim bundle — the same sources the engine embeds via its
@@ -90,12 +93,55 @@ if (typeof sleep === 'undefined') {
 /// native modules, the `trp`/`pm`/`bru` binding bridge, and the blocking
 /// `sleep` helper with the interrupt deadline re-armed after it.
 ///
+/// W2 line 181: previously diverged from the engine's `create_vu_js_context`
+/// on four points, all now aligned: (1) `sleep` slices and polls the
+/// force-stop flag instead of one uninterruptible chunk; (2) the context is
+/// built with `new_with_force_stop` over a CALLER-held flag — the old
+/// `JsContext::new` wired a private `AtomicBool` nobody could flip, so
+/// `exec.scenario.executor()` / `vusActive` / every force-stop check was
+/// dead; (3) a non-default `SandboxConfig` preamble is evaluated before the
+/// shim bundle, so a custom canonical name/aliases actually install; (4)
+/// every failure is LOGGED (warn/error) instead of a silent `.ok()?`.
+///
 /// Returns `None` when context creation fails (scripts are then skipped, as
 /// in the engine). Memory and execution-time limits mirror the engine's.
-pub async fn create_web_js_context(pm_state: &SharedPmState) -> Option<JsContext> {
-    let mut ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
-        .await
-        .ok()?;
+pub async fn create_web_js_context(
+    pm_state: &SharedPmState,
+    config: &SandboxConfig,
+    force_stop: Arc<AtomicBool>,
+) -> Option<JsContext> {
+    let mut ctx = match JsContext::new_with_force_stop(
+        Some(10 * 1024 * 1024),
+        Some(Duration::from_secs(10)),
+        force_stop.clone(),
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            tracing::warn!(
+                "tropel-web: failed to create JS context: {e} (scripts will be skipped)"
+            );
+            return None;
+        }
+    };
+
+    // W2 line 181 (engine parity): a NON-default sandbox config (custom
+    // canonical name / aliases) must be installed as `__tropel_sandbox_config`
+    // BEFORE the shim bundle evals, so pm.js's install tail exposes the
+    // configured names. The default config is skipped — pm.js's own fallback
+    // (`tropel` + `wire`) is byte-identical.
+    if config != &SandboxConfig::default() {
+        if let Err(e) = ctx.eval(&config.render_js_preamble()).await {
+            // Loud: the embedder asked for a specific canonical name and
+            // silently getting `tropel.*` would make every `trp.*` script
+            // throw ReferenceError at runtime.
+            tracing::warn!(
+                "tropel-web: failed to set sandbox config preamble: {e} — failing the JS context"
+            );
+            return None;
+        }
+    }
 
     // N1: the bundle is one source text — the host import on wasm32 (the
     // browser build supplies its own), the embedded set on native. A `None`
@@ -103,24 +149,30 @@ pub async fn create_web_js_context(pm_state: &SharedPmState) -> Option<JsContext
     // fail loudly per item (ReferenceError surfaced in script_failures),
     // the same contract as the engine's shim-eval failure path.
     if let Some(bundle) = shim_bundle() {
-        if ctx.bootstrap_library(&bundle).await.is_err() {
+        if let Err(e) = ctx.bootstrap_library(&bundle).await {
+            // W2 line 181: loud, like the engine's shim-bootstrap error path
+            // — a silent skip left every script throwing `pm is not defined`.
+            tracing::error!("tropel-web: JS shim bootstrap FAILED: {e} — scripts will be skipped");
             return None;
         }
     }
 
-    if tropel_native::install_all(&mut ctx).await.is_err() {
-        return None;
+    if let Err(e) = tropel_native::install_all(&mut ctx).await {
+        tracing::warn!("tropel-web: failed to install native modules: {e}");
     }
 
     let bridge = TrpBridge::new(pm_state.clone());
-    if bridge.install(&mut ctx).is_err() {
-        return None;
+    if let Err(e) = bridge.install(&mut ctx) {
+        tracing::warn!("tropel-web: failed to install PM bridge functions: {e}");
     }
 
     // The sleep burns WALL time; the per-eval JS interrupt deadline must not
     // count it against the JS execution budget (engine parity, backlog line
-    // 104). Re-arm the deadline after the blocking sleep.
+    // 104). W2 line 181: the sleep is sliced and polls the force-stop flag
+    // (engine parity) — on force-stop the JS deadline is zeroed so the eval
+    // interrupts the moment control returns to JS.
     let (deadline, max_exec) = ctx.interrupt_deadline_handle();
+    let force_stop_sleep = force_stop.clone();
     ctx.with_ctx(|rq_ctx| {
         let globals = rq_ctx.globals();
         let deadline_sleep = deadline.clone();
@@ -128,7 +180,17 @@ pub async fn create_web_js_context(pm_state: &SharedPmState) -> Option<JsContext
             "__tropel_native_sleep",
             rquickjs::function::Func::from(move |ms: f64| {
                 if ms > 0.0 {
-                    std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
+                    let step = Duration::from_millis(10);
+                    let mut remaining = Duration::from_secs_f64(ms / 1000.0);
+                    while remaining > Duration::ZERO {
+                        if force_stop_sleep.load(Ordering::Acquire) {
+                            deadline_sleep.store(0, Ordering::Relaxed);
+                            return;
+                        }
+                        let slice = remaining.min(step);
+                        std::thread::sleep(slice);
+                        remaining -= slice;
+                    }
                 }
                 tropel_js::rearm_deadline(&deadline_sleep, max_exec);
             }),
@@ -137,4 +199,60 @@ pub async fn create_web_js_context(pm_state: &SharedPmState) -> Option<JsContext
     let _ = ctx.eval(SLEEP_CODE).await;
 
     Some(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tropel_sandbox::state::new_pm_state;
+
+    /// W2 line 181: the web context must honor a NON-default SandboxConfig
+    /// (engine parity) — custom namespace + aliases installed via the
+    /// preamble BEFORE the shim bundle, default `trp` absent.
+    #[tokio::test]
+    async fn create_web_js_context_honors_custom_sandbox_config() {
+        let pm_state = new_pm_state();
+        let config = SandboxConfig {
+            namespace: "acme".into(),
+            aliases: vec!["product".into(), "wire".into()],
+        };
+        let mut ctx = create_web_js_context(&pm_state, &config, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("context must be created");
+
+        let check = ctx
+            .eval(
+                "typeof acme === 'object' && typeof product === 'object' \
+                 && product === acme && wire === acme && typeof pm === 'object' \
+                 && typeof trp === 'undefined' && typeof tropel === 'undefined'",
+            )
+            .await
+            .expect("probe should eval");
+        assert_eq!(
+            check, "true",
+            "custom namespace/aliases must be installed via the preamble; default trp absent — got: {check}"
+        );
+    }
+
+    /// W2 line 181: the force-stop flag must actually interrupt a busy-loop
+    /// eval. The old `JsContext::new` wired a private flag nobody could flip,
+    /// so the force-stop checks (exec.scenario.executor / vusActive) were
+    /// dead in the web slice.
+    #[tokio::test]
+    async fn create_web_js_context_force_stop_interrupts_busy_loop() {
+        let pm_state = new_pm_state();
+        let force_stop = Arc::new(AtomicBool::new(false));
+        let mut ctx =
+            create_web_js_context(&pm_state, &SandboxConfig::default(), force_stop.clone())
+                .await
+                .expect("context must be created");
+
+        force_stop.store(true, Ordering::Release);
+        // A busy loop would run the full 10s deadline if the flag were ignored.
+        let err = ctx.eval("while (true) {}").await.err();
+        assert!(
+            err.is_some(),
+            "force-stop flag must interrupt a busy-loop eval, got Ok"
+        );
+    }
 }
