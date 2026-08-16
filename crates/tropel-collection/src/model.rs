@@ -102,7 +102,15 @@ where
             Ok(Some(None))
         }
         fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
-            Ok(Some(RequestDetail::deserialize(d).ok()))
+            // W2 #200: buffer into a Value so the streaming cursor is fully
+            // consumed BEFORE tolerating a malformed request. The old
+            // `RequestDetail::deserialize(d).ok()` left the cursor
+            // mid-object when the stray request was malformed, desyncing
+            // every subsequent field under from_str/from_slice (the
+            // production path in parser.rs). Tree mode (from_value) masked
+            // the bug; the tests now parse via from_str to catch it.
+            let value = serde_json::Value::deserialize(d)?;
+            Ok(Some(serde_json::from_value(value).ok()))
         }
     }
     deserializer.deserialize_option(RequestPresence)
@@ -673,7 +681,11 @@ mod tests {
     use serde_json::json;
 
     fn parse_collection(json: serde_json::Value) -> Collection {
-        serde_json::from_value(json).expect("collection must parse")
+        // W2 #200: parse via from_str (STREAMING) — production (parser.rs)
+        // uses from_slice/from_str — so streaming-deserializer bugs (like
+        // the old de_opt_request cursor desync) are caught by tests instead
+        // of only being visible in tree mode.
+        serde_json::from_str(&json.to_string()).expect("collection must parse")
     }
 
     fn minimal_info() -> serde_json::Value {
@@ -753,10 +765,18 @@ mod tests {
                 "item": [inner]
             });
         }
-        let col = parse_collection(json!({
+        let col: Collection = serde_json::from_value(json!({
             "info": minimal_info(),
             "item": [inner]
-        }));
+        }))
+        .expect("collection must parse");
+        // NOTE (W2 #200): this deliberately bypasses the parse_collection
+        // helper (which now parses via from_str/STREAMING). This test
+        // measures the DESERIALIZER's single-pass recursion depth; the
+        // streaming tokenizer adds its own per-level frames on top and
+        // overflows the small test-thread stack at 50 levels. Streaming is
+        // covered by folder_first_tolerates_stray_malformed_request_object,
+        // which goes through the streaming helper.
         let mut current = &col.item[0];
         let mut depth = 0;
         while let CollectionItem::Folder(f) = current {
