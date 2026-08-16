@@ -562,6 +562,38 @@ pm.test.skip = function (name) {
 // each pm.expect() allocates one small instance + one proxy, and
 // to/be/not/... return `this` (the same proxy) so a chain of any length
 // never allocates again.
+// W1-A #6: own-property + prototype walk UP TO BUT NOT INCLUDING
+// Object.prototype. `prop in t` walked the ENTIRE chain, so `.toString`,
+// `.constructor`, `.hasOwnProperty`, `.valueOf`, `.__proto__` all resolved
+// (truthy Functions → recorded PASS) instead of throwing — a typo could
+// never fail. guardChain wraps BOTH plain literals (pm.response.to — members
+// are own props) AND AssertChain instances (chain getters/methods live on
+// AssertChain.prototype), so the check must see own props of the target AND
+// own props of its prototypes, stopping before Object.prototype. Hoisted to a
+// named helper (defined once): the chain is a hot path and an inline IIFE
+// would allocate a closure per property read.
+function isChainMember(t, prop) {
+    // `constructor` is an OWN property of every prototype object (the
+    // standard back-reference), so the own-property walk below would find it
+    // on AssertChain.prototype and let `pm.expect(1).to.be.constructor`
+    // resolve to a truthy Function → silent PASS. It is NOT a chain member
+    // — reject it like any other unknown name (W1-A #6).
+    if (prop === 'constructor') {
+        return false;
+    }
+    if (Object.prototype.hasOwnProperty.call(t, prop)) {
+        return true;
+    }
+    var p = Object.getPrototypeOf(t);
+    while (p && p !== Object.prototype) {
+        if (Object.prototype.hasOwnProperty.call(p, prop)) {
+            return true;
+        }
+        p = Object.getPrototypeOf(p);
+    }
+    return false;
+}
+
 function guardChain(target) {
     return new Proxy(target, {
         get: function (t, prop, receiver) {
@@ -571,7 +603,7 @@ function guardChain(target) {
             ) {
                 return Reflect.get(t, prop, receiver);
             }
-            if (prop in t) {
+            if (isChainMember(t, prop)) {
                 // No recursion needed: every chain getter returns `this`
                 // (already the proxy), so nested reads cost one getter call.
                 return Reflect.get(t, prop, receiver);

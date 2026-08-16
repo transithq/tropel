@@ -275,14 +275,19 @@ var chai = chai || {};
     // ── Assertion Methods ──
 
     // .equal(expected)
+    // Real chai: `.deep.equal(x)` performs a DEEP comparison (the `deep`
+    // chainable getter sets `__flags.deep`, and `equal` must honor it —
+    // W1-A exposed that `.deep.equal` silently did a shallow `===`, so
+    // `expect({a:1}).to.deep.equal({a:1})` threw).
     Assertion.prototype.equal = function (value) {
         var negate = !!(this.__flags && this.__flags.negate);
-        var passed = (this._obj === value) !== negate;
+        var deep = !!(this.__flags && this.__flags.deep);
+        var passed = (deep ? nativeDeepEqual(this._obj, value) : this._obj === value) !== negate;
         if (!passed) {
             throw new Error(
                 (this._msg ? this._msg + ': ' : '') +
                 'expected ' + JSON.stringify(this._obj) +
-                (negate ? ' not' : '') + ' to equal ' + JSON.stringify(value)
+                (negate ? ' not' : '') + (deep ? ' to deeply equal ' : ' to equal ') + JSON.stringify(value)
             );
         }
         return this;
@@ -712,7 +717,21 @@ var chai = chai || {};
                         return receiver;
                     };
                 }
-                if (prop in Assertion.prototype || prop in target) {
+                // W1-A: `prop in …` leaked Object.prototype — `.toString`,
+                // `.constructor`, `.hasOwnProperty`, `.__proto__`, `._obj`,
+                // `.__flags` all resolved (and recorded PASS) instead of
+                // throwing, so a typo could never fail. Own-property checks
+                // only: real assertions are defineProperty'd onto the
+                // Assertion prototype, and instance state (_obj/_flags) lives
+                // on the instance itself. `constructor` is an OWN property of
+                // every prototype object (the standard back-reference), so it
+                // would slip through the own-property check — reject it
+                // explicitly; it is not an assertion member.
+                if (
+                    prop !== 'constructor' &&
+                    (Object.prototype.hasOwnProperty.call(Assertion.prototype, prop) ||
+                        Object.prototype.hasOwnProperty.call(target, prop))
+                ) {
                     return Reflect.get(target, prop, receiver);
                 }
                 throw new Error("unknown assertion property '" + String(prop) + "'");
@@ -902,7 +921,19 @@ var chai = chai || {};
     chai.should = function () {
         Object.defineProperty(Object.prototype, 'should', {
             get: function () {
-                return guardAssertion(new Assertion(this));
+                // `(5).should` boxes the primitive — `this` is `new Number(5)`
+                // and `new Number(5) === 5` is false, so `(5).should.equal(5)`
+                // would throw "expected 5 to equal 5" with the boxed _obj.
+                // Unbox Number/String/Boolean wrappers (W1-A regression test
+                // exposed this; Date etc. keep their valueOf untouched).
+                var obj = this;
+                if (
+                    typeof obj === 'object' && obj !== null &&
+                    (obj instanceof Number || obj instanceof String || obj instanceof Boolean)
+                ) {
+                    obj = obj.valueOf();
+                }
+                return guardAssertion(new Assertion(obj));
             },
             set: function () {},
             configurable: true,

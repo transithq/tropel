@@ -5586,6 +5586,120 @@ mod tests {
     }
 
     #[test]
+    fn test_object_prototype_members_do_not_bypass_guards() {
+        // W1-A: both proxy guards used `prop in t`, which walks the ENTIRE
+        // prototype chain — `.toString`, `.constructor`, `.hasOwnProperty`,
+        // `.valueOf`, `.__proto__` resolved to truthy Functions inherited
+        // from Object.prototype and every one recorded PASS, so a typo like
+        // `pm.expect(x).to.be.tostring` could never fail (silent green). The
+        // guards now use own-property checks that stop before
+        // Object.prototype: the real assertion members still resolve, but
+        // Object.prototype members THROW. Internal instance state (`_actual`,
+        // `_obj`, `__flags`) stays readable — real chai exposes those too and
+        // the shims' own methods read them through the proxy.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Stub the response bridges — the TODO's EXEC case is
+                // "against a 200", i.e. the plain-literal guard path
+                // (pm.response.to.be.*), which wraps a DIFFERENT target kind
+                // than the AssertChain instances pm.expect uses.
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
+                globalThis.__tropel_pm_response_time = function () { return 42.5; };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_header = function (key) {
+                    if (String(key).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_cookies = function () { return {}; };
+                globalThis.__tropel_pm_response_body = function () { return '{}'; };
+                globalThis.__tropel_pm_response_json = function () { return {}; };
+
+                globalThis.__r = {};
+                // Install the `.should` getter (chai.should() defines
+                // Object.prototype.should) — without it `(5).should.equal(5)`
+                // below would throw "should is not a function" before the
+                // guard is ever reached.
+                chai.should();
+                function trial(key, fn) {
+                    globalThis.__r[key] = String((function () {
+                        try { fn(); return true; }
+                        catch (e) { return e.name === 'RangeError' ? 'stack-overflow' : 'threw'; }
+                    })());
+                }
+                // pm.response.to (plain-literal guard path): Object.prototype
+                // members must throw — the TODO's "against a 200" EXEC.
+                trial('resp_toString', function () { pm.response.to.be.toString; });
+                trial('resp_constructor', function () { pm.response.to.constructor; });
+                trial('resp_hasOwnProperty', function () { pm.response.to.be.hasOwnProperty; });
+                trial('resp_valueOf', function () { pm.response.to.valueOf; });
+                trial('resp_proto', function () { pm.response.to.be.__proto__; });
+                // pm.expect chains (AssertChain guard path): same.
+                trial('pm_toString', function () { pm.expect(1).to.be.toString; });
+                trial('pm_constructor', function () { pm.expect(1).to.be.constructor; });
+                trial('pm_hasOwnProperty', function () { pm.expect(1).to.be.hasOwnProperty; });
+                trial('pm_valueOf', function () { pm.expect(1).to.be.valueOf; });
+                trial('pm_proto', function () { pm.expect(1).to.be.__proto__; });
+                // chai.expect chains: same.
+                trial('chai_toString', function () { chai.expect(1).to.be.toString; });
+                trial('chai_constructor', function () { chai.expect(1).to.be.constructor; });
+                trial('chai_hasOwnProperty', function () { chai.expect(1).to.be.hasOwnProperty; });
+                trial('chai_valueOf', function () { chai.expect(1).to.be.valueOf; });
+                trial('chai_proto', function () { chai.expect(1).to.be.__proto__; });
+                // Real assertions still resolve and pass.
+                trial('pm_real', function () { pm.expect(true).to.be.true; });
+                trial('resp_status_real', function () { pm.response.to.have.status(200); });
+                trial('chai_real', function () { chai.expect({ a: 1 }).to.deep.equal({ a: 1 }); });
+                trial('chai_should_real', function () { (5).should.equal(5); });
+                // Real typos still throw (guard parity).
+                trial('pm_typo', function () { pm.expect(1).to.be.tostring; });
+                trial('chai_typo', function () { chai.expect(1).to.be.tostring; });
+                "#,
+            )
+            .expect("guard leak script should eval");
+            for (name, want) in [
+                ("resp_toString", "threw"),
+                ("resp_constructor", "threw"),
+                ("resp_hasOwnProperty", "threw"),
+                ("resp_valueOf", "threw"),
+                ("resp_proto", "threw"),
+                ("pm_toString", "threw"),
+                ("pm_constructor", "threw"),
+                ("pm_hasOwnProperty", "threw"),
+                ("pm_valueOf", "threw"),
+                ("pm_proto", "threw"),
+                ("chai_toString", "threw"),
+                ("chai_constructor", "threw"),
+                ("chai_hasOwnProperty", "threw"),
+                ("chai_valueOf", "threw"),
+                ("chai_proto", "threw"),
+                ("pm_real", "true"),
+                ("resp_status_real", "true"),
+                ("chai_real", "true"),
+                ("chai_should_real", "true"),
+                ("pm_typo", "threw"),
+                ("chai_typo", "threw"),
+            ] {
+                let expr = format!("__r.{name}");
+                assert_eq!(
+                    ctx.eval::<String, _>(expr).unwrap(),
+                    want,
+                    "{name}: Object.prototype members must not bypass the guard"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_pm_expect_chain_allocates_once_not_per_read() {
         // Backlog line 105: pm.expect was ~10x slower than chai.expect
         // (2511 ms vs 235 ms over 200k assertions) because EVERY call built
