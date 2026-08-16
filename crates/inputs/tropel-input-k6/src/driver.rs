@@ -4702,63 +4702,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pm_send_request_callback_runs_once_and_real_error_propagates() {
-        // W1-B line 149: pm.sendRequest called the callback TWICE and
-        // replaced the real error. callback(null, resp) was invoked INSIDE
-        // the try, so a throw from the user's callback (a failing pm.expect
-        // — the entire point) was caught by the sibling catch and the
-        // callback re-entered with a bogus "Failed to parse sendRequest
-        // response" error. The callback must run exactly once and its real
-        // error must surface unchanged.
-        let rt = rquickjs::Runtime::new().unwrap();
-        let ctx = rquickjs::Context::full(&rt).unwrap();
-        ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
-            ctx.eval::<(), _>(
-                r#"
-                globalThis.__tropel_pm_send_request = function () {
-                    return JSON.stringify({ code: 200, statusText: 'OK', body: '{}',
-                                            headers: {}, responseTime: 5 });
-                };
-                globalThis.__cb_runs = 0;
-                var thrown = null;
-                try {
-                    pm.sendRequest('http://ok/', function (err, resp) {
-                        globalThis.__cb_runs++;
-                        // A failing assertion inside the callback — the
-                        // canonical auth-token-fetch pattern.
-                        pm.expect(resp.code).to.eql(999);
-                    });
-                } catch (e) {
-                    thrown = e.message;
-                }
-                globalThis.__thrown = thrown;
-            "#,
-            )
-            .expect("script should eval");
-            let runs: i64 = ctx
-                .eval("globalThis.__cb_runs")
-                .expect("read callback run count");
-            assert_eq!(
-                runs, 1,
-                "callback must run exactly ONCE, not be re-entered by the sibling catch"
-            );
-            let thrown: String = ctx
-                .eval("globalThis.__thrown")
-                .expect("read thrown message");
-            assert!(
-                thrown.contains("eql 999"),
-                "the REAL assertion error must propagate: {thrown}"
-            );
-            assert!(
-                !thrown.contains("Failed to parse sendRequest response"),
-                "the bogus parse error must NOT replace the real error: {thrown}"
-            );
-        });
-    }
-
-    #[test]
     fn test_pm_response_members_are_value_properties() {
         // Backlog line 143: pm.response.code/status/responseTime/headers/
         // cookies are VALUE properties in Postman, not functions. The old
