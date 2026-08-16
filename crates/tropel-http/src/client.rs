@@ -825,11 +825,20 @@ impl HttpClient {
                 if let Some(location) = location {
                     // Capture the hop as its own response (own duration). The
                     // body is the usually-tiny redirect body — drain it so the
-                    // connection returns to the pool.
+                    // connection returns to the pool. The response-size cap
+                    // applies here too, so a giant redirect body can't bypass
+                    // it (the final body has the same ceiling).
                     let mut hop_body: Vec<u8> = Vec::new();
                     while let Some(chunk) = response.chunk().await.map_err(|e| {
                         TropelError::Http(format!("Failed to read redirect body: {}", e))
                     })? {
+                        if let Some(cap) = self.config.max_response_bytes {
+                            if hop_body.len() as u64 + chunk.len() as u64 > cap {
+                                return Err(TropelError::Http(format!(
+                                    "redirect body exceeds the {cap} byte limit"
+                                )));
+                            }
+                        }
                         hop_body.extend_from_slice(&chunk);
                     }
                     let hop_total = hop_start.elapsed();
@@ -951,6 +960,22 @@ impl HttpClient {
                     drained += chunk.len() as u64;
                 }
                 (Vec::new(), drained)
+            } else if let Some(cap) = self.config.max_response_bytes {
+                // Stream with a hard ceiling instead of `response.bytes()`:
+                // a runaway upstream is aborted mid-body once the cap would be
+                // exceeded, keeping the proxy's memory use bounded.
+                let mut body: Vec<u8> = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(|e| {
+                    TropelError::Http(format!("Failed to read response body: {}", e))
+                })? {
+                    if body.len() as u64 + chunk.len() as u64 > cap {
+                        return Err(TropelError::Http(format!(
+                            "response body exceeds the {cap} byte limit"
+                        )));
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                (body.clone(), body.len() as u64)
             } else {
                 let body = response
                     .bytes()
@@ -1238,9 +1263,10 @@ impl HttpResponse {
 /// Parse a single `Set-Cookie` header value into a structured [`Cookie`].
 ///
 /// Handles the standard `name=value; Attr=Val; Flag` grammar — name/value are
-/// the bare pair, then optional `Domain`, `Path`, `Expires`, `SameSite`
-/// attributes plus the boolean `HttpOnly` / `Secure` flags. Unknown attributes
-/// are ignored. Returns `None` when the header has no `name=value` pair.
+/// the bare pair, then optional `Domain`, `Path`, `Expires`, `Max-Age`,
+/// `SameSite` attributes plus the boolean `HttpOnly` / `Secure` flags. Unknown
+/// attributes are ignored. Returns `None` when the header has no `name=value`
+/// pair.
 fn parse_set_cookie(header: &str) -> Option<Cookie> {
     let mut parts = header.split(';');
     let pair = parts.next()?.trim();
@@ -1255,6 +1281,7 @@ fn parse_set_cookie(header: &str) -> Option<Cookie> {
         secure: None,
         same_site: None,
         expires: None,
+        max_age: None,
     };
 
     for attr in parts {
@@ -1272,6 +1299,7 @@ fn parse_set_cookie(header: &str) -> Option<Cookie> {
                 "path" => cookie.path = Some(val.trim().trim_matches('"').to_string()),
                 "expires" => cookie.expires = Some(val.trim().trim_matches('"').to_string()),
                 "samesite" => cookie.same_site = Some(val.trim().trim_matches('"').to_string()),
+                "max-age" => cookie.max_age = val.trim().trim_matches('"').parse::<i64>().ok(),
                 _ => {}
             },
             None => match attr.to_ascii_lowercase().as_str() {
@@ -1307,7 +1335,7 @@ fn body_to_bytes(body: &Body) -> Vec<u8> {
     match body {
         Body::Raw(s) => s.as_bytes().to_vec(),
         Body::Json(val) => serde_json::to_string(val).unwrap_or_default().into_bytes(),
-        Body::FormData(map) => multipart_form_data_bytes(map),
+        Body::FormData(parts) => multipart_form_data_bytes(parts),
         Body::UrlEncoded(map) => {
             // Backlog line 143: sort by key — a HashMap's RandomState iteration
             // order made the encoded body nondeterministic run-to-run (broke
@@ -1335,24 +1363,48 @@ pub fn body_size(body: &Body) -> usize {
     body_to_bytes(body).len()
 }
 
-fn multipart_form_data_bytes(map: &HashMap<String, String>) -> Vec<u8> {
+fn multipart_form_data_bytes(parts: &[FormDataPart]) -> Vec<u8> {
     let mut body = Vec::new();
 
-    // Backlog line 143: sort by key so the multipart framing is byte-stable
+    // Backlog line 143: sort by name so the multipart framing is byte-stable
     // run-to-run (a HashMap iterates in nondeterministic RandomState order).
-    let mut fields: Vec<(&String, &String)> = map.iter().collect();
-    fields.sort();
+    // Line 198: file parts now carry (filename, mime, raw bytes) — a part
+    // with data is emitted with `filename=` and a per-part Content-Type,
+    // which every mainstream parser keys the file branch off of.
+    let mut fields: Vec<&FormDataPart> = parts.iter().collect();
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
 
-    for (name, value) in fields {
+    for part in fields {
         body.extend_from_slice(format!("--{}\r\n", MULTIPART_BOUNDARY).as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
-                escape_multipart_field_name(name)
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(value.as_bytes());
+        if let Some(data) = &part.data {
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                    escape_multipart_field_name(&part.name),
+                    escape_multipart_field_name(part.filename.as_deref().unwrap_or("file"))
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(
+                format!(
+                    "Content-Type: {}\r\n\r\n",
+                    part.mime.as_deref().unwrap_or("application/octet-stream")
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(data);
+        } else {
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                    escape_multipart_field_name(&part.name)
+                )
+                .as_bytes(),
+            );
+            if let Some(value) = &part.value {
+                body.extend_from_slice(value.as_bytes());
+            }
+        }
         body.extend_from_slice(b"\r\n");
     }
 
@@ -1378,17 +1430,52 @@ mod multipart_tests {
 
     #[test]
     fn multipart_form_data_serializes_with_boundary() {
-        let mut formdata = HashMap::new();
-        formdata.insert("field1".to_string(), "value1".to_string());
-        formdata.insert("field 2".to_string(), "two".to_string());
+        let formdata = vec![
+            FormDataPart {
+                name: "field1".to_string(),
+                value: Some("value1".to_string()),
+                filename: None,
+                mime: None,
+                data: None,
+            },
+            FormDataPart {
+                name: "field 2".to_string(),
+                value: Some("two".to_string()),
+                filename: None,
+                mime: None,
+                data: None,
+            },
+            // Line 198: a file part must carry filename= + per-part
+            // Content-Type so parsers route it to the file branch.
+            FormDataPart {
+                name: "upload".to_string(),
+                value: None,
+                filename: Some("photo.png".to_string()),
+                mime: Some("image/png".to_string()),
+                data: Some(vec![0x89, 0x50, 0x4e, 0x47]),
+            },
+        ];
 
         let bytes = multipart_form_data_bytes(&formdata);
-        let text = String::from_utf8(bytes.clone()).expect("multipart body must be UTF-8");
+        // from_utf8_LOSSY: the PNG file part is raw binary (0x89 lead byte
+        // is not valid UTF-8) — lossy keeps the ASCII framing inspectable
+        // without panicking on the file bytes.
+        let text = String::from_utf8_lossy(&bytes);
 
         assert!(text.contains("Content-Disposition: form-data; name=\"field1\""));
         assert!(text.contains("Content-Disposition: form-data; name=\"field 2\""));
         assert!(text.contains("value1"));
         assert!(text.contains("two"));
+        assert!(text
+            .contains("Content-Disposition: form-data; name=\"upload\"; filename=\"photo.png\""));
+        assert!(text.contains("Content-Type: image/png"));
+        // Raw-byte check: the PNG signature 0x89 0x50 0x4E 0x47 must be on
+        // the wire verbatim (lossy text shows U+FFFD for the 0x89 lead
+        // byte, so assert on the raw bytes, not the text).
+        assert!(
+            bytes.windows(4).any(|w| w == [0x89, 0x50, 0x4e, 0x47]),
+            "PNG signature bytes must be present verbatim"
+        );
         assert!(text.ends_with("------------------------tropel-boundary-7a2f24b9--\r\n"));
         assert_eq!(body_size(&Body::FormData(formdata)), bytes.len());
     }
@@ -1734,9 +1821,13 @@ mod tests {
 
         // Multipart framing: the wire body includes boundaries and
         // Content-Disposition headers, far larger than `k=v&k=v`.
-        let mut form = std::collections::HashMap::new();
-        form.insert("a".to_string(), "b".to_string());
-        let framed = Body::FormData(form);
+        let framed = Body::FormData(vec![FormDataPart {
+            name: "a".to_string(),
+            value: Some("b".to_string()),
+            filename: None,
+            mime: None,
+            data: None,
+        }]);
         assert!(
             body_size(&framed) > 3,
             "multipart framing must exceed the raw k=v size"
@@ -1762,10 +1853,29 @@ mod tests {
         urlenc.insert("a".to_string(), "2".to_string());
         urlenc.insert("m".to_string(), "3".to_string());
 
-        let mut form = HashMap::new();
-        form.insert("z".to_string(), "1".to_string());
-        form.insert("a".to_string(), "2".to_string());
-        form.insert("m".to_string(), "3".to_string());
+        let form = vec![
+            FormDataPart {
+                name: "z".to_string(),
+                value: Some("1".to_string()),
+                filename: None,
+                mime: None,
+                data: None,
+            },
+            FormDataPart {
+                name: "a".to_string(),
+                value: Some("2".to_string()),
+                filename: None,
+                mime: None,
+                data: None,
+            },
+            FormDataPart {
+                name: "m".to_string(),
+                value: Some("3".to_string()),
+                filename: None,
+                mime: None,
+                data: None,
+            },
+        ];
 
         // UrlEncoded: key-sorted `a=2&m=3&z=1`. NOTE: a repeated-serialization
         // loop would NOT guard this — RandomState is seeded per PROCESS, so

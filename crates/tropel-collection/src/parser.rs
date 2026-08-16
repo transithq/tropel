@@ -399,6 +399,34 @@ fn assemble_url(url: &UrlDetail) -> String {
     format!("{}://{}{}{}", proto, host, port, path)
 }
 
+/// Best-effort per-part Content-Type from a file name (line 198).
+///
+/// Postman doesn't export a per-file mime on form-data parts, but every
+/// mainstream multipart parser keys the file branch off `filename` and
+/// reads Content-Type from the part header — without one the part is
+/// treated as `text/plain` and binary uploads break. Falls back to
+/// `application/octet-stream`.
+fn mime_from_filename(filename: &str) -> String {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png".into(),
+        Some("jpg") | Some("jpeg") => "image/jpeg".into(),
+        Some("gif") => "image/gif".into(),
+        Some("webp") => "image/webp".into(),
+        Some("svg") => "image/svg+xml".into(),
+        Some("pdf") => "application/pdf".into(),
+        Some("json") => "application/json".into(),
+        Some("txt") => "text/plain".into(),
+        Some("csv") => "text/csv".into(),
+        Some("zip") => "application/zip".into(),
+        Some("xml") => "application/xml".into(),
+        _ => "application/octet-stream".into(),
+    }
+}
+
 fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
     match body {
         Some(b) => match b.mode.as_str() {
@@ -418,22 +446,57 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                         .iter()
                         .filter(|p| !p.disabled)
                         .map(|p| {
-                            let value = if p.param_type.as_deref() == Some("file") {
-                                // Backlog line 138: a file part's content
-                                // comes from `src` (a path on disk), not
-                                // `value` — it used to become an EMPTY text
-                                // field. Read the file's text content
-                                // (lossy for binary files — the FormData
-                                // model is HashMap<String, String>).
-                                p.src
-                                    .as_ref()
-                                    .and_then(|s| std::fs::read(s).ok())
-                                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                                    .unwrap_or_default()
+                            // Line 198: a file part's content comes from
+                            // `src` (a path on disk), carried as RAW bytes
+                            // with its filename + mime so the multipart
+                            // builder can emit `filename=` and a per-part
+                            // Content-Type (mainstream parsers key the file
+                            // branch off `filename`). Text fields stay as
+                            // values.
+                            if p.param_type.as_deref() == Some("file") {
+                                let filename = p.src.as_ref().and_then(|s| {
+                                    std::path::Path::new(s)
+                                        .file_name()
+                                        .map(|f| f.to_string_lossy().into_owned())
+                                });
+                                let mime = filename.as_deref().map(mime_from_filename);
+                                match p.src.as_ref().and_then(|s| std::fs::read(s).ok()) {
+                                    Some(bytes) => FormDataPart {
+                                        name: p.key.clone(),
+                                        value: None,
+                                        filename,
+                                        mime,
+                                        data: Some(bytes),
+                                    },
+                                    // Line 198 (c): a missing file used to
+                                    // silently become an EMPTY part — the
+                                    // normal case on a worker. Warn so it is
+                                    // visible; the part is still emitted
+                                    // (empty) so the request shape survives.
+                                    None => {
+                                        tracing::warn!(
+                                            "form-data file part '{}' source {:?} missing or unreadable — sending empty part",
+                                            p.key,
+                                            p.src
+                                        );
+                                        FormDataPart {
+                                            name: p.key.clone(),
+                                            value: None,
+                                            filename,
+                                            mime: None,
+                                            data: None,
+                                        }
+                                    }
+                                }
                             } else {
-                                p.value.clone().unwrap_or_default()
-                            };
-                            (p.key.clone(), value)
+                                FormDataPart {
+                                    name: p.key.clone(),
+                                    value: Some(p.value.clone().unwrap_or_default()),
+                                    filename: None,
+                                    mime: None,
+                                    data: None,
+                                }
+                            }
                         })
                         .collect(),
                 )
@@ -847,9 +910,14 @@ mod tests {
         let scenario = collection_to_scenario(collection, HashMap::new());
         let req = scenario.items[0].request.as_ref().expect("request");
         match &req.body {
-            Some(Body::FormData(map)) => {
-                assert_eq!(map.get("name").map(String::as_str), Some("alice"));
-                assert_eq!(map.get("file").map(String::as_str), Some("part-contents"));
+            Some(Body::FormData(parts)) => {
+                let name = parts.iter().find(|p| p.name == "name").expect("name part");
+                assert_eq!(name.value.as_deref(), Some("alice"));
+                let file = parts.iter().find(|p| p.name == "file").expect("file part");
+                // Line 198: the file part must carry its raw bytes and the
+                // original filename (NOT a lossy string and no filename).
+                assert_eq!(file.filename.as_deref(), Some("tropel-test-form.txt"));
+                assert_eq!(file.data.as_deref(), Some(b"part-contents".as_slice()));
             }
             other => panic!("expected FormData body, got {other:?}"),
         }
