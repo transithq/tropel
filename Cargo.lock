@@ -4376,6 +4376,7 @@ dependencies = [
  "tropel-es",
  "tropel-ext",
  "tropel-http",
+ "tropel-input-bru",
  "tropel-input-curl",
  "tropel-input-har",
  "tropel-input-http",
@@ -4448,6 +4449,15 @@ dependencies = [
  "tower",
  "tracing",
  "tropel-auth",
+ "tropel-sdk",
+]
+
+[[package]]
+name = "tropel-input-bru"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "serde_json",
  "tropel-sdk",
 ]
 
