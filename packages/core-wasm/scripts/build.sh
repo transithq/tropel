@@ -37,7 +37,21 @@ else
   echo "warning: wasm-opt not found — shipping unoptimized (npm exec -y -p binaryen -- wasm-opt …)" >&2
 fi
 
-# ── 4. Sanity: smoke test + size report ───────────────────────────────────
+# ── 4. Extract catalog metadata from the COMPILED wasm (single source of
+#       truth: Rust PREDEFINED_VARIABLE_META) for init-free autocomplete.
+#       Written as meta.js (plain ESM default export) so consumers need no
+#       import-assertion support ───────────────────────────────────────────
+node -e "
+const fs = require('fs');
+(async () => {
+  const g = await import('./pkg/tropel_core_wasm.js');
+  await g.default({ module_or_path: fs.readFileSync('./pkg/tropel_core_wasm_bg.wasm') });
+  const meta = JSON.parse(g.predefinedVariablesMeta());
+  fs.writeFileSync('./pkg/meta.js', 'export default ' + JSON.stringify(meta, null, 2) + ';\n');
+})().catch((e) => { console.error(e); process.exit(1); });
+"
+
+# ── 5. Sanity: smoke test + size report ───────────────────────────────────
 node smoke.mjs
 SIZE=$(wc -c < pkg/tropel_core_wasm_bg.wasm)
 echo "  wasm size: $((SIZE / 1024)) KiB"

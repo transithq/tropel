@@ -8,15 +8,20 @@
 // Usage (KnockPort):
 //   await initCoreWasm();            // app boot — fire and forget
 //   const out = resolveDynamicVariables("id={{$guid}}");  // sync, wasm-backed
+//   const names = getPredefinedVariableNames();           // sync, no init needed
 //
-// Until init resolves (or in environments without WebAssembly) the resolver
-// degrades to a no-op passthrough — `{{$…}}` survive literal and the
-// embedder's own {{var}} map still resolves. The embedder may keep a small
-// TS fallback for exactly that race.
+// The name/description metadata is extracted from the compiled catalog at
+// package build time (pkg/meta.js, single source of truth: the Rust
+// PREDEFINED_VARIABLE_META table), so autocomplete lists work before the
+// wasm fetch finishes — and without import-assertion syntax, which has
+// uneven browser support. Until init resolves (or in environments without
+// WebAssembly) the resolver degrades to a no-op passthrough — `{{$…}}`
+// survive literal and the embedder's own {{var}} map still resolves.
+
+import CATALOG_META from "../pkg/meta.js";
 
 let wasmInstance = null;
 let glue = null;
-let metaCache = null;
 
 /**
  * Initialize the core wasm. Resolves `true` when ready.
@@ -58,14 +63,16 @@ export function resolveDynamicVariables(template) {
   return glue !== null ? glue.resolveVariables(template) : template;
 }
 
-/** Catalog metadata `[{"name":"$guid","description":…}]` for editor UIs. */
+/**
+ * Catalog metadata `[{"name":"$guid","description":…}]` for editor UIs.
+ * Synchronous and init-free: extracted from the compiled catalog at package
+ * build time (single source of truth — the Rust PREDEFINED_VARIABLE_META).
+ */
 export function getPredefinedVariablesMeta() {
-  if (glue === null) return [];
-  metaCache ??= JSON.parse(glue.predefinedVariablesMeta());
-  return metaCache;
+  return CATALOG_META;
 }
 
 /** Just the `$`-prefixed catalog names (autocomplete lists). */
 export function getPredefinedVariableNames() {
-  return getPredefinedVariablesMeta().map((m) => m.name);
+  return CATALOG_META.map((m) => m.name);
 }
