@@ -31,6 +31,109 @@ const MAX_DYNAMIC_LENGTH: usize = 10_000;
 /// miss is a static property of the code, not of the run.
 static UNKNOWN_DYNAMIC_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
+/// Curated metadata for editor UIs (KnockPort `{{…}}` autocomplete; a future
+/// `tropel docs variables`). Mirrors the handler set in
+/// [`DynamicCatalog::resolve`] — keep the two in sync when adding a handler.
+/// Spelling aliases (W2 #199 forms like `$randomLorem`) are deliberately NOT
+/// listed: they resolve, but editors should surface the canonical name.
+#[derive(Debug, Clone, Copy)]
+pub struct PredefinedVariableMeta {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+pub static PREDEFINED_VARIABLE_META: &[PredefinedVariableMeta] = &[
+    PredefinedVariableMeta { name: "$guid", description: "A v4 GUID" },
+    PredefinedVariableMeta {
+        name: "$timestamp",
+        description: "Current UNIX timestamp (seconds)",
+    },
+    PredefinedVariableMeta {
+        name: "$isoTimestamp",
+        description: "Current ISO timestamp (UTC)",
+    },
+    PredefinedVariableMeta { name: "$randomUUID", description: "A random v4 UUID" },
+    PredefinedVariableMeta { name: "$randomInt", description: "Random integer 0–999" },
+    PredefinedVariableMeta {
+        name: "$randomFloat",
+        description: "Random float 0–1000 (6 decimals)",
+    },
+    PredefinedVariableMeta {
+        name: "$randomString",
+        description: "Random alphanumeric string ({{$randomString:16}} for length)",
+    },
+    PredefinedVariableMeta {
+        name: "$randomAlphabetic",
+        description: "Random alphabetic string",
+    },
+    PredefinedVariableMeta {
+        name: "$randomAlphaNumeric",
+        description: "Random alphanumeric string",
+    },
+    PredefinedVariableMeta { name: "$randomBoolean", description: "true or false" },
+    PredefinedVariableMeta {
+        name: "$randomHexColor",
+        description: "Random #rrggbb colour",
+    },
+    PredefinedVariableMeta {
+        name: "$randomHex",
+        description: "Random hex string ({{$randomHex:8}} for length)",
+    },
+    PredefinedVariableMeta { name: "$randomColor", description: "Random colour name" },
+    PredefinedVariableMeta { name: "$randomEmail", description: "Random email address" },
+    PredefinedVariableMeta { name: "$randomPhone", description: "Random phone number" },
+    PredefinedVariableMeta { name: "$randomPhoneNumber", description: "Random phone number" },
+    PredefinedVariableMeta { name: "$randomCompany", description: "Random company name" },
+    PredefinedVariableMeta { name: "$randomCompanyName", description: "Random company name" },
+    PredefinedVariableMeta {
+        name: "$randomLoremText",
+        description: "Random lorem paragraph",
+    },
+    PredefinedVariableMeta {
+        name: "$randomLoremSentence",
+        description: "Random lorem sentence",
+    },
+    PredefinedVariableMeta { name: "$randomWord", description: "Random word" },
+    PredefinedVariableMeta {
+        name: "$randomWords",
+        description: "Random words ({{$randomWords:5}} for count)",
+    },
+    PredefinedVariableMeta {
+        name: "$randomDate",
+        description: "Random date 1990–2035 (YYYY-MM-DD)",
+    },
+    PredefinedVariableMeta {
+        name: "$randomDatePast",
+        description: "Random date in the past 10 years",
+    },
+    PredefinedVariableMeta {
+        name: "$randomDateFuture",
+        description: "Random date in the next 10 years",
+    },
+    PredefinedVariableMeta { name: "$randomTime", description: "Random HH:MM:SS time" },
+    PredefinedVariableMeta { name: "$randomIP", description: "Random IPv4 address" },
+    PredefinedVariableMeta { name: "$randomIPV6", description: "Random IPv6 address" },
+    PredefinedVariableMeta { name: "$randomMACAddress", description: "Random MAC address" },
+    PredefinedVariableMeta {
+        name: "$randomPassword",
+        description: "Random 12-char password ({{$randomPassword:16}} for length)",
+    },
+    PredefinedVariableMeta { name: "$randomCity", description: "Random city name" },
+    PredefinedVariableMeta { name: "$randomCountry", description: "Random country name" },
+    PredefinedVariableMeta {
+        name: "$randomStreetName",
+        description: "Random street address",
+    },
+    PredefinedVariableMeta {
+        name: "$randomPostcode",
+        description: "Random 5-digit postcode",
+    },
+    PredefinedVariableMeta { name: "$randomName", description: "Random full name" },
+    PredefinedVariableMeta { name: "$randomFullName", description: "Random full name" },
+    PredefinedVariableMeta { name: "$randomFirstName", description: "Random first name" },
+    PredefinedVariableMeta { name: "$randomLastName", description: "Random last name" },
+];
+
 /// Parse a `:length` / `:count` capture, clamping to [`MAX_DYNAMIC_LENGTH`].
 /// Unparseable or missing captures fall back to `default` (the variable's
 /// built-in size), matching Postman.
@@ -52,6 +155,23 @@ fn capped_len(raw: Option<&str>, default: usize) -> usize {
 pub struct DynamicCatalog {
     // Uses direct string replacement and regex-based replacement internally
     // All patterns are matched by their literal strings
+}
+
+/// Clock back end. `wasm32-unknown-unknown` has no OS clock behind
+/// `SystemTime::now()` (it panics), so there we go through `web-time`, which
+/// reads the host's `Date.now()` — the same host every browser/Node embedder
+/// runs in. Native and WASI builds keep the std/chrono fast path.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+fn chrono_now() -> chrono::DateTime<chrono::Utc> {
+    let d = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or_default();
+    chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos()).unwrap_or_default()
+}
+
+#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
+fn chrono_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
 }
 
 impl DynamicCatalog {
@@ -81,13 +201,8 @@ impl DynamicCatalog {
         // {{$timestamp}} — fresh Unix timestamp per occurrence
         if result.contains("{{$timestamp}}") {
             let re = cached_re!(RE_TIMESTAMP, r"\{\{\$timestamp\}\}");
-            result = self.replace_with_func(&result, re, |_| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    .to_string()
-            });
+            result =
+                self.replace_with_func(&result, re, |_| epoch_secs().to_string());
         }
 
         // {{$isoTimestamp}} — fresh ISO timestamp per occurrence
@@ -265,6 +380,17 @@ impl DynamicCatalog {
                     rng.random_range(0..255u32),
                     rng.random_range(1..255u32)
                 )
+            });
+        }
+
+        // {{$randomIPV6}} — full-form random IPv6 address (8×4 hex groups).
+        if result.contains("{{$randomIPV6}}") {
+            let re = cached_re!(RE_RANDOM_IPV6, r"\{\{\$randomIPV6\}\}");
+            result = self.replace_with_func(&result, re, |_| {
+                (0..8)
+                    .map(|_| format!("{:04x}", rng.random::<u16>()))
+                    .collect::<Vec<_>>()
+                    .join(":")
             });
         }
 
@@ -748,13 +874,13 @@ fn random_date<R: RngExt>(rng: &mut R) -> String {
 }
 
 fn random_date_past<R: RngExt>(rng: &mut R) -> String {
-    let now = chrono::Utc::now().date_naive();
+    let now = chrono_now().date_naive();
     let start = now - chrono::Duration::days(3650);
     random_date_in_range(rng, start, now)
 }
 
 fn random_date_future<R: RngExt>(rng: &mut R) -> String {
-    let now = chrono::Utc::now().date_naive();
+    let now = chrono_now().date_naive();
     let end = now + chrono::Duration::days(3650);
     random_date_in_range(rng, now, end)
 }
@@ -803,8 +929,24 @@ fn random_string(rng: &mut impl RngExt, length: usize, charset: &str) -> String 
 }
 
 fn chrono_now_iso() -> String {
-    let now = chrono::Utc::now();
-    now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    chrono_now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Unix epoch seconds via the portable clock (see `chrono_now`).
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+fn epoch_secs() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

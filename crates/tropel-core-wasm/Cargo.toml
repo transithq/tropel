@@ -1,0 +1,38 @@
+[package]
+name = "tropel-core-wasm"
+version = "0.1.0"
+# Explicit (not `.workspace = true`): wasm-pack 0.10's manifest parser
+# rejects inherited table fields ("invalid type: map, expected a string").
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/transithq/tropel"
+rust-version = "1.85"
+publish = false
+description = "Core tier of Tropel for browser embedders (KnockPort): variables/auth/import compiled to wasm32-unknown-unknown with a wasm-bindgen surface. No QuickJS — see API_CLIENT_WEB_PAYLOAD.md §2.3 (two-tier wasm)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+# wasm-pack's pinned binaryen (171374efd61df962) predates the reference-types
+# era and chokes on rustc's multi-table output ("Only 1 table definition
+# allowed in MVP"); skip its `-O` pass and optimize downstream (wasm-size.sh /
+# a current binaryen) where it is wanted.
+wasm-opt = false
+
+[dependencies]
+tropel-variables.workspace = true
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+# Only the metadata tests parse the generated JSON.
+serde_json.workspace = true
+
+# wasm32-unknown-unknown RNG backend. getrandom 0.4 refuses to compile on the
+# JS target without an explicit backend selection; `wasm_js` routes the
+# catalog's rand/uuid usage through `crypto.getRandomValues` host imports.
+# rand 0.10 no longer re-exports the feature, so it is enabled on getrandom
+# directly (feature unification covers rand's and uuid's transitive use).
+[target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+uuid = { workspace = true, features = ["js"] }
