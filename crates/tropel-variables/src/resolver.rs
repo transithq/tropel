@@ -34,6 +34,13 @@ fn var_re() -> &'static Regex {
     VAR_RE.get_or_init(|| Regex::new(r"\{\{([^{}]+)\}\}").expect("valid variable regex"))
 }
 
+/// Postman resolves nested `{{a}}` → `{{b}}` chains up to 20 levels deep
+/// (its docs call this the "maximum nesting depth" — 19 levels + the outer
+/// reference). The runner previously hardcoded a bare `5` at ten call sites,
+/// so chains 6+ deep left a literal `{{x}}` on the wire. A single named
+/// constant keeps every call site in lockstep with Postman.
+pub const MAX_VARIABLE_RESOLUTION_PASSES: usize = 20;
+
 /// Resolves {{variable}} references with scope precedence.
 pub struct VariableResolver {
     dynamic_catalog: DynamicCatalog,
@@ -576,6 +583,56 @@ mod tests {
         };
         let result = resolver.resolve_deep("https://{{host_{{suffix}}}}/v1", &scope, 5);
         assert_eq!(result, "https://api-dev.example.com/v1");
+    }
+
+    #[test]
+    fn test_deep_chain_beyond_five_resolves_to_postman_depth() {
+        // Backlog line 204: the runner hardcoded resolution depth 5, so a
+        // 6-level chain left `{{v1}}` literal on the wire. Postman resolves
+        // up to 20 levels — a 10-level chain must resolve fully.
+        let resolver = VariableResolver::new();
+        let mut env = HashMap::new();
+        for i in 0..10 {
+            let key = format!("v{i}");
+            let val = if i == 9 {
+                "final".to_string()
+            } else {
+                format!("{{{{v{}}}}}", i + 1)
+            };
+            env.insert(key, val);
+        }
+        let scope = VariableScope {
+            env,
+            ..Default::default()
+        };
+        let result = resolver.resolve_deep("{{v0}}", &scope, MAX_VARIABLE_RESOLUTION_PASSES);
+        assert_eq!(result, "final");
+    }
+
+    #[test]
+    fn test_chain_deeper_than_postman_cap_stops_at_cap() {
+        // A 25-level chain exceeds Postman's 20-level cap: resolution stops
+        // at the cap and the deepest reference stays literal (matching
+        // Postman, which also gives up at 20 levels).
+        let resolver = VariableResolver::new();
+        let mut env = HashMap::new();
+        for i in 0..25 {
+            let key = format!("w{i}");
+            let val = if i == 24 {
+                "deep".to_string()
+            } else {
+                format!("{{{{w{}}}}}", i + 1)
+            };
+            env.insert(key, val);
+        }
+        let scope = VariableScope {
+            env,
+            ..Default::default()
+        };
+        let result = resolver.resolve_deep("{{w0}}", &scope, MAX_VARIABLE_RESOLUTION_PASSES);
+        // Exactly 20 passes run: references w0..w19 are consumed, so the
+        // string is `{{w20}}` — w20's value ("{{w21}}") is never substituted.
+        assert_eq!(result, "{{w20}}");
     }
 
     #[test]
