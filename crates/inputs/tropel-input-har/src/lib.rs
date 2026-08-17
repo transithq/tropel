@@ -30,7 +30,7 @@
 use base64::Engine;
 use serde::Deserialize;
 use std::collections::HashMap;
-use tropel_sdk::{Body, Method, Request};
+use tropel_sdk::{Body, FormDataPart, Method, Request};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, TropelError};
 use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
@@ -416,7 +416,20 @@ fn build_body(pd: HarPostData) -> Body {
             // corrupt it. Content-Type header with boundary is preserved.
             Body::Raw(pd.text)
         } else {
-            Body::FormData(pd.params.into_iter().map(|p| (p.name, p.value)).collect())
+            // Line 198: form-data parts are text fields OR file uploads;
+            // HAR postData params are all text fields.
+            Body::FormData(
+                pd.params
+                    .into_iter()
+                    .map(|p| FormDataPart {
+                        name: p.name,
+                        value: Some(p.value),
+                        filename: None,
+                        mime: None,
+                        data: None,
+                    })
+                    .collect(),
+            )
         }
     } else {
         Body::Raw(pd.text)

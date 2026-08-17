@@ -31,7 +31,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, Method, Request};
+use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, FormDataPart, Method, Request};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, TropelError};
 use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
@@ -1178,7 +1178,19 @@ fn build_request_body(rb: &OasRequestBody) -> Option<(Body, String)> {
                     map.insert(name.clone(), val);
                 }
             }
-            return Some((Body::FormData(map), "multipart/form-data".to_string()));
+            // Line 198: form-data parts are text fields OR file uploads;
+            // OpenAPI example/default values are all text fields.
+            let parts = map
+                .into_iter()
+                .map(|(name, value)| FormDataPart {
+                    name,
+                    value: Some(value),
+                    filename: None,
+                    mime: None,
+                    data: None,
+                })
+                .collect();
+            return Some((Body::FormData(parts), "multipart/form-data".to_string()));
         }
         return None;
     }

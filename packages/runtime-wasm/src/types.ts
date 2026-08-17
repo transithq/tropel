@@ -99,4 +99,6 @@ export interface ResponseCookie {
   secure?: boolean | null;
   sameSite?: string | null;
   expires?: string | null;
+  /** `Max-Age` attribute in seconds (SDK Cookie.max_age, added at W2 #198). */
+  maxAge?: number | null;
 }

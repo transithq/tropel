@@ -899,10 +899,19 @@ fn resolve_body(
                 serde_json::from_str(&resolved).unwrap_or_else(|_| val.clone()),
             )
         }
-        tropel_sdk::types::Body::FormData(map) => {
-            let resolved: HashMap<String, String> = map
+        tropel_sdk::types::Body::FormData(parts) => {
+            // Line 198: form-data parts are text fields OR file uploads
+            // (filename/mime/raw bytes). Variables resolve in text-field
+            // values only — file bytes must never pass through the resolver.
+            let resolved: Vec<tropel_sdk::types::FormDataPart> = parts
                 .iter()
-                .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, scope, 5)))
+                .map(|p| {
+                    let mut part = p.clone();
+                    if let Some(v) = &p.value {
+                        part.value = Some(resolver.resolve_deep(v, scope, 5));
+                    }
+                    part
+                })
                 .collect();
             tropel_sdk::types::Body::FormData(resolved)
         }
