@@ -378,7 +378,9 @@ fn build_url(detail: &RequestDetail) -> String {
         .filter(|v| !v.key.is_empty())
         .filter_map(|v| v.value.as_deref().map(|value| (v.key.as_str(), value)))
         .collect();
-    vars.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    // Longest key first so `:host` wins over `:h` when both match. clippy
+    // wants sort_by_key; Reverse preserves the longest-first order.
+    vars.sort_by_key(|v| std::cmp::Reverse(v.0.len()));
     for (key, value) in vars {
         let key = format!(":{key}");
         result = result.replace(&key, value);
