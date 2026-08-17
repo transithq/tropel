@@ -95,6 +95,12 @@ pub struct HttpConfig {
     /// resolved address is blacklisted the request fails with a clear error.
     #[serde(default, alias = "blacklistIPs")]
     pub blacklist_ips: Vec<String>,
+    /// Hard ceiling on the response body size in BYTES, enforced while the
+    /// body is streamed (final response AND redirect-hop bodies). `None`
+    /// (default) is unlimited — k6 semantics. Proxy-style consumers
+    /// (KnockPort relay) set this so a runaway upstream can't fill memory.
+    #[serde(default, alias = "maxResponseBytes")]
+    pub max_response_bytes: Option<u64>,
     /// Log every HTTP request/response at debug level (method, URL, status,
     /// timing). Off by default; enable with the `--http-debug` CLI flag.
     #[serde(default)]
@@ -135,6 +141,7 @@ impl Default for HttpConfig {
             rps: None,
             hosts: HashMap::new(),
             blacklist_ips: Vec::new(),
+            max_response_bytes: None,
             http_debug: false,
         }
     }
