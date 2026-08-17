@@ -76,3 +76,153 @@ export function getPredefinedVariablesMeta() {
 export function getPredefinedVariableNames() {
   return CATALOG_META.map((m) => m.name);
 }
+
+// ── OAuth2 flows (RFC 6749 + RFC 7636 PKCE, pure — the embedder sends) ──────
+// All functions throw when the wasm is not ready; embedders should await
+// initCoreWasm() and degrade gracefully (e.g. disable the token buttons).
+
+function requireGlue(name) {
+  if (glue === null) throw new Error(`[tropel-core] ${name} requires the core wasm (initCoreWasm)`);
+  return glue;
+}
+
+/**
+ * Generate a PKCE pair: `{codeVerifier, codeChallengeMethod:"S256",
+ * codeChallenge}`. The verifier is 128 chars from the RFC 7636 charset,
+ * drawn from `crypto.getRandomValues`; the S256 challenge is computed by the
+ * wasm (SHA-256 + base64url) so it matches the token-request builder byte
+ * for byte.
+ */
+export function generatePkcePair() {
+  const g = requireGlue("generatePkcePair");
+  const CHARS =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  const buf = new Uint8Array(128);
+  crypto.getRandomValues(buf);
+  const codeVerifier = Array.from(buf, (byte) => CHARS[byte % CHARS.length]).join("");
+  const pairJson = g.oauth2GeneratePkcePair(codeVerifier);
+  const pair = JSON.parse(pairJson);
+  return {
+    codeVerifier,
+    codeChallengeMethod: pair.code_challenge_method,
+    codeChallenge: pair.code_challenge,
+  };
+}
+
+/**
+ * Build the OAuth2 authorize URL.
+ * @param {object} params `{auth_url, client_id, redirect_uri, scopes[],
+ * response_type?, state?, pkce?{code_verifier, code_challenge_method},
+ * extra?}` — all `{{var}}` templates must be resolved beforehand.
+ * @returns {{url:string, state:string|null, code_verifier:string|null}}
+ */
+export function oauth2BuildAuthorizeUrl(params) {
+  return JSON.parse(requireGlue("oauth2BuildAuthorizeUrl").oauth2BuildAuthorizeUrl(JSON.stringify(params)));
+}
+
+/**
+ * Build the token-endpoint POST.
+ * @param {object} params `{grant_type:"authorization_code"|"client_credentials"|
+ * "password"|"refresh_token", token_url, client_id, client_secret?,
+ * auth_method?:"basic"|"post_body", code?, redirect_uri?, code_verifier?,
+ * username?, password?, refresh_token?, scopes[]}`
+ * @returns {{url:string, body:string, basic_auth_header:string|null, content_type:string}}
+ */
+export function oauth2BuildTokenRequest(params) {
+  return JSON.parse(requireGlue("oauth2BuildTokenRequest").oauth2BuildTokenRequest(JSON.stringify(params)));
+}
+
+/**
+ * Parse a token-endpoint response body (RFC 6749 §5.1). Throws on error
+ * payloads (§5.2) and non-JSON bodies.
+ * @returns {{access_token:string, token_type:string|null, expires_in:number|null,
+ * refresh_token:string|null, scope:string|null, id_token:string|null}}
+ */
+export function oauth2ParseTokenResponse(body) {
+  return JSON.parse(requireGlue("oauth2ParseTokenResponse").oauth2ParseTokenResponse(body));
+}
+
+/**
+ * Fold a parsed token response into a stored token with an absolute
+ * `expires_at` (host clock). Input: the object from oauth2ParseTokenResponse.
+ * @returns {{access_token:string, token_type:string, refresh_token:string|null,
+ * expires_at:number|null, scope:string|null}}
+ */
+export function oauth2StoreToken(parsedResponse) {
+  return JSON.parse(requireGlue("oauth2StoreToken").oauth2StoreToken(JSON.stringify(parsedResponse)));
+}
+
+/**
+ * Is a stored token expired? Pure JS (host clock), init-free. Tokens without
+ * `expires_at` are never expired. `skewSecs` defaults to 60.
+ */
+export function oauth2IsTokenExpired(token, skewSecs = 60) {
+  return typeof token.expires_at === "number"
+    ? Math.floor(Date.now() / 1000) + skewSecs >= token.expires_at
+    : false;
+}
+
+/**
+ * Position a token on a request.
+ * @param {string} token
+ * @param {string|null} tokenType e.g. "Bearer"
+ * @param {"header"|"query"} placement
+ * @param {string|null} headerPrefix overrides the token type prefix
+ * @param {string|null} queryKey overrides the "access_token" query name
+ * @returns {{kind:"header"|"query", key:string, value:string}}
+ */
+export function oauth2AttachToken(token, tokenType, placement, headerPrefix = null, queryKey = null) {
+  return JSON.parse(
+    requireGlue("oauth2AttachToken").oauth2AttachToken(
+      token,
+      tokenType ?? "",
+      placement,
+      headerPrefix ?? "",
+      queryKey ?? "",
+    ),
+  );
+}
+
+/**
+ * Decode a compact JWT (no signature verification — clients display tokens,
+ * they don't trust them) → `{header, payload, signature}`. Throws on
+ * malformed tokens.
+ */
+export function oauth2DecodeJwt(token) {
+  return JSON.parse(requireGlue("oauth2DecodeJwt").oauth2DecodeJwt(token));
+}
+
+/** The JWT `exp` claim (UNIX seconds), or null when absent/malformed. */
+export function oauth2JwtExpiresAt(token) {
+  const secs = Number(requireGlue("oauth2JwtExpiresAt").oauth2JwtExpiresAt(token));
+  return secs < 0 ? null : secs;
+}
+
+/**
+ * Sign a compact JWT with an HMAC-SHA2 algorithm.
+ * @param {object} payload the claims — a plain JSON object.
+ * @param {object|null} header optional JOSE header fields; `alg` is forced to
+ * `algorithm`, `typ` defaults to "JWT". Pass null for the standard header.
+ * @param {"HS256"|"HS384"|"HS512"} algorithm
+ * @param {string} secret the HMAC key (shared secret).
+ * @returns {string} the compact `header.payload.signature` token.
+ */
+export function oauth2SignJwt(payload, header, algorithm, secret) {
+  return requireGlue("oauth2SignJwt").oauth2SignJwt(
+    header === null || header === undefined ? "" : JSON.stringify(header),
+    JSON.stringify(payload),
+    algorithm,
+    secret,
+  );
+}
+
+/**
+ * Build a WSSE UsernameToken security header set (SOAP, SHA-1 digest profile).
+ * @param {object} params `{username, password, nonce?, created?}` — empty
+ * nonce/created are generated (random nonce + host-clock RFC 3339 timestamp).
+ * @returns {{authorization:string, nonce:string, created:string}} attach
+ * `authorization` as the `Authorization` header value.
+ */
+export function wsseSign(params) {
+  return JSON.parse(requireGlue("wsseSign").wsseSign(JSON.stringify(params)));
+}
