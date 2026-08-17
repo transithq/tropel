@@ -212,7 +212,10 @@ tropel-native = { path = "crates/tropel-native", version = "0.1.0" }
 # (engine, and runtime via its forwarding feature) opt back in explicitly.
 tropel-sandbox = { path = "crates/tropel-sandbox", version = "0.1.0", default-features = false }
 tropel-http = { path = "crates/tropel-http", version = "0.1.0" }
-tropel-auth = { path = "crates/tropel-auth", version = "0.1.0" }
+# default-features = false keeps `reqwest`/`chrono` out of the browser core
+# graph; tropel-core-wasm only needs the pure `oauth` module, while native
+# consumers (tropel-http) opt back in via the default features.
+tropel-auth = { path = "crates/tropel-auth", version = "0.1.0", default-features = false }
 # P5b: mirror the tropel-sandbox treatment — default-features must be
 # declared at the WORKSPACE level (a member-level override is silently
 # ignored). runtime's default `send-request` drags tropel-http → reqwest →

@@ -4267,15 +4267,20 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.0",
  "chrono",
+ "getrandom 0.4.3",
  "hex",
  "hmac 0.13.0",
  "md-5",
  "percent-encoding",
  "rand",
  "reqwest",
+ "serde",
+ "serde_json",
  "sha1",
  "sha2 0.11.0",
+ "thiserror 2.0.19",
  "tropel-sdk",
+ "web-time",
 ]
 
 [[package]]
@@ -4340,7 +4345,9 @@ name = "tropel-core-wasm"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "serde",
  "serde_json",
+ "tropel-auth",
  "tropel-variables",
  "uuid",
  "wasm-bindgen",

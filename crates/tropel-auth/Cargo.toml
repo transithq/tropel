@@ -6,17 +6,40 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = true
-description = "HTTP request auth signers (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1, Hawk, Digest)"
+description = "HTTP request auth signers (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1, Hawk, Digest) plus pure OAuth2/PKCE/JWT flow builders. The oauth module is transport-free (wasm32-unknown-unknown safe); the reqwest-coupled signers are feature-gated."
+
+[features]
+default = ["reqwest"]
+# The reqwest-coupled signers (signers.rs). Off for the browser core tier,
+# where reqwest cannot compile; `tropel-core-wasm` consumes the always-on
+# `oauth` module with `default-features = false`.
+reqwest = ["dep:reqwest", "dep:chrono"]
 
 [dependencies]
 tropel-sdk.workspace = true
-reqwest.workspace = true
+# oauth module + signers module (pure hashing/encoding). sha1 is used by the
+# pure WSSE UsernameToken digest too, so it is NOT part of the reqwest feature.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 base64.workspace = true
 hmac.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 md-5.workspace = true
 hex.workspace = true
-chrono.workspace = true
 percent-encoding.workspace = true
 rand.workspace = true
+# Transport-coupled signers only (sigv4 uses chrono for UTC timestamps)
+reqwest = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+
+# Clock back end for wasm32-unknown-unknown (token expiry computation): std's
+# SystemTime::now() panics there; web-time reads the host's Date.now() in
+# browser/Node and is never resolved on native graphs (target-gated).
+[target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
+web-time = "1"
+# Portable RNG backend for state/PKCE verifier generation — mirrors
+# tropel-core-wasm's pin (getrandom 0.4 needs an explicit backend selection
+# on the JS target; rand 0.10 no longer re-exports the feature).
+getrandom = { version = "0.4.3", features = ["wasm_js"] }

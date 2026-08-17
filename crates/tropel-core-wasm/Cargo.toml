@@ -22,10 +22,9 @@ wasm-opt = false
 
 [dependencies]
 tropel-variables.workspace = true
+tropel-auth.workspace = true
 wasm-bindgen = "0.2"
-
-[dev-dependencies]
-# Only the metadata tests parse the generated JSON.
+serde.workspace = true
 serde_json.workspace = true
 
 # wasm32-unknown-unknown RNG backend. getrandom 0.4 refuses to compile on the
