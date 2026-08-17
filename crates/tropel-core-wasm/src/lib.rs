@@ -35,9 +35,12 @@ pub fn resolve_variables(input: &str) -> String {
 /// Feed the names into editor autocomplete; the descriptions into tooltips.
 #[wasm_bindgen(js_name = "predefinedVariablesMeta")]
 pub fn predefined_variables_meta() -> String {
-    let entries = PREDEFINED_VARIABLE_META
-        .iter()
-        .map(|m| format!("{{\"name\":\"{}\",\"description\":\"{}\"}}", m.name, m.description));
+    let entries = PREDEFINED_VARIABLE_META.iter().map(|m| {
+        format!(
+            "{{\"name\":\"{}\",\"description\":\"{}\"}}",
+            m.name, m.description
+        )
+    });
     format!("[{}]", entries.collect::<Vec<_>>().join(","))
 }
 
@@ -80,7 +83,10 @@ mod tests {
             // Parameterized entries carry an argument in their description
             // example (`{{$randomString:16}}`); resolve the bare form.
             let resolved = catalog().resolve(&format!("{{{{{name}}}}}"));
-            assert!(!resolved.contains(&format!("{{{{{name}}}}}")), "{name} must resolve");
+            assert!(
+                !resolved.contains(&format!("{{{{{name}}}}}")),
+                "{name} must resolve"
+            );
         }
     }
 }

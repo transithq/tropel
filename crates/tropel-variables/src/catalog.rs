@@ -43,7 +43,10 @@ pub struct PredefinedVariableMeta {
 }
 
 pub static PREDEFINED_VARIABLE_META: &[PredefinedVariableMeta] = &[
-    PredefinedVariableMeta { name: "$guid", description: "A v4 GUID" },
+    PredefinedVariableMeta {
+        name: "$guid",
+        description: "A v4 GUID",
+    },
     PredefinedVariableMeta {
         name: "$timestamp",
         description: "Current UNIX timestamp (seconds)",
@@ -52,8 +55,14 @@ pub static PREDEFINED_VARIABLE_META: &[PredefinedVariableMeta] = &[
         name: "$isoTimestamp",
         description: "Current ISO timestamp (UTC)",
     },
-    PredefinedVariableMeta { name: "$randomUUID", description: "A random v4 UUID" },
-    PredefinedVariableMeta { name: "$randomInt", description: "Random integer 0–999" },
+    PredefinedVariableMeta {
+        name: "$randomUUID",
+        description: "A random v4 UUID",
+    },
+    PredefinedVariableMeta {
+        name: "$randomInt",
+        description: "Random integer 0–999",
+    },
     PredefinedVariableMeta {
         name: "$randomFloat",
         description: "Random float 0–1000 (6 decimals)",
@@ -70,7 +79,10 @@ pub static PREDEFINED_VARIABLE_META: &[PredefinedVariableMeta] = &[
         name: "$randomAlphaNumeric",
         description: "Random alphanumeric string",
     },
-    PredefinedVariableMeta { name: "$randomBoolean", description: "true or false" },
+    PredefinedVariableMeta {
+        name: "$randomBoolean",
+        description: "true or false",
+    },
     PredefinedVariableMeta {
         name: "$randomHexColor",
         description: "Random #rrggbb colour",
@@ -79,12 +91,30 @@ pub static PREDEFINED_VARIABLE_META: &[PredefinedVariableMeta] = &[
         name: "$randomHex",
         description: "Random hex string ({{$randomHex:8}} for length)",
     },
-    PredefinedVariableMeta { name: "$randomColor", description: "Random colour name" },
-    PredefinedVariableMeta { name: "$randomEmail", description: "Random email address" },
-    PredefinedVariableMeta { name: "$randomPhone", description: "Random phone number" },
-    PredefinedVariableMeta { name: "$randomPhoneNumber", description: "Random phone number" },
-    PredefinedVariableMeta { name: "$randomCompany", description: "Random company name" },
-    PredefinedVariableMeta { name: "$randomCompanyName", description: "Random company name" },
+    PredefinedVariableMeta {
+        name: "$randomColor",
+        description: "Random colour name",
+    },
+    PredefinedVariableMeta {
+        name: "$randomEmail",
+        description: "Random email address",
+    },
+    PredefinedVariableMeta {
+        name: "$randomPhone",
+        description: "Random phone number",
+    },
+    PredefinedVariableMeta {
+        name: "$randomPhoneNumber",
+        description: "Random phone number",
+    },
+    PredefinedVariableMeta {
+        name: "$randomCompany",
+        description: "Random company name",
+    },
+    PredefinedVariableMeta {
+        name: "$randomCompanyName",
+        description: "Random company name",
+    },
     PredefinedVariableMeta {
         name: "$randomLoremText",
         description: "Random lorem paragraph",
@@ -93,7 +123,10 @@ pub static PREDEFINED_VARIABLE_META: &[PredefinedVariableMeta] = &[
         name: "$randomLoremSentence",
         description: "Random lorem sentence",
     },
-    PredefinedVariableMeta { name: "$randomWord", description: "Random word" },
+    PredefinedVariableMeta {
+        name: "$randomWord",
+        description: "Random word",
+    },
     PredefinedVariableMeta {
         name: "$randomWords",
         description: "Random words ({{$randomWords:5}} for count)",
@@ -110,16 +143,34 @@ pub static PREDEFINED_VARIABLE_META: &[PredefinedVariableMeta] = &[
         name: "$randomDateFuture",
         description: "Random date in the next 10 years",
     },
-    PredefinedVariableMeta { name: "$randomTime", description: "Random HH:MM:SS time" },
-    PredefinedVariableMeta { name: "$randomIP", description: "Random IPv4 address" },
-    PredefinedVariableMeta { name: "$randomIPV6", description: "Random IPv6 address" },
-    PredefinedVariableMeta { name: "$randomMACAddress", description: "Random MAC address" },
+    PredefinedVariableMeta {
+        name: "$randomTime",
+        description: "Random HH:MM:SS time",
+    },
+    PredefinedVariableMeta {
+        name: "$randomIP",
+        description: "Random IPv4 address",
+    },
+    PredefinedVariableMeta {
+        name: "$randomIPV6",
+        description: "Random IPv6 address",
+    },
+    PredefinedVariableMeta {
+        name: "$randomMACAddress",
+        description: "Random MAC address",
+    },
     PredefinedVariableMeta {
         name: "$randomPassword",
         description: "Random 12-char password ({{$randomPassword:16}} for length)",
     },
-    PredefinedVariableMeta { name: "$randomCity", description: "Random city name" },
-    PredefinedVariableMeta { name: "$randomCountry", description: "Random country name" },
+    PredefinedVariableMeta {
+        name: "$randomCity",
+        description: "Random city name",
+    },
+    PredefinedVariableMeta {
+        name: "$randomCountry",
+        description: "Random country name",
+    },
     PredefinedVariableMeta {
         name: "$randomStreetName",
         description: "Random street address",
@@ -128,10 +179,22 @@ pub static PREDEFINED_VARIABLE_META: &[PredefinedVariableMeta] = &[
         name: "$randomPostcode",
         description: "Random 5-digit postcode",
     },
-    PredefinedVariableMeta { name: "$randomName", description: "Random full name" },
-    PredefinedVariableMeta { name: "$randomFullName", description: "Random full name" },
-    PredefinedVariableMeta { name: "$randomFirstName", description: "Random first name" },
-    PredefinedVariableMeta { name: "$randomLastName", description: "Random last name" },
+    PredefinedVariableMeta {
+        name: "$randomName",
+        description: "Random full name",
+    },
+    PredefinedVariableMeta {
+        name: "$randomFullName",
+        description: "Random full name",
+    },
+    PredefinedVariableMeta {
+        name: "$randomFirstName",
+        description: "Random first name",
+    },
+    PredefinedVariableMeta {
+        name: "$randomLastName",
+        description: "Random last name",
+    },
 ];
 
 /// Parse a `:length` / `:count` capture, clamping to [`MAX_DYNAMIC_LENGTH`].
@@ -201,8 +264,7 @@ impl DynamicCatalog {
         // {{$timestamp}} — fresh Unix timestamp per occurrence
         if result.contains("{{$timestamp}}") {
             let re = cached_re!(RE_TIMESTAMP, r"\{\{\$timestamp\}\}");
-            result =
-                self.replace_with_func(&result, re, |_| epoch_secs().to_string());
+            result = self.replace_with_func(&result, re, |_| epoch_secs().to_string());
         }
 
         // {{$isoTimestamp}} — fresh ISO timestamp per occurrence
