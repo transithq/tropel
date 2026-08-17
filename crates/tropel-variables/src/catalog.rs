@@ -146,11 +146,13 @@ impl DynamicCatalog {
             });
         }
 
-        // {{$randomAlphanumeric[:length]}}
-        if result.contains("{{$randomAlphanumeric") {
+        // {{$randomAlphaNumeric[:length]}} — Postman's spelling (W2 #199:
+        // the old $randomAlphanumeric misspelling never resolves in real
+        // collections). The misspelling is kept as a resolving alias.
+        if result.contains("{{$randomAlphaNumeric") || result.contains("{{$randomAlphanumeric") {
             let re = cached_re!(
                 RE_RANDOM_ALPHANUMERIC,
-                r"\{\{\$randomAlphanumeric(?::(\d+))?\}\}"
+                r"\{\{\$random(?:AlphaNumeric|Alphanumeric)(?::(\d+))?\}\}"
             );
             result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
@@ -207,15 +209,19 @@ impl DynamicCatalog {
             result = self.replace_with_func(&result, re, |_| random_company_name(&mut rng));
         }
 
-        // {{$randomLorem}} — one paragraph of lorem-style text
-        if result.contains("{{$randomLorem}}") {
-            let re = cached_re!(RE_RANDOM_LOREM, r"\{\{\$randomLorem\}\}");
+        // {{$randomLoremText}} — one paragraph of lorem-style text. Postman's
+        // spelling is $randomLoremText, not $randomLorem (W2 #199); the
+        // misspelling is kept as a resolving alias.
+        if result.contains("{{$randomLoremText}}") || result.contains("{{$randomLorem}}") {
+            let re = cached_re!(RE_RANDOM_LOREM, r"\{\{\$random(?:LoremText|Lorem)\}\}");
             result = self.replace_with_func(&result, re, |_| random_lorem_paragraph(&mut rng));
         }
 
-        // {{$randomSentence}} / {{$randomWords[:count]}} / {{$randomWord}}
-        if result.contains("{{$randomSentence}}") {
-            let re = cached_re!(RE_RANDOM_SENTENCE, r"\{\{\$randomSentence\}\}");
+        // {{$randomLoremSentence}} / {{$randomWords[:count]}} / {{$randomWord}}
+        // Postman's spelling is $randomLoremSentence, not $randomSentence
+        // (W2 #199); the misspelling is kept as a resolving alias.
+        if result.contains("{{$randomLoremSentence}}") || result.contains("{{$randomSentence}}") {
+            let re = cached_re!(RE_RANDOM_SENTENCE, r"\{\{\$random(?:Lorem)?Sentence\}\}");
             result = self.replace_with_func(&result, re, |_| random_sentence(&mut rng));
         }
         if result.contains("{{$randomWords") {
@@ -262,9 +268,9 @@ impl DynamicCatalog {
             });
         }
 
-        // {{$randomCity}}, {{$randomCountry}}, {{$randomStreet}}, {{$randomPostcode}},
-        // {{$randomNameFullName}}, {{$randomNameFirstName}}, {{$randomNameLastName}},
-        // {{$randomName}}, {{$randomColor}}, {{$randomMAC}}
+        // {{$randomCity}}, {{$randomCountry}}, {{$randomStreetName}}, {{$randomPostcode}},
+        // {{$randomFullName}}, {{$randomFirstName}}, {{$randomLastName}},
+        // {{$randomName}}, {{$randomColor}}, {{$randomMACAddress}}
         if result.contains("{{$randomCity}}") {
             let re = cached_re!(RE_RANDOM_CITY, r"\{\{\$randomCity\}\}");
             result = self.replace_with_func(&result, re, |_| random_city(&mut rng));
@@ -273,8 +279,10 @@ impl DynamicCatalog {
             let re = cached_re!(RE_RANDOM_COUNTRY, r"\{\{\$randomCountry\}\}");
             result = self.replace_with_func(&result, re, |_| random_country(&mut rng));
         }
-        if result.contains("{{$randomStreet}}") {
-            let re = cached_re!(RE_RANDOM_STREET, r"\{\{\$randomStreet\}\}");
+        // Postman's spelling is $randomStreetName, not $randomStreet (W2
+        // #199); the misspelling is kept as a resolving alias.
+        if result.contains("{{$randomStreetName}}") || result.contains("{{$randomStreet}}") {
+            let re = cached_re!(RE_RANDOM_STREET, r"\{\{\$random(?:StreetName|Street)\}\}");
             result = self.replace_with_func(&result, re, |_| random_street(&mut rng));
         }
         if result.contains("{{$randomPostcode}}") {
@@ -283,20 +291,23 @@ impl DynamicCatalog {
         }
         if result.contains("{{$randomName}}") {
             // Note: {{$randomName}} is the base pattern; longer forms like
-            // {{$randomNameFullName}} are handled later with more specific regexes.
+            // {{$randomFullName}} are handled later with more specific regexes.
             let re = cached_re!(RE_RANDOM_NAME, r"\{\{\$randomName\}\}");
             result = self.replace_with_func(&result, re, |_| random_full_name(&mut rng));
         }
-        if result.contains("{{$randomNameFullName}}") {
-            let re = cached_re!(RE_RANDOM_NAME_FULL, r"\{\{\$randomNameFullName\}\}");
+        // Postman's spellings are $randomFullName / $randomFirstName /
+        // $randomLastName, NOT the $randomName* forms (W2 #199). The old
+        // misspellings are kept as resolving aliases.
+        if result.contains("{{$randomNameFullName}}") || result.contains("{{$randomFullName}}") {
+            let re = cached_re!(RE_RANDOM_NAME_FULL, r"\{\{\$random(?:Name)?FullName\}\}");
             result = self.replace_with_func(&result, re, |_| random_full_name(&mut rng));
         }
-        if result.contains("{{$randomNameFirstName}}") {
-            let re = cached_re!(RE_RANDOM_NAME_FIRST, r"\{\{\$randomNameFirstName\}\}");
+        if result.contains("{{$randomNameFirstName}}") || result.contains("{{$randomFirstName}}") {
+            let re = cached_re!(RE_RANDOM_NAME_FIRST, r"\{\{\$random(?:Name)?FirstName\}\}");
             result = self.replace_with_func(&result, re, |_| random_first_name(&mut rng));
         }
-        if result.contains("{{$randomNameLastName}}") {
-            let re = cached_re!(RE_RANDOM_NAME_LAST, r"\{\{\$randomNameLastName\}\}");
+        if result.contains("{{$randomNameLastName}}") || result.contains("{{$randomLastName}}") {
+            let re = cached_re!(RE_RANDOM_NAME_LAST, r"\{\{\$random(?:Name)?LastName\}\}");
             result = self.replace_with_func(&result, re, |_| random_last_name(&mut rng));
         }
         // {{$randomColor}} — a colour WORD (Postman: faker.commerce.color), NOT
@@ -313,25 +324,10 @@ impl DynamicCatalog {
         // the log exactly N times, not once per request. The cheap `{{$`
         // gate means the regex pass only runs for inputs that actually
         // contain an unresolved dynamic variable.
-        if result.contains("{{$") {
-            let re = cached_re!(
-                RE_UNRESOLVED_DYNAMIC,
-                r"\{\{\$([A-Za-z][A-Za-z0-9_]*)(?::[^}]*)?\}\}"
-            );
-            for caps in re.captures_iter(&result) {
-                let name = caps.get(1).unwrap().as_str().to_string();
-                let warned = UNKNOWN_DYNAMIC_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-                let mut warned = warned.lock().unwrap();
-                if warned.insert(name.clone()) {
-                    warn!(
-                        variable = %name,
-                        "unimplemented Postman dynamic variable — sent verbatim as the literal placeholder"
-                    );
-                }
-            }
-        }
-        if result.contains("{{$randomMAC}}") {
-            let re = cached_re!(RE_RANDOM_MAC, r"\{\{\$randomMAC\}\}");
+        // Postman's spelling is $randomMACAddress, not $randomMAC (W2 #199);
+        // the misspelling is kept as a resolving alias.
+        if result.contains("{{$randomMACAddress}}") || result.contains("{{$randomMAC}}") {
+            let re = cached_re!(RE_RANDOM_MAC, r"\{\{\$randomMAC(?:Address)?\}\}");
             result = self.replace_with_func(&result, re, |_| {
                 let hex = random_string(&mut rng, 12, "0123456789abcdef");
                 hex.chars()
@@ -354,6 +350,36 @@ impl DynamicCatalog {
                     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*",
                 )
             });
+        }
+
+        // Backlog line 141: any dynamic variable that is NOT in the catalog
+        // ({{$randomUserName}}, …) survives resolution and is sent to the
+        // server as the literal placeholder — silently, with no warning. Warn
+        // ONCE per distinct name so a multi-million-iteration load run spams
+        // the log exactly N times, not once per request. The cheap `{{$`
+        // gate means the regex pass only runs for inputs that actually
+        // contain an unresolved dynamic variable.
+        //
+        // W2 #199: this pass runs LAST, after every implemented handler — it
+        // used to sit before the $randomMAC / $randomPassword handlers, so it
+        // warned about two variables that ARE implemented, immediately before
+        // resolving them.
+        if result.contains("{{$") {
+            let re = cached_re!(
+                RE_UNRESOLVED_DYNAMIC,
+                r"\{\{\$([A-Za-z][A-Za-z0-9_]*)(?::[^}]*)?\}\}"
+            );
+            for caps in re.captures_iter(&result) {
+                let name = caps.get(1).unwrap().as_str().to_string();
+                let warned = UNKNOWN_DYNAMIC_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+                let mut warned = warned.lock().unwrap();
+                if warned.insert(name.clone()) {
+                    warn!(
+                        variable = %name,
+                        "unimplemented Postman dynamic variable — sent verbatim as the literal placeholder"
+                    );
+                }
+            }
         }
 
         result
