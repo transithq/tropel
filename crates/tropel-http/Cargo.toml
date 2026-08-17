@@ -13,7 +13,7 @@ description = "HTTP protocol implementation for Tropel: reqwest client, connecti
 
 [dependencies]
 tropel-sdk.workspace = true
-tropel-auth.workspace = true
+tropel-auth = { workspace = true, features = ["reqwest"] }
 serde.workspace = true
 reqwest.workspace = true
 tower.workspace = true
