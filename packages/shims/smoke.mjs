@@ -18,6 +18,7 @@ const repo = path.join(__dirname, "..", "..");
 // (ShimBundle::default()). If that file gains or reorders an entry, update
 // this list AND scripts/render-bundle.mjs's DEFAULT_ORDER together.
 const DEFAULT_ORDER = [
+  ["deep-equal-shim", "js/shared/deep-equal.js"],
   ["pm-shim", "js/scripting-api/pm.js"],
   ["chai-shim", "js/chai/chai-shim.js"],
   ["lodash-shim", "js/lodash/lodash-shim.js"],

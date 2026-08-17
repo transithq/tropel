@@ -1318,6 +1318,10 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
+            .eval(include_str!("../../../js/shared/deep-equal.js"))
+            .await
+            .expect("shared deep-equal should eval");
+        js_ctx
             .eval(include_str!("../../../js/scripting-api/pm.js"))
             .await
             .expect("pm shim should eval");
@@ -1425,6 +1429,10 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
+            .eval(include_str!("../../../js/shared/deep-equal.js"))
+            .await
+            .expect("shared deep-equal should eval");
+        js_ctx
             .eval(include_str!("../../../js/scripting-api/pm.js"))
             .await
             .expect("pm shim should eval");
@@ -1522,6 +1530,10 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
+            .eval(include_str!("../../../js/shared/deep-equal.js"))
+            .await
+            .expect("shared deep-equal should eval");
+        js_ctx
             .eval(include_str!("../../../js/scripting-api/pm.js"))
             .await
             .expect("pm shim should eval");
@@ -1578,6 +1590,10 @@ mod tests {
                 .await
                 .expect("js context should construct"),
         );
+        js_ctx
+            .eval(include_str!("../../../js/shared/deep-equal.js"))
+            .await
+            .expect("shared deep-equal should eval");
         js_ctx
             .eval(include_str!("../../../js/scripting-api/pm.js"))
             .await
