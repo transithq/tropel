@@ -43,7 +43,8 @@ fn validate_methods(items: &[CollectionItem]) -> Result<()> {
                 if Method::parse(&req.request.method).is_none() {
                     return Err(CollectionError::InvalidRequest(format!(
                         "item '{}' has invalid HTTP method {:?}",
-                        req.name, req.request.method
+                        req.name.as_deref().unwrap_or("<unnamed>"),
+                        req.request.method
                     )));
                 }
             }
@@ -56,7 +57,7 @@ fn validate_methods(items: &[CollectionItem]) -> Result<()> {
 /// Convert a Collection into a protocol-agnostic Scenario.
 pub fn collection_to_scenario(
     collection: Collection,
-    _env_vars: HashMap<String, String>,
+    env_vars: HashMap<String, String>,
 ) -> Scenario {
     let mut scenario = Scenario {
         info: ScenarioInfo {
@@ -74,6 +75,17 @@ pub fn collection_to_scenario(
         if let Some(value) = &var.value {
             scenario.variables.insert(var.key.clone(), value.clone());
         }
+    }
+
+    // Backlog line 205: environment vars had NO path into collection
+    // conversion — the parameter was ignored and the sole caller passed an
+    // empty map, so an env file (--env-file / Postman environment export)
+    // could never seed `{{var}}` resolution for a Postman collection. Postman
+    // precedence: environment OVERRIDES collection variables.
+    for (key, value) in env_vars {
+        scenario
+            .variables
+            .insert(key, serde_json::Value::String(value));
     }
 
     // Convert items, threading collection-level auth down as the inherited
@@ -135,7 +147,7 @@ fn convert_items(
                 }
                 let scenario_item = ScenarioItem {
                     id: folder.id.clone(),
-                    name: folder.name.clone(),
+                    name: folder.name.clone().unwrap_or_default(),
                     request: None,
                     // The folder's own scripts are ALSO folded into every
                     // descendant leaf below, so they run before/after each
@@ -181,7 +193,7 @@ fn convert_request_item(
 
     ScenarioItem {
         id: req.id.clone(),
-        name: req.name.clone(),
+        name: req.name.clone().unwrap_or_default(),
         request: Some(request),
         prerequest: find_prerequest_script(&events),
         test: find_test_script(&events),
@@ -1955,5 +1967,76 @@ mod tests {
             }
             other => panic!("expected UrlEncoded body, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn collection_to_scenario_seeds_env_vars_with_postman_precedence() {
+        // Backlog line 205: the env_vars parameter was ignored (the sole
+        // caller passed an empty map), so an env file could never seed
+        // {{var}} resolution for a Postman collection. Env vars must land in
+        // scenario.variables AND override collection variables (Postman
+        // precedence: environment > collection).
+        let json = r#"{
+            "info": { "name": "Env Vars", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+            "variable": [
+                { "key": "host", "value": "collection.example.com" },
+                { "key": "only-collection", "value": "from-collection" }
+            ],
+            "item": [
+                { "request": { "method": "GET", "url": "http://{{host}}/a" } }
+            ]
+        }"#;
+        let collection = parse_collection_str(json).unwrap();
+        let env_vars = HashMap::from([
+            ("host".to_string(), "env.example.com".to_string()),
+            ("only-env".to_string(), "from-env".to_string()),
+        ]);
+
+        let scenario = collection_to_scenario(collection, env_vars);
+        assert_eq!(
+            scenario.variables.get("host"),
+            Some(&serde_json::Value::String("env.example.com".into())),
+            "env var must override the collection variable"
+        );
+        assert_eq!(
+            scenario.variables.get("only-collection"),
+            Some(&serde_json::Value::String("from-collection".into())),
+            "collection-only var must survive"
+        );
+        assert_eq!(
+            scenario.variables.get("only-env"),
+            Some(&serde_json::Value::String("from-env".into())),
+            "env-only var must be seeded"
+        );
+    }
+
+    #[test]
+    fn unnamed_items_parse_to_empty_names() {
+        // Backlog line 205: the v2.1 schema makes item `name` OPTIONAL, but
+        // the model required it, so a real export with an unnamed item
+        // failed the WHOLE collection parse. Request and folder names are
+        // now Option<String> and convert to empty ScenarioItem names.
+        let json = r#"{
+            "info": { "name": "Unnamed Items", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+            "item": [
+                {
+                    "request": { "method": "GET", "url": "http://example.com/a" }
+                },
+                {
+                    "item": [
+                        { "request": { "method": "GET", "url": "http://example.com/b" } }
+                    ]
+                }
+            ]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        assert_eq!(scenario.items.len(), 2, "both unnamed items must parse");
+        assert_eq!(scenario.items[0].name, "", "unnamed request -> empty name");
+        assert_eq!(scenario.items[1].name, "", "unnamed folder -> empty name");
+        assert_eq!(
+            scenario.items[1].items[0].name, "",
+            "unnamed nested request -> empty name"
+        );
     }
 }
