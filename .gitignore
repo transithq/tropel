@@ -41,6 +41,7 @@ $RECYCLE.BIN/
 !packages/exec-wasm/package.json
 !packages/exec-wasm/tsconfig.json
 !packages/shims/package.json
+!packages/core-wasm/package.json
 # W2 #186: the ROOT npm workspace manifest must be tracked — CI's npm install
 # resolves @tropel/shims to the local packages/ sibling only via this file.
 !/package.json

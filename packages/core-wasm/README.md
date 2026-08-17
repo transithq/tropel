@@ -1,0 +1,64 @@
+# @tropel/core-wasm
+
+Tropel's **core tier** for browser embedders — the pure compute every API
+client page needs, compiled to `wasm32-unknown-unknown` with a wasm-bindgen
+surface. No QuickJS, no WASI, no scenario runner: that is the separate
+heavy tier (`@tropel/runtime-wasm` / `tropel_web.wasm`).
+
+Today it ships the **dynamic-variable catalog** (`{{$guid}}`,
+`{{$timestamp}}`, `{{$randomHexColor}}`, 35+ variables — the same
+`DynamicCatalog` the native runner uses, so the website, the extension and
+the CLI can never drift). Next residents: auth signing, OpenAPI/Postman
+import parsing, declarative assertions.
+
+## Why it exists
+
+`API_CLIENT_WEB_PAYLOAD.md` §2.3 (two-tier wasm):
+
+```
+core tier    variables · auth signing · import parse        ~450 KB raw
+             NO QuickJS — loaded eagerly
+
+script tier  QuickJS + sandbox + shims (tropel-web)          ~2.5 MB
+             extension/native only (or loaded only when a
+             request actually has scripts)
+```
+
+A website/web app always executes scripts in the browser's own JS engine
+(`@tropel/shims`) and hits APIs through a CORS relay — it never needs the
+QuickJS tier. See KnockPort's `WEB_EXTENSION_RUNTIME_SPLIT.md`.
+
+## Usage
+
+```js
+import { initCoreWasm, resolveDynamicVariables, getPredefinedVariableNames } from "@tropel/core-wasm";
+
+await initCoreWasm();                                    // app boot
+const out = resolveDynamicVariables("id={{$guid}}");     // sync, wasm-backed
+const names = getPredefinedVariableNames();              // for editor autocomplete
+```
+
+`initCoreWasm` accepts `{ wasmUrl }` or `{ wasmBytes }` (Node/tests);
+by default it fetches `pkg/tropel_core_wasm_bg.wasm` relative to the
+package. Until (or if) init succeeds, `resolveDynamicVariables` degrades
+to a passthrough — `{{$…}}` survive literal and nothing throws.
+
+## Building
+
+```bash
+bash scripts/build.sh        # cargo release-wasm → wasm-bindgen → wasm-opt -Oz → smoke → pack dry-run
+```
+
+Requires the `wasm32-unknown-unknown` target and a modern `wasm-opt`
+(npm `binaryen`; wasm-pack's pinned 171374efd61df962 predates
+reference-types and cannot parse the output). Rust tests live in the
+crate (`cargo test -p tropel-core-wasm`); the JS smoke test runs in Node:
+`node smoke.mjs`.
+
+## Size
+
+457 KB raw after `wasm-opt -Oz --strip-debug` (≈140 KB brotli). Measured
+with `twiggy top`: the dominant costs are the `regex` engine code +
+`unicode-perl` tables (the full default Unicode property tables were cut —
+the catalog patterns are ASCII-only), the wasm-bindgen custom section, and
+chrono/uuid/rand glue.

@@ -1,0 +1,51 @@
+{
+  "name": "@tropel/core-wasm",
+  "version": "0.1.0",
+  "description": "Tropel core tier for browser embedders (KnockPort): the dynamic-variable catalog (and later auth signing / import parse) compiled to wasm32-unknown-unknown. No QuickJS — see API_CLIENT_WEB_PAYLOAD.md §2.3 two-tier split.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./glue": {
+      "types": "./pkg/tropel_core_wasm.d.ts",
+      "default": "./pkg/tropel_core_wasm.js"
+    },
+    "./wasm/tropel_core_wasm_bg.wasm": "./pkg/tropel_core_wasm_bg.wasm"
+  },
+  "files": [
+    "src",
+    "pkg",
+    "LICENSE-APACHE"
+  ],
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "test": "node smoke.mjs",
+    "pack:dry": "bash scripts/build.sh && npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/transithq/tropel.git",
+    "directory": "packages/core-wasm"
+  },
+  "homepage": "https://github.com/transithq/tropel/tree/main/packages/core-wasm",
+  "keywords": [
+    "postman",
+    "variables",
+    "dynamic-variables",
+    "wasm",
+    "webassembly",
+    "api-client"
+  ]
+}
