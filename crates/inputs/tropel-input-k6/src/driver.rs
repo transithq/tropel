@@ -1593,14 +1593,14 @@ fn build_k6_request(
         if let Some(Body::Raw(text)) = &req_body {
             if let Some(compressed) = compress_k6_body(&params.compression, text.as_bytes()) {
                 req_body = Some(Body::Binary(compressed));
-                headers.insert(
+                headers.push((
                     "Content-Encoding".to_string(),
                     if params.compression.contains("gzip") {
                         "gzip".to_string()
                     } else {
                         "deflate".to_string()
                     },
-                );
+                ));
             }
         }
     }
@@ -3703,28 +3703,29 @@ async fn bootstrap_js_libs(
 /// `serde_json::from_str(...).unwrap_or_default()`, which silently dropped
 /// ALL headers whenever the payload wasn't a plain object — a silent
 /// correctness divergence (P3 · k6 header-parse divergence).
-fn parse_headers_tolerant(json: &str) -> HashMap<String, String> {
+fn parse_headers_tolerant(json: &str) -> Vec<(String, String)> {
     if json.is_empty() || json == "{}" || json == "[]" {
-        return HashMap::new();
+        return Vec::new();
     }
     // Object form must tolerate non-string values (e.g. {"Content-Length":
     // 123}) — the old `HashMap<String, String>` parse fell through to the
     // array form and returned an EMPTY map whenever any value was
     // non-string, silently dropping every header (backlog P3). Scalars are
-    // stringified; null/complex values are skipped.
+    // stringified; null/complex values are skipped. W2 #203: an ordered Vec
+    // (declaration order, duplicates preserved).
     if json.trim_start().starts_with('{') {
         if let Ok(map) = serde_json::from_str::<HashMap<String, serde_json::Value>>(json) {
-            let mut headers = HashMap::new();
+            let mut headers = Vec::new();
             for (k, v) in map {
                 match v {
                     serde_json::Value::String(s) => {
-                        headers.insert(k, s);
+                        headers.push((k, s));
                     }
                     serde_json::Value::Number(n) => {
-                        headers.insert(k, n.to_string());
+                        headers.push((k, n.to_string()));
                     }
                     serde_json::Value::Bool(b) => {
-                        headers.insert(k, b.to_string());
+                        headers.push((k, b.to_string()));
                     }
                     _ => {}
                 }
@@ -3734,18 +3735,18 @@ fn parse_headers_tolerant(json: &str) -> HashMap<String, String> {
     }
     if json.trim_start().starts_with('[') {
         if let Ok(arr) = serde_json::from_str::<Vec<HashMap<String, serde_json::Value>>>(json) {
-            let mut headers = HashMap::new();
+            let mut headers = Vec::new();
             for entry in arr {
                 let key = entry.get("key").and_then(|v| v.as_str()).unwrap_or("");
                 let value = entry.get("value").and_then(|v| v.as_str()).unwrap_or("");
                 if !key.is_empty() {
-                    headers.insert(key.to_string(), value.to_string());
+                    headers.push((key.to_string(), value.to_string()));
                 }
             }
             return headers;
         }
     }
-    HashMap::new()
+    Vec::new()
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -7698,7 +7699,7 @@ mod tests {
         let req = Request {
             url: "http://down:9/".into(),
             method: Method::GET,
-            headers: HashMap::new(),
+            headers: Vec::new(),
             query_params: HashMap::new(),
             body: Some(Body::Raw("payload".to_string())),
             auth: None,

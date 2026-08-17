@@ -482,21 +482,22 @@ fn should_replay_header(name: &str) -> bool {
 /// value is a single cookie with a comma in it, not two cookies, and servers
 /// (and the request's own cookie jar) would mis-read it. `Cookie` matching is
 /// case-insensitive per HTTP semantics.
-fn merge_headers<I: Iterator<Item = (String, String)>>(pairs: I) -> HashMap<String, String> {
-    let mut map: HashMap<String, String> = HashMap::new();
+fn merge_headers<I: Iterator<Item = (String, String)>>(pairs: I) -> Vec<(String, String)> {
+    // W2 #203: ordered Vec in FIRST-SEEN order; duplicate names fold into the
+    // existing entry (`, ` join, `; ` for Cookie per RFC 6265) — the data is
+    // preserved, unlike a HashMap's last-wins collapse.
+    let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in pairs {
         let is_cookie = k.eq_ignore_ascii_case("cookie");
-        match map.get_mut(&k) {
-            Some(existing) => {
+        match out.iter_mut().find(|(name, _)| name == &k) {
+            Some((_, existing)) => {
                 existing.push_str(if is_cookie { "; " } else { ", " });
                 existing.push_str(&v);
             }
-            None => {
-                map.insert(k, v);
-            }
+            None => out.push((k, v)),
         }
     }
-    map
+    out
 }
 
 /// Generate a human-readable item name from a URL.
@@ -866,12 +867,16 @@ mod tests {
         }"#;
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
-        assert_eq!(
-            req.headers.get("Cookie").unwrap(),
-            "session=abc; theme=dark"
-        );
+        let get = |k: &str| {
+            req.headers
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+        };
+        assert_eq!(get("Cookie"), "session=abc; theme=dark");
         // Non-Cookie duplicates still join with `, `.
-        assert_eq!(req.headers.get("X-Trace").unwrap(), "a, b");
+        assert_eq!(get("X-Trace"), "a, b");
     }
 
     #[test]
@@ -899,8 +904,15 @@ mod tests {
         }"#;
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
-        assert_eq!(req.headers.get("X-Trace").unwrap(), "a, b");
-        assert_eq!(req.headers.get("Accept").unwrap(), "*/*");
+        let get = |k: &str| {
+            req.headers
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+        };
+        assert_eq!(get("X-Trace"), "a, b");
+        assert_eq!(get("Accept"), "*/*");
     }
 
     #[test]
@@ -1033,31 +1045,35 @@ mod tests {
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
 
+        let names: Vec<&str> = req.headers.iter().map(|(k, _)| k.as_str()).collect();
         // Pseudo-headers must NOT survive into Request.headers.
         assert!(
-            req.headers.keys().all(|k| !k.starts_with(':')),
+            names.iter().all(|k| !k.starts_with(':')),
             "pseudo-headers must be stripped, got {:?}",
-            req.headers.keys()
+            names
         );
         // Content-Length / Accept-Encoding stripped case-insensitively.
         assert!(
-            !req.headers
-                .keys()
+            !names
+                .iter()
                 .any(|k| k.eq_ignore_ascii_case("content-length")),
             "Content-Length must be stripped"
         );
         assert!(
-            !req.headers
-                .keys()
+            !names
+                .iter()
                 .any(|k| k.eq_ignore_ascii_case("accept-encoding")),
             "Accept-Encoding must be stripped"
         );
         // Real headers survive.
-        assert_eq!(
-            req.headers.get("Authorization").map(String::as_str),
-            Some("Bearer tok")
-        );
-        assert_eq!(req.headers.get("X-Trace").map(String::as_str), Some("abc"));
+        let get = |k: &str| {
+            req.headers
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("Authorization"), Some("Bearer tok"));
+        assert_eq!(get("X-Trace"), Some("abc"));
     }
 
     #[test]

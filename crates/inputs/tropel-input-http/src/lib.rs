@@ -236,7 +236,9 @@ fn block_to_item(
 
     // Header lines until a blank line. A non-header line before the blank
     // means the author omitted the separator — treat it as body start.
-    let mut headers: HashMap<String, String> = HashMap::new();
+    // W2 #203: ordered Vec in file order; duplicates fold (`, ` join) so no
+    // header value is dropped.
+    let mut headers: Vec<(String, String)> = Vec::new();
     while i < lines.len() {
         let t = lines[i].trim();
         if t.is_empty() {
@@ -293,14 +295,14 @@ fn block_to_item(
 /// `Raw` — re-quoting would change the payload), everything else is `Raw`
 /// (urlencoded / multipart bodies are kept in wire format with their
 /// Content-Type header preserved, mirroring the HAR adapter).
-fn pick_body(text: &str, headers: &HashMap<String, String>) -> Option<Body> {
+fn pick_body(text: &str, headers: &[(String, String)]) -> Option<Body> {
     if text.is_empty() {
         return None;
     }
     let content_type = headers
-        .get("Content-Type")
-        .or_else(|| headers.get("content-type"))
-        .map(|v| v.to_lowercase())
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.to_lowercase())
         .unwrap_or_default();
     if content_type.contains("json") {
         match serde_json::from_str(text) {
@@ -314,15 +316,13 @@ fn pick_body(text: &str, headers: &HashMap<String, String>) -> Option<Body> {
 
 /// Insert a header, joining duplicate names with `, ` (RFC 9110 field-line
 /// combination) instead of silently dropping data.
-fn merge_header(headers: &mut HashMap<String, String>, name: String, value: String) {
-    match headers.get_mut(&name) {
-        Some(existing) => {
+fn merge_header(headers: &mut Vec<(String, String)>, name: String, value: String) {
+    match headers.iter_mut().find(|(n, _)| n == &name) {
+        Some((_, existing)) => {
             existing.push_str(", ");
             existing.push_str(&value);
         }
-        None => {
-            headers.insert(name, value);
-        }
+        None => headers.push((name, value)),
     }
 }
 
@@ -436,8 +436,15 @@ mod tests {
         );
         let scenario = adapter.parse(data.as_bytes()).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
-        assert_eq!(req.headers.get("Accept").unwrap(), "application/json");
-        assert_eq!(req.headers.get("X-Trace").unwrap(), "a, b");
+        let get = |k: &str| {
+            req.headers
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+        };
+        assert_eq!(get("Accept"), "application/json");
+        assert_eq!(get("X-Trace"), "a, b");
     }
 
     #[test]

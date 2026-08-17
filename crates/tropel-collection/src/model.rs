@@ -102,7 +102,15 @@ where
             Ok(Some(None))
         }
         fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
-            Ok(Some(RequestDetail::deserialize(d).ok()))
+            // W2 #200: buffer into a Value so the streaming cursor is fully
+            // consumed BEFORE tolerating a malformed request. The old
+            // `RequestDetail::deserialize(d).ok()` left the cursor
+            // mid-object when the stray request was malformed, desyncing
+            // every subsequent field under from_str/from_slice (the
+            // production path in parser.rs). Tree mode (from_value) masked
+            // the bug; the tests now parse via from_str to catch it.
+            let value = serde_json::Value::deserialize(d)?;
+            Ok(Some(serde_json::from_value(value).ok()))
         }
     }
     deserializer.deserialize_option(RequestPresence)
@@ -566,26 +574,58 @@ pub struct Variable {
     pub description: Option<String>,
 }
 
+/// Deserialize an auth scheme's attributes in EITHER Postman form (W2 #201):
+/// the v2.1 array form `[{ "key": "username", "value": "u" }, ...]`, or the
+/// v2.0 object form `{ "username": "u", "password": "p" }` (the v2.0.0
+/// schema types every scheme's attributes as an OBJECT, so a v2.0 export used
+/// to fail the WHOLE collection parse against `Vec<AuthAttribute>`). Both
+/// normalize to `Vec<AuthAttribute>`; consumers are unchanged.
+fn de_auth_attrs<'de, D>(deserializer: D) -> Result<Vec<AuthAttribute>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum AuthAttrs {
+        List(Vec<AuthAttribute>),
+        Map(std::collections::BTreeMap<String, serde_json::Value>),
+    }
+    Ok(match AuthAttrs::deserialize(deserializer)? {
+        AuthAttrs::List(list) => list,
+        AuthAttrs::Map(map) => map
+            .into_iter()
+            .map(|(key, value)| AuthAttribute {
+                key,
+                value,
+                attr_type: None,
+            })
+            .collect(),
+    })
+}
+
 /// Auth configuration in Postman format.
+///
+/// Each scheme's attributes accept BOTH the v2.1 array form and the v2.0
+/// object form (see [`de_auth_attrs`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionAuth {
     #[serde(rename = "type")]
     pub auth_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub bearer: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub basic: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub apikey: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub digest: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub oauth1: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub oauth2: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub awsv4: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub hawk: Vec<AuthAttribute>,
 }
 
@@ -673,7 +713,11 @@ mod tests {
     use serde_json::json;
 
     fn parse_collection(json: serde_json::Value) -> Collection {
-        serde_json::from_value(json).expect("collection must parse")
+        // W2 #200: parse via from_str (STREAMING) — production (parser.rs)
+        // uses from_slice/from_str — so streaming-deserializer bugs (like
+        // the old de_opt_request cursor desync) are caught by tests instead
+        // of only being visible in tree mode.
+        serde_json::from_str(&json.to_string()).expect("collection must parse")
     }
 
     fn minimal_info() -> serde_json::Value {
@@ -753,10 +797,18 @@ mod tests {
                 "item": [inner]
             });
         }
-        let col = parse_collection(json!({
+        let col: Collection = serde_json::from_value(json!({
             "info": minimal_info(),
             "item": [inner]
-        }));
+        }))
+        .expect("collection must parse");
+        // NOTE (W2 #200): this deliberately bypasses the parse_collection
+        // helper (which now parses via from_str/STREAMING). This test
+        // measures the DESERIALIZER's single-pass recursion depth; the
+        // streaming tokenizer adds its own per-level frames on top and
+        // overflows the small test-thread stack at 50 levels. Streaming is
+        // covered by folder_first_tolerates_stray_malformed_request_object,
+        // which goes through the streaming helper.
         let mut current = &col.item[0];
         let mut depth = 0;
         while let CollectionItem::Folder(f) = current {
@@ -791,6 +843,88 @@ mod tests {
             "malformed request sub-fields must error loudly, not become an empty folder: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn v2_0_object_form_auth_attributes_parse() {
+        // W2 #201: the v2.0.0 collection schema types every auth scheme's
+        // attributes as an OBJECT (`"basic": { "username": "u" }`) while
+        // v2.1 uses an array of `{key, value}` pairs. The model typed all
+        // eight schemes as `Vec<AuthAttribute>`, so a v2.0 export failed
+        // the WHOLE collection parse. Both forms must normalize.
+        let col = parse_collection(json!({
+            "info": {
+                "name": "t",
+                "schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json"
+            },
+            "item": [{
+                "name": "req",
+                "request": {
+                    "method": "GET",
+                    "url": "https://x.test/",
+                    "auth": {
+                        "type": "basic",
+                        "basic": { "username": "u", "password": "p" }
+                    }
+                }
+            }]
+        }));
+        let req = match &col.item[0] {
+            CollectionItem::Request(r) => r,
+            CollectionItem::Folder(_) => panic!("expected request item"),
+        };
+        let auth = req.request.auth.as_ref().expect("auth must be present");
+        assert_eq!(auth.auth_type, "basic");
+        assert_eq!(auth.basic.len(), 2);
+        // BTreeMap normalizes in alphabetical order, so look up by key.
+        let get = |k: &str| {
+            auth.basic
+                .iter()
+                .find(|a| a.key == k)
+                .map(|a| a.value.clone())
+        };
+        assert_eq!(get("username"), Some(json!("u")));
+        assert_eq!(get("password"), Some(json!("p")));
+    }
+
+    #[test]
+    fn v2_0_object_form_oauth1_with_boolean_value_parses() {
+        // W2 #201: v2.0 object form with a non-string value (boolean) must
+        // parse — the object value is kept as structured JSON, exactly like
+        // the v2.1 array form already does (backlog §4).
+        let col = parse_collection(json!({
+            "info": {
+                "name": "t",
+                "schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json"
+            },
+            "item": [{
+                "name": "req",
+                "request": {
+                    "method": "GET",
+                    "url": "https://x.test/",
+                    "auth": {
+                        "type": "oauth1",
+                        "oauth1": { "consumerKey": "ck", "encodeOAuthSign": true }
+                    }
+                }
+            }]
+        }));
+        let req = match &col.item[0] {
+            CollectionItem::Request(r) => r,
+            CollectionItem::Folder(_) => panic!("expected request item"),
+        };
+        let auth = req.request.auth.as_ref().expect("auth must be present");
+        assert_eq!(auth.auth_type, "oauth1");
+        assert_eq!(auth.oauth1.len(), 2);
+        // Order-independent lookup (BTreeMap sorts keys alphabetically).
+        let get = |k: &str| {
+            auth.oauth1
+                .iter()
+                .find(|a| a.key == k)
+                .map(|a| a.value.clone())
+        };
+        assert_eq!(get("consumerKey"), Some(json!("ck")));
+        assert_eq!(get("encodeOAuthSign"), Some(json!(true)));
     }
 
     #[test]

@@ -208,7 +208,10 @@ fn convert_request(
 
     let mut url = build_url(detail);
 
-    let mut headers: HashMap<String, String> = detail
+    // W2 #203: keep headers in DECLARATION ORDER with duplicates preserved
+    // (the old HashMap collapsed two `Cookie:` headers into one — last
+    // value wins — and let header order vary request-to-request).
+    let mut headers: Vec<(String, String)> = detail
         .header
         .iter()
         .filter(|h| !h.disabled)
@@ -244,10 +247,10 @@ fn convert_request(
     if body.is_some() {
         if let Some(content_type) = raw_content_type(detail.body.as_ref()) {
             let has_ct = headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("content-type"));
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
             if !has_ct {
-                headers.insert("Content-Type".to_string(), content_type);
+                headers.push(("Content-Type".to_string(), content_type));
             }
         }
     }
@@ -366,16 +369,24 @@ fn build_url(detail: &RequestDetail) -> String {
     // `url.variable` as `{key, value}` and referenced in the URL as `:key`
     // segments (e.g. `https://api.test/users/:id`). They were parsed and
     // never read — substitute each declared variable into the URL now.
-    for v in &url.variable {
+    // W2 #202: substitute in DESCENDING key-length order so a prefix
+    // variable can't eat a longer one. With an ordered replace,
+    // `/users/:user/posts/:userId` (user declared first) became
+    // `.../posts/bobId` — the outcome depended on declaration order.
+    let mut vars: Vec<(&str, &str)> = url
+        .variable
+        .iter()
         // Guard against malformed declarations: an empty key would build
         // ":" and replace EVERY colon in the URL (protocol + port).
-        if v.key.is_empty() {
-            continue;
-        }
-        if let Some(value) = &v.value {
-            let key = format!(":{}", v.key);
-            result = result.replace(&key, value);
-        }
+        .filter(|v| !v.key.is_empty())
+        .filter_map(|v| v.value.as_deref().map(|value| (v.key.as_str(), value)))
+        .collect();
+    // Longest key first so `:host` wins over `:h` when both match. clippy
+    // wants sort_by_key; Reverse preserves the longest-first order.
+    vars.sort_by_key(|v| std::cmp::Reverse(v.0.len()));
+    for (key, value) in vars {
+        let key = format!(":{key}");
+        result = result.replace(&key, value);
     }
 
     result
@@ -432,6 +443,8 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
         Some(b) => match b.mode.as_str() {
             "raw" => b.raw.clone().map(Body::Raw),
             "urlencoded" => b.urlencoded.as_ref().map(|params| {
+                // W2 #203: preserve duplicate keys in declaration order (the
+                // old HashMap collapsed `tag=a`+`tag=b` into one field).
                 Body::UrlEncoded(
                     params
                         .iter()
@@ -814,6 +827,49 @@ mod tests {
     }
 
     #[test]
+    fn test_path_variable_prefix_substitution_is_order_independent() {
+        // W2 #202: an ordered str::replace let a prefix variable eat a
+        // longer one — `/users/:user/posts/:userId` with `user` declared
+        // first became `.../posts/bobId` (the `:user` prefix consumed
+        // `:userId`). Substitution sorts by descending key length, so the
+        // outcome must not depend on declaration order.
+        let url_of = |vars: &str| -> String {
+            let json = format!(
+                r#"{{
+                    "info": {{
+                        "name": "PV",
+                        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                    }},
+                    "item": [{{
+                        "name": "Get User",
+                        "request": {{
+                            "method": "GET",
+                            "url": {{
+                                "raw": "https://api.test/users/:user/posts/:userId",
+                                "variable": {vars}
+                            }}
+                        }}
+                    }}]
+                }}"#
+            );
+            let collection = parse_collection_str(&json).unwrap();
+            let scenario = collection_to_scenario(collection, HashMap::new());
+            scenario.items[0]
+                .request
+                .as_ref()
+                .expect("request")
+                .url
+                .clone()
+        };
+        let user_first =
+            url_of(r#"[{"key": "user", "value": "bob"}, {"key": "userId", "value": "1234"}]"#);
+        let id_first =
+            url_of(r#"[{"key": "userId", "value": "1234"}, {"key": "user", "value": "bob"}]"#);
+        assert_eq!(user_first, "https://api.test/users/bob/posts/1234");
+        assert_eq!(id_first, "https://api.test/users/bob/posts/1234");
+    }
+
+    #[test]
     fn test_raw_language_sets_content_type() {
         // Backlog line 138: options.raw.language ("json") must set
         // Content-Type: application/json — the field was parsed, never read.
@@ -838,10 +894,12 @@ mod tests {
         let collection = parse_collection_str(json).unwrap();
         let scenario = collection_to_scenario(collection, HashMap::new());
         let req = scenario.items[0].request.as_ref().expect("request");
-        assert_eq!(
-            req.headers.get("Content-Type").map(String::as_str),
-            Some("application/json")
-        );
+        let ct = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Content-Type")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ct, Some("application/json"));
     }
 
     #[test]
@@ -1738,7 +1796,12 @@ mod tests {
         assert_eq!(scenario.items[0].name, "Shape Req");
         let req = scenario.items[0].request.as_ref().expect("request parsed");
         assert_eq!(req.url, "https://api.example.com/shapes");
-        assert_eq!(req.headers.get("X-No-Value").map(String::as_str), Some(""));
+        let no_value = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-No-Value")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(no_value, Some(""));
         // String-form exec must still surface as a test script.
         let test = &scenario.items[0].test;
         assert!(
@@ -1888,8 +1951,7 @@ mod tests {
         match &req.body {
             Some(Body::UrlEncoded(params)) => {
                 assert_eq!(params.len(), 1, "disabled param dropped");
-                assert_eq!(params.get("user").map(String::as_str), Some("alice"));
-                assert!(params.get("pass").is_none());
+                assert_eq!(params[0], ("user".to_string(), "alice".to_string()));
             }
             other => panic!("expected UrlEncoded body, got {:?}", other),
         }

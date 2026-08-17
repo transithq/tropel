@@ -83,7 +83,7 @@ fn fixture_run_request() -> RunRequest {
         request: Some(Request {
             url: url.into(),
             method: Method::GET,
-            headers: HashMap::new(),
+            headers: Vec::new(),
             query_params: HashMap::new(),
             body,
             auth: None,

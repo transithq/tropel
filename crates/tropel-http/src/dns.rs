@@ -240,6 +240,30 @@ impl DnsResolver {
     }
 }
 
+/// Non-public address ranges used as an SSRF guard by proxy-style consumers
+/// (the KnockPort relay). Feed these into `HttpConfig.blacklist_ips` (or
+/// [`parse_blacklist`] directly) so every resolved address AND every
+/// IP-literal host — including each redirect hop — must clear them:
+/// loopback, RFC 1918 private, link-local (incl. IPv6 ULA), CGNAT,
+/// unspecified, and the IPv6 unique-local/link-local blocks. v4-mapped v6
+/// forms are caught because `IpCidr::contains` canonicalizes both sides.
+pub const SSRF_BLOCKLIST: [&str; 14] = [
+    "127.0.0.0/8",        // v4 loopback
+    "10.0.0.0/8",         // RFC 1918
+    "172.16.0.0/12",      // RFC 1918
+    "192.168.0.0/16",     // RFC 1918
+    "169.254.0.0/16",     // v4 link-local
+    "100.64.0.0/10",      // CGNAT (RFC 6598)
+    "0.0.0.0/8",          // unspecified (incl. 0.0.0.0 itself)
+    "224.0.0.0/4",        // multicast
+    "240.0.0.0/4",        // reserved
+    "255.255.255.255/32", // broadcast
+    "::1/128",            // v6 loopback
+    "::/128",             // v6 unspecified
+    "fc00::/7",           // v6 unique local (ULA)
+    "fe80::/10",          // v6 link-local
+];
+
 /// Parse a `blacklistIPs` list into CIDRs, warning and skipping entries that
 /// fail to parse. Shared by [`DnsResolver::from_config`] and the per-hop
 /// IP-literal check in [`crate::client::HttpClient`] — both need the exact
@@ -334,8 +358,11 @@ impl Resolve for DnsResolver {
             }
 
             // 5. Blacklist filter. If the lookup returned addresses but every
-            //    one of them is blacklisted, the request must fail loudly —
-            //    this is how k6 surfaces a blocked host.
+            // one of them is blacklisted, the request must fail loudly —
+            // this is how k6 surfaces a blocked host. (Blocked entries are
+            // removed from the list BEFORE the connector sees them, so a
+            // mixed answer still never CONNECTS to a blacklisted address;
+            // failing requires the whole answer to be blocked.)
             if !inner.blacklist.is_empty() {
                 let before = addrs.len();
                 addrs.retain(|a| !inner.blacklist.iter().any(|c| c.contains(a.ip())));

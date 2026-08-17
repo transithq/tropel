@@ -363,18 +363,41 @@ impl ScenarioRunner {
                     // `=` cannot split the query into extra params (backlog
                     // line 96); headers/query_params keep raw substitution
                     // (the HTTP layer encodes query params itself).
-                    let resolved_url = resolver.resolve_url_deep(&request.url, &scope, 5);
+                    let resolved_url = resolver.resolve_url_deep(
+                        &request.url,
+                        &scope,
+                        tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                    );
 
-                    // Resolve headers, query params, body
-                    let resolved_headers: HashMap<String, String> = request
+                    // Resolve headers, query params, body. Headers keep
+                    // declaration order + duplicates (W2 #203).
+                    let resolved_headers: Vec<(String, String)> = request
                         .headers
                         .iter()
-                        .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                resolver.resolve_deep(
+                                    v,
+                                    &scope,
+                                    tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                                ),
+                            )
+                        })
                         .collect();
                     let resolved_query: HashMap<String, String> = request
                         .query_params
                         .iter()
-                        .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                resolver.resolve_deep(
+                                    v,
+                                    &scope,
+                                    tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                                ),
+                            )
+                        })
                         .collect();
                     let resolved_body = request
                         .body
@@ -883,9 +906,17 @@ fn resolve_body(
             let trimmed = s.trim_start();
             let looks_like_json = trimmed.starts_with('{') || trimmed.starts_with('[');
             if looks_like_json {
-                tropel_sdk::types::Body::Raw(resolver.resolve_json_deep(s, scope, 5))
+                tropel_sdk::types::Body::Raw(resolver.resolve_json_deep(
+                    s,
+                    scope,
+                    tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                ))
             } else {
-                tropel_sdk::types::Body::Raw(resolver.resolve_deep(s, scope, 5))
+                tropel_sdk::types::Body::Raw(resolver.resolve_deep(
+                    s,
+                    scope,
+                    tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                ))
             }
         }
         tropel_sdk::types::Body::Json(val) => {
@@ -894,7 +925,11 @@ fn resolve_body(
             // the document (previously a quote in the data fell back to the
             // UNRESOLVED value — the substitution silently never happened).
             let s = serde_json::to_string(val).unwrap_or_default();
-            let resolved = resolver.resolve_json_deep(&s, scope, 5);
+            let resolved = resolver.resolve_json_deep(
+                &s,
+                scope,
+                tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+            );
             tropel_sdk::types::Body::Json(
                 serde_json::from_str(&resolved).unwrap_or_else(|_| val.clone()),
             )
@@ -908,17 +943,31 @@ fn resolve_body(
                 .map(|p| {
                     let mut part = p.clone();
                     if let Some(v) = &p.value {
-                        part.value = Some(resolver.resolve_deep(v, scope, 5));
+                        part.value = Some(resolver.resolve_deep(
+                            v,
+                            scope,
+                            tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                        ));
                     }
                     part
                 })
                 .collect();
             tropel_sdk::types::Body::FormData(resolved)
         }
-        tropel_sdk::types::Body::UrlEncoded(map) => {
-            let resolved: HashMap<String, String> = map
+        tropel_sdk::types::Body::UrlEncoded(fields) => {
+            // Duplicate keys preserved in order (W2 #203).
+            let resolved: Vec<(String, String)> = fields
                 .iter()
-                .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, scope, 5)))
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        resolver.resolve_deep(
+                            v,
+                            scope,
+                            tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                        ),
+                    )
+                })
                 .collect();
             tropel_sdk::types::Body::UrlEncoded(resolved)
         }
@@ -930,10 +979,18 @@ fn resolve_body(
             // GraphQL query text is not JSON — raw substitution; the
             // variables map IS JSON and gets the same quote-safe resolution
             // as the Json arm (backlog line 96).
-            let resolved_query = resolver.resolve_deep(query, scope, 5);
+            let resolved_query = resolver.resolve_deep(
+                query,
+                scope,
+                tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+            );
             let resolved_vars = variables.as_ref().map(|vars| {
                 let s = serde_json::to_string(vars).unwrap_or_default();
-                let resolved = resolver.resolve_json_deep(&s, scope, 5);
+                let resolved = resolver.resolve_json_deep(
+                    &s,
+                    scope,
+                    tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                );
                 serde_json::from_str(&resolved).unwrap_or_else(|_| vars.clone())
             });
             tropel_sdk::types::Body::GraphQL {
@@ -975,7 +1032,7 @@ mod tests {
             request: Some(tropel_sdk::types::Request {
                 url: format!("http://example.com/{name}"),
                 method: Method::GET,
-                headers: HashMap::new(),
+                headers: Vec::new(),
                 query_params: HashMap::new(),
                 body: None,
                 auth: None,
@@ -1212,7 +1269,7 @@ mod tests {
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/a".into(),
                         method: Method::GET,
-                        headers: HashMap::new(),
+                        headers: Vec::new(),
                         query_params: HashMap::new(),
                         body: None,
                         auth: None,
@@ -1232,7 +1289,7 @@ mod tests {
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/b".into(),
                         method: Method::GET,
-                        headers: HashMap::new(),
+                        headers: Vec::new(),
                         query_params: HashMap::new(),
                         body: None,
                         auth: None,

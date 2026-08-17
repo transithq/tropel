@@ -433,7 +433,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                 .chain(operation.parameters.iter())
                 .collect();
 
-            let mut headers: HashMap<String, String> = HashMap::new();
+            let mut headers: Vec<(String, String)> = Vec::new();
             let mut query_params: HashMap<String, String> = HashMap::new();
             let mut path_params: HashMap<String, String> = HashMap::new();
 
@@ -441,7 +441,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                 let val = extract_param_value(param);
                 match param.r#in.as_str() {
                     "header" => {
-                        headers.insert(param.name.clone(), val);
+                        headers.push((param.name.clone(), val));
                     }
                     "query" => {
                         query_params.insert(param.name.clone(), val);
@@ -479,7 +479,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                     .iter()
                     .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
                 if !has_ct {
-                    headers.insert("Content-Type".to_string(), ct);
+                    headers.push(("Content-Type".to_string(), ct));
                 }
             }
 
@@ -1134,10 +1134,10 @@ fn build_request_body(rb: &OasRequestBody) -> Option<(Body, String)> {
     // Then application/x-www-form-urlencoded
     if let Some(mt) = rb.content.get("application/x-www-form-urlencoded") {
         if let Some(ref schema) = mt.schema {
-            let mut map = HashMap::new();
+            // W2 #203: ordered Vec (sorted keys keep the body identical
+            // across runs); duplicates are impossible from a schema.
+            let mut fields: Vec<(String, String)> = Vec::new();
             if let Some(ref props) = schema.properties {
-                // Sort property keys — HashMap iteration order is unstable,
-                // so form bodies must be identical across runs.
                 let mut keys: Vec<&String> = props.keys().collect();
                 keys.sort();
                 for name in keys {
@@ -1148,11 +1148,11 @@ fn build_request_body(rb: &OasRequestBody) -> Option<(Body, String)> {
                         .or_else(|| prop_schema.default.clone())
                         .map(|v| value_to_string(&v))
                         .unwrap_or_else(|| "example".to_string());
-                    map.insert(name.clone(), val);
+                    fields.push((name.clone(), val));
                 }
             }
             return Some((
-                Body::UrlEncoded(map),
+                Body::UrlEncoded(fields),
                 "application/x-www-form-urlencoded".to_string(),
             ));
         }
@@ -1837,7 +1837,10 @@ components:
         // http client only auto-sets one for multipart, so without this the
         // raw XML body would go out headerless and get 415'd.
         assert_eq!(
-            req.headers.get("Content-Type").map(|s| s.as_str()),
+            req.headers
+                .iter()
+                .find(|(k, _)| k == "Content-Type")
+                .map(|(_, v)| v.as_str()),
             Some("application/xml")
         );
     }
@@ -1869,7 +1872,10 @@ components:
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
         assert_eq!(
-            req.headers.get("Content-Type").map(|s| s.as_str()),
+            req.headers
+                .iter()
+                .find(|(k, _)| k == "Content-Type")
+                .map(|(_, v)| v.as_str()),
             Some("application/json")
         );
     }
@@ -1905,7 +1911,10 @@ components:
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
         assert_eq!(
-            req.headers.get("Content-Type").map(|s| s.as_str()),
+            req.headers
+                .iter()
+                .find(|(k, _)| k == "Content-Type")
+                .map(|(_, v)| v.as_str()),
             Some("application/vnd.api+json"),
             "explicit header must not be overridden by media type"
         );
