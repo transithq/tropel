@@ -418,6 +418,16 @@ impl ScenarioRunner {
                         response_type: request.response_type,
                     };
 
+                    // Backlog line 205: test scripts read pm.request from
+                    // state.request, which was seeded from the UNRESOLVED
+                    // item before the prerequest ran. Refresh it with the
+                    // fully-resolved request so pm.request.url/headers/body
+                    // show substituted values, not literal {{templates}}.
+                    {
+                        let mut state = self.pm_state.lock().unwrap();
+                        state.request = Some(resolved_req.clone());
+                    }
+
                     // ── gRPC protocol dispatch (grpc:// or grpcs://) ──
                     // When the URL uses the gRPC scheme, dispatch to the
                     // registered protocol instead of the HTTP client. The
@@ -509,6 +519,14 @@ impl ScenarioRunner {
                         // decoupling from the HTTP crate).
                         if resolved_req.auth.is_none() {
                             resolved_req.auth = self.scenario.auth.clone();
+                            // Backlog line 205 (cont.): the scenario-auth fold
+                            // happens AFTER the pre-dispatch refresh — mirror it
+                            // so pm.request in test scripts shows the auth that
+                            // actually went out on the wire.
+                            {
+                                let mut state = self.pm_state.lock().unwrap();
+                                state.request = Some(resolved_req.clone());
+                            }
                         }
 
                         // Execute the request directly via the per-VU HTTP client
@@ -1245,6 +1263,72 @@ mod tests {
             resolver.resolve("{{authToken}}", &scope2),
             "fresh-token",
             "script-set env must override a stale seeded value"
+        );
+    }
+
+    #[tokio::test]
+    async fn pm_request_is_refreshed_with_resolved_url_after_iteration() {
+        // Backlog line 205: state.request was seeded from the UNRESOLVED
+        // item before the prerequest ran and never refreshed with the
+        // resolved request, so test scripts reading pm.request saw literal
+        // `{{templates}}` on the wire. After an iteration, pm.request must
+        // expose the variable-substituted URL.
+        let scenario = Arc::new(Scenario {
+            info: tropel_sdk::scenario::ScenarioInfo {
+                name: "resolved".into(),
+                description: None,
+                schema: None,
+            },
+            variables: HashMap::new(),
+            auth: None,
+            items: vec![ScenarioItem {
+                name: "resolved-item".into(),
+                id: None,
+                request: Some(tropel_sdk::types::Request {
+                    url: "http://{{host}}/v1".into(),
+                    method: Method::GET,
+                    headers: Vec::new(),
+                    query_params: HashMap::new(),
+                    body: None,
+                    auth: None,
+                    certificate: None,
+                    follow_redirects: true,
+                    timeout: None,
+                    response_type: Default::default(),
+                }),
+                prerequest: vec![],
+                test: vec![],
+                assertions: vec![],
+                items: vec![],
+            }],
+        });
+        let execution_items: Arc<Vec<ScenarioItem>> =
+            Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
+        let client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
+            HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client should construct"),
+        ));
+        let mut runner = ScenarioRunner::new(
+            scenario,
+            execution_items,
+            names,
+            client,
+            0,
+            "resolved".into(),
+        );
+
+        let mut env = HashMap::new();
+        env.insert("host".to_string(), "api.example.com".to_string());
+        runner.run_iteration(0, None, &env).await;
+
+        let state = runner.pm_state().lock().unwrap();
+        let seen_url = state.request.as_ref().map(|r| r.url.clone());
+        assert_eq!(
+            seen_url.as_deref(),
+            Some("http://api.example.com/v1"),
+            "pm.request.url must show the RESOLVED url, got {seen_url:?}"
         );
     }
 
