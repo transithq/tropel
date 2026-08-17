@@ -43,7 +43,8 @@ fn validate_methods(items: &[CollectionItem]) -> Result<()> {
                 if Method::parse(&req.request.method).is_none() {
                     return Err(CollectionError::InvalidRequest(format!(
                         "item '{}' has invalid HTTP method {:?}",
-                        req.name, req.request.method
+                        req.name.as_deref().unwrap_or("<unnamed>"),
+                        req.request.method
                     )));
                 }
             }
@@ -135,7 +136,7 @@ fn convert_items(
                 }
                 let scenario_item = ScenarioItem {
                     id: folder.id.clone(),
-                    name: folder.name.clone(),
+                    name: folder.name.clone().unwrap_or_default(),
                     request: None,
                     // The folder's own scripts are ALSO folded into every
                     // descendant leaf below, so they run before/after each
@@ -181,7 +182,7 @@ fn convert_request_item(
 
     ScenarioItem {
         id: req.id.clone(),
-        name: req.name.clone(),
+        name: req.name.clone().unwrap_or_default(),
         request: Some(request),
         prerequest: find_prerequest_script(&events),
         test: find_test_script(&events),
@@ -1955,5 +1956,35 @@ mod tests {
             }
             other => panic!("expected UrlEncoded body, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn unnamed_items_parse_to_empty_names() {
+        // Backlog line 205: the v2.1 schema makes item `name` OPTIONAL, but
+        // the model required it, so a real export with an unnamed item
+        // failed the WHOLE collection parse. Request and folder names are
+        // now Option<String> and convert to empty ScenarioItem names.
+        let json = r#"{
+            "info": { "name": "Unnamed Items", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+            "item": [
+                {
+                    "request": { "method": "GET", "url": "http://example.com/a" }
+                },
+                {
+                    "item": [
+                        { "request": { "method": "GET", "url": "http://example.com/b" } }
+                    ]
+                }
+            ]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        assert_eq!(scenario.items.len(), 2, "both unnamed items must parse");
+        assert_eq!(scenario.items[0].name, "", "unnamed request -> empty name");
+        assert_eq!(scenario.items[1].name, "", "unnamed folder -> empty name");
+        assert_eq!(
+            scenario.items[1].items[0].name, "",
+            "unnamed nested request -> empty name"
+        );
     }
 }

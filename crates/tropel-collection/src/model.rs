@@ -136,7 +136,11 @@ where
 struct ItemUnion {
     #[serde(default)]
     id: Option<String>,
-    name: String,
+    /// v2.1 schema: item `name` is OPTIONAL. The old model required it, so a
+    /// real export with an unnamed item (Postman emits these freely) failed
+    /// the WHOLE collection parse.
+    #[serde(default)]
+    name: Option<String>,
     /// `None` = no `item` key (not a folder). `Some(Some(..))` = folder
     /// children (possibly empty). `Some(None)` = `"item": null`.
     #[serde(default, deserialize_with = "de_presence")]
@@ -312,7 +316,10 @@ pub struct RequestItem {
     /// Postman item id — resolves `setNextRequest` BEFORE names (backlog §4).
     #[serde(default)]
     pub id: Option<String>,
-    pub name: String,
+    /// v2.1 schema: item `name` is OPTIONAL — an unnamed request must parse
+    /// (the ScenarioItem conversion falls back to an empty name).
+    #[serde(default)]
+    pub name: Option<String>,
     pub request: RequestDetail,
     /// Postman `protocolProfileBehavior` — emitted at ITEM level as a
     /// sibling of `request` (line 196). Drives GET/HEAD body pruning.
@@ -331,7 +338,10 @@ pub struct FolderItem {
     /// Postman item id — resolves `setNextRequest` BEFORE names (backlog §4).
     #[serde(default)]
     pub id: Option<String>,
-    pub name: String,
+    /// v2.1 schema: item `name` is OPTIONAL — an unnamed folder must parse
+    /// (the ScenarioItem conversion falls back to an empty name).
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub item: Vec<CollectionItem>,
     #[serde(default)]
@@ -744,7 +754,7 @@ mod tests {
         assert_eq!(col.item.len(), 1);
         match &col.item[0] {
             CollectionItem::Folder(f) => {
-                assert_eq!(f.name, "folder");
+                assert_eq!(f.name.as_deref(), Some("folder"));
                 assert_eq!(f.item.len(), 1, "folder must keep its child");
                 assert!(matches!(f.item[0], CollectionItem::Request(_)));
             }
@@ -771,7 +781,7 @@ mod tests {
         assert_eq!(col.item.len(), 1);
         match &col.item[0] {
             CollectionItem::Folder(f) => {
-                assert_eq!(f.name, "folder");
+                assert_eq!(f.name.as_deref(), Some("folder"));
                 assert_eq!(f.item.len(), 1, "folder must keep its child");
                 assert!(matches!(f.item[0], CollectionItem::Request(_)));
             }
@@ -819,7 +829,7 @@ mod tests {
         }
         assert_eq!(depth, 50, "all 50 folder levels must survive");
         match current {
-            CollectionItem::Request(r) => assert_eq!(r.name, "deep-req"),
+            CollectionItem::Request(r) => assert_eq!(r.name.as_deref(), Some("deep-req")),
             CollectionItem::Folder(_) => panic!("expected the deepest request"),
         }
     }
