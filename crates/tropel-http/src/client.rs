@@ -35,6 +35,27 @@ fn is_credential_header(key: &str) -> bool {
     CREDENTIAL_HEADERS.contains(&key)
 }
 
+/// Convert an execution error into [`TropelError::Http`], joining the FULL
+/// error `source()` chain into the message. reqwest folds DNS-layer failures
+/// — including this crate's `blacklistIPs` resolver
+/// ("all resolved addresses for 'host' are blacklisted") — into the request
+/// error, whose `Display` alone drops that cause. Walking the chain lets
+/// proxy-style consumers (the KnockPort relay maps a blacklisted hop to a
+/// clean 403 "target address is blocked") detect the root cause from the
+/// message string instead of every blocked target degrading to a generic
+/// "upstream request failed".
+fn http_request_error(e: &dyn std::error::Error) -> TropelError {
+    let mut msg = format!("Request failed: {e}");
+    let mut src = std::error::Error::source(e);
+    for _ in 0..8 {
+        let Some(s) = src else { break };
+        msg.push_str(" -> ");
+        msg.push_str(&s.to_string());
+        src = std::error::Error::source(s);
+    }
+    TropelError::Http(msg)
+}
+
 /// Canonicalize an HTTP header name to Go's MIME canonical form
 /// (uppercase first letter of each dash-separated word, lowercase the
 /// rest): `content-type` → `Content-Type`, `x-request-id` →
@@ -583,8 +604,8 @@ impl HttpClient {
             if let Some(content_type) = &multipart_content_type {
                 if !request
                     .headers
-                    .keys()
-                    .any(|k| k.eq_ignore_ascii_case("content-type"))
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                 {
                     req_builder = req_builder.header("Content-Type", content_type);
                 }
@@ -620,8 +641,8 @@ impl HttpClient {
                 if let Some(jar) = jar {
                     let has_explicit_cookie = request
                         .headers
-                        .keys()
-                        .any(|k| k.eq_ignore_ascii_case("cookie"));
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("cookie"));
                     if !has_explicit_cookie {
                         if let Ok(url) = reqwest::Url::parse(&current_url) {
                             if let Some(value) = jar.cookies(&url) {
@@ -713,7 +734,7 @@ impl HttpClient {
             let mut response =
                 crate::subtimings::TimedRequest::new(client.execute(built_request), slot.clone())
                     .await
-                    .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
+                    .map_err(|e| http_request_error(&e))?;
             let mut waiting_duration = waiting_start.elapsed();
 
             // HTTP Digest (RFC 7616) is challenge-response: the first request goes
@@ -751,7 +772,7 @@ impl HttpClient {
                                     slot.clone(),
                                 )
                                 .await
-                                .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
+                                .map_err(|e| http_request_error(&e))?;
                                 waiting_duration = retry_start.elapsed();
                                 tracing::debug!(
                                     "Digest auth: retried after 401 challenge (status now {})",
@@ -774,17 +795,16 @@ impl HttpClient {
             // (Content-Type, X-Request-Id) because reqwest's HeaderName is
             // always lowercase; k6/Postman scripts index headers by their
             // canonical spelling and every doc example would otherwise see
-            // undefined.
-            let headers: HashMap<String, String> = response
-                .headers()
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        canonical_header_name(k.as_str()),
-                        v.to_str().unwrap_or("").to_string(),
-                    )
-                })
-                .collect();
+            // undefined. `raw_headers` keeps EVERY line in arrival order
+            // (duplicate names preserved) for lossless consumers.
+            let mut headers: HashMap<String, String> = HashMap::new();
+            let mut raw_headers: Vec<(String, String)> = Vec::new();
+            for (k, v) in response.headers().iter() {
+                let name = canonical_header_name(k.as_str());
+                let value = v.to_str().unwrap_or("").to_string();
+                headers.insert(name.clone(), value.clone());
+                raw_headers.push((name, value));
+            }
 
             // Parse Set-Cookie headers into structured cookies so scripts can
             // read `res.cookies` (pm.response.cookies / k6 res.cookies). The
@@ -868,6 +888,7 @@ impl HttpClient {
                         status_code,
                         status_text,
                         headers,
+                        raw_headers,
                         body: hop_body,
                         text_cache: std::cell::OnceCell::new(),
                         json_cache: std::cell::OnceCell::new(),
@@ -1043,6 +1064,7 @@ impl HttpClient {
                 status_code,
                 status_text,
                 headers,
+                raw_headers,
                 body: body_vec,
                 text_cache: std::cell::OnceCell::new(),
                 json_cache: std::cell::OnceCell::new(),
@@ -1182,6 +1204,12 @@ pub struct HttpResponse {
     pub status_code: u16,
     pub status_text: String,
     pub headers: HashMap<String, String>,
+    /// Every response header in ARRIVAL ORDER with duplicate names preserved
+    /// (unlike the `headers` map, where the last line wins). Consumers that
+    /// need lossless forwarding (proxy relays) use this; script-facing APIs
+    /// keep using the map. Entries carry canonicalized names
+    /// ([`canonical_header_name`]).
+    pub raw_headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// Memoized UTF-8 decode of `body` (see `body_text()`).
     pub text_cache: std::cell::OnceCell<Option<String>>,
@@ -1263,10 +1291,9 @@ impl HttpResponse {
 /// Parse a single `Set-Cookie` header value into a structured [`Cookie`].
 ///
 /// Handles the standard `name=value; Attr=Val; Flag` grammar — name/value are
-/// the bare pair, then optional `Domain`, `Path`, `Expires`, `Max-Age`,
-/// `SameSite` attributes plus the boolean `HttpOnly` / `Secure` flags. Unknown
-/// attributes are ignored. Returns `None` when the header has no `name=value`
-/// pair.
+/// the bare pair, then optional `Domain`, `Path`, `Expires`, `SameSite`
+/// attributes plus the boolean `HttpOnly` / `Secure` flags. Unknown attributes
+/// are ignored. Returns `None` when the header has no `name=value` pair.
 fn parse_set_cookie(header: &str) -> Option<Cookie> {
     let mut parts = header.split(';');
     let pair = parts.next()?.trim();
@@ -1299,7 +1326,6 @@ fn parse_set_cookie(header: &str) -> Option<Cookie> {
                 "path" => cookie.path = Some(val.trim().trim_matches('"').to_string()),
                 "expires" => cookie.expires = Some(val.trim().trim_matches('"').to_string()),
                 "samesite" => cookie.same_site = Some(val.trim().trim_matches('"').to_string()),
-                "max-age" => cookie.max_age = val.trim().trim_matches('"').parse::<i64>().ok(),
                 _ => {}
             },
             None => match attr.to_ascii_lowercase().as_str() {
@@ -1336,16 +1362,12 @@ fn body_to_bytes(body: &Body) -> Vec<u8> {
         Body::Raw(s) => s.as_bytes().to_vec(),
         Body::Json(val) => serde_json::to_string(val).unwrap_or_default().into_bytes(),
         Body::FormData(parts) => multipart_form_data_bytes(parts),
-        Body::UrlEncoded(map) => {
-            // Backlog line 143: sort by key — a HashMap's RandomState iteration
-            // order made the encoded body nondeterministic run-to-run (broke
-            // body-signing prerequest scripts and byte-reproducibility).
-            let mut params: Vec<(String, String)> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone().to_string()))
-                .collect();
-            params.sort();
-            serde_urlencoded::to_string(params)
+        Body::UrlEncoded(fields) => {
+            // W2 #203: fields are an ordered Vec (declaration order,
+            // duplicates preserved) — byte-stable by construction, so no
+            // sort is needed (the old HashMap required the key sort for
+            // run-to-run determinism, backlog line 143).
+            serde_urlencoded::to_string(fields)
                 .unwrap_or_default()
                 .into_bytes()
         }
@@ -1597,7 +1619,7 @@ mod tests {
         Request {
             url: url.to_string(),
             method: Method::GET,
-            headers: HashMap::new(),
+            headers: Vec::new(),
             query_params: HashMap::new(),
             body: None,
             auth: None,
@@ -1735,6 +1757,7 @@ mod tests {
                 status_code: 200,
                 status_text: "OK".into(),
                 headers: Default::default(),
+                raw_headers: Default::default(),
                 body,
                 text_cache: Default::default(),
                 json_cache: Default::default(),
@@ -1809,9 +1832,7 @@ mod tests {
         //
         // "a&b" percent-encodes to "a%26b" — `&` (1 byte) becomes `%26`
         // (3 bytes) — so the encoded size is LARGER than the raw concat.
-        let mut map = std::collections::HashMap::new();
-        map.insert("k".to_string(), "a&b".to_string());
-        let url = Body::UrlEncoded(map);
+        let url = Body::UrlEncoded(vec![("k".to_string(), "a&b".to_string())]);
         let wire = serde_urlencoded::to_string(vec![("k".to_string(), "a&b".to_string())]).unwrap();
         assert_eq!(wire, "k=a%26b");
         // 5 raw bytes vs 7 encoded — the old function reported 5.
@@ -1848,10 +1869,11 @@ mod tests {
         qp.insert("alpha".to_string(), "1".to_string());
         qp.insert("mid".to_string(), "x".to_string());
 
-        let mut urlenc = HashMap::new();
-        urlenc.insert("z".to_string(), "1".to_string());
-        urlenc.insert("a".to_string(), "2".to_string());
-        urlenc.insert("m".to_string(), "3".to_string());
+        let urlenc = vec![
+            ("a".to_string(), "2".to_string()),
+            ("m".to_string(), "3".to_string()),
+            ("z".to_string(), "1".to_string()),
+        ];
 
         let form = vec![
             FormDataPart {
@@ -1877,11 +1899,9 @@ mod tests {
             },
         ];
 
-        // UrlEncoded: key-sorted `a=2&m=3&z=1`. NOTE: a repeated-serialization
-        // loop would NOT guard this — RandomState is seeded per PROCESS, so
-        // iteration order is already stable within one process. The assertion
-        // that matters is the exact sorted output (a HashMap iterates in a
-        // random order that would almost never be alphabetical).
+        // UrlEncoded: wire bytes follow DECLARATION ORDER (W2 #203 — the
+        // fields are an ordered Vec now, byte-stable by construction; the old
+        // HashMap required the key sort for determinism, backlog line 143).
         let urlenc_bytes = body_to_bytes(&Body::UrlEncoded(urlenc.clone()));
         assert_eq!(
             String::from_utf8_lossy(&urlenc_bytes),

@@ -17,7 +17,7 @@ fn make_request(url: &str, body: Option<Body>) -> Request {
     Request {
         url: url.to_string(),
         method: Method::GET,
-        headers: HashMap::new(),
+        headers: Vec::new(),
         query_params: HashMap::new(),
         body,
         auth: None,

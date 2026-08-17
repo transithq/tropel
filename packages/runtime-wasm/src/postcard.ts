@@ -271,11 +271,39 @@ export function decodeHttpRequest(bytes: Uint8Array): HttpRequest {
   return {
     url: parsed.url ?? "",
     method: parsed.method ?? "GET",
-    headers: parsed.headers ?? {},
+    // W2 #203: the SDK Request.headers wire form is now an ARRAY of
+    // [name, value] pairs (order + duplicates preserved). The legacy object
+    // form is still accepted; both normalize to a Record for the fetch API.
+    headers: normalizeHeaders(parsed.headers),
     queryParams: parsed.query_params ?? {},
     body,
     bodyDecoded,
   };
+}
+
+/**
+ * Normalize the host-sent headers into a `Record<string, string>` for the
+ * fetch API: array-of-pairs (`[["name", "value"], ...]`) or legacy object
+ * (`{"name": "value"}`). Last value wins on duplicate names in the array
+ * form (the fetch API cannot express duplicate headers).
+ */
+function normalizeHeaders(headers: unknown): Record<string, string> {
+  if (headers == null) {
+    return {};
+  }
+  if (Array.isArray(headers)) {
+    const out: Record<string, string> = {};
+    for (const pair of headers) {
+      if (Array.isArray(pair) && pair.length >= 2) {
+        out[String(pair[0])] = String(pair[1]);
+      }
+    }
+    return out;
+  }
+  if (typeof headers === "object") {
+    return headers as Record<string, string>;
+  }
+  return {};
 }
 
 // ── Response (host → wasm, across the tropel_host_http bridge) ───────────

@@ -65,6 +65,7 @@ fn fixture_response(req: &Request) -> Result<Response> {
             secure: None,
             same_site: None,
             expires: None,
+            max_age: None,
         }],
         size: 12,
         request_body_size: 0,
@@ -82,7 +83,7 @@ fn fixture_run_request() -> RunRequest {
         request: Some(Request {
             url: url.into(),
             method: Method::GET,
-            headers: HashMap::new(),
+            headers: Vec::new(),
             query_params: HashMap::new(),
             body,
             auth: None,

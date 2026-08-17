@@ -228,6 +228,7 @@ mod tests {
                 secure: None,
                 same_site: None,
                 expires: None,
+                max_age: None,
             }],
             size: 12,
             request_body_size: 0,
@@ -248,7 +249,7 @@ mod tests {
                 request: Some(tropel_sdk::types::Request {
                     url: "https://example.com/ping".into(),
                     method: Method::GET,
-                    headers: HashMap::new(),
+                    headers: Vec::new(),
                     query_params: HashMap::new(),
                     body: None,
                     auth: None,
@@ -327,7 +328,7 @@ mod tests {
         let inner = scenario.items[0].request.as_mut().unwrap();
         inner.body = Some(Body::Json(serde_json::json!({"a": 1})));
         // Override with UrlEncoded — the last write wins.
-        inner.body = Some(Body::UrlEncoded(HashMap::from([("a".into(), "1".into())])));
+        inner.body = Some(Body::UrlEncoded(vec![("a".into(), "1".into())]));
 
         // Round-trip through postcard as scenario_json string.
         let req = RunRequest {

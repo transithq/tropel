@@ -681,10 +681,17 @@ fn resolve_proto(
             return Ok((p.to_string(), dir));
         }
     }
-    // 2. request headers
-    if let Some(p) = req.headers.get("x-grpc-proto") {
-        let dir = req.headers.get("x-grpc-proto-dir").cloned();
-        return Ok((p.clone(), dir));
+    // 2. request headers (W2 #203: headers are an ordered Vec now — find
+    // by case-insensitive name instead of HashMap .get).
+    let get_header = |name: &str| {
+        req.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    if let Some(p) = get_header("x-grpc-proto") {
+        let dir = get_header("x-grpc-proto-dir");
+        return Ok((p, dir));
     }
     // 3. env
     if let Ok(p) = std::env::var("TROPEL_GRPC_PROTO") {

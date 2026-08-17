@@ -908,7 +908,13 @@ struct WasmRequest {
     url: String,
     #[serde(default)]
     method: String,
-    #[serde(default)]
+    // W2 #203: the SDK serializes request headers as an ORDERED array of
+    // pairs, but older wasm payloads and the JS fetch boundary send an
+    // object. serde's streaming HashMap deserializer REJECTS the array form
+    // ("invalid type: sequence, expected a map"), so a custom deserializer
+    // accepts both. Duplicates collapse on the wasm side; the JS fetch API
+    // cannot express duplicate headers anyway.
+    #[serde(default, deserialize_with = "de_headers")]
     headers: HashMap<String, String>,
     #[serde(default)]
     query_params: HashMap<String, String>,
@@ -934,6 +940,37 @@ struct WasmAuth {
 
 fn return_true() -> bool {
     true
+}
+
+/// Deserialize request headers from EITHER the legacy JSON object form
+/// (`{"name": "value"}`) or the W2 #203 array-of-pairs form
+/// (`[["name", "value"], ...]`) that the SDK `Request` now serializes.
+///
+/// serde_json's streaming `HashMap` deserializer rejects a sequence input
+/// ("invalid type: sequence, expected a map"), so an untagged enum tries the
+/// map form first, then the list form. Subtlety notes:
+/// - `#[derive(serde::Deserialize)]` is fully-qualified, so `use
+///   serde::Deserialize;` must be in scope inside the fn for the
+///   `HeadersForm::deserialize` method call to resolve (E0599).
+/// - The return type is `std::result::Result` because the crate re-exports
+///   `tropel_sdk::Result<T>` — a 1-generic alias — so a 2-arg
+///   `Result<_, D::Error>` would be E0107 ("type alias takes 1 generic
+///   argument but 2 supplied").
+fn de_headers<'de, D>(deserializer: D) -> std::result::Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum HeadersForm {
+        Map(HashMap<String, String>),
+        List(Vec<(String, String)>),
+    }
+    Ok(match HeadersForm::deserialize(deserializer)? {
+        HeadersForm::Map(map) => map,
+        HeadersForm::List(list) => list.into_iter().collect(),
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1039,15 +1076,16 @@ fn convert_request(wr: &WasmRequest) -> Result<Request> {
             .map(Body::Json)
             .unwrap_or_else(|_| Body::Raw(b.clone())),
         "form" => {
-            let mut map = HashMap::new();
+            // W2 #203: ordered Vec — duplicates preserved, declaration order.
+            let mut fields = Vec::new();
             for param in b.split('&') {
                 if let Some(eq) = param.find('=') {
                     let k = &param[..eq];
                     let v = &param[eq + 1..];
-                    map.insert(k.to_string(), v.to_string());
+                    fields.push((k.to_string(), v.to_string()));
                 }
             }
-            Body::UrlEncoded(map)
+            Body::UrlEncoded(fields)
         }
         _ => Body::Raw(b.clone()),
     });
@@ -1055,7 +1093,13 @@ fn convert_request(wr: &WasmRequest) -> Result<Request> {
     Ok(Request {
         url: wr.url.clone(),
         method,
-        headers: wr.headers.clone(),
+        // W2 #203: the JS boundary sends headers as an object (HashMap); the
+        // SDK Request now carries an ordered duplicate-preserving Vec.
+        headers: wr
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         query_params: wr.query_params.clone(),
         body,
         auth: wr.auth.as_ref().and_then(convert_auth),
@@ -1305,6 +1349,24 @@ mod tests {
             ws.items[0].request.as_ref().unwrap().url,
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn test_wasm_request_headers_dual_form() {
+        // W2 #203: the SDK serializes request headers as an ORDERED array of
+        // pairs, but older wasm payloads and the JS fetch boundary send an
+        // object. serde's HashMap natively accepts BOTH forms — pin it here
+        // so a future wire change cannot silently break the boundary.
+        let from_array: WasmRequest = serde_json::from_str(
+            r#"{"url":"u","method":"GET","headers":[["X-A","1"],["X-B","2"]]}"#,
+        )
+        .unwrap();
+        assert_eq!(from_array.headers.get("X-A").unwrap(), "1");
+        assert_eq!(from_array.headers.get("X-B").unwrap(), "2");
+
+        let from_object: WasmRequest =
+            serde_json::from_str(r#"{"url":"u","method":"GET","headers":{"X-C":"3"}}"#).unwrap();
+        assert_eq!(from_object.headers.get("X-C").unwrap(), "3");
     }
 
     #[test]

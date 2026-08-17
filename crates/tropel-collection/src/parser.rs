@@ -208,7 +208,10 @@ fn convert_request(
 
     let mut url = build_url(detail);
 
-    let mut headers: HashMap<String, String> = detail
+    // W2 #203: keep headers in DECLARATION ORDER with duplicates preserved
+    // (the old HashMap collapsed two `Cookie:` headers into one — last
+    // value wins — and let header order vary request-to-request).
+    let mut headers: Vec<(String, String)> = detail
         .header
         .iter()
         .filter(|h| !h.disabled)
@@ -244,10 +247,10 @@ fn convert_request(
     if body.is_some() {
         if let Some(content_type) = raw_content_type(detail.body.as_ref()) {
             let has_ct = headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("content-type"));
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
             if !has_ct {
-                headers.insert("Content-Type".to_string(), content_type);
+                headers.push(("Content-Type".to_string(), content_type));
             }
         }
     }
@@ -438,6 +441,8 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
         Some(b) => match b.mode.as_str() {
             "raw" => b.raw.clone().map(Body::Raw),
             "urlencoded" => b.urlencoded.as_ref().map(|params| {
+                // W2 #203: preserve duplicate keys in declaration order (the
+                // old HashMap collapsed `tag=a`+`tag=b` into one field).
                 Body::UrlEncoded(
                     params
                         .iter()
@@ -887,10 +892,12 @@ mod tests {
         let collection = parse_collection_str(json).unwrap();
         let scenario = collection_to_scenario(collection, HashMap::new());
         let req = scenario.items[0].request.as_ref().expect("request");
-        assert_eq!(
-            req.headers.get("Content-Type").map(String::as_str),
-            Some("application/json")
-        );
+        let ct = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Content-Type")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ct, Some("application/json"));
     }
 
     #[test]
@@ -1787,7 +1794,12 @@ mod tests {
         assert_eq!(scenario.items[0].name, "Shape Req");
         let req = scenario.items[0].request.as_ref().expect("request parsed");
         assert_eq!(req.url, "https://api.example.com/shapes");
-        assert_eq!(req.headers.get("X-No-Value").map(String::as_str), Some(""));
+        let no_value = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-No-Value")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(no_value, Some(""));
         // String-form exec must still surface as a test script.
         let test = &scenario.items[0].test;
         assert!(
@@ -1937,8 +1949,7 @@ mod tests {
         match &req.body {
             Some(Body::UrlEncoded(params)) => {
                 assert_eq!(params.len(), 1, "disabled param dropped");
-                assert_eq!(params.get("user").map(String::as_str), Some("alice"));
-                assert!(params.get("pass").is_none());
+                assert_eq!(params[0], ("user".to_string(), "alice".to_string()));
             }
             other => panic!("expected UrlEncoded body, got {:?}", other),
         }
