@@ -65,6 +65,7 @@ fn fixture_response(req: &Request) -> Result<Response> {
             secure: None,
             same_site: None,
             expires: None,
+            max_age: None,
         }],
         size: 12,
         request_body_size: 0,
