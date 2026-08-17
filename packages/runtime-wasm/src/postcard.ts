@@ -324,6 +324,17 @@ function writeOptionBool(w: Writer, v: boolean | null | undefined): void {
   }
 }
 
+function writeOptionI64(w: Writer, v: number | null | undefined): void {
+  if (v == null) w.optionNone();
+  else {
+    w.optionSome();
+    // Cookie.max_age is Option<i64> seconds; postcard encodes i64 as a
+    // varint of the two's-complement bits. Seconds values are far inside the
+    // JS safe-integer range and non-negative in practice.
+    w.varint(v);
+  }
+}
+
 function writeDurationMs(w: Writer, ms: number): void {
   const totalNs = Math.max(0, Math.round(ms * 1_000_000));
   const secs = Math.floor(totalNs / 1_000_000_000);
@@ -369,7 +380,7 @@ export function encodeResponse(resp: HttpResponse): Uint8Array {
     // Rust Cookie.name / Cookie.value are REQUIRED String fields (types.rs) —
     // writing them through writeOptionStr would emit a 0x01 tag where the
     // wasm expects a bare string and corrupt every cookie (review catch). The
-    // other six fields are Option on the Rust side.
+    // other seven fields are Option on the Rust side.
     w.str(c.name);
     w.str(c.value);
     writeOptionStr(w, c.domain);
@@ -378,6 +389,10 @@ export function encodeResponse(resp: HttpResponse): Uint8Array {
     writeOptionBool(w, c.secure);
     writeOptionStr(w, c.sameSite);
     writeOptionStr(w, c.expires);
+    // W2 #198: SDK Cookie gained max_age (Option<i64>) after expires; omitting
+    // it makes the wasm decoder read the next varint byte as its Option
+    // discriminant ("Option discriminant that wasn't 0 or 1").
+    writeOptionI64(w, c.maxAge);
   }
   w.varint(resp.size ?? resp.body.length);
   w.varint(resp.requestBodySize ?? 0);
