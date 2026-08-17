@@ -574,26 +574,58 @@ pub struct Variable {
     pub description: Option<String>,
 }
 
+/// Deserialize an auth scheme's attributes in EITHER Postman form (W2 #201):
+/// the v2.1 array form `[{ "key": "username", "value": "u" }, ...]`, or the
+/// v2.0 object form `{ "username": "u", "password": "p" }` (the v2.0.0
+/// schema types every scheme's attributes as an OBJECT, so a v2.0 export used
+/// to fail the WHOLE collection parse against `Vec<AuthAttribute>`). Both
+/// normalize to `Vec<AuthAttribute>`; consumers are unchanged.
+fn de_auth_attrs<'de, D>(deserializer: D) -> Result<Vec<AuthAttribute>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum AuthAttrs {
+        List(Vec<AuthAttribute>),
+        Map(std::collections::BTreeMap<String, serde_json::Value>),
+    }
+    Ok(match AuthAttrs::deserialize(deserializer)? {
+        AuthAttrs::List(list) => list,
+        AuthAttrs::Map(map) => map
+            .into_iter()
+            .map(|(key, value)| AuthAttribute {
+                key,
+                value,
+                attr_type: None,
+            })
+            .collect(),
+    })
+}
+
 /// Auth configuration in Postman format.
+///
+/// Each scheme's attributes accept BOTH the v2.1 array form and the v2.0
+/// object form (see [`de_auth_attrs`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionAuth {
     #[serde(rename = "type")]
     pub auth_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub bearer: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub basic: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub apikey: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub digest: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub oauth1: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub oauth2: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub awsv4: Vec<AuthAttribute>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_auth_attrs")]
     pub hawk: Vec<AuthAttribute>,
 }
 
@@ -811,6 +843,88 @@ mod tests {
             "malformed request sub-fields must error loudly, not become an empty folder: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn v2_0_object_form_auth_attributes_parse() {
+        // W2 #201: the v2.0.0 collection schema types every auth scheme's
+        // attributes as an OBJECT (`"basic": { "username": "u" }`) while
+        // v2.1 uses an array of `{key, value}` pairs. The model typed all
+        // eight schemes as `Vec<AuthAttribute>`, so a v2.0 export failed
+        // the WHOLE collection parse. Both forms must normalize.
+        let col = parse_collection(json!({
+            "info": {
+                "name": "t",
+                "schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json"
+            },
+            "item": [{
+                "name": "req",
+                "request": {
+                    "method": "GET",
+                    "url": "https://x.test/",
+                    "auth": {
+                        "type": "basic",
+                        "basic": { "username": "u", "password": "p" }
+                    }
+                }
+            }]
+        }));
+        let req = match &col.item[0] {
+            CollectionItem::Request(r) => r,
+            CollectionItem::Folder(_) => panic!("expected request item"),
+        };
+        let auth = req.request.auth.as_ref().expect("auth must be present");
+        assert_eq!(auth.auth_type, "basic");
+        assert_eq!(auth.basic.len(), 2);
+        // BTreeMap normalizes in alphabetical order, so look up by key.
+        let get = |k: &str| {
+            auth.basic
+                .iter()
+                .find(|a| a.key == k)
+                .map(|a| a.value.clone())
+        };
+        assert_eq!(get("username"), Some(json!("u")));
+        assert_eq!(get("password"), Some(json!("p")));
+    }
+
+    #[test]
+    fn v2_0_object_form_oauth1_with_boolean_value_parses() {
+        // W2 #201: v2.0 object form with a non-string value (boolean) must
+        // parse — the object value is kept as structured JSON, exactly like
+        // the v2.1 array form already does (backlog §4).
+        let col = parse_collection(json!({
+            "info": {
+                "name": "t",
+                "schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json"
+            },
+            "item": [{
+                "name": "req",
+                "request": {
+                    "method": "GET",
+                    "url": "https://x.test/",
+                    "auth": {
+                        "type": "oauth1",
+                        "oauth1": { "consumerKey": "ck", "encodeOAuthSign": true }
+                    }
+                }
+            }]
+        }));
+        let req = match &col.item[0] {
+            CollectionItem::Request(r) => r,
+            CollectionItem::Folder(_) => panic!("expected request item"),
+        };
+        let auth = req.request.auth.as_ref().expect("auth must be present");
+        assert_eq!(auth.auth_type, "oauth1");
+        assert_eq!(auth.oauth1.len(), 2);
+        // Order-independent lookup (BTreeMap sorts keys alphabetically).
+        let get = |k: &str| {
+            auth.oauth1
+                .iter()
+                .find(|a| a.key == k)
+                .map(|a| a.value.clone())
+        };
+        assert_eq!(get("consumerKey"), Some(json!("ck")));
+        assert_eq!(get("encodeOAuthSign"), Some(json!(true)));
     }
 
     #[test]
