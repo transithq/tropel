@@ -366,16 +366,24 @@ fn build_url(detail: &RequestDetail) -> String {
     // `url.variable` as `{key, value}` and referenced in the URL as `:key`
     // segments (e.g. `https://api.test/users/:id`). They were parsed and
     // never read — substitute each declared variable into the URL now.
-    for v in &url.variable {
+    // W2 #202: substitute in DESCENDING key-length order so a prefix
+    // variable can't eat a longer one. With an ordered replace,
+    // `/users/:user/posts/:userId` (user declared first) became
+    // `.../posts/bobId` — the outcome depended on declaration order.
+    let mut vars: Vec<(&str, &str)> = url
+        .variable
+        .iter()
         // Guard against malformed declarations: an empty key would build
         // ":" and replace EVERY colon in the URL (protocol + port).
-        if v.key.is_empty() {
-            continue;
-        }
-        if let Some(value) = &v.value {
-            let key = format!(":{}", v.key);
-            result = result.replace(&key, value);
-        }
+        .filter(|v| !v.key.is_empty())
+        .filter_map(|v| v.value.as_deref().map(|value| (v.key.as_str(), value)))
+        .collect();
+    // Longest key first so `:host` wins over `:h` when both match. clippy
+    // wants sort_by_key; Reverse preserves the longest-first order.
+    vars.sort_by_key(|v| std::cmp::Reverse(v.0.len()));
+    for (key, value) in vars {
+        let key = format!(":{key}");
+        result = result.replace(&key, value);
     }
 
     result
@@ -811,6 +819,49 @@ mod tests {
         let scenario = collection_to_scenario(collection, HashMap::new());
         let req = scenario.items[0].request.as_ref().expect("request");
         assert_eq!(req.url, "https://api.test/users/42");
+    }
+
+    #[test]
+    fn test_path_variable_prefix_substitution_is_order_independent() {
+        // W2 #202: an ordered str::replace let a prefix variable eat a
+        // longer one — `/users/:user/posts/:userId` with `user` declared
+        // first became `.../posts/bobId` (the `:user` prefix consumed
+        // `:userId`). Substitution sorts by descending key length, so the
+        // outcome must not depend on declaration order.
+        let url_of = |vars: &str| -> String {
+            let json = format!(
+                r#"{{
+                    "info": {{
+                        "name": "PV",
+                        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                    }},
+                    "item": [{{
+                        "name": "Get User",
+                        "request": {{
+                            "method": "GET",
+                            "url": {{
+                                "raw": "https://api.test/users/:user/posts/:userId",
+                                "variable": {vars}
+                            }}
+                        }}
+                    }}]
+                }}"#
+            );
+            let collection = parse_collection_str(&json).unwrap();
+            let scenario = collection_to_scenario(collection, HashMap::new());
+            scenario.items[0]
+                .request
+                .as_ref()
+                .expect("request")
+                .url
+                .clone()
+        };
+        let user_first =
+            url_of(r#"[{"key": "user", "value": "bob"}, {"key": "userId", "value": "1234"}]"#);
+        let id_first =
+            url_of(r#"[{"key": "userId", "value": "1234"}, {"key": "user", "value": "bob"}]"#);
+        assert_eq!(user_first, "https://api.test/users/bob/posts/1234");
+        assert_eq!(id_first, "https://api.test/users/bob/posts/1234");
     }
 
     #[test]
