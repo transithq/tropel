@@ -365,8 +365,9 @@ impl ScenarioRunner {
                     // (the HTTP layer encodes query params itself).
                     let resolved_url = resolver.resolve_url_deep(&request.url, &scope, 5);
 
-                    // Resolve headers, query params, body
-                    let resolved_headers: HashMap<String, String> = request
+                    // Resolve headers, query params, body. Headers keep
+                    // declaration order + duplicates (W2 #203).
+                    let resolved_headers: Vec<(String, String)> = request
                         .headers
                         .iter()
                         .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
@@ -915,8 +916,9 @@ fn resolve_body(
                 .collect();
             tropel_sdk::types::Body::FormData(resolved)
         }
-        tropel_sdk::types::Body::UrlEncoded(map) => {
-            let resolved: HashMap<String, String> = map
+        tropel_sdk::types::Body::UrlEncoded(fields) => {
+            // Duplicate keys preserved in order (W2 #203).
+            let resolved: Vec<(String, String)> = fields
                 .iter()
                 .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, scope, 5)))
                 .collect();
@@ -975,7 +977,7 @@ mod tests {
             request: Some(tropel_sdk::types::Request {
                 url: format!("http://example.com/{name}"),
                 method: Method::GET,
-                headers: HashMap::new(),
+                headers: Vec::new(),
                 query_params: HashMap::new(),
                 body: None,
                 auth: None,
@@ -1212,7 +1214,7 @@ mod tests {
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/a".into(),
                         method: Method::GET,
-                        headers: HashMap::new(),
+                        headers: Vec::new(),
                         query_params: HashMap::new(),
                         body: None,
                         auth: None,
@@ -1232,7 +1234,7 @@ mod tests {
                     request: Some(tropel_sdk::types::Request {
                         url: "http://127.0.0.1:1/b".into(),
                         method: Method::GET,
-                        headers: HashMap::new(),
+                        headers: Vec::new(),
                         query_params: HashMap::new(),
                         body: None,
                         auth: None,

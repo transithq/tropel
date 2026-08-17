@@ -618,7 +618,7 @@ impl WasmHttpRequest {
         Ok(Request {
             url: self.url,
             method,
-            headers: self.headers,
+            headers: self.headers.into_iter().collect(),
             query_params: HashMap::new(),
             body: req_body,
             auth: None,

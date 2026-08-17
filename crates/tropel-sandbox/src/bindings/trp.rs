@@ -222,13 +222,13 @@ fn resolve_send_request(
     environment: &HashMap<String, String>,
     collection_vars: &HashMap<String, serde_json::Value>,
     globals: &HashMap<String, serde_json::Value>,
-) -> (String, HashMap<String, String>, Option<Body>) {
+) -> (String, Vec<(String, String)>, Option<Body>) {
     let resolved_url = resolve_vars(url, local_vars, environment, collection_vars, globals);
-    let headers: HashMap<String, String> = parse_headers(headers_json)
+    let headers: Vec<(String, String)> = parse_headers(headers_json)
         .into_iter()
         .map(|(k, v)| {
             (
-                k.clone(),
+                k,
                 resolve_vars(&v, local_vars, environment, collection_vars, globals),
             )
         })
@@ -662,7 +662,12 @@ impl TrpBridge {
                     let st = state_clone.lock().unwrap();
                     st.request
                         .as_ref()
-                        .map(|r| r.headers.clone())
+                        .map(|r| {
+                            r.headers
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect::<HashMap<String, String>>()
+                        })
                         .unwrap_or_default()
                 }),
             );
@@ -690,18 +695,14 @@ impl TrpBridge {
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
                     if let Some(r) = st.request.as_mut() {
-                        let existing = r
+                        if let Some(existing) = r
                             .headers
-                            .keys()
-                            .find(|k| k.eq_ignore_ascii_case(&key))
-                            .cloned();
-                        match existing {
-                            Some(ek) => {
-                                r.headers.insert(ek, value);
-                            }
-                            None => {
-                                r.headers.insert(key, value);
-                            }
+                            .iter_mut()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                        {
+                            existing.1 = value;
+                        } else {
+                            r.headers.push((key, value));
                         }
                     }
                 }),
@@ -713,7 +714,7 @@ impl TrpBridge {
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     if let Some(r) = st.request.as_mut() {
-                        r.headers.retain(|k, _| !k.eq_ignore_ascii_case(&key));
+                        r.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
                     }
                 }),
             );
@@ -1705,8 +1706,11 @@ mod tests {
             &globals,
         );
         assert_eq!(url_local, "https://api.example.com/v1?key=local-tok");
+        fn get<'a>(hs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+            hs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        }
         assert_eq!(
-            headers_local.get("Authorization").map(String::as_str),
+            get(&headers_local, "Authorization"),
             Some("Bearer local-tok")
         );
         assert_eq!(
@@ -1717,12 +1721,12 @@ mod tests {
             Some("{\"token\":\"local-tok\"}".to_string())
         );
         assert_eq!(
-            headers.get("Authorization").map(String::as_str),
+            get(&headers, "Authorization"),
             Some("Bearer s3cret"),
             "header values must resolve"
         );
         assert_eq!(
-            headers.get("X-Static").map(String::as_str),
+            get(&headers, "X-Static"),
             Some("v"),
             "non-placeholder headers must pass through untouched"
         );
