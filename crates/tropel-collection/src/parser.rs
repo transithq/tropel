@@ -57,7 +57,7 @@ fn validate_methods(items: &[CollectionItem]) -> Result<()> {
 /// Convert a Collection into a protocol-agnostic Scenario.
 pub fn collection_to_scenario(
     collection: Collection,
-    _env_vars: HashMap<String, String>,
+    env_vars: HashMap<String, String>,
 ) -> Scenario {
     let mut scenario = Scenario {
         info: ScenarioInfo {
@@ -75,6 +75,17 @@ pub fn collection_to_scenario(
         if let Some(value) = &var.value {
             scenario.variables.insert(var.key.clone(), value.clone());
         }
+    }
+
+    // Backlog line 205: environment vars had NO path into collection
+    // conversion — the parameter was ignored and the sole caller passed an
+    // empty map, so an env file (--env-file / Postman environment export)
+    // could never seed `{{var}}` resolution for a Postman collection. Postman
+    // precedence: environment OVERRIDES collection variables.
+    for (key, value) in env_vars {
+        scenario
+            .variables
+            .insert(key, serde_json::Value::String(value));
     }
 
     // Convert items, threading collection-level auth down as the inherited
@@ -1956,6 +1967,47 @@ mod tests {
             }
             other => panic!("expected UrlEncoded body, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn collection_to_scenario_seeds_env_vars_with_postman_precedence() {
+        // Backlog line 205: the env_vars parameter was ignored (the sole
+        // caller passed an empty map), so an env file could never seed
+        // {{var}} resolution for a Postman collection. Env vars must land in
+        // scenario.variables AND override collection variables (Postman
+        // precedence: environment > collection).
+        let json = r#"{
+            "info": { "name": "Env Vars", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+            "variable": [
+                { "key": "host", "value": "collection.example.com" },
+                { "key": "only-collection", "value": "from-collection" }
+            ],
+            "item": [
+                { "request": { "method": "GET", "url": "http://{{host}}/a" } }
+            ]
+        }"#;
+        let collection = parse_collection_str(json).unwrap();
+        let env_vars = HashMap::from([
+            ("host".to_string(), "env.example.com".to_string()),
+            ("only-env".to_string(), "from-env".to_string()),
+        ]);
+
+        let scenario = collection_to_scenario(collection, env_vars);
+        assert_eq!(
+            scenario.variables.get("host"),
+            Some(&serde_json::Value::String("env.example.com".into())),
+            "env var must override the collection variable"
+        );
+        assert_eq!(
+            scenario.variables.get("only-collection"),
+            Some(&serde_json::Value::String("from-collection".into())),
+            "collection-only var must survive"
+        );
+        assert_eq!(
+            scenario.variables.get("only-env"),
+            Some(&serde_json::Value::String("from-env".into())),
+            "env-only var must be seeded"
+        );
     }
 
     #[test]
