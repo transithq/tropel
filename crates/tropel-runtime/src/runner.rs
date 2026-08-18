@@ -358,11 +358,11 @@ impl ScenarioRunner {
                                 .expect("guarded by item.request.is_some()")
                         })
                     };
-                    // Resolve variables across the entire request. The URL gets
-                    // percent-encoded values so a data value containing `&` or
-                    // `=` cannot split the query into extra params (backlog
-                    // line 96); headers/query_params keep raw substitution
-                    // (the HTTP layer encodes query params itself).
+                    // Resolve variables across the entire request. URL resolution
+                    // uses EscapeMode::Url (currently a passthrough — the planned
+                    // percent-encoding was deliberately removed; backlog line 96).
+                    // The HTTP layer handles query-param encoding on the wire.
+                    // headers/query_params keep raw substitution.
                     let resolved_url = resolver.resolve_url_deep(
                         &request.url,
                         &scope,
