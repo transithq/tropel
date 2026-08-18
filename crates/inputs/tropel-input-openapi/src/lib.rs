@@ -218,6 +218,13 @@ struct OasSchema {
     items: Option<Box<OasSchema>>,
     #[serde(default)]
     required: Vec<String>,
+    // Composition keywords — the universal inheritance idiom.
+    #[serde(default, rename = "allOf")]
+    all_of: Option<Vec<OasSchema>>,
+    #[serde(default, rename = "oneOf")]
+    one_of: Option<Vec<OasSchema>>,
+    #[serde(default, rename = "anyOf")]
+    any_of: Option<Vec<OasSchema>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1266,6 +1273,48 @@ fn generate_schema_example(schema: Option<&OasSchema>) -> Option<serde_json::Val
         return Some(default.clone());
     }
 
+    // Composition keywords (W4 #217): allOf merges properties from all
+    // sub-schemas; oneOf/anyOf picks the first variant that generates an
+    // example. Without this, these schemas silently produce null.
+    if let Some(ref all_of) = schema.all_of {
+        let mut merged_props: HashMap<String, &Box<OasSchema>> = HashMap::new();
+        for sub in all_of {
+            if let Some(ref props) = sub.properties {
+                for (k, v) in props {
+                    merged_props.entry(k.clone()).or_insert(v);
+                }
+            }
+        }
+        if !merged_props.is_empty() {
+            let mut keys: Vec<&String> = merged_props.keys().collect();
+            keys.sort();
+            let mut obj = serde_json::Map::new();
+            for name in keys {
+                let val = generate_schema_example(Some(merged_props[name]))
+                    .unwrap_or(serde_json::Value::Null);
+                obj.insert(name.clone(), val);
+            }
+            return Some(serde_json::Value::Object(obj));
+        }
+        // allOf with no properties — try the first sub-schema.
+        if let Some(first) = all_of.first() {
+            if let Some(val) = generate_schema_example(Some(first)) {
+                return Some(val);
+            }
+        }
+    }
+    let variant_lists: Vec<&Vec<OasSchema>> = [&schema.one_of, &schema.any_of]
+        .iter()
+        .filter_map(|o| o.as_ref())
+        .collect();
+    for vars in variant_lists {
+        for variant in vars {
+            if let Some(val) = generate_schema_example(Some(variant)) {
+                return Some(val);
+            }
+        }
+    }
+
     match schema.r#type.as_deref() {
         Some("object") => {
             let mut obj = serde_json::Map::new();
@@ -2283,5 +2332,88 @@ components:
         assert_eq!(scenario.items.len(), 1);
         let req = scenario.items[0].request.as_ref().unwrap();
         assert_eq!(req.url, "/items");
+    }
+
+    #[test]
+    fn test_allof_schema_generates_merged_body() {
+        // W4 #217: allOf merges properties from all sub-schemas into one
+        // example object, instead of producing null.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "AllOf", "version": "1.0"},
+            "paths": {
+                "/items": {
+                    "post": {
+                        "operationId": "createItem",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "allOf": [
+                                            {"type": "object", "properties": {"name": {"type": "string"}}},
+                                            {"type": "object", "properties": {"count": {"type": "integer"}}}
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        let body = req.body.as_ref().expect("allOf must generate a body");
+        match body {
+            Body::Json(v) => {
+                let s = v.to_string();
+                assert!(s.contains("\"name\""), "must contain 'name', got: {s}");
+                assert!(s.contains("\"count\""), "must contain 'count', got: {s}");
+            }
+            other => panic!("expected Json body, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_oneof_schema_picks_first_variant() {
+        // W4 #217: oneOf picks the first variant that generates an example.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "OneOf", "version": "1.0"},
+            "paths": {
+                "/items": {
+                    "post": {
+                        "operationId": "createItem",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "oneOf": [
+                                            {"type": "object", "properties": {"id": {"type": "integer"}}},
+                                            {"type": "string"}
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        let body = req.body.as_ref().expect("oneOf must generate a body");
+        match body {
+            Body::Json(v) => {
+                // First variant is object with "id": 1
+                let s = v.to_string();
+                assert!(s.contains("\"id\""), "must pick first variant, got: {s}");
+            }
+            other => panic!("expected Json body, got {:?}", other),
+        }
     }
 }
