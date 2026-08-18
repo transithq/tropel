@@ -169,11 +169,13 @@ jobs:
           # (see .gitmodules) — every cargo job needs it populated.
           submodules: recursive
       - uses: EmbarkStudios/cargo-deny-action@v2
+        env:
+          # Override rust-toolchain.toml's "stable" channel which resolves to
+          # stable-x86_64-unknown-linux-musl inside the action's Docker
+          # container — that toolchain doesn't exist and the action fails.
+          RUSTUP_TOOLCHAIN: "1.85.0"
         with:
           command: check advisories licenses bans sources
-          # Use the MSRV toolchain (already in the action image) instead of
-          # letting rust-toolchain.toml's "stable" override trigger a fresh
-          # toolchain download into the container on every run.
           rust-version: 1.85.0
 
   sdk-gates:
