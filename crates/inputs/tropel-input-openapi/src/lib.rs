@@ -928,8 +928,6 @@ fn normalize_swagger2_operation(op: &mut Value) {
 /// instead of recursing forever. A recursive body schema now yields a
 /// one-level, bounded example rather than megabytes or a kill.
 fn resolve_refs(doc: &Value) -> Value {
-    // Clone the root once; each $ref lookup reads from it.
-    let root = doc.clone();
     let mut cache: HashMap<String, Value> = HashMap::new();
     let mut in_progress: HashSet<String> = HashSet::new();
 
@@ -940,7 +938,7 @@ fn resolve_refs(doc: &Value) -> Value {
     for (k, v) in map {
         let resolved = match k.as_str() {
             // paths → operations (params, requestBody, auth) are consumed.
-            "paths" => resolve_value(v, &root, &mut cache, &mut in_progress),
+            "paths" => resolve_value(v, doc, &mut cache, &mut in_progress),
             // components: only securitySchemes is read by resolve_auth;
             // schemas / parameters / requestBodies are dead code but refs
             // INTO them from paths resolve lazily via resolve_value. A
@@ -950,7 +948,7 @@ fn resolve_refs(doc: &Value) -> Value {
                     let mut comp_out = serde_json::Map::with_capacity(comp_map.len());
                     for (ck, cv) in comp_map {
                         let cres = if ck == "securitySchemes" {
-                            resolve_value(cv, &root, &mut cache, &mut in_progress)
+                            resolve_value(cv, doc, &mut cache, &mut in_progress)
                         } else {
                             cv.clone()
                         };
