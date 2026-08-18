@@ -220,11 +220,11 @@ struct OasSchema {
     required: Vec<String>,
     // Composition keywords — the universal inheritance idiom.
     #[serde(default, rename = "allOf")]
-    all_of: Option<Vec<Box<OasSchema>>>,
+    all_of: Option<Vec<OasSchema>>,
     #[serde(default, rename = "oneOf")]
-    one_of: Option<Vec<Box<OasSchema>>>,
+    one_of: Option<Vec<OasSchema>>,
     #[serde(default, rename = "anyOf")]
-    any_of: Option<Vec<Box<OasSchema>>>,
+    any_of: Option<Vec<OasSchema>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1303,12 +1303,14 @@ fn generate_schema_example(schema: Option<&OasSchema>) -> Option<serde_json::Val
             }
         }
     }
-    for variants in [&schema.one_of, &schema.any_of] {
-        if let Some(ref vars) = variants {
-            for variant in vars {
-                if let Some(val) = generate_schema_example(Some(variant)) {
-                    return Some(val);
-                }
+    let variant_lists: Vec<&Vec<OasSchema>> = [&schema.one_of, &schema.any_of]
+        .iter()
+        .filter_map(|o| o.as_ref())
+        .collect();
+    for vars in variant_lists {
+        for variant in vars {
+            if let Some(val) = generate_schema_example(Some(variant)) {
+                return Some(val);
             }
         }
     }
