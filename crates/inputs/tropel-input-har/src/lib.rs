@@ -30,6 +30,7 @@
 use base64::Engine;
 use serde::Deserialize;
 use std::collections::HashMap;
+use tracing::warn;
 use tropel_sdk::{Body, FormDataPart, Method, Request};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, TropelError};
@@ -384,8 +385,17 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
 fn build_body(pd: HarPostData) -> Body {
     // base64-encoded payload (binary uploads) → decode to bytes.
     if pd.encoding.as_deref() == Some("base64") {
-        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(pd.text.as_bytes()) {
-            return Body::Binary(bytes);
+        match base64::engine::general_purpose::STANDARD.decode(pd.text.as_bytes()) {
+            Ok(bytes) => return Body::Binary(bytes),
+            Err(e) => {
+                // W4 #224: on decode failure the base64 text was silently
+                // shipped as the body. Log a warning so users know the
+                // payload is wrong instead of getting a mystery 400.
+                warn!(
+                    error = %e,
+                    "base64 decode failed for HAR postData; shipping raw text as body"
+                );
+            }
         }
     }
 
@@ -442,7 +452,7 @@ fn build_body(pd: HarPostData) -> Body {
 /// detection — used to decide whether to fold the query into the URL).
 fn has_duplicate_keys(pairs: &[(String, String)]) -> bool {
     let mut seen = std::collections::HashSet::new();
-    pairs.iter().any(|(k, _)| !seen.insert(k.clone()))
+    pairs.iter().any(|(k, _)| !seen.insert(k.as_str()))
 }
 
 fn merge_pairs<I: Iterator<Item = (String, String)>>(pairs: I) -> HashMap<String, String> {
@@ -492,10 +502,15 @@ fn merge_headers<I: Iterator<Item = (String, String)>>(pairs: I) -> Vec<(String,
     // W2 #203: ordered Vec in FIRST-SEEN order; duplicate names fold into the
     // existing entry (`, ` join, `; ` for Cookie per RFC 6265) — the data is
     // preserved, unlike a HashMap's last-wins collapse.
+    // HTTP header names are case-insensitive (RFC 9110 §5.1), so duplicate
+    // detection must compare case-insensitively (W4 #224).
     let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in pairs {
         let is_cookie = k.eq_ignore_ascii_case("cookie");
-        match out.iter_mut().find(|(name, _)| name == &k) {
+        match out
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&k))
+        {
             Some((_, existing)) => {
                 existing.push_str(if is_cookie { "; " } else { ", " });
                 existing.push_str(&v);
