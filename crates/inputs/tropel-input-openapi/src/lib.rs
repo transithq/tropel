@@ -938,7 +938,34 @@ fn resolve_refs(doc: &Value) -> Value {
     for (k, v) in map {
         let resolved = match k.as_str() {
             // paths → operations (params, requestBody, auth) are consumed.
-            "paths" => resolve_value(v, doc, &mut cache, &mut in_progress),
+            // responses are NOT consumed — skip resolving them to avoid
+            // inlining potentially huge response schemas (W4 #213).
+            "paths" => match v.as_object() {
+                Some(path_map) => {
+                    let mut path_out = serde_json::Map::with_capacity(path_map.len());
+                    for (pk, pv) in path_map {
+                        let resolved_path = match pv.as_object() {
+                            Some(method_map) => {
+                                let mut method_out =
+                                    serde_json::Map::with_capacity(method_map.len());
+                                for (mk, mv) in method_map {
+                                    let resolved_method = if mk == "responses" {
+                                        mv.clone()
+                                    } else {
+                                        resolve_value(mv, doc, &mut cache, &mut in_progress)
+                                    };
+                                    method_out.insert(mk.clone(), resolved_method);
+                                }
+                                Value::Object(method_out)
+                            }
+                            None => resolve_value(pv, doc, &mut cache, &mut in_progress),
+                        };
+                        path_out.insert(pk.clone(), resolved_path);
+                    }
+                    Value::Object(path_out)
+                }
+                None => v.clone(),
+            },
             // components: only securitySchemes is read by resolve_auth;
             // schemas / parameters / requestBodies are dead code but refs
             // INTO them from paths resolve lazily via resolve_value. A
@@ -2215,5 +2242,46 @@ components:
         let result = adapter.parse(data);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no paths"));
+    }
+
+    #[test]
+    fn test_responses_refs_not_resolved() {
+        // W4 #213: response schemas are never consumed by tropel, so $ref
+        // inside responses should NOT be resolved. A broken ref in responses
+        // must not cause the parse to fail.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "RespRef", "version": "1.0"},
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"$ref": "#/components/schemas/Nonexistent"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Item": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        assert_eq!(scenario.items.len(), 1);
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.url, "/items");
     }
 }
