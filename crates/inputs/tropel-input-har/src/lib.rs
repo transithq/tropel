@@ -465,14 +465,20 @@ fn merge_pairs<I: Iterator<Item = (String, String)>>(pairs: I) -> HashMap<String
 ///
 /// Returns false for HTTP/2 pseudo-headers (`:method`, `:authority`,
 /// `:scheme`, `:path` — Chrome HARs record them; they're not valid HTTP/1.1
-/// header names and `HeaderName::try_from` rejects the `:`), and for
-/// `Content-Length` / `Accept-Encoding`, which the HTTP client manages
-/// itself. Everything else is replayed as recorded.
+/// header names and `HeaderName::try_from` rejects the `:`), for
+/// `Content-Length` / `Accept-Encoding` (the HTTP client manages them),
+/// and for cache-validation headers `If-None-Match` / `If-Modified-Since`
+/// — replaying them causes 304s with `http_req_failed` at 0.00,
+/// silently invalidating the entire load-test result (W4 #223).
+/// Everything else is replayed as recorded.
 fn should_replay_header(name: &str) -> bool {
     if name.starts_with(':') {
         return false;
     }
-    !name.eq_ignore_ascii_case("content-length") && !name.eq_ignore_ascii_case("accept-encoding")
+    !name.eq_ignore_ascii_case("content-length")
+        && !name.eq_ignore_ascii_case("accept-encoding")
+        && !name.eq_ignore_ascii_case("if-none-match")
+        && !name.eq_ignore_ascii_case("if-modified-since")
 }
 
 /// Combine duplicate header lines into one value per name.
@@ -1074,6 +1080,63 @@ mod tests {
         };
         assert_eq!(get("Authorization"), Some("Bearer tok"));
         assert_eq!(get("X-Trace"), Some("abc"));
+    }
+
+    #[test]
+    fn test_cache_validation_headers_stripped() {
+        // W4 #223: If-None-Match / If-Modified-Since cause 304 responses
+        // on replay, making http_req_failed 0.00 and silently invalidating
+        // the entire load-test result.
+        let adapter = HarInputAdapter;
+        let data = br#"{
+            "log": {
+                "version": "1.2",
+                "entries": [
+                    {
+                        "request": {
+                            "method": "GET",
+                            "url": "https://api.example.com/data",
+                            "headers": [
+                                {"name": "If-None-Match", "value": "\"abc123\""},
+                                {"name": "If-Modified-Since", "value": "Mon, 01 Jan 2024 00:00:00 GMT"},
+                                {"name": "Authorization", "value": "Bearer tok"},
+                                {"name": "Accept", "value": "application/json"}
+                            ],
+                            "queryString": []
+                        },
+                        "response": {"status": 200, "statusText": "OK"}
+                    }
+                ]
+            }
+        }"#;
+
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        let names: Vec<&str> = req.headers.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(
+            !names
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case("if-none-match")),
+            "If-None-Match must be stripped, got {:?}",
+            names
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case("if-modified-since")),
+            "If-Modified-Since must be stripped, got {:?}",
+            names
+        );
+        // Real headers survive.
+        let get = |k: &str| {
+            req.headers
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("Authorization"), Some("Bearer tok"));
+        assert_eq!(get("Accept"), Some("application/json"));
     }
 
     #[test]
