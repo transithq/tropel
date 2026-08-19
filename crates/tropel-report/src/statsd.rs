@@ -212,6 +212,10 @@ fn sanitize_component(s: &str) -> String {
         .map(|c| {
             if matches!(c, ':' | '|' | ',' | '#' | '@') {
                 '_'
+            } else if c.is_control() {
+                // Newlines/tabs/control chars in tag values inject extra
+                // lines into the UDP datagram, causing metric corruption.
+                '_'
             } else {
                 c
             }
