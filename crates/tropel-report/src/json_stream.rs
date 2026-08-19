@@ -112,14 +112,14 @@ impl JsonStreamOutput {
             !seen.insert(metric_name.to_string())
         };
         if !seen {
-            // k6 Metric definition record — emitted once per metric, exactly
-            // the keys k6's JSON output emits (name, type, contains,
-            // thresholds, submetrics). The old record carried InfluxDB-ish
-            // extras (tainted/time/tags/samples) k6 never emits.
+            // k6 Metric definition record — emitted once per metric.
+            // k6 puts `metric` at the top level; tropel adds it for
+            // jq/select compatibility (`jq 'select(.metric=="http_req_duration")'`).
             let def = serde_json::json!({
                 "type": "Metric",
+                "metric": metric_name,
                 "data": {
-                    "name": metric_name,
+                    "name": sample.metric,
                     "type": k6_metric_type(&sample.sample_type),
                     "contains": tropel_metrics::time_metrics::unit_of(&metric_name).as_str(),
                     "thresholds": [],
@@ -131,16 +131,13 @@ impl JsonStreamOutput {
             self.total_buffered.fetch_add(1, Ordering::Relaxed);
         }
 
-        // k6 Point record — one per sample. k6's schema puts the metric
-        // name under `metric` and the value directly under `value` (NOT the
-        // InfluxDB `measurement` / `fields.value` shape) — every jq
-        // `.data.value` pipeline, k6-reporter, and Grafana JSON ingest
-        // depends on this exact layout (backlog line 97).
+        // k6 Point record — one per sample. k6 puts `metric` at the
+        // top level; `data.metric` is kept for backward compatibility.
         let point = serde_json::json!({
             "type": "Point",
+            "metric": sample.metric,
             "data": {
                 "time": k6_timestamp(sample.timestamp),
-                "metric": sample.metric,
                 "tags": sample.tags,
                 "value": sample.value,
             },
@@ -301,9 +298,8 @@ mod tests {
                 "Point" => {
                     points += 1;
                     let data = &v["data"];
-                    // k6 Point schema: `metric` + top-level `value`, never the
-                    // InfluxDB `measurement` / `fields.value` shape.
-                    assert!(data["metric"].is_string());
+                    // k6 Point schema: `metric` at top level for jq compatibility.
+                    assert!(v["metric"].is_string(), "metric at top level");
                     assert!(data["time"].is_string());
                     assert!(data["value"].is_number());
                     assert!(
@@ -312,7 +308,7 @@ mod tests {
                     );
                     assert!(data.get("fields").is_none(), "no InfluxDB fields wrapper");
                     assert!(data["tags"]["status"] == "200");
-                    if data["metric"] == "http_req_duration" {
+                    if v["metric"] == "http_req_duration" {
                         duration_points += 1;
                     }
                 }
@@ -357,9 +353,9 @@ mod tests {
 
         let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(v["type"], "Metric");
-        // Exactly k6's Metric keys — no InfluxDB-ish extras. Order-independent
-        // (serde_json Map is a BTreeMap by default but may be an IndexMap
-        // under preserve_order).
+        // k6 puts `metric` at top level for jq compatibility.
+        assert_eq!(v["metric"], "http_req_duration");
+        // Exactly k6's Metric data keys — no InfluxDB-ish extras.
         let mut keys: Vec<&str> = v["data"]
             .as_object()
             .unwrap()
@@ -376,8 +372,9 @@ mod tests {
 
         let v: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(v["type"], "Point");
+        // k6 puts `metric` at top level for jq compatibility.
+        assert_eq!(v["metric"], "http_req_duration");
         let data = &v["data"];
-        assert_eq!(data["metric"], "http_req_duration");
         assert_eq!(data["value"], 12.5);
         assert!(
             data["time"].as_str().unwrap().ends_with('Z'),
