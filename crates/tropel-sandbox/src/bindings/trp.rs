@@ -1130,8 +1130,6 @@ impl TrpBridge {
                 "__tropel_pm_metrics_add",
                 Func::from(move |name: String, value: f64, metric_type_str: String| {
                     let mut st = state_clone.lock().unwrap();
-                    // Track current value
-                    st.custom_metrics.insert(name.clone(), value);
                     // Emit a metric sample with the appropriate type
                     let sample_type = match metric_type_str.as_str() {
                         "counter" => tropel_sdk::types::SampleType::Counter,
@@ -1139,6 +1137,12 @@ impl TrpBridge {
                         "rate" => tropel_sdk::types::SampleType::Rate,
                         _ => tropel_sdk::types::SampleType::Trend,
                     };
+                    // Track current value — accumulate for counters, replace for others
+                    if sample_type == tropel_sdk::types::SampleType::Counter {
+                        *st.custom_metrics.entry(name.clone()).or_insert(0.0) += value;
+                    } else {
+                        st.custom_metrics.insert(name.clone(), value);
+                    }
                     // W2 line 188: custom metrics recorded inside a group()
                     // must carry the group path like http/checks/group_duration
                     // (they used to be UNTAGGED — invisible to group-filtered
@@ -1189,9 +1193,6 @@ impl TrpBridge {
                             tropel_sdk::types::TagMap::from_pairs(parsed)
                         };
 
-                        // Track the current value per metric+tags combo
-                        st.custom_metrics.insert(name.clone(), value);
-
                         // Determine sample type from type string
                         let sample_type = match metric_type_str.as_str() {
                             "counter" => tropel_sdk::types::SampleType::Counter,
@@ -1199,6 +1200,12 @@ impl TrpBridge {
                             "rate" => tropel_sdk::types::SampleType::Rate,
                             _ => tropel_sdk::types::SampleType::Trend,
                         };
+                        // Track current value — accumulate for counters, replace for others
+                        if sample_type == tropel_sdk::types::SampleType::Counter {
+                            *st.custom_metrics.entry(name.clone()).or_insert(0.0) += value;
+                        } else {
+                            st.custom_metrics.insert(name.clone(), value);
+                        }
 
                         // W2 line 188: custom metrics recorded inside a
                         // group() must carry the group path like
