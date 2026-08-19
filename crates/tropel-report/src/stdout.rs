@@ -98,7 +98,7 @@ impl StdoutReporter {
         out.push_str(&format!(
             "    {:<14}{} ({:.1}%)\n",
             "Failed",
-            (result.http_req_failed * result.http_reqs as f64) as u64,
+            (result.http_req_failed * result.http_reqs as f64).round() as u64,
             result.http_req_failed * 100.0
         ));
         out.push_str(&format!(
