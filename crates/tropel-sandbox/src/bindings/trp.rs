@@ -1035,13 +1035,13 @@ impl TrpBridge {
                     }
 
                     // 1. Item id first (Postman resolves ids before names).
-                    if let Some(pos) = st.request_ids.iter().position(|i| i == &request_id) {
+                    if let Some(&pos) = st.id_to_index.get(&request_id) {
                         st.next_request = Some(pos);
                         return;
                     }
 
                     // 2. Name — last-wins on duplicates (Postman).
-                    if let Some(pos) = st.request_names.iter().rposition(|n| n == &request_id) {
+                    if let Some(&pos) = st.name_to_last_index.get(&request_id) {
                         st.next_request = Some(pos);
                         return;
                     }
