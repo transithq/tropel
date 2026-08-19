@@ -2619,9 +2619,12 @@ impl K6DriverInstance {
                             return serde_json::json!({"ok": false}).to_string();
                         };
                         drop(guard);
-                        session.msgs_sent.fetch_add(1, Ordering::Relaxed);
-                        session.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        let data_len = data.len() as u64;
                         let ok = try_send_cmd(&session.cmd_tx, WsCommand::SendText(data));
+                        if ok {
+                            session.msgs_sent.fetch_add(1, Ordering::Relaxed);
+                            session.bytes_sent.fetch_add(data_len, Ordering::Relaxed);
+                        }
                         serde_json::json!({"ok": ok}).to_string()
                     },
                 ),
