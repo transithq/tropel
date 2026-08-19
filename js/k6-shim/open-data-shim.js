@@ -24,9 +24,9 @@
 // ══════════════════════════════════════════════════════════════════
 
 // ── open(path, mode) ──
-// NOTE: declared as top-level functions (NOT inside `if` guards) — QuickJS
-// block-scopes function declarations, so a declaration inside `if (...) {}
-// would be invisible to the proxy-install IIFE at the bottom of this file.
+// NOTE: declared as top-level functions (NOT inside `if` guards) — keeps
+// the shim self-contained and avoids re-declaration when loaded alongside
+// a bundled version.
 function open(path, mode) {
     if (typeof __tropel_k6_open !== 'function') {
         throw new Error('open() requires the native bridge __tropel_k6_open (k6 driver)');

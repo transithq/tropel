@@ -1083,9 +1083,8 @@ function fail(msg) {
 }
 
 // check(val, conds) — defined in pm-api/pm.js if loaded, else here.
-// NOTE: uses `var` assignment (NOT `function` inside the guard) — QuickJS
-// block-scopes function declarations, so a `function` here would be invisible
-// outside the if-block whenever the fallback actually ran.
+// NOTE: uses `var` assignment (NOT `function` inside the guard) — using `var`
+// avoids re-declaring the function when the guard condition is true.
 if (typeof check !== 'function') {
     // Backlog line 149: k6 parity — null/non-object conds throw, raw
     // check names (no "check " prefix), 3rd tags arg forwarded, and a
@@ -1171,8 +1170,8 @@ var __ITER = __ITER || 0;
 // ══════════════════════════════════════════════════════════════════
 
 // These are also defined in pm-api/pm.js — only define if missing.
-// NOTE: `var` assignments, not `function` declarations — QuickJS block-scopes
-// the latter, so a guarded fallback would be invisible outside its if-block.
+// NOTE: `var` assignments, not `function` declarations — avoids re-declaring
+// when the guard condition is true.
 if (typeof Counter !== 'function') {
     var Counter = function (name) {
         if (!name || typeof name !== 'string') {
