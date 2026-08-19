@@ -492,7 +492,8 @@ fn sigv4_canonical_headers(
     amz_date: &str,
     session_token: Option<&str>,
 ) -> Vec<(String, String)> {
-    let mut out: HashMap<String, String> = HashMap::new();
+    // BTreeMap gives sorted keys for free — no need for HashMap + sort.
+    let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     out.insert("host".to_string(), canonical_host(request.url()));
 
