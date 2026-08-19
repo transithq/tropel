@@ -86,6 +86,12 @@ impl StdoutReporter {
         for (label, value) in exec_rows {
             out.push_str(&format!("    {:<14}{}\n", label, value));
         }
+        if result.output_samples_dropped > 0 {
+            out.push_str(&format!(
+                "    {:<14}{}\n",
+                "Samples dropped", result.output_samples_dropped
+            ));
+        }
 
         // HTTP requests — aligned two-column block
         out.push_str("\n  ── HTTP requests ─────────────────────────────────────────\n");

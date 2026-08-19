@@ -144,7 +144,8 @@ impl InfluxdbOutput {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::trace!("influxdb dropped {n} samples (consumer lag)");
+                            tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!("influxdb dropped {n} samples (consumer lag)");
                         }
                     },
                     _ = tick.tick() => {

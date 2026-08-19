@@ -1158,6 +1158,8 @@ impl Aggregator {
             data_sent,
             errors,
             series_dropped: self.series_dropped,
+            output_samples_dropped: crate::OUTPUT_SAMPLES_DROPPED
+                .load(std::sync::atomic::Ordering::Relaxed),
             dropped_iterations: self
                 .totals
                 .get("dropped_iterations")
@@ -1566,6 +1568,9 @@ pub struct MetricsResult {
     /// (backlog line 53: previously counted and read nowhere — now surfaced
     /// so reporters can warn on truncated per-URL stats).
     pub series_dropped: u64,
+    /// Samples dropped by streaming output consumers due to broadcast lag
+    /// (P0: backlog line 332). Surfaced so reporters warn on data loss.
+    pub output_samples_dropped: u64,
     /// Iterations dropped because the VU pool was saturated (arrival-rate mode).
     pub dropped_iterations: u64,
     /// HTTP request failure rate (0.0 - 1.0).
@@ -1604,6 +1609,7 @@ impl Default for MetricsResult {
             data_sent: 0.0,
             errors: 0,
             series_dropped: 0,
+            output_samples_dropped: 0,
             dropped_iterations: 0,
             http_req_failed: 0.0,
             iterations: 0,

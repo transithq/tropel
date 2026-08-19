@@ -97,7 +97,8 @@ impl OtlpOutput {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::trace!("otlp output dropped {n} samples (consumer lag)");
+                            tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!("otlp output dropped {n} samples (consumer lag)");
                         }
                     },
                     _ = tick.tick() => {

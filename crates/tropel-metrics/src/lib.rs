@@ -13,6 +13,14 @@ pub use collector::*;
 pub use histogram::*;
 pub use thresholds::*;
 
+/// Global atomic counter of samples dropped by output consumers due to
+/// broadcast lag (RecvError::Lagged).  Every streaming output (InfluxDB,
+/// StatsD, JSON-stream, OTLP, Prometheus, extension) increments this on
+/// lag; the stdout reporter and MetricsResult surface it so users can
+/// see how many samples were silently lost.
+pub static OUTPUT_SAMPLES_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The k6 metric unit model (backlog line 32): a metric carries BOTH an
 /// aggregation type (`MetricType`: Counter/Gauge/Rate/Trend) AND a unit
 /// (`Time`/`Data`/`Default`). `Time` values are fractional milliseconds

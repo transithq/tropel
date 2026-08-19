@@ -139,7 +139,8 @@ impl StreamingStdoutOutput {
                         Ok(sample) => state.record(&sample),
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::trace!("Streaming output dropped {} samples (consumer lag)", n);
+                            tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!("extension output dropped {n} samples (consumer lag)");
                         }
                     },
                     _ = ticker.tick() => {
