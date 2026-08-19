@@ -786,11 +786,17 @@ fn generate_main_rs(config: &BuildConfig) -> String {
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {{
-    // Delegate to the shared CLI entry point.
-    tropel_engine::cli::run_cli().await?;
-    Ok(())
+fn main() -> Result<(), Box<dyn std::error::Error>> {{
+    let workers: usize = std::env::var("TROPEL_TOKIO_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(2)
+        .clamp(1, 128);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    rt.block_on(tropel_engine::cli::run_cli())
 }}
 "#,
         imports = imports.trim_end(),
