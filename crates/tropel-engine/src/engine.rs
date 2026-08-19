@@ -345,7 +345,7 @@ impl Engine {
         // flush() when the stream closes. This replaces the old
         // "extension reporter not supported" dead end.
         for name in &config.output.reporters {
-            if create_reporter(name).is_some() {
+            if create_reporter(name, None).is_some() {
                 continue; // built-in reporters handled above / at the end
             }
             if let Some(mut ext) = self.extension_registry.get_output(name) {
@@ -663,7 +663,7 @@ impl Engine {
     fn create_reporters(&self, config: &OutputConfig) -> Vec<Box<dyn Reporter>> {
         let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
         for name in &config.reporters {
-            if let Some(reporter) = create_reporter(name) {
+            if let Some(reporter) = create_reporter(name, config.output_file.as_deref()) {
                 reporters.push(reporter);
             } else if self
                 .extension_registry
