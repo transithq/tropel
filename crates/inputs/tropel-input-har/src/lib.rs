@@ -182,16 +182,15 @@ impl InputAdapter for HarInputAdapter {
             .entries
             .into_iter()
             .filter(|e| {
+                // blob: URLs with HTML content must NOT claim the
+                // primary-document slot — they're unsendable and would burn
+                // the slot, dropping the real document.
+                let url = e.request.url.to_lowercase();
+                let is_blob = url.starts_with("blob:") || url.starts_with("data:");
                 let mime = e.response.content.mime_type.to_lowercase();
-                // Only a 2xx HTML response can claim the document slot — a
-                // 3xx redirect or 4xx/5xx error page with an HTML body must
-                // not consume it, or the real document that follows would be
-                // filtered out. All OTHER text/html (subsequent 2xx documents,
-                // redirects, error pages) is filtered as static by
-                // is_static_resource below.
                 let is_2xx_html =
                     mime.starts_with("text/html") && (200..300).contains(&e.response.status);
-                if is_2xx_html && !html_kept {
+                if is_2xx_html && !is_blob && !html_kept {
                     html_kept = true;
                     return true;
                 }
