@@ -728,6 +728,67 @@ fn interned(s: &'static str) -> Arc<str> {
     }
 }
 
+/// Intern common HTTP method strings to avoid per-sample allocation.
+/// The 9 standard methods plus common custom ones cover 99.9%+ of traffic.
+fn intern_method(s: &str) -> Arc<str> {
+    use std::sync::OnceLock;
+    static GET: OnceLock<Arc<str>> = OnceLock::new();
+    static POST: OnceLock<Arc<str>> = OnceLock::new();
+    static PUT: OnceLock<Arc<str>> = OnceLock::new();
+    static PATCH: OnceLock<Arc<str>> = OnceLock::new();
+    static DELETE: OnceLock<Arc<str>> = OnceLock::new();
+    static HEAD: OnceLock<Arc<str>> = OnceLock::new();
+    static OPTIONS: OnceLock<Arc<str>> = OnceLock::new();
+    static TRACE: OnceLock<Arc<str>> = OnceLock::new();
+    static CONNECT: OnceLock<Arc<str>> = OnceLock::new();
+    match s {
+        "GET" => GET.get_or_init(|| Arc::from("GET")).clone(),
+        "POST" => POST.get_or_init(|| Arc::from("POST")).clone(),
+        "PUT" => PUT.get_or_init(|| Arc::from("PUT")).clone(),
+        "PATCH" => PATCH.get_or_init(|| Arc::from("PATCH")).clone(),
+        "DELETE" => DELETE.get_or_init(|| Arc::from("DELETE")).clone(),
+        "HEAD" => HEAD.get_or_init(|| Arc::from("HEAD")).clone(),
+        "OPTIONS" => OPTIONS.get_or_init(|| Arc::from("OPTIONS")).clone(),
+        "TRACE" => TRACE.get_or_init(|| Arc::from("TRACE")).clone(),
+        "CONNECT" => CONNECT.get_or_init(|| Arc::from("CONNECT")).clone(),
+        other => Arc::from(other),
+    }
+}
+
+/// Intern common HTTP status code strings to avoid per-sample allocation.
+fn intern_status(s: &str) -> Arc<str> {
+    use std::sync::OnceLock;
+    static S200: OnceLock<Arc<str>> = OnceLock::new();
+    static S201: OnceLock<Arc<str>> = OnceLock::new();
+    static S204: OnceLock<Arc<str>> = OnceLock::new();
+    static S301: OnceLock<Arc<str>> = OnceLock::new();
+    static S302: OnceLock<Arc<str>> = OnceLock::new();
+    static S304: OnceLock<Arc<str>> = OnceLock::new();
+    static S400: OnceLock<Arc<str>> = OnceLock::new();
+    static S401: OnceLock<Arc<str>> = OnceLock::new();
+    static S403: OnceLock<Arc<str>> = OnceLock::new();
+    static S404: OnceLock<Arc<str>> = OnceLock::new();
+    static S500: OnceLock<Arc<str>> = OnceLock::new();
+    static S502: OnceLock<Arc<str>> = OnceLock::new();
+    static S503: OnceLock<Arc<str>> = OnceLock::new();
+    match s {
+        "200" => S200.get_or_init(|| Arc::from("200")).clone(),
+        "201" => S201.get_or_init(|| Arc::from("201")).clone(),
+        "204" => S204.get_or_init(|| Arc::from("204")).clone(),
+        "301" => S301.get_or_init(|| Arc::from("301")).clone(),
+        "302" => S302.get_or_init(|| Arc::from("302")).clone(),
+        "304" => S304.get_or_init(|| Arc::from("304")).clone(),
+        "400" => S400.get_or_init(|| Arc::from("400")).clone(),
+        "401" => S401.get_or_init(|| Arc::from("401")).clone(),
+        "403" => S403.get_or_init(|| Arc::from("403")).clone(),
+        "404" => S404.get_or_init(|| Arc::from("404")).clone(),
+        "500" => S500.get_or_init(|| Arc::from("500")).clone(),
+        "502" => S502.get_or_init(|| Arc::from("502")).clone(),
+        "503" => S503.get_or_init(|| Arc::from("503")).clone(),
+        other => Arc::from(other),
+    }
+}
+
 /// Build the standard http_req_* tag set (url/method/status/name/group).
 /// The url value is allocated ONCE and shared by both `url` and `name`
 /// (refcount bump, not a second string copy); static keys come from
@@ -772,8 +833,8 @@ fn http_tags_for(
     let mut tags = TagMap::with_capacity(6);
     let url_arc: Arc<str> = Arc::from(url);
     tags.insert(interned("url"), url_arc.clone());
-    tags.insert(interned("method"), Arc::from(method));
-    tags.insert(interned("status"), Arc::from(status));
+    tags.insert(interned("method"), intern_method(method));
+    tags.insert(interned("status"), intern_status(status));
     tags.insert(interned("name"), url_arc);
     tags.insert(
         interned("group"),
