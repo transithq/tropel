@@ -1175,7 +1175,7 @@ impl Aggregator {
             // healthy runs (the engine stamps the final value post-run).
             run_duration: self.started.elapsed(),
             summary_trend_stats: self.summary_trend_stats.clone(),
-            effective_thresholds: self.effective_thresholds.clone(),
+            effective_thresholds: self.effective_thresholds.clone(),            output_samples_dropped: super::OUTPUT_SAMPLES_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1586,6 +1586,10 @@ pub struct MetricsResult {
     /// Reporters evaluate and display pass/fail against this set.
     pub effective_thresholds:
         std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
+    /// Samples dropped by output consumer lag (broadcast channel overflow).
+    /// Incremented in each output's `Lagged` handler; surfaced here so the
+    /// summary can warn operators about invisible data loss.
+    pub output_samples_dropped: u64,
 }
 
 impl Default for MetricsResult {
@@ -1611,6 +1615,7 @@ impl Default for MetricsResult {
             run_duration: Duration::ZERO,
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),
+            output_samples_dropped: 0,
         }
     }
 }

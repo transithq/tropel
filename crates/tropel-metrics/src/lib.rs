@@ -13,6 +13,12 @@ pub use collector::*;
 pub use histogram::*;
 pub use thresholds::*;
 
+/// Global counter for samples dropped by output consumer lag.
+/// Incremented in each output's `Lagged` handler and surfaced in
+/// `MetricsResult` so the summary can warn operators.
+pub static OUTPUT_SAMPLES_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The k6 metric unit model (backlog line 32): a metric carries BOTH an
 /// aggregation type (`MetricType`: Counter/Gauge/Rate/Trend) AND a unit
 /// (`Time`/`Data`/`Default`). `Time` values are fractional milliseconds

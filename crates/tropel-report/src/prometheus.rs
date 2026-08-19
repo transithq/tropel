@@ -163,7 +163,8 @@ impl PrometheusRemoteWriteOutput {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::trace!("prometheus output dropped {n} samples (consumer lag)");
+                            crate::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!("prometheus output dropped {n} samples (consumer lag)");
                         }
                     },
                     _ = tick.tick() => {

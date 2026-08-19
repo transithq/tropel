@@ -109,7 +109,8 @@ impl StatsdOutput {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::trace!("statsd dropped {n} samples (consumer lag)");
+                            crate::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!("statsd dropped {n} samples (consumer lag)");
                         }
                     },
                     _ = tick.tick() => {

@@ -52,6 +52,7 @@ impl Engine {
         // Forget any unit declarations from a previous run in this process
         // (backlog line 32) — the registry must never leak across runs.
         tropel_metrics::time_metrics::clear();
+        tropel_report::OUTPUT_SAMPLES_DROPPED.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let registry = Arc::new(self.extension_registry.clone());
         let format_hint = config.input_type.clone();

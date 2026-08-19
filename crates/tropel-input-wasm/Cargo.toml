@@ -1,0 +1,32 @@
+[package]
+name = "tropel-input-wasm"
+version = "0.1.0"
+# Explicit (not `.workspace = true`): wasm-pack 0.10's manifest parser
+# rejects inherited table fields ("invalid type: map, expected a string").
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/transithq/tropel"
+rust-version = "1.85"
+publish = false
+description = "Lazy collection-import slice for browser embedders (KnockPort): OpenAPI 3.x / Swagger 2.0, Postman v2.x and HAR compiled to wasm32-unknown-unknown with a wasm-bindgen surface. Loaded on demand when the import UI opens — see API_CLIENT_WEB_PAYLOAD.md §2.3 (two-tier wasm)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+# Same rationale as tropel-core-wasm: wasm-pack's pinned binaryen predates
+# the reference-types era; skip its -O pass and optimize downstream.
+wasm-opt = false
+
+[dependencies]
+tropel-sdk.workspace = true
+tropel-input-openapi.workspace = true
+tropel-input-postman.workspace = true
+tropel-input-har.workspace = true
+wasm-bindgen = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+
+# wasm32-unknown-unknown RNG backend (mirrors tropel-core-wasm).
+[target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
