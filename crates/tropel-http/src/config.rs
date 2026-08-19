@@ -116,12 +116,12 @@ impl Default for HttpConfig {
         Self {
             // 2xx-3xx = success (default, matches k6 behavior)
             expected_statuses: default_expected_statuses(),
-            // With per-VU HTTP clients, each VU has its own connection pool.
-            // A VU only makes one request at a time (sequential), so 4 idle
-            // connections per host per VU is plenty. The old default of 100
-            // was designed for shared clients — with per-VU clients and 100 VUs
-            // it would mean 10,000 idle connections total.
-            max_idle_connections: 4,
+            // The HTTP client is shared across all VUs (Arc), so this caps
+            // idle connections per host for the ENTIRE run, not per VU.
+            // reqwest's own default is usize::MAX (unlimited); k6 gives 6 per
+            // VU so 100 VUs = 600 idle connections per host. Using reqwest's
+            // default matches that scaling behavior.
+            max_idle_connections: usize::MAX,
             keep_alive: Some("30s".to_string()),
             // How long an idle connection is kept before being closed.
             idle_connection_timeout: Some("30s".to_string()),
