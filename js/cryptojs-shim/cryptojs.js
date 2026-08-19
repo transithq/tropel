@@ -447,12 +447,21 @@ var CryptoJS = CryptoJS || {};
     };
 
     CryptoJS.SHA256 = function (message, key) {
-        var hasher = createHasher('SHA256');
-        var result = hasher.finalize(message);
+        // Real CryptoJS: SHA256(msg, cfg) where cfg may have
+        // outputLength. The old code treated the 2nd arg as an HMAC key,
+        // so SHA256('abc', {outputLength:224}) silently returned an HMAC
+        // instead of a truncated SHA-256 hash.
+        if (key && typeof key === 'object' && !key.words) {
+            // Config object — ignore (CryptoJS SHA256 has no cfg options
+            // beyond what HmacSHA256 provides). Just hash normally.
+            var hasher = createHasher('SHA256');
+            return hasher.finalize(message);
+        }
         if (key) {
             return CryptoJS.HmacSHA256(message, key);
         }
-        return result;
+        var hasher = createHasher('SHA256');
+        return hasher.finalize(message);
     };
 
     CryptoJS.SHA384 = function (message) {
