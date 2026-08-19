@@ -728,7 +728,10 @@ impl Aggregator {
         // merged_iter_dur) are NOT tag-keyed, so they must keep recording or
         // the headline percentiles freeze while `http_reqs` keeps climbing
         // (backlog line 53).
-        if !self.data.contains_key(&key) && self.data.len() >= self.max_series {
+        // Check cardinality BEFORE entry() — entry() holds a mutable
+        // borrow that prevents reading self.data.len().
+        let at_capacity = !self.data.contains_key(&key) && self.data.len() >= self.max_series;
+        if at_capacity {
             self.series_dropped += 1;
             if self.series_dropped == 1 {
                 tracing::warn!(
@@ -741,7 +744,7 @@ impl Aggregator {
             return;
         }
 
-        // Use the type from the first sample for this key
+        // Use entry() to insert in one hash when the key is new.
         let metric_set = self
             .data
             .entry(key)
