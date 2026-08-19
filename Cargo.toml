@@ -41,6 +41,14 @@ license = "Apache-2.0"
 repository = "https://github.com/transithq/tropel"
 rust-version = "1.85"
 
+# Native release profile. Optimized for load generation: thin LTO for
+# size, single codegen unit for best optimization, symbols stripped.
+# Do NOT set panic = "abort" — the VU pool depends on unwinding.
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+
 # P5b / API_CLIENT_WEB_PAYLOAD.md §2.4 — size discipline for the browser
 # slice. A SEPARATE profile, not [profile.release]: native release builds
 # must stay fast for load generation (k6 competition), so the wasm-only

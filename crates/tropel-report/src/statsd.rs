@@ -21,7 +21,7 @@
 //! and forget (UDP has no delivery guarantee; failures are logged only).
 
 use async_trait::async_trait;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -55,10 +55,16 @@ pub struct StatsdOutput {
 impl StatsdOutput {
     /// Create an output sending to `addr` (host:port, e.g. `127.0.0.1:8125`).
     pub fn new(addr: impl Into<String>) -> Result<Self> {
-        let addr: SocketAddr = addr
-            .into()
-            .parse()
-            .map_err(|e| TropelError::Config(format!("invalid statsd address: {e}")))?;
+        let addr_str = addr.into();
+        // Resolve hostnames (e.g. `localhost:8125`) — `SocketAddr::parse`
+        // only accepts IP literals, but the CLI help example is `localhost:8125`.
+        let addr: SocketAddr = addr_str
+            .to_socket_addrs()
+            .map_err(|e| TropelError::Config(format!("invalid statsd address '{addr_str}': {e}")))?
+            .next()
+            .ok_or_else(|| {
+                TropelError::Config(format!("no addresses resolved for '{addr_str}'"))
+            })?;
         Ok(Self {
             addr,
             buffer: Mutex::new(Vec::new()),

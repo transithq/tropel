@@ -21,7 +21,7 @@
 //! fatal to the run.
 
 use async_trait::async_trait;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -87,9 +87,17 @@ impl InfluxdbOutput {
         let target = if addr.starts_with("http://") || addr.starts_with("https://") {
             parse_http_target(&addr)?
         } else {
+            // Resolve hostnames (e.g. `localhost:8089`) — `SocketAddr::parse`
+            // only accepts IP literals, but the CLI help example is `localhost:8089`.
             let sock: SocketAddr = addr
-                .parse()
-                .map_err(|e| TropelError::Config(format!("invalid influxdb address: {e}")))?;
+                .to_socket_addrs()
+                .map_err(|e| {
+                    TropelError::Config(format!("invalid influxdb address '{addr}': {e}"))
+                })?
+                .next()
+                .ok_or_else(|| {
+                    TropelError::Config(format!("no addresses resolved for '{addr}'"))
+                })?;
             InfluxTarget::Udp(sock)
         };
         Ok(Self {
@@ -185,12 +193,10 @@ impl InfluxdbOutput {
                 .collect();
             line.push_str(&format!(",{}", tag_list.join(",")));
         }
-        // field set
-        let value = if sample.value.fract() == 0.0 && sample.value.abs() < 9_007_199_254_740_992.0 {
-            format!("{}i", sample.value as i64)
-        } else {
-            sample.value.to_string()
-        };
+        // field set — always emit float. InfluxDB pins the field type on
+        // the first write; emitting `12i` then `12.5` on the same field
+        // causes a type conflict. k6 always emits float.
+        let value = sample.value.to_string();
         line.push_str(&format!(" value={value}"));
         if matches!(self.target, InfluxTarget::Http { .. }) {
             let ns = sample
@@ -409,7 +415,7 @@ mod tests {
         output.buffer(&sample("http_reqs", 1.0, &[("status", "200")]));
         output.buffer(&sample("http_req_duration", 12.5, &[("status", "200")]));
         let lines = output.buffer.lock().unwrap().clone();
-        assert_eq!(lines[0], "http_reqs,status=200 value=1i");
+        assert_eq!(lines[0], "http_reqs,status=200 value=1");
         assert_eq!(lines[1], "http_req_duration,status=200 value=12.5");
     }
 
@@ -493,7 +499,7 @@ mod tests {
         let http = InfluxdbOutput::new("http://localhost:8086?org=o&bucket=b").unwrap();
         http.buffer(&sample("http_reqs", 1.0, &[]));
         let line = http.buffer.lock().unwrap().first().unwrap().clone();
-        // line = "http_reqs value=1i <ns>" — exactly 3 whitespace tokens and
+        // line = "http_reqs value=1 <ns>" — exactly 3 whitespace tokens and
         // the final token is all digits (the ns timestamp).
         let tokens: Vec<&str> = line.split_whitespace().collect();
         assert_eq!(tokens.len(), 3, "metric tags value ns: {line}");
@@ -506,7 +512,7 @@ mod tests {
         udp.buffer(&sample("http_reqs", 1.0, &[]));
         let line = udp.buffer.lock().unwrap().first().unwrap().clone();
         assert_eq!(
-            line, "http_reqs value=1i",
+            line, "http_reqs value=1",
             "UDP line has no timestamp: {line}"
         );
     }
@@ -529,6 +535,6 @@ mod tests {
         let mut buf = [0u8; 1024];
         let (n, _from) = receiver.recv_from(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf[..n]);
-        assert_eq!(text, "http_reqs,status=200 value=1i");
+        assert_eq!(text, "http_reqs,status=200 value=1");
     }
 }
