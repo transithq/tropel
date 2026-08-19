@@ -226,6 +226,10 @@ impl ScenarioRunner {
             // iteration ran exactly one request. Jumps are per-iteration in
             // Postman; clear any stale pending jump at iteration start.
             state.next_request = None;
+            // Newman scopes pm.variables per request — clear accumulated
+            // local_vars from the previous iteration so they don't grow
+            // monotonically (backlog line 353).
+            state.local_vars.clear();
         }
 
         // Walk through the flattened execution list (folders descended).
