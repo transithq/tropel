@@ -1258,7 +1258,9 @@ impl DriverInstance for K6DriverInstance {
         // active scenario name (this is what makes scenario-scoped thresholds
         // like `http_req_duration{scenario:api_load}` resolve) — stamp it on
         // the drained samples so they match k6 semantics.
-        let mut bridge_samples = std::mem::take(&mut *self.sample_sink.lock().unwrap());
+        // drain(..) preserves the Vec's capacity — mem::take would replace
+        // with Vec::new() and lose it, causing re-growth every iteration.
+        let mut bridge_samples: Vec<_> = self.sample_sink.lock().unwrap().drain(..).collect();
         if !ctx.scenario_name.is_empty() {
             let scenario = ctx.scenario_name.clone();
             for s in &mut bridge_samples {
