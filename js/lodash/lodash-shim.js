@@ -78,6 +78,24 @@ var _ = _ || {};
         }
         return function (x) { return !!x; };
     }
+    // Expose toPredicate as _.iteratee for new collection helpers.
+    // Lodash _.iteratee handles: function → itself, string → property
+    // accessor, array → deep property, object → matcher, other → identity.
+    _.iteratee = function (value) {
+        if (typeof value === 'function') return value;
+        if (typeof value === 'string') return function (obj) { return obj[value]; };
+        if (Array.isArray(value)) {
+            return function (obj) {
+                return value.reduce(function (o, k) { return o && o[k]; }, obj);
+            };
+        }
+        if (value && typeof value === 'object') {
+            return function (obj) {
+                return Object.keys(value).every(function (k) { return obj[k] === value[k]; });
+            };
+        }
+        return function (x) { return x; };
+    };
 
     _.findIndex = function (array, predicate, fromIndex) {
         var pred = toPredicate(predicate);
@@ -871,6 +889,252 @@ var _ = _ || {};
     _.constant = function (value) { return function () { return value; }; };
     _.identity = function (value) { return value; };
     _.noop = function () {};
+    _.now = function () { return Date.now(); };
+    _.parseInt = function (string, radix) {
+        return parseInt(string, radix || 10);
+    };
+    _.round = function (number, precision) {
+        precision = precision === undefined ? 0 : precision;
+        var factor = Math.pow(10, precision);
+        return Math.round(number * factor) / factor;
+    };
+    _.floor = function (number, precision) {
+        precision = precision === undefined ? 0 : precision;
+        var factor = Math.pow(10, precision);
+        return Math.floor(number * factor) / factor;
+    };
+    _.ceil = function (number, precision) {
+        precision = precision === undefined ? 0 : precision;
+        var factor = Math.pow(10, precision);
+        return Math.ceil(number * factor) / factor;
+    };
+    _.range = function (start, end, step) {
+        if (end === undefined) { end = start; start = 0; }
+        step = step || 1;
+        var result = [];
+        if (step > 0) { for (var i = start; i < end; i += step) result.push(i); }
+        else { for (var i = start; i > end; i += step) result.push(i); }
+        return result;
+    };
+    _.toNumber = function (value) {
+        if (typeof value === 'number') return value;
+        return Number(value) || 0;
+    };
+    _.isInteger = function (value) {
+        return typeof value === 'number' && (value | 0) === value && isFinite(value);
+    };
+    _.isPlainObject = function (value) {
+        if (typeof value !== 'object' || value === null) return false;
+        var proto = Object.getPrototypeOf(value);
+        return proto === Object.prototype || proto === null;
+    };
+
+    // ── Collection ──
+    _.groupBy = function (collection, iteratee) {
+        iteratee = _.iteratee(iteratee);
+        var result = {};
+        collection.forEach(function (item) {
+            var key = iteratee(item);
+            if (!result[key]) result[key] = [];
+            result[key].push(item);
+        });
+        return result;
+    };
+    _.keyBy = function (collection, iteratee) {
+        iteratee = _.iteratee(iteratee);
+        var result = {};
+        collection.forEach(function (item) {
+            result[iteratee(item)] = item;
+        });
+        return result;
+    };
+    _.countBy = function (collection, iteratee) {
+        iteratee = _.iteratee(iteratee);
+        var result = {};
+        collection.forEach(function (item) {
+            var key = iteratee(item);
+            result[key] = (result[key] || 0) + 1;
+        });
+        return result;
+    };
+    _.partition = function (collection, predicate) {
+        predicate = _.iteratee(predicate);
+        var pass = [], fail = [];
+        collection.forEach(function (item) {
+            (predicate(item) ? pass : fail).push(item);
+        });
+        return [pass, fail];
+    };
+    _.flatMap = function (collection, iteratee) {
+        iteratee = _.iteratee(iteratee);
+        return _.flatten(collection.map(iteratee));
+    };
+    _.orderBy = function (collection, iteratees, orders) {
+        iteratees = Array.isArray(iteratees) ? iteratees : [iteratees];
+        orders = Array.isArray(orders) ? orders : [orders];
+        return collection.slice().sort(function (a, b) {
+            for (var i = 0; i < iteratees.length; i++) {
+                var it = _.iteratee(iteratees[i]);
+                var va = it(a), vb = it(b);
+                if (va !== vb) {
+                    var dir = (orders[i] || 'asc') === 'desc' ? -1 : 1;
+                    return va < vb ? -dir : dir;
+                }
+            }
+            return 0;
+        });
+    };
+    _.sortBy = function (collection, iteratees) {
+        iteratees = Array.isArray(iteratees) ? iteratees : (iteratees ? [iteratees] : []);
+        if (iteratees.length === 0) iteratees = [_.identity];
+        return _.orderBy(collection, iteratees, iteratees.map(function () { return 'asc'; }));
+    };
+    _.uniqBy = function (array, iteratee) {
+        iteratee = _.iteratee(iteratee);
+        var seen = [];
+        return array.filter(function (item) {
+            var val = iteratee(item);
+            if (seen.indexOf(val) !== -1) return false;
+            seen.push(val);
+            return true;
+        });
+    };
+    _.sample = function (collection) {
+        return collection[Math.floor(Math.random() * collection.length)];
+    };
+    _.shuffle = function (array) {
+        var result = array.slice();
+        for (var i = result.length - 1; i > 0; i--) {
+            var j = Math.floor(Math.random() * (i + 1));
+            var tmp = result[i];
+            result[i] = result[j];
+            result[j] = tmp;
+        }
+        return result;
+    };
+
+    // ── Object ──
+    _.mapKeys = function (object, iteratee) {
+        iteratee = _.iteratee(iteratee);
+        var result = {};
+        Object.keys(object).forEach(function (key) {
+            result[iteratee(object[key], key, object)] = object[key];
+        });
+        return result;
+    };
+    _.mapValues = function (object, iteratee) {
+        iteratee = _.iteratee(iteratee);
+        var result = {};
+        Object.keys(object).forEach(function (key) {
+            result[key] = iteratee(object[key], key, object);
+        });
+        return result;
+    };
+    _.invert = function (object) {
+        var result = {};
+        Object.keys(object).forEach(function (key) {
+            result[object[key]] = key;
+        });
+        return result;
+    };
+    _.zipObject = function (keys, values) {
+        var result = {};
+        for (var i = 0; i < keys.length; i++) {
+            result[keys[i]] = values[i];
+        }
+        return result;
+    };
+    _.pickBy = function (object, predicate) {
+        predicate = _.iteratee(predicate);
+        var result = {};
+        Object.keys(object).forEach(function (key) {
+            if (predicate(object[key], key, object)) result[key] = object[key];
+        });
+        return result;
+    };
+    _.omitBy = function (object, predicate) {
+        predicate = _.iteratee(predicate);
+        var result = {};
+        Object.keys(object).forEach(function (key) {
+            if (!predicate(object[key], key, object)) result[key] = object[key];
+        });
+        return result;
+    };
+
+    // ── Function ──
+    _.once = function (fn) {
+        var called = false, result;
+        return function () {
+            if (!called) { called = true; result = fn.apply(this, arguments); }
+            return result;
+        };
+    };
+    _.after = function (n, fn) {
+        var count = 0;
+        return function () {
+            count++;
+            if (count >= n) return fn.apply(this, arguments);
+        };
+    };
+    _.memoize = function (fn, resolver) {
+        var cache = {};
+        var memoized = function () {
+            var key = resolver ? resolver.apply(this, arguments) : arguments[0];
+            if (!(key in cache)) cache[key] = fn.apply(this, arguments);
+            return cache[key];
+        };
+        memoized.cache = cache;
+        return memoized;
+    };
+    _.curry = function (fn) {
+        var arity = fn.length;
+        return function curried() {
+            var args = Array.prototype.slice.call(arguments);
+            if (args.length >= arity) return fn.apply(this, args);
+            return function () {
+                return curried.apply(this, args.concat(Array.prototype.slice.call(arguments)));
+            };
+        };
+    };
+    _.padStart = function (string, length, chars) {
+        string = String(string);
+        length = length || 0;
+        chars = chars || ' ';
+        var padLen = Math.max(0, length - string.length);
+        return chars.slice(0, padLen).split('').join('').slice(0, padLen) + string;
+    };
+    _.padEnd = function (string, length, chars) {
+        string = String(string);
+        length = length || 0;
+        chars = chars || ' ';
+        var padLen = Math.max(0, length - string.length);
+        return string + chars.slice(0, padLen).split('').join('').slice(0, padLen);
+    };
+    _.deburr = function (string) {
+        return string
+            .replace(/[\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u02ff]/g, function (c) {
+                return c.normalize('NFD').replace(/\u0300-\u036f/g, '');
+            });
+    };
+    _.startCase = function (string) {
+        return string
+            .replace(/([a-z])([A-Z])/g, '$1 $2')
+            .replace(/[_\-]+/g, ' ')
+            .replace(/\b\w/g, function (c) { return c.toUpperCase(); })
+            .replace(/^\s+|\s+$/g, '');
+    };
+    _.template = function (string) {
+        var re = /<%=\s*([\s\S]*?)\s*%>/g;
+        return function (data) {
+            return string.replace(re, function (match, code) {
+                try {
+                    return new Function('obj', 'with(obj){return ' + code + '}')(data);
+                } catch (e) {
+                    return '';
+                }
+            });
+        };
+    };
     _.times = function (n, iteratee) {
         var result = [];
         for (var i = 0; i < n; i++) result.push(iteratee(i));
