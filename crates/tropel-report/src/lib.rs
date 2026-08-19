@@ -34,12 +34,17 @@ pub trait Reporter: Send + Sync {
     async fn report(&self, result: &MetricsResult) -> Result<()>;
 }
 
-/// Create reporters by name.
-pub fn create_reporter(name: &str) -> Option<Box<dyn Reporter>> {
+/// Create reporters by name, optionally with an output file path from
+/// `-o`/`--output`. Without a path, json/csv reporters write to stdout.
+pub fn create_reporter(name: &str, output_file: Option<&str>) -> Option<Box<dyn Reporter>> {
     match name {
         "stdout" => Some(Box::new(StdoutReporter)),
-        "json" => Some(Box::new(JsonReporter::new(None))),
-        "csv" => Some(Box::new(CsvReporter::new(None))),
+        "json" => Some(Box::new(JsonReporter::new(
+            output_file.map(|s| s.to_string()),
+        ))),
+        "csv" => Some(Box::new(CsvReporter::new(
+            output_file.map(|s| s.to_string()),
+        ))),
         _ => None,
     }
 }
