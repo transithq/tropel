@@ -181,9 +181,17 @@ function normalizeK6Request(method, url, body, params) {
     // application/json). The copy keeps the stamp per-request.
     var headers = {};
     var srcHeaders = params.headers;
-    if (srcHeaders && typeof srcHeaders === 'object' && !Array.isArray(srcHeaders)) {
-        for (var hk in srcHeaders) {
-            if (srcHeaders.hasOwnProperty(hk)) headers[hk] = srcHeaders[hk];
+    if (srcHeaders && typeof srcHeaders === 'object') {
+        if (Array.isArray(srcHeaders)) {
+            // Postman array form: [{key: 'Authorization', value: 'Bearer T'}]
+            for (var i = 0; i < srcHeaders.length; i++) {
+                var h = srcHeaders[i];
+                if (h && h.key) headers[h.key] = h.value !== undefined ? h.value : '';
+            }
+        } else {
+            for (var hk in srcHeaders) {
+                if (srcHeaders.hasOwnProperty(hk)) headers[hk] = srcHeaders[hk];
+            }
         }
     }
     // Backlog P1: the GLOBAL HttpConfig.request_timeout must bound k6
