@@ -4208,14 +4208,16 @@ mod tests {
                 .expect("read captured[1] body");
             assert_eq!(second_body, "plain text");
 
-            // 3. Iteration 1 (object body) still gets application/json ON THE
-            //    COPY (not on the caller's object).
+            // 3. Iteration 1 (object body) gets application/x-www-form-urlencoded
+            //    (k6 default for object bodies without explicit Content-Type).
             let first_headers: String = ctx
                 .eval("JSON.stringify(__captured[0].headers)")
                 .expect("read captured[0] headers");
             assert!(
-                first_headers.to_lowercase().contains("application/json"),
-                "object body not labelled json: {first_headers}"
+                first_headers
+                    .to_lowercase()
+                    .contains("x-www-form-urlencoded"),
+                "object body not labelled form-urlencoded per k6: {first_headers}"
             );
 
             // 4. Multipart: the generated boundary MUST reach the header.
