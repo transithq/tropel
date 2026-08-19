@@ -92,6 +92,12 @@ impl StdoutReporter {
                 "Samples dropped", result.output_samples_dropped
             ));
         }
+        if result.series_dropped > 0 {
+            out.push_str(&format!(
+                "    {:<14}{}\n",
+                "Series dropped", result.series_dropped
+            ));
+        }
 
         // HTTP requests — aligned two-column block
         out.push_str("\n  ── HTTP requests ─────────────────────────────────────────\n");
