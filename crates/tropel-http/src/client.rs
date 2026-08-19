@@ -912,15 +912,11 @@ impl HttpClient {
                     })?;
 
                     // Cross-origin redirect → drop credentials for the next hop.
-                    let cur = reqwest::Url::parse(&current_url).ok();
-                    let same_origin = match &cur {
-                        Some(c) => {
-                            c.scheme() == next.scheme()
-                                && c.host_str() == next.host_str()
-                                && c.port_or_known_default() == next.port_or_known_default()
-                        }
-                        None => false,
-                    };
+                    // Reuse `base` (already parsed above) instead of parsing
+                    // the same URL a second time.
+                    let same_origin = base.scheme() == next.scheme()
+                        && base.host_str() == next.host_str()
+                        && base.port_or_known_default() == next.port_or_known_default();
                     if !same_origin {
                         strip_sensitive = true;
                     }
