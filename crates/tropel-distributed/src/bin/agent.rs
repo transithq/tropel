@@ -4,6 +4,15 @@
 //! Usage:
 //!   tropel-agent --controller <host:port>
 
+// Select the global allocator at compile time via feature flags.
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "alloc-jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::Parser;
 use std::path::PathBuf;
 use tropel_distributed::resolve_token;

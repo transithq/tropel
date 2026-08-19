@@ -12,6 +12,15 @@
 //!   tropel-cloud-run agent --controller controller-svc:17890
 //!   tropel-cloud-run k8s --config job.json --agents 4 --image reg/tropel:v1 --namespace loadtest
 
+// Select the global allocator at compile time via feature flags.
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "alloc-jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tokio::net::TcpListener;
