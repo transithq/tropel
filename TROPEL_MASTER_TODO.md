@@ -225,7 +225,7 @@ Every entry is "there are two implementations of one thing and only one got fixe
 
 ### Outputs
 - [ ] **JSON-stream envelope wrong.** Confirmed against Grafana's docs: k6 puts `metric` at the **top level** of both records; tropel nests it inside `data` for Point and omits it for Metric. `jq 'select(.metric=="http_req_duration")'` matches **zero lines**. Extra `name` k6 never emits, missing `tainted`, `thresholds` hardcoded `[]`. **`point_record_matches_k6_schema:333-391` locks the wrong shape in** and the module doc asserts this *is* k6's schema. **READ**
-- [ ] **InfluxDB int/float flap** — `12.0 → 12i`, `12.5 → 12.5` on the same field; first sample pins the type and the next 400s the **already-drained** batch. A test asserts both shapes. **READ**
+- [x] **InfluxDB int/float flap** — `12.0 → 12i`, `12.5 → 12.5` on the same field; first sample pins the type and the next 400s the **already-drained** batch. A test asserts both shapes. **READ** — ✅ DONE (PR #144)
 - [ ] **Hostnames rejected by `parse::<SocketAddr>()`** for StatsD/Influx-UDP — **while the CLI help itself gives `localhost:8125` as the example.** **READ**
 - [ ] **`-o/--output` silently ignored for `-r json`/`-r csv`** (`tropel-report/lib.rs:41-42` hardcodes `new(None)`; `output_file` is plumbed through three layers and read by nothing) · **`-r json` cannot tell CI whether the run passed** — no `thresholds`, no verdict, no `run_duration`/`iterations`/`vus_max`/`per_url`/`per_group`. **READ**
 - [ ] **Prometheus `cumulative` never evicted** (~140 MB at max cardinality) · tag limits ship disabled with no CLI flag · **`--json-stream` appends and never truncates** where k6 truncates, so re-runs concatenate with duplicate `Metric` records and every aggregation double-counts. **READ**
@@ -315,7 +315,7 @@ Each of these makes a *working* script behave wrongly or abort. Distinct from th
   - `body_size()` → use `resp.request_body_size` (`driver.rs:1653`) — currently **re-serializes the entire request body just to measure it**; the exact count is already on the response.
   - `record_batch(Vec<Sample>)` **by value** (`collector.rs:483`) + an `AtomicBool` fast path in `forward_to_sink` (`:453`), mirroring the `aggregator_spawned` flag three fields away.
 - [ ] **The response body is copied 6 times; the floor is 2.** `Bytes` → `to_vec` → `clone` → `Response::from` → `from_utf8_lossy().into_owned()` → QuickJS heap. 4 KB: **24 KB moved, 16 KB avoidable.** 1 MB: **6 MB moved, 4 MB avoidable** plus four megabyte-scale malloc/free pairs. Only the last copy is irreducible — pass `&str` to `obj.set`. **Request bodies are the same story: 6 copies. k6 does 1.**
-- [ ] **Add `[profile.release]`** — there is none; native release runs on cargo defaults.
+- [x] **Add `[profile.release]`** — there is none; native release runs on cargo defaults. — ✅ DONE (PR #145)
   ```toml
   [profile.release]
   lto           = "thin"      # −8-12 % size, +3-8 % runtime, +20-30 % build
