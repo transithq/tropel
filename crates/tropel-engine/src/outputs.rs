@@ -41,7 +41,8 @@ pub(crate) fn spawn_extension_output(
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::trace!("extension output dropped {n} samples (consumer lag)");
+                        tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!("extension output dropped {n} samples (consumer lag)");
                     }
                 },
                 _ = tick.tick() => {
