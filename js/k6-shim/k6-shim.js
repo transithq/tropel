@@ -399,6 +399,12 @@ function serializeK6Body(body, headers) {
                 headers['Content-Type'] = multipart.contentType;
             } else if (contentType && contentType.indexOf('application/x-www-form-urlencoded') !== -1 && typeof body === 'object') {
                 bodyStr = serializeUrlEncoded(body);
+            } else if (!contentType && typeof body === 'object') {
+                // k6 default: objects are form-urlencoded, not JSON.
+                bodyStr = serializeUrlEncoded(body);
+                if (!headers['Content-Type'] && !headers['content-type']) {
+                    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+                }
             } else {
                 try {
                     bodyStr = JSON.stringify(body);
