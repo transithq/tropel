@@ -411,7 +411,10 @@ impl ScenarioRunner {
                         headers: resolved_headers,
                         query_params: resolved_query,
                         body: resolved_body,
-                        auth: request.auth.clone(),
+                        auth: request
+                            .auth
+                            .as_ref()
+                            .map(|a| resolve_auth(a, &resolver, &scope)),
                         certificate: request.certificate.clone(),
                         follow_redirects: request.follow_redirects,
                         timeout: request.timeout,
@@ -907,6 +910,82 @@ pub fn flatten_execution_items(items: &[ScenarioItem]) -> Vec<ScenarioItem> {
     out
 }
 
+/// Resolve variables inside an `AuthConfig`. Every string field that
+/// could contain `{{var}}` placeholders (Bearer token, Basic username/
+/// password, ApiKey value, etc.) is run through the variable resolver.
+/// This ensures `Authorization: Bearer {{token}}` is resolved before
+/// going on the wire (backlog line 218).
+fn resolve_auth(
+    auth: &tropel_sdk::types::AuthConfig,
+    resolver: &tropel_variables::VariableResolver,
+    scope: &tropel_variables::VariableScope,
+) -> tropel_sdk::types::AuthConfig {
+    use tropel_sdk::types::AuthConfig;
+    let r =
+        |s: &str| resolver.resolve_deep(s, scope, tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES);
+    match auth {
+        AuthConfig::NoAuth => AuthConfig::NoAuth,
+        AuthConfig::Bearer { token } => AuthConfig::Bearer { token: r(token) },
+        AuthConfig::Basic { username, password } => AuthConfig::Basic {
+            username: r(username),
+            password: r(password),
+        },
+        AuthConfig::ApiKey {
+            key,
+            value,
+            location,
+        } => AuthConfig::ApiKey {
+            key: r(key),
+            value: r(value),
+            location: location.clone(),
+        },
+        AuthConfig::Digest { username, password } => AuthConfig::Digest {
+            username: r(username),
+            password: r(password),
+        },
+        AuthConfig::OAuth1 {
+            consumer_key,
+            consumer_secret,
+            token,
+            token_secret,
+        } => AuthConfig::OAuth1 {
+            consumer_key: r(consumer_key),
+            consumer_secret: r(consumer_secret),
+            token: token.as_deref().map(r),
+            token_secret: token_secret.as_deref().map(r),
+        },
+        AuthConfig::OAuth2 {
+            access_token,
+            token_type,
+        } => AuthConfig::OAuth2 {
+            access_token: r(access_token),
+            token_type: token_type.as_deref().map(r),
+        },
+        AuthConfig::AwsSigV4 {
+            access_key,
+            secret_key,
+            region,
+            service,
+            session_token,
+        } => AuthConfig::AwsSigV4 {
+            access_key: r(access_key),
+            secret_key: r(secret_key),
+            region: region.as_deref().map(r),
+            service: service.as_deref().map(r),
+            session_token: session_token.as_deref().map(r),
+        },
+        AuthConfig::Hawk {
+            auth_id,
+            auth_key,
+            algorithm,
+        } => AuthConfig::Hawk {
+            auth_id: r(auth_id),
+            auth_key: r(auth_key),
+            algorithm: algorithm.as_deref().map(r),
+        },
+    }
+}
+
 /// Resolve variables in a request body.
 fn resolve_body(
     body: &tropel_sdk::types::Body,
@@ -1143,6 +1222,52 @@ mod tests {
         match resolved {
             tropel_sdk::types::Body::Raw(s) => assert_eq!(s, "<m>hi\"there</m>"),
             other => panic!("Raw body must stay Raw, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_auth_bearer_token() {
+        // backlog line 218: auth fields must be variable-resolved so
+        // `Authorization: Bearer {{token}}` is resolved before going on
+        // the wire, not sent literally.
+        let resolver = tropel_variables::VariableResolver::new();
+        let scope = tropel_variables::VariableScope {
+            env: HashMap::from([("token".into(), "my-secret-jwt".into())]),
+            ..Default::default()
+        };
+        let auth = tropel_sdk::types::AuthConfig::Bearer {
+            token: "{{token}}".to_string(),
+        };
+        let resolved = resolve_auth(&auth, &resolver, &scope);
+        match resolved {
+            tropel_sdk::types::AuthConfig::Bearer { token } => {
+                assert_eq!(token, "my-secret-jwt");
+            }
+            other => panic!("expected Bearer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_auth_basic_username_password() {
+        let resolver = tropel_variables::VariableResolver::new();
+        let scope = tropel_variables::VariableScope {
+            env: HashMap::from([
+                ("user".into(), "admin".into()),
+                ("pass".into(), "s3cret".into()),
+            ]),
+            ..Default::default()
+        };
+        let auth = tropel_sdk::types::AuthConfig::Basic {
+            username: "{{user}}".to_string(),
+            password: "{{pass}}".to_string(),
+        };
+        let resolved = resolve_auth(&auth, &resolver, &scope);
+        match resolved {
+            tropel_sdk::types::AuthConfig::Basic { username, password } => {
+                assert_eq!(username, "admin");
+                assert_eq!(password, "s3cret");
+            }
+            other => panic!("expected Basic, got {:?}", other),
         }
     }
 
