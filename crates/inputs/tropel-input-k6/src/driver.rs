@@ -169,7 +169,10 @@ impl Driver for K6Driver {
             .await
             .unwrap_or(None);
         if has_iter.is_none() {
-            tracing::warn!("k6 script did not define a default export function — __tropel_iteration is not set");
+            return Err(TropelError::Parse(
+                "k6 script did not define a default export function — \
+                 expected `export default function() { ... }` or `export function handleSummary() { ... }`".into(),
+            ));
         }
 
         Ok(Box::new(K6DriverInstance {
