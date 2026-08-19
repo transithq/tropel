@@ -77,6 +77,9 @@ pub struct InfluxdbOutput {
     total_buffered: AtomicUsize,
     /// Tag forwarding policy (allowlist + cardinality cap).
     tag_policy: TagPolicy,
+    /// Reused HTTP client — created once, not per-flush.
+    /// Only `Some` when `target` is `InfluxTarget::Http`.
+    http_client: Option<reqwest::Client>,
 }
 
 impl InfluxdbOutput {
@@ -100,11 +103,17 @@ impl InfluxdbOutput {
                 })?;
             InfluxTarget::Udp(sock)
         };
+        let http_client = if matches!(target, InfluxTarget::Http { .. }) {
+            Some(reqwest::Client::new())
+        } else {
+            None
+        };
         Ok(Self {
             target,
             buffer: Mutex::new(Vec::new()),
             total_buffered: AtomicUsize::new(0),
             tag_policy: TagPolicy::default(),
+            http_client,
         })
     }
 
@@ -275,7 +284,10 @@ impl InfluxdbOutput {
                 user,
                 password,
             } => {
-                let client = reqwest::Client::new();
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .expect("http_client must be Some for HTTP target");
                 let (url, builder) = if let (Some(org), Some(bucket)) = (org, bucket) {
                     // v2 write endpoint.
                     let url = format!("{base}/api/v2/write?org={org}&bucket={bucket}&precision=ns");
