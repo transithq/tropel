@@ -765,13 +765,7 @@ impl Aggregator {
             // order, so pin `url` FIRST explicitly — a bare
             // `find(url || name)` could flip the key between samples when a
             // script sets url != name, splitting one URL into two rows.
-            if let Some(url) = sample
-                .tags
-                .iter()
-                .find(|(k, _)| *k == "url")
-                .or_else(|| sample.tags.iter().find(|(k, _)| *k == "name"))
-                .map(|(_, v)| v)
-            {
+            if let Some(url) = sample.tags.get("url").or_else(|| sample.tags.get("name")) {
                 self.merged_per_url
                     .entry(url.to_string())
                     .or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
@@ -782,10 +776,10 @@ impl Aggregator {
         // Per-group merge: any series carrying a `group` tag (the runner
         // emits `group=http` by default; named groups from `group()` /
         // `pm.group` produce the meaningful rows).
-        if let Some(group) = sample.tags.iter().find(|(k, _)| *k == "group") {
+        if let Some(group) = sample.tags.get("group") {
             let entry = self
                 .merged_per_group
-                .entry((sample.metric.to_string(), group.1.to_string()));
+                .entry((sample.metric.to_string(), group.to_string()));
             entry
                 .or_insert_with(|| MetricSet::new(metric_type, hmax))
                 .record(sample.value, &sample.sample_type);
