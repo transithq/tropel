@@ -99,6 +99,16 @@ pub fn validate_thresholds(thresholds: &HashMap<String, ThresholdConfig>) -> Res
                         name, s, clause, expr
                     ));
                 }
+                // Reject out-of-range percentiles: p(150) silently becomes max,
+                // p(-5) silently becomes min — both are almost certainly typos.
+                if let Some(pct) = parse_percentile(s) {
+                    if !(0.0..=100.0).contains(&pct) {
+                        return Err(format!(
+                            "threshold '{}': percentile {} is out of range (must be 0-100) in clause '{}' of '{}'",
+                            name, s, clause, expr
+                        ));
+                    }
+                }
             }
         }
     }
