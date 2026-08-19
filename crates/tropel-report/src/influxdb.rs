@@ -171,6 +171,19 @@ impl InfluxdbOutput {
                 ' ' | ',' | '=' if !in_quotes => out.push('\\'),
                 '"' if in_quotes => out.push('\\'),
                 '\\' => out.push('\\'),
+                // Newlines/tabs in tag values inject extra lines into the
+                // line protocol, causing silent metric corruption.
+                '\n' | '\r' | '\t' => {
+                    out.push('\\');
+                    let esc = match c {
+                        '\n' => "n",
+                        '\r' => "r",
+                        '\t' => "t",
+                        _ => unreachable!(),
+                    };
+                    out.push_str(esc);
+                    continue;
+                }
                 _ => {}
             }
             out.push(c);
