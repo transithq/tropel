@@ -971,8 +971,10 @@ impl JsContext {
     /// This is the `qjsc`-style path: `JS_Eval` with
     /// `JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY` parses and compiles
     /// the source, returning the compiled function without running it;
-    /// `JS_WriteObject` with `JS_WRITE_OBJ_BYTECODE` serializes it into a
-    /// self-contained byte blob.
+    /// `JS_WriteObject` with `JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_STRIP_SOURCE`
+    /// serializes it into a self-contained byte blob with function source
+    /// stripped (~291 KB saved per VU — the source is retained only for
+    /// `Function.prototype.toString` which shim code never calls).
     ///
     /// The resulting bytes are tied to the QuickJS build (version + feature
     /// flags), not to any particular context, so they can be compiled ONCE
@@ -1011,7 +1013,8 @@ impl JsContext {
                     raw,
                     &mut size,
                     val,
-                    rquickjs::qjs::JS_WRITE_OBJ_BYTECODE as i32,
+                    rquickjs::qjs::JS_WRITE_OBJ_BYTECODE as i32
+                        | rquickjs::qjs::JS_WRITE_OBJ_STRIP_SOURCE as i32,
                 )
             };
             unsafe { rquickjs::qjs::JS_FreeValue(raw, val) };
