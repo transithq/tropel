@@ -21,7 +21,7 @@
 //! fatal to the run.
 
 use async_trait::async_trait;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -87,9 +87,17 @@ impl InfluxdbOutput {
         let target = if addr.starts_with("http://") || addr.starts_with("https://") {
             parse_http_target(&addr)?
         } else {
+            // Resolve hostnames (e.g. `localhost:8089`) — `SocketAddr::parse`
+            // only accepts IP literals, but the CLI help example is `localhost:8089`.
             let sock: SocketAddr = addr
-                .parse()
-                .map_err(|e| TropelError::Config(format!("invalid influxdb address: {e}")))?;
+                .to_socket_addrs()
+                .map_err(|e| {
+                    TropelError::Config(format!("invalid influxdb address '{addr}': {e}"))
+                })?
+                .next()
+                .ok_or_else(|| {
+                    TropelError::Config(format!("no addresses resolved for '{addr}'"))
+                })?;
             InfluxTarget::Udp(sock)
         };
         Ok(Self {
