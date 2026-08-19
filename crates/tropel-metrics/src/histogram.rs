@@ -259,15 +259,24 @@ impl LatencyHistogram {
 
     /// Export histogram statistics.
     pub fn stats(&self) -> HistogramStats {
+        // Use value_at_quantiles for a single-pass computation of all
+        // four percentiles instead of four separate value_at_percentile
+        // calls (each a linear scan). Backlog line 336.
+        let [p50_raw, p90_raw, p95_raw, p99_raw]: [u64; 4] = self
+            .inner
+            .value_at_quantiles([0.50, 0.90, 0.95, 0.99])
+            .collect::<Vec<u64>>()
+            .try_into()
+            .unwrap_or([0; 4]);
         HistogramStats {
             count: self.count(),
             min: self.min(),
             max: self.max(),
             mean: self.mean(),
-            p50: self.p50(),
-            p90: self.p90(),
-            p95: self.p95(),
-            p99: self.p99(),
+            p50: p50_raw as f64 / 1000.0,
+            p90: p90_raw as f64 / 1000.0,
+            p95: p95_raw as f64 / 1000.0,
+            p99: p99_raw as f64 / 1000.0,
         }
     }
 }
