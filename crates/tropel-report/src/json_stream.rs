@@ -21,7 +21,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -46,6 +46,8 @@ pub struct JsonStreamOutput {
     /// Metric names already emitted as a `Metric` definition record. Each
     /// metric's definition is written once, before its first `Point`.
     seen_metrics: Mutex<HashSet<String>>,
+    /// Buffered file writer — avoids one unbuffered write(2) per line.
+    writer: Mutex<Option<BufWriter<std::fs::File>>>,
 }
 
 impl JsonStreamOutput {
@@ -56,6 +58,7 @@ impl JsonStreamOutput {
             buffer: Mutex::new(Vec::new()),
             total_buffered: AtomicUsize::new(0),
             seen_metrics: Mutex::new(HashSet::new()),
+            writer: Mutex::new(None),
         }
     }
 
@@ -160,16 +163,27 @@ impl JsonStreamOutput {
             return Ok(());
         }
 
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| {
-                TropelError::Report(format!("json-stream open '{}' failed: {e}", self.path))
-            })?;
-        for line in &lines {
-            writeln!(file, "{line}")
-                .map_err(|e| TropelError::Report(format!("json-stream write failed: {e}")))?;
+        // Lazily open (and reuse) a buffered writer across flushes.
+        {
+            let mut wguard = self.writer.lock().unwrap();
+            if wguard.is_none() {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .map_err(|e| {
+                        TropelError::Report(format!("json-stream open '{}' failed: {e}", self.path))
+                    })?;
+                *wguard = Some(BufWriter::new(file));
+            }
+            let writer = wguard.as_mut().unwrap();
+            for line in &lines {
+                writeln!(writer, "{line}")
+                    .map_err(|e| TropelError::Report(format!("json-stream write failed: {e}")))?;
+            }
+            writer
+                .flush()
+                .map_err(|e| TropelError::Report(format!("json-stream flush failed: {e}")))?;
         }
         Ok(())
     }
