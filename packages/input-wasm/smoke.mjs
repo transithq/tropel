@@ -31,6 +31,24 @@ const har = text(JSON.stringify({
   },
 }));
 
+const insomnia = text(JSON.stringify({
+  _type: "export",
+  __export_format: 4,
+  resources: [
+    { _type: "workspace", _id: "wrk_1", name: "Pets API", parentId: null },
+    { _type: "request", _id: "req_1", parentId: "wrk_1", name: "List pets", method: "GET", url: "https://api.example.com/pets" },
+  ],
+}));
+
+const bru = text(JSON.stringify({
+  version: "1",
+  uid: "c1",
+  name: "Pets API",
+  items: [
+    { uid: "r1", type: "http-request", name: "List pets", request: { url: "https://api.example.com/pets", method: "GET" } },
+  ],
+}));
+
 let failures = 0;
 const check = (cond, label) => {
   if (!cond) { console.error(`FAIL: ${label}`); failures++; }
@@ -40,6 +58,8 @@ const check = (cond, label) => {
 check(detect(postman) === "postman", "detect postman");
 check(detect(openapi) === "openapi", "detect openapi");
 check(detect(har) === "har", "detect har");
+check(detect(insomnia) === "insomnia", "detect insomnia");
+check(detect(bru) === "bru", "detect bru");
 check(detect(text("hello")) === "", "detect unknown");
 
 const s1 = JSON.parse(importAny(postman));
@@ -50,6 +70,12 @@ check(s2.info.name === "Pets" && s2.items.length === 1, "importAny openapi");
 
 const s3 = JSON.parse(importAny(har));
 check(s3.items.length === 1, "importAny har");
+
+const s5 = JSON.parse(importAny(insomnia));
+check(s5.info.name === "Pets API" && s5.items.length === 1, "importAny insomnia");
+
+const s6 = JSON.parse(importAny(bru));
+check(s6.info.name === "Pets API" && s6.items.length === 1, "importAny bru");
 
 const s4 = JSON.parse(importById("openapi", openapi));
 check(s4.info.name === "Pets", "importById openapi");
