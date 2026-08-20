@@ -69,6 +69,9 @@ pub struct PrometheusRemoteWriteOutput {
     /// per-window delta would make counters appear to reset every flush and
     /// break `rate()`/`increase()`.
     cumulative: Mutex<HashMap<SeriesKey, f64>>,
+    /// Maximum cumulative series before new entries are dropped (P1: prevents
+    /// unbounded memory growth at high cardinality — ~140 MB at 1M series).
+    max_cumulative: usize,
     /// Number of series currently buffered (fast read without the lock).
     total_buffered: AtomicUsize,
     /// Tag forwarding policy (allowlist + cardinality cap).
@@ -122,6 +125,7 @@ impl PrometheusRemoteWriteOutput {
             client: reqwest::Client::new(),
             series: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(HashMap::new()),
+            max_cumulative: 100_000,
             total_buffered: AtomicUsize::new(0),
             tag_policy: TagPolicy::default(),
         }
@@ -130,6 +134,12 @@ impl PrometheusRemoteWriteOutput {
     /// Set the tag forwarding policy (allowlist + cardinality cap).
     pub fn with_tag_policy(mut self, policy: TagPolicy) -> Self {
         self.tag_policy = policy;
+        self
+    }
+
+    /// Set the maximum number of cumulative series (default: 100 000).
+    pub fn with_max_cumulative(mut self, max: usize) -> Self {
+        self.max_cumulative = max;
         self
     }
 
@@ -245,9 +255,18 @@ impl PrometheusRemoteWriteOutput {
         // before the POST await below.
         let wire_series: HashMap<SeriesKey, Vec<(f64, i64)>> = {
             let mut cumulative = self.cumulative.lock().unwrap();
+            let at_cap = cumulative.len() >= self.max_cumulative;
+            if at_cap {
+                tracing::warn!(
+                    "prometheus cumulative series cap reached ({}); new series will be dropped",
+                    self.max_cumulative
+                );
+            }
             series
                 .iter()
-                .flat_map(|(key, agg)| expand_series(key, agg, ts_ms, &mut cumulative))
+                .flat_map(|(key, agg)| {
+                    expand_series(key, agg, ts_ms, &mut cumulative, self.max_cumulative)
+                })
                 .collect()
         };
 
@@ -328,9 +347,14 @@ fn expand_series(
     agg: &SeriesAgg,
     ts_ms: i64,
     cumulative: &mut HashMap<SeriesKey, f64>,
+    max_cumulative: usize,
 ) -> Vec<(SeriesKey, Vec<(f64, i64)>)> {
     match agg.sample_type {
         SampleType::Counter | SampleType::Rate => {
+            // P1: cap cumulative series to prevent unbounded memory growth.
+            if cumulative.len() >= max_cumulative && !cumulative.contains_key(key) {
+                return vec![];
+            }
             let total = cumulative.entry(key.clone()).or_insert(0.0);
             *total += agg.sum;
             vec![(key.clone(), vec![(*total, ts_ms)])]
@@ -363,6 +387,14 @@ fn expand_series(
             // Scoped so each `entry` borrow of `cumulative` ends before the
             // next one starts (E0499: cannot borrow `*cumulative` as mutable
             // more than once).
+            // P1: cap cumulative series to prevent unbounded memory growth.
+            // Count both count_key and sum_key as new entries.
+            let count_is_new = !cumulative.contains_key(&count_key);
+            let sum_is_new = !cumulative.contains_key(&sum_key);
+            let at_cap = cumulative.len() >= max_cumulative;
+            if at_cap && (count_is_new || sum_is_new) {
+                return vec![];
+            }
             let count_total = {
                 let e = cumulative.entry(count_key.clone()).or_insert(0.0);
                 *e += agg.count as f64;
@@ -604,7 +636,7 @@ mod tests {
         let mut cumulative: HashMap<SeriesKey, f64> = HashMap::new();
         series
             .iter()
-            .flat_map(|(k, a)| expand_series(k, a, ts_ms, &mut cumulative))
+            .flat_map(|(k, a)| expand_series(k, a, ts_ms, &mut cumulative, usize::MAX))
             .collect()
     }
 
@@ -690,7 +722,7 @@ mod tests {
             sum: 500.0,
             last: 1.0,
         };
-        let out1 = expand_series(&key, &w1, 1000, &mut cumulative);
+        let out1 = expand_series(&key, &w1, 1000, &mut cumulative, usize::MAX);
         assert_eq!(
             out1[0].1[0].0, 500.0,
             "first window: cumulative == window sum"
@@ -702,7 +734,7 @@ mod tests {
             sum: 480.0,
             last: 1.0,
         };
-        let out2 = expand_series(&key, &w2, 2000, &mut cumulative);
+        let out2 = expand_series(&key, &w2, 2000, &mut cumulative, usize::MAX);
         assert_eq!(
             out2[0].1[0].0, 980.0,
             "second window must be CUMULATIVE (500+480), not the 480 delta"
@@ -716,14 +748,14 @@ mod tests {
             sum: 300.0,
             last: 100.0,
         };
-        let tout1 = expand_series(&tkey, &tw1, 1000, &mut cumulative);
+        let tout1 = expand_series(&tkey, &tw1, 1000, &mut cumulative, usize::MAX);
         let tw2 = SeriesAgg {
             sample_type: SampleType::Trend,
             count: 2,
             sum: 250.0,
             last: 125.0,
         };
-        let tout2 = expand_series(&tkey, &tw2, 2000, &mut cumulative);
+        let tout2 = expand_series(&tkey, &tw2, 2000, &mut cumulative, usize::MAX);
         let count2 = tout2
             .iter()
             .find(|(k, _)| k.metric.ends_with("_count"))
@@ -778,7 +810,7 @@ mod tests {
             sum: 45.0,
             last: 45.0,
         };
-        let expanded = expand_series(&key, &agg, 1000, &mut HashMap::new());
+        let expanded = expand_series(&key, &agg, 1000, &mut HashMap::new(), usize::MAX);
         assert_eq!(expanded.len(), 2);
         for (k, samples) in &expanded {
             // __custom tag survives on the sub-series.
@@ -954,5 +986,50 @@ mod tests {
         let series = decoded.values().next().unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].0, 1.0);
+    }
+
+    #[test]
+    fn max_cumulative_cap_drops_new_series() {
+        // When the cumulative map is at capacity, new series are dropped
+        // to prevent unbounded memory growth (~140 MB at 1M series).
+        let mut cumulative = HashMap::new();
+        let cap = 2;
+
+        // Fill to capacity with two distinct counter series.
+        let key_a = SeriesKey::from_parts("req_a", &TagMap::new());
+        let agg_a = SeriesAgg {
+            sample_type: SampleType::Counter,
+            count: 1,
+            sum: 1.0,
+            last: 1.0,
+        };
+        let out1 = expand_series(&key_a, &agg_a, 1000, &mut cumulative, cap);
+        assert_eq!(out1.len(), 1, "first series accepted");
+
+        let key_b = SeriesKey::from_parts("req_b", &TagMap::new());
+        let agg_b = SeriesAgg {
+            sample_type: SampleType::Counter,
+            count: 1,
+            sum: 2.0,
+            last: 2.0,
+        };
+        let out2 = expand_series(&key_b, &agg_b, 1000, &mut cumulative, cap);
+        assert_eq!(out2.len(), 1, "second series accepted");
+
+        // Third NEW series must be dropped.
+        let key_c = SeriesKey::from_parts("req_c", &TagMap::new());
+        let agg_c = SeriesAgg {
+            sample_type: SampleType::Counter,
+            count: 1,
+            sum: 3.0,
+            last: 3.0,
+        };
+        let out3 = expand_series(&key_c, &agg_c, 1000, &mut cumulative, cap);
+        assert!(out3.is_empty(), "third new series must be dropped at cap");
+
+        // Existing series still accumulates (no cap hit).
+        let out4 = expand_series(&key_a, &agg_a, 2000, &mut cumulative, cap);
+        assert_eq!(out4.len(), 1, "existing series still accepted");
+        assert_eq!(out4[0].1[0].0, 2.0, "existing series accumulates (1+1)");
     }
 }
