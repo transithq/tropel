@@ -1123,7 +1123,8 @@ mod tests {
         ) -> Result<tropel_sdk::types::Response> {
             let signer = req.auth.as_ref().and_then(|a| self.0.get_signer(a));
             let resp = self.0.execute(req, signer.as_deref()).await?;
-            Ok(tropel_sdk::types::Response::from(&resp))
+            // Backlog line 312: use by-value conversion to avoid 16 clones.
+            Ok(tropel_sdk::types::Response::from(resp))
         }
     }
 

@@ -482,7 +482,8 @@ impl DriverHttpClient for DriverHttpClientImpl {
         // digest on ONE request don't need the whole scenario to share it.
         let signer = req.auth.as_ref().and_then(|a| self.client.get_signer(a));
         let http_resp = self.client.execute(req, signer.as_deref()).await?;
-        Ok(Response::from(&http_resp))
+        // Backlog line 312: use by-value conversion to avoid 16 clones.
+        Ok(Response::from(http_resp))
     }
 }
 /// Pick the per-VU HTTP client for a VU spawn.
