@@ -557,6 +557,7 @@ pub(crate) async fn run_scenario_vus(
     protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
+    input_path: &str,
 ) -> (u32, u64) {
     // Expected statuses are read by every VU's ScenarioRunner — snapshot them once
     // and share (the closure no longer captures the whole HttpConfig, which
@@ -603,6 +604,13 @@ pub(crate) async fn run_scenario_vus(
     let names_c: Arc<Vec<String>> =
         Arc::new(flattened_c.iter().map(|item| item.name.clone()).collect());
 
+    // P-B: source-gated bundle split — scan the script once per scenario
+    // and build a minimal shim bundle (skipping cryptojs/lodash when unused).
+    // This is shared across all VUs — one scan, one bundle, ~120KB/VU saved.
+    let shim = Arc::new(ShimBundle::from_script_path(std::path::Path::new(
+        input_path,
+    )));
+
     run_vus(
         sc_name,
         start_delay,
@@ -627,6 +635,8 @@ pub(crate) async fn run_scenario_vus(
             let flattened_vu = flattened_c.clone();
             let names_vu = names_c.clone();
             let expected_statuses_vu = expected_statuses_c.clone();
+            // P-B: cheap Arc clone per-VU instead of deep-copying the shim bundle.
+            let shim_vu = shim.clone();
 
             // 1-VU-per-task: pin this VU to its own dedicated worker thread so
             // a blocking script `sleep()` (std::thread::sleep) never freezes a
@@ -677,7 +687,7 @@ pub(crate) async fn run_scenario_vus(
                     vu_id,
                     &pm_state,
                     &bridge_client,
-                    &ShimBundle::default(),
+                    &shim_vu,
                     &SandboxConfig::default(),
                     sched.force_stop_flag(),
                 )
