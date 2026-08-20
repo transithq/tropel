@@ -455,7 +455,8 @@ fn expand_series(
 /// message Sample      { double value = 1; int64 timestamp = 2; } // ms
 /// ```
 fn encode_write_request(series: &HashMap<SeriesKey, Vec<(f64, i64)>>) -> Vec<u8> {
-    let mut out = Vec::new();
+    // Pre-allocate: ~100 B per series (labels + samples) on average.
+    let mut out = Vec::with_capacity(series.len() * 100);
     for (key, samples) in series {
         let mut ts = Vec::new();
         for (name, value) in &key.labels {
