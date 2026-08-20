@@ -730,6 +730,17 @@ impl JsContext {
         })
     }
 
+    /// Set a global variable to an integer directly (no serialization round-trip).
+    pub async fn set_global_int(&mut self, name: &str, value: i32) -> Result<()> {
+        let name = name.to_string();
+        self.ctx.with(move |ctx| {
+            let globals = ctx.globals();
+            globals
+                .set(name, value)
+                .map_err(|e| JsError::Conversion(format!("set_global_int error: {}", e)))
+        })
+    }
+
     /// Set a global variable from a JSON value.
     pub async fn set_global_json(
         &mut self,
