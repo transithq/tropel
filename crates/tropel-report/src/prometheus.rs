@@ -98,17 +98,42 @@ struct SeriesKey {
     labels: Vec<(String, String)>,
 }
 
+/// Sanitize a string to a valid Prometheus label/metric name.
+/// Prometheus requires `[a-zA-Z_][a-zA-Z0-9_]*`; invalid chars
+/// are replaced with `_`.
+fn sanitize_prometheus_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if i == 0 {
+            if c.is_ascii_alphabetic() || c == '_' {
+                out.push(c);
+            } else {
+                out.push('_');
+            }
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
 impl SeriesKey {
     fn from_parts(metric: &str, tags: &tropel_sdk::types::TagMap) -> Self {
         let mut labels: Vec<(String, String)> = tags
             .iter()
             .filter(|(k, _)| k != &"__name__") // avoid duplicate __name__ label
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (sanitize_prometheus_name(k), v.to_string()))
             .collect();
-        labels.push(("__name__".to_string(), metric.to_string()));
+        let metric_name = sanitize_prometheus_name(metric);
+        labels.push(("__name__".to_string(), metric_name.clone()));
         labels.sort();
         Self {
-            metric: metric.to_string(),
+            metric: metric_name,
             labels,
         }
     }
@@ -296,6 +321,9 @@ impl PrometheusRemoteWriteOutput {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             tracing::warn!("remote-write rejected ({status}): {body}");
+            return Err(TropelError::Report(format!(
+                "prometheus remote-write rejected ({status}): {body}"
+            )));
         }
         Ok(())
     }
@@ -1031,5 +1059,21 @@ mod tests {
         let out4 = expand_series(&key_a, &agg_a, 2000, &mut cumulative, cap);
         assert_eq!(out4.len(), 1, "existing series still accepted");
         assert_eq!(out4[0].1[0].0, 2.0, "existing series accumulates (1+1)");
+    }
+
+    #[test]
+    fn sanitize_prometheus_name_invalid_chars() {
+        // Prometheus label names must match [a-zA-Z_][a-zA-Z0-9_]*.
+        assert_eq!(sanitize_prometheus_name("valid_name"), "valid_name");
+        assert_eq!(
+            sanitize_prometheus_name("http_req_duration"),
+            "http_req_duration"
+        );
+        assert_eq!(sanitize_prometheus_name("req.url"), "req_url");
+        assert_eq!(sanitize_prometheus_name("status-code"), "status_code");
+        assert_eq!(sanitize_prometheus_name("1bad"), "_bad");
+        assert_eq!(sanitize_prometheus_name("a b"), "a_b");
+        assert_eq!(sanitize_prometheus_name(""), "_");
+        assert_eq!(sanitize_prometheus_name("my.label/name"), "my_label_name");
     }
 }
