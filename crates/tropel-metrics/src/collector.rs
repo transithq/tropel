@@ -728,28 +728,31 @@ impl Aggregator {
         // merged_iter_dur) are NOT tag-keyed, so they must keep recording or
         // the headline percentiles freeze while `http_reqs` keeps climbing
         // (backlog line 53).
-        // Check cardinality BEFORE entry() — entry() holds a mutable
-        // borrow that prevents reading self.data.len().
-        let at_capacity = !self.data.contains_key(&key) && self.data.len() >= self.max_series;
-        if at_capacity {
-            self.series_dropped += 1;
-            if self.series_dropped == 1 {
-                tracing::warn!(
-                    "metrics: series cardinality reached {}; dropping samples for new \
-                     series (check for a high-cardinality url/name tag)",
-                    self.max_series
-                );
+        // P-J: single hash via entry() — avoids the old contains_key + entry
+        // pattern that hashed the MetricKey twice per sample.
+        let current_len = self.data.len();
+        match self.data.entry(key) {
+            indexmap::map::Entry::Occupied(mut e) => {
+                e.get_mut().record(sample.value, &sample.sample_type);
             }
-            self.record_headline_accumulators(&sample);
-            return;
+            indexmap::map::Entry::Vacant(e) => {
+                if current_len >= self.max_series {
+                    self.series_dropped += 1;
+                    if self.series_dropped == 1 {
+                        tracing::warn!(
+                            "metrics: series cardinality reached {}; dropping \
+                             samples for new series (check for a high-cardinality \
+                             url/name tag)",
+                            self.max_series
+                        );
+                    }
+                    self.record_headline_accumulators(&sample);
+                    return;
+                }
+                e.insert(MetricSet::new(metric_type, self.histogram_max_ms))
+                    .record(sample.value, &sample.sample_type);
+            }
         }
-
-        // Use entry() to insert in one hash when the key is new.
-        let metric_set = self
-            .data
-            .entry(key)
-            .or_insert_with(|| MetricSet::new(metric_type, self.histogram_max_ms));
-        metric_set.record(sample.value, &sample.sample_type);
 
         // Maintain the incremental merged accumulators (headline http_req_
         // duration / iteration_duration, per-URL, per-group) on EVERY sample
