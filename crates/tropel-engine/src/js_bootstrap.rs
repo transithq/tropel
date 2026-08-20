@@ -5,6 +5,26 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// P2 line 286: per-VU QuickJS heap cap (bytes). Configurable via
+/// `TROPEL_JS_HEAP_MB` env var (default 10 MB).
+pub(crate) fn js_heap_bytes() -> usize {
+    std::env::var("TROPEL_JS_HEAP_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(10 * 1024 * 1024)
+}
+
+/// P2 line 286: per-eval JS execution deadline (seconds). Configurable via
+/// `TROPEL_JS_DEADLINE_SECS` env var (default 10 s).
+pub(crate) fn js_deadline_secs() -> Duration {
+    std::env::var("TROPEL_JS_DEADLINE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(10))
+}
 use tropel_sandbox::config::SandboxConfig;
 use tropel_sandbox::state::SharedPmState;
 use tropel_sdk::error::TropelError;
@@ -247,8 +267,8 @@ pub(crate) async fn create_vu_js_context(
     force_stop: Arc<AtomicBool>,
 ) -> Option<tropel_js::JsContext> {
     let mut ctx = match tropel_js::JsContext::new_with_force_stop(
-        Some(10 * 1024 * 1024),
-        Some(Duration::from_secs(10)),
+        Some(js_heap_bytes()),
+        Some(js_deadline_secs()),
         force_stop.clone(),
     )
     .await
