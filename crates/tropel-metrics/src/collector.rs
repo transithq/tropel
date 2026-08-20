@@ -1310,10 +1310,10 @@ impl Aggregator {
         if self.effective_thresholds.is_empty() && !snap.thresholds.is_empty() {
             self.effective_thresholds = snap.thresholds.clone();
         }
-        // Series arrive pre-aggregated here (not through `record()`), so the
-        // incremental merged accumulators must be rebuilt from `self.data` to
-        // keep `build_results`' pre-merged headlines correct.
-        self.rebuild_merged();
+        // NOTE: rebuild_merged() is NOT called here — it is hoisted out of
+        // absorb_snapshot and called once after all snapshots are absorbed
+        // in merge_snapshots (line 338 optimization). Calling it per-snapshot
+        // wasted ~25s CPU and ~30GB churn at 50 agents × 100k series.
         Ok(())
     }
 
@@ -1444,6 +1444,9 @@ pub fn merge_snapshots(
     for snap in &snapshots {
         agg.absorb_snapshot(snap)?;
     }
+    // P-D (line 338): rebuild merged accumulators once after all snapshots
+    // are absorbed, instead of per-snapshot inside absorb_snapshot.
+    agg.rebuild_merged();
     let mut result = agg.build_results();
     // W0 P0#2: the fresh Aggregator's `started` is the merge instant, so
     // build_results stamps run_duration = merge time. Override with the
