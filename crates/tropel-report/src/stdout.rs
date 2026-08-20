@@ -263,9 +263,10 @@ impl StdoutReporter {
         }
 
         // Thresholds — pass/fail against the effective threshold set.
-        if !result.effective_thresholds.is_empty() {
+        // Compute once (backlog line 339 sub-item: was called twice).
+        let threshold_results = evaluate_thresholds(&result.effective_thresholds, result);
+        if !threshold_results.is_empty() {
             out.push_str("\n  ── Thresholds ──────────────────────────────────────────\n");
-            let threshold_results = evaluate_thresholds(&result.effective_thresholds, result);
             for tr in &threshold_results {
                 let op = tr.expression.split_whitespace().nth(1).unwrap_or("<?>");
                 if tr.passed {
@@ -287,9 +288,7 @@ impl StdoutReporter {
         // FAIL is driven by THRESHOLDS ONLY — matching k6 semantics and the
         // CLI exit code (cli.rs returns Err on threshold failure, not on
         // ordinary request failures like a single 404 in thousands).
-        let thresholds_failed = evaluate_thresholds(&result.effective_thresholds, result)
-            .iter()
-            .any(|t| !t.passed);
+        let thresholds_failed = threshold_results.iter().any(|t| !t.passed);
         let (status, color) = if thresholds_failed {
             ("✗ FAIL — one or more thresholds crossed", "\x1b[31m") // red
         } else {
