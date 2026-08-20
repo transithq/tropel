@@ -879,7 +879,6 @@ impl JsContext {
         precomputed_hash: Option<u64>,
     ) -> Result<bool> {
         self.reset_interrupt();
-        let source = source.to_string();
 
         let hash = precomputed_hash.unwrap_or_else(|| {
             let mut hasher = DefaultHasher::new();
@@ -919,7 +918,7 @@ impl JsContext {
                         promise,
                         WRAPPER_OFFSET,
                         Some(source_url_str),
-                        Some(&source),
+                        Some(source),
                     )?;
                 }
                 Ok::<_, JsError>(true)
@@ -949,7 +948,7 @@ impl JsContext {
             let script = CachedScript::compile(
                 &ctx,
                 func,
-                &source,
+                source,
                 Some(source_url_str.to_string()),
                 WRAPPER_OFFSET,
             );
@@ -962,7 +961,7 @@ impl JsContext {
                     promise,
                     WRAPPER_OFFSET,
                     Some(source_url_str),
-                    Some(&source),
+                    Some(source),
                 )?;
             }
 
