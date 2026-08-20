@@ -992,14 +992,16 @@ impl HttpClient {
                     }
                     body.extend_from_slice(&chunk);
                 }
-                (body.clone(), body.len() as u64)
+                let len = body.len() as u64;
+                (body, len)
             } else {
                 let body = response
                     .bytes()
                     .await
                     .map_err(|e| TropelError::Http(format!("Failed to read response body: {}", e)))?
                     .to_vec();
-                (body.clone(), body.len() as u64)
+                let len = body.len() as u64;
+                (body, len)
             };
             let receiving_duration = receiving_start.elapsed();
 
