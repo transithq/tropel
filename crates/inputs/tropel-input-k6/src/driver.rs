@@ -3210,7 +3210,7 @@ async fn eval_module_export_json(
     env: &HashMap<String, String>,
     script_dir: Option<PathBuf>,
 ) -> Result<Option<String>> {
-    let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+    let mut js_ctx = JsContext::new(Some(k6_vu_heap_bytes()), Some(k6_deadline()))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
@@ -3289,7 +3289,7 @@ async fn eval_module_handle_summary(
     env: &HashMap<String, String>,
     script_dir: Option<PathBuf>,
 ) -> Result<Option<HashMap<String, String>>> {
-    let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+    let mut js_ctx = JsContext::new(Some(k6_vu_heap_bytes()), Some(k6_deadline()))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
@@ -3367,7 +3367,7 @@ async fn eval_module_call_export(
     http_client: Arc<dyn DriverHttpClient + Send + Sync>,
     sink: Arc<Mutex<Vec<Sample>>>,
 ) -> Result<Option<String>> {
-    let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+    let mut js_ctx = JsContext::new(Some(k6_vu_heap_bytes()), Some(k6_deadline()))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
@@ -10092,7 +10092,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
     /// theoretical OOM a cross-boundary panic).
     #[tokio::test]
     async fn test_k6_binary_body_alloc_failure_degrades_to_status0_error() {
-        let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+        let mut js_ctx = JsContext::new(Some(k6_vu_heap_bytes()), Some(k6_deadline()))
             .await
             .unwrap();
         // (1) The status-0 degradation contract, exercised directly on the
