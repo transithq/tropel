@@ -85,7 +85,7 @@ impl VariableResolver {
     /// stays literal `{{name}}` in every mode.
     fn resolve_with(&self, input: &str, scope: &VariableScope, mode: EscapeMode) -> String {
         if !input.contains("{{") {
-            return input.to_string();
+            return input.to_owned();
         }
 
         // First resolve dynamic variables ({{$xxx}})
@@ -129,7 +129,9 @@ impl VariableResolver {
             }
         });
 
-        result.to_string()
+        // Backlog line 349: .to_string() on Cow::Owned allocates a fresh
+        // String + memcpy; .into_owned() is free for Cow::Owned.
+        result.into_owned()
     }
 
     /// Resolve a single variable name against the scope.
