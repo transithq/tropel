@@ -45,6 +45,9 @@ pub struct JobConfig {
     /// Threshold configuration.
     #[serde(default)]
     pub thresholds: HashMap<String, ThresholdConfig>,
+    /// Skip all threshold evaluation (--no-thresholds).
+    #[serde(default)]
+    pub no_thresholds: bool,
     /// Output/reporter configuration.
     #[serde(default)]
     pub output: OutputConfig,
@@ -116,6 +119,7 @@ impl Default for JobConfig {
             execution_segment_sequence: None,
             distributed_worker: false,
             control_port: None,
+            no_thresholds: false,
         }
     }
 }
