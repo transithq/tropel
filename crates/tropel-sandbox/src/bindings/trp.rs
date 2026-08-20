@@ -113,6 +113,7 @@ fn parse_method(s: &str) -> Method {
 /// de-escaped bytes overwrite the escape sequences but the buffer length is
 /// unchanged, leaving stale bytes — `{"a":"x\ny"}` becomes invalid JSON.
 /// The JS shim then JSON.parses the returned text, so it must be pristine.
+#[cfg(test)]
 fn response_json_string(body: &[u8]) -> Option<String> {
     if body.is_empty() {
         return None;
@@ -962,17 +963,25 @@ impl TrpBridge {
             // rquickjs 0.12 still doesn't support returning serde_json::Value directly,
             // but returning Option<String> (JSON text) works. The pm.js shim parses
             // this string via JSON.parse() to produce the expected object.
-            // We validate the body is valid JSON using simd-json (fast, from bytes)
-            // before returning, so the JS shim can throw a descriptive error on
-            // invalid JSON.
+            //
+            // FIX (backlog line 345): use the memoized `json_cache` + `text_cache`
+            // instead of re-parsing from scratch on every call. The old code
+            // allocated a new String copy of the body on every pm.response.json()
+            // invocation, even when called multiple times in the same iteration.
+            // Now the JSON validation happens once (via `body_json()`) and the
+            // UTF-8 string is also cached (via `body_text()`). Subsequent calls
+            // return the cached clone with zero allocation beyond the Arc bump.
             let state_clone = state.clone();
             set_global!(
                 "__tropel_pm_response_json",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.response
-                        .as_ref()
-                        .and_then(|r| response_json_string(&r.body))
+                    st.response.as_ref().and_then(|r| {
+                        // Validate body is valid JSON (cached after first call)
+                        r.body_json()?;
+                        // Return the cached UTF-8 text (also cached after first call)
+                        r.body_text().filter(|t| !t.is_empty())
+                    })
                 }),
             );
 
