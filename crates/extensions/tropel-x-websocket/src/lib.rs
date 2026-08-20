@@ -205,8 +205,8 @@ impl Protocol for WebSocketProtocol {
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect(),
             body: body.clone(),
-            text_cache: std::cell::OnceCell::new(),
-            json_cache: std::cell::OnceCell::new(),
+            text_cache: std::sync::OnceLock::new(),
+            json_cache: std::sync::OnceLock::new(),
             response_time: duration,
             timings: None,
             cookies: vec![],
