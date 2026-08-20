@@ -174,15 +174,24 @@ impl InfluxdbOutput {
     }
 
     /// Escape a line-protocol component per InfluxDB rules.
-    fn escape(s: &str, in_quotes: bool) -> String {
+    fn escape(s: &str, in_quotes: bool) -> std::borrow::Cow<'_, str> {
+        // Backlog line 339: return Cow::Borrowed when no characters need
+        // escaping, avoiding a String allocation on the hot path.
+        let needs_escape = s.chars().any(|c| {
+            matches!(c, ' ' | ',' | '=' if !in_quotes)
+                || (in_quotes && c == '"')
+                || c == '\\'
+                || matches!(c, '\n' | '\r' | '\t')
+        });
+        if !needs_escape {
+            return std::borrow::Cow::Borrowed(s);
+        }
         let mut out = String::with_capacity(s.len());
         for c in s.chars() {
             match c {
                 ' ' | ',' | '=' if !in_quotes => out.push('\\'),
                 '"' if in_quotes => out.push('\\'),
                 '\\' => out.push('\\'),
-                // Newlines/tabs in tag values inject extra lines into the
-                // line protocol, causing silent metric corruption.
                 '\n' | '\r' | '\t' => {
                     out.push('\\');
                     let esc = match c {
@@ -198,7 +207,7 @@ impl InfluxdbOutput {
             }
             out.push(c);
         }
-        out
+        std::borrow::Cow::Owned(out)
     }
 
     /// Encode a sample as one line-protocol line and buffer it. HTTP
@@ -207,7 +216,8 @@ impl InfluxdbOutput {
     fn buffer(&self, sample: &Sample) {
         // measurement[,tag=val,...] field=value — no stray space between
         // the measurement and the tag set (line protocol is strict).
-        let mut line = Self::escape(&sample.metric, false);
+        let escaped_metric = Self::escape(&sample.metric, false);
+        let mut line = escaped_metric.into_owned();
         let tags = self.tag_policy.apply(&sample.tags);
         if !tags.is_empty() {
             let tag_list: Vec<String> = tags
