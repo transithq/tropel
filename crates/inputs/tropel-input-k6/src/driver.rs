@@ -66,7 +66,30 @@ use tropel_sdk::{Result, TropelError};
 /// `JsContext::new_with_force_stop`. A server-controlled response body larger
 /// than this must degrade to an error response, NOT `.expect()`-panic across
 /// the QuickJS FFI boundary (backlog line 46 P0).
-const K6_VU_HEAP_BYTES: usize = 10 * 1024 * 1024;
+///
+/// Configurable via `TROPEL_K6_HEAP_MB` env var (default 10 MB).
+const DEFAULT_K6_VU_HEAP_MB: usize = 10;
+
+fn k6_vu_heap_bytes() -> usize {
+    std::env::var("TROPEL_K6_HEAP_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_K6_VU_HEAP_MB)
+        * 1024
+        * 1024
+}
+
+/// Per-VU QuickJS deadline (seconds), configurable via `TROPEL_K6_DEADLINE_S`.
+const DEFAULT_K6_DEADLINE_S: u64 = 10;
+
+fn k6_deadline() -> Duration {
+    Duration::from_secs(
+        std::env::var("TROPEL_K6_DEADLINE_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_K6_DEADLINE_S),
+    )
+}
 
 pub struct K6Driver;
 
@@ -130,8 +153,8 @@ impl Driver for K6Driver {
         // interrupt handler keeps polling the instance-local `force_stop`.
         let sched_link: Arc<OnceLock<Arc<AtomicBool>>> = Arc::new(OnceLock::new());
         let mut js_ctx = JsContext::new_with_force_stop(
-            Some(K6_VU_HEAP_BYTES),
-            Some(Duration::from_secs(10)),
+            Some(k6_vu_heap_bytes()),
+            Some(k6_deadline()),
             force_stop.clone(),
         )
         .await
@@ -1495,7 +1518,7 @@ fn build_k6_response_object<'js>(
     // guarded the former, so an oversized TEXT body silently became
     // `status:200, body:''` — `let _ =` swallowed the OOM and JSON.parse
     // threw with no indication.
-    if body.len() >= K6_VU_HEAP_BYTES {
+    if body.len() >= k6_vu_heap_bytes() {
         return match k6_error_envelope(
             ctx,
             "response body exceeds the per-VU JS heap cap",
@@ -7973,7 +7996,7 @@ mod tests {
                 &ctx,
                 200,
                 "OK".into(),
-                vec![0u8; K6_VU_HEAP_BYTES], // >= cap → guaranteed-OOM pre-check
+                vec![0u8; k6_vu_heap_bytes()], // >= cap → guaranteed-OOM pre-check
                 &HashMap::new(),
                 5.0,
                 None,
@@ -8009,7 +8032,7 @@ mod tests {
                 &ctx,
                 200,
                 "OK".into(),
-                vec![b'x'; K6_VU_HEAP_BYTES], // >= cap → guaranteed-OOM pre-check
+                vec![b'x'; k6_vu_heap_bytes()], // >= cap → guaranteed-OOM pre-check
                 &HashMap::new(),
                 5.0,
                 None,
@@ -9976,7 +9999,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
     /// `#[cfg(test)]` `degrade_to_status0_error` was dead code whose
     /// ArrayBuffer-body contract production never matched (W2 line 189).
     /// `set_memory_limit` is QuickJS's HARD limit, so the bridge pre-guards
-    /// (body.len() >= K6_VU_HEAP_BYTES) and degrades BEFORE any allocation
+    /// (body.len() >= k6_vu_heap_bytes()) and degrades BEFORE any allocation
     /// while headroom still exists; part (2) pins the no-panic FFI property
     /// with a body far beyond the cap (the old `.expect()` is what made a
     /// theoretical OOM a cross-boundary panic).
@@ -10015,7 +10038,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         });
         // (2) No-panic property: a 32 MB binary body on a 10 MB heap must
         //     never panic across the FFI boundary. The pre-allocation guard
-        //     (body.len() >= K6_VU_HEAP_BYTES) deterministically fires for
+        //     (body.len() >= k6_vu_heap_bytes()) deterministically fires for
         //     this body, so the builder returns the degraded status-0
         //     envelope as Ok — the allocation is never attempted.
         js_ctx.with_ctx(|ctx| {
