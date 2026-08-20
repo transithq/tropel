@@ -169,7 +169,8 @@ impl JsonStreamOutput {
             if wguard.is_none() {
                 let file = std::fs::OpenOptions::new()
                     .create(true)
-                    .append(true)
+                    .truncate(true)
+                    .write(true)
                     .open(&self.path)
                     .map_err(|e| {
                         TropelError::Report(format!("json-stream open '{}' failed: {e}", self.path))
