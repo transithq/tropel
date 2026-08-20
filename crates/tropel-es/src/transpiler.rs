@@ -38,8 +38,8 @@ use std::cell::Cell;
 use oxc_allocator::{Allocator, Box};
 use oxc_ast::ast::{
     ClassType, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
-    ExportNamedDeclaration, Expression, ExpressionStatement, FunctionType, ParenthesizedExpression,
-    Program, Statement,
+    ExportNamedDeclaration, Expression, ExpressionStatement, FunctionType,
+    ImportDeclarationSpecifier, ParenthesizedExpression, Program, Statement,
 };
 use oxc_codegen::Codegen;
 use oxc_diagnostics::Severity;
@@ -390,8 +390,11 @@ pub fn strip_k6_virtual_imports(source: &str) -> String {
     let program = parser_return.program;
 
     // Collect byte spans of k6-virtual import / re-export statements, in
-    // source order (AST body order == source order).
+    // source order (AST body order == source order), and the imported
+    // binding names from jslib (https://) imports so we can emit stub
+    // declarations (backlog line 279).
     let mut spans: Vec<(u32, u32)> = Vec::new();
+    let mut jslib_stubs: Vec<String> = Vec::new();
     for stmt in &program.body {
         let module_specifier: Option<&str> = match stmt {
             Statement::ImportDeclaration(decl) => Some(decl.source.value.as_str()),
@@ -405,6 +408,35 @@ pub fn strip_k6_virtual_imports(source: &str) -> String {
             if is_k6_virtual_specifier(spec) {
                 let span = stmt.span();
                 spans.push((span.start, span.end));
+                // Backlog line 279: collect imported names from jslib (https://)
+                // imports so we can emit stub declarations. k6/* imports are
+                // fine because the shim provides their APIs as globals (http,
+                // check, group, etc.), but jslib names like `Group` from
+                // `https://jslib.k6.io/group.js` have no global equivalent.
+                // Without a stub, the stripped name becomes undefined and
+                // produces a cryptic ReferenceError.
+                if spec.starts_with("https://") || spec.starts_with("http://") {
+                    if let Statement::ImportDeclaration(decl) = stmt {
+                        if let Some(specifiers) = &decl.specifiers {
+                            for imp_spec in specifiers {
+                                let name = match imp_spec {
+                                    ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                                        s.local.name.as_str()
+                                    }
+                                    ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                                        s.local.name.as_str()
+                                    }
+                                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                                        s.local.name.as_str()
+                                    }
+                                };
+                                if !name.is_empty() {
+                                    jslib_stubs.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -422,6 +454,23 @@ pub fn strip_k6_virtual_imports(source: &str) -> String {
         cursor = end as usize;
     }
     result.push_str(&source[cursor..]);
+
+    // Backlog line 279: inject stub `var` declarations for every stripped
+    // jslib import name. This turns a cryptic `ReferenceError: Group is
+    // not defined` into a clear error message when the script tries to
+    // use the stripped binding. k6/* imports (http, check, group, etc.)
+    // don't need stubs because the shim already provides them as globals.
+    if !jslib_stubs.is_empty() {
+        result.push_str("\n// [tropel] stub declarations for stripped jslib imports\n");
+        for name in &jslib_stubs {
+            use std::fmt::Write;
+            let _ = writeln!(
+                result,
+                "var {name} = (function() {{ throw new Error('jslib import \"{name}\" is not available in tropel — jslib HTTP imports are not supported'); }})();"
+            );
+        }
+    }
+
     result
 }
 
@@ -972,5 +1021,49 @@ mod tests {
         let js = typescript_to_javascript(source, "test.ts").unwrap();
         assert_reparses(&js);
         js
+    }
+
+    #[test]
+    fn test_jslib_imports_produce_stubs() {
+        // Backlog line 279: https:// imports are stripped but should
+        // produce stub declarations so scripts don't get ReferenceError.
+        let source = r#"import { Group } from "https://jslib.k6.io/group/1.0.0/group.mjs";
+import http from "k6/http";
+import { check } from "k6";
+check(http.get("https://example.com"), { "status is 200": (r) => r.status === 200 });
+"#;
+        let result = strip_k6_virtual_imports(source);
+        // The jslib import gets a stub, k6/* imports are silently stripped.
+        assert!(
+            result.contains("var Group"),
+            "jslib import should produce a stub: {result}"
+        );
+        assert!(
+            result.contains("not available in tropel"),
+            "stub should have a clear error message: {result}"
+        );
+        assert!(
+            result.contains("http.get"),
+            "non-import code should be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_k6_imports_do_not_produce_stubs() {
+        // k6/* imports are provided as globals by the shim, so they
+        // should NOT produce stubs - just silently stripped.
+        let source = r#"import http from "k6/http";
+import { check, group } from "k6";
+http.get("https://example.com");
+"#;
+        let result = strip_k6_virtual_imports(source);
+        assert!(
+            !result.contains("var http"),
+            "k6 imports should not get stubs: {result}"
+        );
+        assert!(
+            result.contains("http.get"),
+            "non-import code should be preserved: {result}"
+        );
     }
 }
