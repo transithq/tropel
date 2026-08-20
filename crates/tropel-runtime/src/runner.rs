@@ -651,12 +651,13 @@ impl ScenarioRunner {
                                     // reuse no connector call happens, so
                                     // blocked/dns/connecting are 0.
                                     if let Some(timings) = &resp.timings {
+                                        // Backlog line 459: omit tls_handshaking and sending
+                                        // — always zero (folded into connecting/waiting by
+                                        // reqwest). Saves 2 MetricKey builds per request.
                                         let sub_timing_metrics = [
                                             ("http_req_blocked", timings.blocked),
                                             ("http_req_dns", timings.dns),
                                             ("http_req_connecting", timings.connecting),
-                                            ("http_req_tls_handshaking", timings.tls_handshaking),
-                                            ("http_req_sending", timings.sending),
                                             ("http_req_waiting", timings.waiting),
                                             ("http_req_receiving", timings.receiving),
                                         ];

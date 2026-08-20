@@ -1075,12 +1075,14 @@ fn push_http_samples_for(
     // waiting by reqwest, same as the declarative path). Emitted with the
     // same tags so thresholds like http_req_waiting:p(95) resolve.
     if let Some(t) = timings {
+        // Backlog line 459: emit only the sub-timings that carry real data.
+        // tls_handshaking and sending are ALWAYS zero (folded into
+        // connecting/waiting by reqwest); omitting them saves 2 MetricKey
+        // builds + 2 Arc<str> string allocations per request per VU.
         let sub = [
             ("http_req_blocked", t.blocked),
             ("http_req_dns", t.dns),
             ("http_req_connecting", t.connecting),
-            ("http_req_tls_handshaking", t.tls_handshaking),
-            ("http_req_sending", t.sending),
             ("http_req_waiting", t.waiting),
             ("http_req_receiving", t.receiving),
         ];
@@ -7809,8 +7811,9 @@ mod tests {
             "http_req_blocked",
             "http_req_dns",
             "http_req_connecting",
-            "http_req_tls_handshaking",
-            "http_req_sending",
+            // http_req_tls_handshaking and http_req_sending are always 0
+            // (folded into connecting/waiting by reqwest) and omitted to
+            // save 2 MetricKey builds per request (backlog line 459).
             "http_req_waiting",
             "http_req_receiving",
         ] {
@@ -7828,7 +7831,8 @@ mod tests {
             .find(|s| s.metric == "http_req_blocked")
             .unwrap();
         assert_eq!(blocked.value, 0.1, "blocked must carry the pool-wait in ms");
-        assert_eq!(samples.len(), 12, "5 base + 7 sub-timing samples");
+        // 5 base + 5 sub-timing samples (tls_handshaking/sending omitted — always 0)
+        assert_eq!(samples.len(), 10, "5 base + 5 sub-timing samples");
     }
 
     #[test]
