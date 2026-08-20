@@ -165,7 +165,9 @@ impl ScenarioRunner {
 
     /// Set expected status codes/ranges for http_req_failed evaluation.
     pub fn with_expected_statuses(mut self, expected: Vec<ExpectedStatus>) -> Self {
-        self.expected_statuses = expected;
+        // Backlog line 353: pre-parse Range strings into bounds so
+        // matches() avoids re-parsing on every HTTP response.
+        self.expected_statuses = expected.iter().map(|e| e.pre_parse()).collect();
         self
     }
 
