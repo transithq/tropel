@@ -10,7 +10,7 @@ use tropel_sandbox::state::{PmState, SharedPmState};
 use tropel_sdk::config::ExpectedStatus;
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
 use tropel_sdk::traits::{DriverHttpClient, Protocol};
-use tropel_sdk::types::{Sample, SampleType, TagMap};
+use tropel_sdk::types::{tag_keys, Sample, SampleType, TagMap};
 use tropel_sdk::Result;
 
 /// Result of running a VU iteration.
@@ -574,13 +574,22 @@ impl ScenarioRunner {
                                     .iter()
                                     .chain(std::iter::once(&http_response));
                                 for resp in chain {
-                                    // Build tags for all request-level metrics
+                                    // Build tags for all request-level metrics.
+                                    // Use static interned keys (tropel_sdk::types::tag_keys)
+                                    // to avoid re-allocating Arc<str> from &str literals
+                                    // on every hop (backlog line 352).
                                     let mut tags = TagMap::with_capacity(5);
-                                    tags.insert("url", resp.url.clone());
-                                    tags.insert("method", resolved_req.method.to_string());
-                                    tags.insert("status", resp.status_code.to_string());
-                                    tags.insert("name", resp.url.clone());
-                                    tags.insert("group", "http");
+                                    tags.insert(Arc::clone(&tag_keys::URL), resp.url.clone());
+                                    tags.insert(
+                                        Arc::clone(&tag_keys::METHOD),
+                                        resolved_req.method.to_string(),
+                                    );
+                                    tags.insert(
+                                        Arc::clone(&tag_keys::STATUS),
+                                        resp.status_code.to_string(),
+                                    );
+                                    tags.insert(Arc::clone(&tag_keys::NAME), resp.url.clone());
+                                    tags.insert(Arc::clone(&tag_keys::GROUP), "http");
                                     // Share one Arc so all ~12 per-request samples bump a
                                     // refcount instead of copying the whole map.
                                     let tags = Arc::new(tags);
