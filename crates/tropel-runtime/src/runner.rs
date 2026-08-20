@@ -119,7 +119,7 @@ impl ScenarioRunner {
             // scenario.variables) so `{{var}}` references in URLs, headers,
             // and bodies resolve. CLI env vars were already merged into
             // scenario.variables by the engine before this point.
-            state.collection_vars.extend(scenario.variables.clone());
+            Arc::make_mut(&mut state.collection_vars).extend(scenario.variables.clone());
         }
         Self {
             scenario,
@@ -838,8 +838,8 @@ impl ScenarioRunner {
             local: state.local_vars.clone(),
             data,
             env,
-            collection: state.collection_vars.clone(),
-            globals: state.globals.clone(),
+            collection: Arc::clone(&state.collection_vars),
+            globals: Arc::clone(&state.globals),
         }
     }
 
