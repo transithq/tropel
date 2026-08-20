@@ -22,7 +22,7 @@
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -48,6 +48,11 @@ pub struct JsonStreamOutput {
     seen_metrics: Mutex<HashSet<String>>,
     /// Buffered file writer — avoids one unbuffered write(2) per line.
     writer: Mutex<Option<BufWriter<std::fs::File>>>,
+    /// P2 line 440: max bytes per output file before rotation. Default 1 GB
+    /// (at ~200 B/sample and 100k rps = ~5 GB/min, so ~12 s per file).
+    max_file_bytes: u64,
+    /// Bytes written to the current file (for rotation check).
+    file_bytes: AtomicU64,
 }
 
 impl JsonStreamOutput {
@@ -59,6 +64,8 @@ impl JsonStreamOutput {
             total_buffered: AtomicUsize::new(0),
             seen_metrics: Mutex::new(HashSet::new()),
             writer: Mutex::new(None),
+            max_file_bytes: 1 << 30, // 1 GB
+            file_bytes: AtomicU64::new(0),
         }
     }
 
@@ -164,6 +171,7 @@ impl JsonStreamOutput {
         }
 
         // Lazily open (and reuse) a buffered writer across flushes.
+        // P2 line 440: rotate the file when it exceeds max_file_bytes.
         {
             let mut wguard = self.writer.lock().unwrap();
             if wguard.is_none() {
@@ -176,6 +184,7 @@ impl JsonStreamOutput {
                         TropelError::Report(format!("json-stream open '{}' failed: {e}", self.path))
                     })?;
                 *wguard = Some(BufWriter::new(file));
+                self.file_bytes.store(0, Ordering::Relaxed);
             }
             let writer = wguard.as_mut().unwrap();
             for line in &lines {
@@ -185,6 +194,27 @@ impl JsonStreamOutput {
             writer
                 .flush()
                 .map_err(|e| TropelError::Report(format!("json-stream flush failed: {e}")))?;
+            // Check file size for rotation.
+            let written: u64 = lines.iter().map(|l| l.len() as u64 + 1).sum(); // +1 for newline
+            let total = self.file_bytes.fetch_add(written, Ordering::Relaxed) + written;
+            if total >= self.max_file_bytes {
+                // Close the current file and rotate.
+                *wguard = None;
+                self.file_bytes.store(0, Ordering::Relaxed);
+                // Find the next rotation number.
+                let mut n = 1u64;
+                while std::path::Path::new(&format!("{}.{n}", self.path)).exists() {
+                    n += 1;
+                }
+                let rotated = format!("{}.{n}", self.path);
+                if let Err(e) = std::fs::rename(&self.path, &rotated) {
+                    tracing::warn!("json-stream rotation rename failed: {e}");
+                } else {
+                    tracing::info!("json-stream rotated output to {rotated}");
+                }
+                // Clear seen_metrics so the new file gets fresh Metric definitions.
+                self.seen_metrics.lock().unwrap().clear();
+            }
         }
         Ok(())
     }
