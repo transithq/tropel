@@ -958,6 +958,11 @@ fn push_redirect_hops(
 /// String>>()` failed on `{"code":200}` and silently dropped the ENTIRE
 /// tag map; this lenient parse never fails and never drops the map.
 fn stringify_tag_map_into(j: &str, tags: &mut TagMap) {
+    // pm.test() always passes '' for tags (pm.js:508) — skip the failed
+    // JSON parse on the common empty-string path (backlog line 348).
+    if j.is_empty() || j == "{}" {
+        return;
+    }
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(j) {
         for (k, val) in map {
             tags.insert(k, coerce_tag_value(&val));
