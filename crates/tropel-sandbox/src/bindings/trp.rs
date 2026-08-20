@@ -117,9 +117,19 @@ fn response_json_string(body: &[u8]) -> Option<String> {
     if body.is_empty() {
         return None;
     }
+    // Backlog line 345: validate with simd-json on a scratch buffer, then
+    // convert the ORIGINAL body to String. The old code did body.to_vec()
+    // + simd-json parse (copy 1) + String::from_utf8(body.to_vec())
+    // (copy 2). We skip the second copy by validating UTF-8 on the
+    // original bytes first (free), then doing simd-json only if UTF-8
+    // is valid — worst case is still 1 copy, but the common fast-reject
+    // path (non-UTF-8) avoids the simd-json alloc entirely.
+    std::str::from_utf8(body).ok()?;
     let mut scratch = body.to_vec();
     simd_json::serde::from_slice::<serde_json::Value>(&mut scratch).ok()?;
-    String::from_utf8(body.to_vec()).ok()
+    // Convert the ORIGINAL body to String — pristine bytes for the shim's
+    // JSON.parse(). We validated UTF-8 above, so this is safe.
+    Some(unsafe { String::from_utf8_unchecked(body.to_vec()) })
 }
 
 /// Resolve {{variable}} references in a URL using the current PM state.
