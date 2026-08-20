@@ -260,10 +260,14 @@ where
         Lines(Vec<String>),
         Single(String),
     }
-    Ok(match ExecForm::deserialize(deserializer)? {
+    let lines = match ExecForm::deserialize(deserializer)? {
         ExecForm::Lines(lines) => lines,
         ExecForm::Single(s) => vec![s],
-    })
+    };
+    // Backlog line 348: Postman's very common ["",""] becomes "\n"
+    // after join, which passes !is_empty() and pays a full dispatch.
+    // Filter out whitespace-only lines at parse time.
+    Ok(lines.into_iter().filter(|l| !l.trim().is_empty()).collect())
 }
 
 /// Accept `responseTime` as either a numeric milliseconds value (as
