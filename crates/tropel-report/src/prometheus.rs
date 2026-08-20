@@ -251,10 +251,16 @@ impl PrometheusRemoteWriteOutput {
                 .collect()
         };
 
-        let payload = encode_write_request(&wire_series);
-        let compressed = snap::raw::Encoder::new()
-            .compress_vec(&payload)
-            .map_err(|e| TropelError::Report(format!("snappy compress failed: {e}")))?;
+        // P1 line 335: move the CPU-heavy encode + compress off the async
+        // worker so the aggregator can keep draining while we serialize.
+        let compressed = tokio::task::spawn_blocking(move || {
+            let payload = encode_write_request(&wire_series);
+            snap::raw::Encoder::new()
+                .compress_vec(&payload)
+                .map_err(|e| TropelError::Report(format!("snappy compress failed: {e}")))
+        })
+        .await
+        .map_err(|e| TropelError::Other(format!("prometheus encode panicked: {e}")))??;
 
         let resp = self
             .client
