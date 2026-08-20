@@ -40,6 +40,7 @@ use futures_util::{SinkExt, StreamExt};
 use rquickjs::function::Func;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -198,6 +199,17 @@ impl Driver for K6Driver {
             ));
         }
 
+        // Backlog line 347: pre-compute the iteration wrapper hash once.
+        // The same `return __tropel_iteration(__tropel_setup)` string is
+        // hashed on every call to run_script_cached; caching here avoids
+        // re-hashing ~125 bytes of SipHash per iteration.
+        let iter_script = "return __tropel_iteration(__tropel_setup)";
+        let iteration_script_hash = {
+            let mut hasher = DefaultHasher::new();
+            iter_script.hash(&mut hasher);
+            hasher.finish()
+        };
+
         Ok(Box::new(K6DriverInstance {
             js_ctx,
             _source_path: source_path.map(|p| p.to_path_buf()),
@@ -211,6 +223,7 @@ impl Driver for K6Driver {
             ws_next_id: Arc::new(AtomicU64::new(0)),
             ws_bridges_registered: false,
             globals_seeded: false,
+            iteration_script_hash,
             force_stop,
             sched_link,
         }))
@@ -666,6 +679,11 @@ pub struct K6DriverInstance {
     /// only refreshes the per-iteration values (__ITER, data row, exec.*)
     /// thereafter.
     globals_seeded: bool,
+    /// Pre-computed hash of the iteration wrapper script (backlog line 347).
+    /// The same `return __tropel_iteration(__tropel_setup)` string is hashed
+    /// on every call to run_script_cached; caching the hash here avoids
+    /// re-hashing ~125 bytes of SipHash per iteration.
+    iteration_script_hash: u64,
 }
 
 /// Execution-context values exposed to scripts via `exec.*` (k6 API).
@@ -1320,9 +1338,10 @@ impl DriverInstance for K6DriverInstance {
         // rejections would be swallowed).
         let iter_result = self
             .js_ctx
-            .run_script_cached(
+            .run_script_cached_with_hash(
                 "return __tropel_iteration(__tropel_setup)",
                 Some("k6-iteration.js".to_string()),
+                Some(self.iteration_script_hash),
             )
             .await;
 

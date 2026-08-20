@@ -865,14 +865,27 @@ impl JsContext {
         source: &str,
         source_url: Option<String>,
     ) -> Result<bool> {
+        self.run_script_cached_with_hash(source, source_url, None)
+            .await
+    }
+
+    /// Like `run_script_cached` but accepts a pre-computed hash to avoid
+    /// re-hashing the source on every call (backlog line 347: the same
+    /// iteration wrapper is hashed 1000s of times per VU).
+    pub async fn run_script_cached_with_hash(
+        &mut self,
+        source: &str,
+        source_url: Option<String>,
+        precomputed_hash: Option<u64>,
+    ) -> Result<bool> {
         self.reset_interrupt();
         let source = source.to_string();
 
-        let hash = {
+        let hash = precomputed_hash.unwrap_or_else(|| {
             let mut hasher = DefaultHasher::new();
             source.hash(&mut hasher);
             hasher.finish()
-        };
+        });
 
         // Wrapper format — 2 lines before user source:
         //   Line 1: (async function __tropel_script(){
