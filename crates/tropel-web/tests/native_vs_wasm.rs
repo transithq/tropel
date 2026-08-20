@@ -48,8 +48,8 @@ fn fixture_response(req: &Request) -> Result<Response> {
         status_text: "OK".into(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: br#"{"ok":true}"#.to_vec(),
-        text_cache: std::cell::OnceCell::new(),
-        json_cache: std::cell::OnceCell::new(),
+        text_cache: std::sync::OnceLock::new(),
+        json_cache: std::sync::OnceLock::new(),
         response_time: std::time::Duration::from_millis(5),
         timings: Some(Timings::from_measured(
             std::time::Duration::from_millis(2),
