@@ -23,7 +23,7 @@ use tropel_core::config::{
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_http::client::{HttpClient, VuCookieClient};
 use tropel_metrics::collector::MetricsCollector;
-use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
+use tropel_metrics::thresholds::evaluate_thresholds;
 use tropel_runtime::ScenarioRunner;
 use tropel_sandbox::config::SandboxConfig;
 use tropel_scheduler::{VUScheduler, VuLease};
@@ -1000,13 +1000,26 @@ fn spawn_abort_coordinator(
                 // k6 `tainted`: ANY failed threshold (abortOnFail or not)
                 // marks the run so the control API status doc reports
                 // `tainted: true` (backlog line 154).
+                // Single-pass: evaluate all thresholds once and check both
+                // tainted + abortOnFail in the same loop.
+                let mut should_abort = false;
                 for tr in evaluate_thresholds(&thresholds, &results) {
                     if !tr.passed {
                         sched.set_tainted();
-                        break;
+                        if tr.abort_on_fail {
+                            // Respect delayAbortEval grace period.
+                            let in_grace = tr.delay_abort_eval.is_some_and(|grace| elapsed < grace);
+                            if !in_grace {
+                                tracing::error!(
+                                    "Threshold '{}' ({}) breached with abortOnFail -- aborting test",
+                                    tr.name, tr.expression
+                                );
+                                should_abort = true;
+                            }
+                        }
                     }
                 }
-                if check_abort_on_fail(&thresholds, &results, elapsed) {
+                if should_abort {
                     sched.request_stop();
                     break;
                 }
