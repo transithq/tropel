@@ -590,7 +590,10 @@ fn get_tag_scoped_metric_value(
         }
         Some("max") => {
             // Return the MAXIMUM max across all matches
-            matched.iter().map(|m| m.max).fold(0.0_f64, f64::max)
+            matched
+                .iter()
+                .map(|m| m.max)
+                .fold(f64::NEG_INFINITY, f64::max)
         }
         Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
         Some("p90") => merged_percentile(&matched, 90.0),
@@ -641,12 +644,18 @@ fn get_tag_scoped_metric_value(
             {
                 return None;
             }
-            matched.iter().map(|m| m.last).fold(0.0_f64, f64::max)
+            matched
+                .iter()
+                .map(|m| m.last)
+                .fold(f64::NEG_INFINITY, f64::max)
         }
         // Bare metric (no stat) → WORST mean across matches (documented
         // default). Backlog §1: an UNKNOWN/typo'd stat must FAIL CLOSED,
         // not silently gate on the mean like the old `_ =>` arm.
-        None => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
+        None => matched
+            .iter()
+            .map(|m| m.mean)
+            .fold(f64::NEG_INFINITY, f64::max),
         Some(_) => return None,
     })
 }
@@ -696,7 +705,7 @@ fn merged_percentile(matched: &[&MetricSummary], pct: f64) -> f64 {
     matched
         .iter()
         .map(|m| percentile_value(m, pct))
-        .fold(0.0_f64, f64::max)
+        .fold(f64::NEG_INFINITY, f64::max)
 }
 
 fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
@@ -723,7 +732,10 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         // Percentiles: merged-population (k6 semantics) when the exact
         // per-series histograms are retained; worst (highest) fallback.
         Some("min") => matched.iter().map(|m| m.min).fold(f64::MAX, f64::min),
-        Some("max") => matched.iter().map(|m| m.max).fold(0.0_f64, f64::max),
+        Some("max") => matched
+            .iter()
+            .map(|m| m.max)
+            .fold(f64::NEG_INFINITY, f64::max),
         Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
         Some("p90") => merged_percentile(&matched, 90.0),
         Some("p95") => merged_percentile(&matched, 95.0),
@@ -791,10 +803,16 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
             {
                 return None;
             }
-            matched.iter().map(|m| m.last).fold(0.0_f64, f64::max)
+            matched
+                .iter()
+                .map(|m| m.last)
+                .fold(f64::NEG_INFINITY, f64::max)
         }
         // Bare metric (no stat) → worst mean across matches.
-        None => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
+        None => matched
+            .iter()
+            .map(|m| m.mean)
+            .fold(f64::NEG_INFINITY, f64::max),
         // Backlog §1: an UNKNOWN/typo'd stat must FAIL CLOSED, not silently
         // gate on the mean like the old `_ =>` arm.
         Some(_) => return None,
