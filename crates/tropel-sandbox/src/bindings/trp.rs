@@ -999,6 +999,7 @@ impl TrpBridge {
                     move |name: String, passed: bool, tags_json: Option<String>| {
                         let extra = tags_json
                             .as_deref()
+                            .filter(|j| !j.is_empty())
                             .and_then(|j| serde_json::from_str::<HashMap<String, String>>(j).ok())
                             .unwrap_or_default();
                         let mut st = state_clone.lock().unwrap();
