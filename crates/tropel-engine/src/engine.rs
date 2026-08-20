@@ -527,6 +527,7 @@ impl Engine {
                             protocols,
                             control_port,
                             rps_limiter_sc,
+                            &input_path,
                         )
                         .await
                     }
