@@ -340,7 +340,14 @@ impl InputAdapter for SubprocessAdapter {
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
         let output = self.run("--parse", "TROPEL_PARSE", bytes)?;
 
-        let raw_scenario: serde_json::Value = serde_json::from_slice(&output).map_err(|e| {
+        // Backlog line 362: avoid double-parse (Value then Scenario).
+        // Try direct Scenario deserialization first; fall back to array.
+        if let Ok(scenario) = serde_json::from_slice::<Scenario>(&output) {
+            return Ok(scenario);
+        }
+
+        // Not a full Scenario — try array of items.
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&output).map_err(|e| {
             TropelError::Parse(format!(
                 "Subprocess '{}' returned invalid JSON: {}. Raw output: {}",
                 self.command,
@@ -349,54 +356,33 @@ impl InputAdapter for SubprocessAdapter {
             ))
         })?;
 
-        // Accept either a full Scenario or an array of items
-        let scenario = if raw_scenario.get("info").is_some() || raw_scenario.get("items").is_some()
-        {
-            serde_json::from_value::<Scenario>(raw_scenario).map_err(|e| {
-                TropelError::Parse(format!(
-                    "Subprocess '{}' returned invalid Scenario: {}",
-                    self.command, e
-                ))
-            })?
-        } else if let Some(items) = raw_scenario.as_array() {
-            // Treat a JSON array as items, auto-generate a name
-            Scenario {
-                info: ScenarioInfo {
-                    name: format!("subprocess-{}", self.command),
-                    description: Some(format!(
-                        "Imported via subprocess adapter '{}'",
-                        self.command
-                    )),
-                    schema: None,
-                },
-                items: items
-                    .iter()
-                    .map(|v| {
-                        serde_json::from_value(v.clone()).unwrap_or_else(|_| {
-                            tropel_sdk::ScenarioItem {
-                                name: "Imported item".to_string(),
-                                id: None,
-                                request: None,
-                                prerequest: vec![],
-                                test: vec![],
-                                assertions: vec![],
-                                items: vec![],
-                            }
-                        })
+        // Treat a JSON array as items, auto-generate a name
+        Ok(Scenario {
+            info: ScenarioInfo {
+                name: format!("subprocess-{}", self.command),
+                description: Some(format!(
+                    "Imported via subprocess adapter '{}'",
+                    self.command
+                )),
+                schema: None,
+            },
+            items: items
+                .iter()
+                .map(|v| {
+                    serde_json::from_value(v.clone()).unwrap_or_else(|_| tropel_sdk::ScenarioItem {
+                        name: "Imported item".to_string(),
+                        id: None,
+                        request: None,
+                        prerequest: vec![],
+                        test: vec![],
+                        assertions: vec![],
+                        items: vec![],
                     })
-                    .collect(),
-                variables: HashMap::new(),
-                auth: None,
-            }
-        } else {
-            return Err(TropelError::Parse(format!(
-                "Subprocess '{}' returned JSON that is neither a Scenario nor an array of items. Got: {}",
-                self.command,
-                String::from_utf8_lossy(&output[..output.len().min(200)])
-            )));
-        };
-
-        Ok(scenario)
+                })
+                .collect(),
+            variables: HashMap::new(),
+            auth: None,
+        })
     }
 
     fn parse_with_path(&self, bytes: &[u8], _source_path: Option<&Path>) -> Result<Scenario> {
