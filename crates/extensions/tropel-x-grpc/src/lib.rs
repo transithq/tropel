@@ -35,8 +35,8 @@ use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Code as GrpcCode, Request as TonicRequest, Status};
 use tropel_sdk::{
-    Body, Protocol, ProtocolOutcome, ProtocolRegistration, Request, Response, Result, Sample,
-    SampleType, TagMap, TropelError,
+    tag_keys, Body, Protocol, ProtocolOutcome, ProtocolRegistration, Request, Response, Result,
+    Sample, SampleType, TagMap, TropelError,
 };
 
 /// Default gRPC port when the URL omits it.
@@ -517,11 +517,17 @@ impl Protocol for GrpcProtocol {
 
         let now = std::time::SystemTime::now();
         let mut tags = TagMap::with_capacity(5);
-        tags.insert("url", req.url.clone());
-        tags.insert("method", format!("{service_full}/{method_name}"));
-        tags.insert("status", grpc_status.to_string());
-        tags.insert("name", format!("{service_full}/{method_name}"));
-        tags.insert("group", "grpc");
+        tags.insert(Arc::clone(&tag_keys::URL), req.url.clone());
+        tags.insert(
+            Arc::clone(&tag_keys::METHOD),
+            format!("{service_full}/{method_name}"),
+        );
+        tags.insert(Arc::clone(&tag_keys::STATUS), grpc_status.to_string());
+        tags.insert(
+            Arc::clone(&tag_keys::NAME),
+            format!("{service_full}/{method_name}"),
+        );
+        tags.insert(Arc::clone(&tag_keys::GROUP), "grpc");
         let tags = std::sync::Arc::new(tags);
 
         let sent = body_to_json(req)
