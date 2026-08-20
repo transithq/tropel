@@ -236,8 +236,7 @@ impl ScenarioRunner {
 
         // Walk through the flattened execution list (folders descended).
 
-        // Build variable scope for this iteration
-        let _scope = self.build_scope(data_row.clone(), env_vars);
+        // Variable scope is built per-item below (line 334).
         let resolver = tropel_variables::VariableResolver::new();
 
         // Walk through the flattened execution list in order
