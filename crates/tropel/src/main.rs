@@ -18,14 +18,20 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 ///
 /// VUs run on the thread-per-core `VUWorkerPool` (current-thread runtimes,
 /// one per CPU core), so the outer orchestrator only needs minimal workers
-/// for scenario coordination and final metric collection. Default 2; override
-/// with `TROPEL_TOKIO_WORKERS` (clamped to [1, 128] — more than the core
-/// count would only add contention).
+/// for scenario coordination and final metric collection. Default 4;
+/// override with `TROPEL_TOKIO_WORKERS` (clamped to [1, 128]).
+///
+/// P1 line 335: the old default of 2 was insufficient — the aggregator,
+/// abort coordinator, VU sampler, control API, and 5+ output consumers
+/// all share this runtime. Two workers caused flush_buffered() to park
+/// a worker while build_results() had no .await inside, blocking the
+/// entire runtime. Four workers give headroom for concurrent output
+/// flushes without starving the aggregator.
 fn outer_worker_threads() -> usize {
     std::env::var("TROPEL_TOKIO_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(2)
+        .unwrap_or(4)
         .clamp(1, 128)
 }
 

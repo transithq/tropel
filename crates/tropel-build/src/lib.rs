@@ -790,7 +790,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {{
     let workers: usize = std::env::var("TROPEL_TOKIO_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(2)
+        .unwrap_or(4)
         .clamp(1, 128);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)

@@ -130,6 +130,10 @@ impl OtlpOutput {
 
     /// Drain the buffer, build an `ExportMetricsServiceRequest` JSON payload,
     /// and POST it to `/v1/metrics`. Non-2xx responses are logged, not fatal.
+    ///
+    /// P1 line 335: the CPU-heavy payload build (tag expansion, JSON
+    /// serialization) runs on spawn_blocking to avoid parking the async
+    /// worker while the aggregator needs to drain its channel.
     async fn flush_buffered(&self) -> Result<()> {
         let metrics = {
             let mut guard = self.metrics.lock().unwrap();
@@ -143,12 +147,19 @@ impl OtlpOutput {
             return Ok(());
         }
 
-        let body = build_export_request(&metrics);
+        // Move the CPU-heavy payload build off the async worker.
+        let body_str = tokio::task::spawn_blocking(move || {
+            let body = build_export_request(&metrics);
+            body.to_string()
+        })
+        .await
+        .map_err(|e| TropelError::Other(format!("otlp payload build panicked: {e}")))?;
+
         let resp = self
             .client
             .post(&self.endpoint)
             .header("Content-Type", "application/json")
-            .body(body.to_string())
+            .body(body_str)
             .send()
             .await
             .map_err(|e| TropelError::Http(format!("otlp POST failed: {e}")))?;
