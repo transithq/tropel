@@ -206,6 +206,11 @@ impl VariableResolver {
         max_passes: usize,
         mode: EscapeMode,
     ) -> String {
+        // Fast path: no {{ means no variable reference — return unchanged
+        // without allocating.
+        if !input.contains("{{") {
+            return input.to_string();
+        }
         let mut result = input.to_string();
         for _ in 0..max_passes {
             if !result.contains("{{") {
