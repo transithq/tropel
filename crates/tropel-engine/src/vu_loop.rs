@@ -733,7 +733,7 @@ pub(crate) async fn run_driver_vus(
 ) -> (u32, u64) {
     let driver_id = driver.id().to_string();
     let input_bytes = match std::fs::read(input_path) {
-        Ok(b) => b,
+        Ok(b) => Arc::new(b),
         Err(e) => {
             tracing::error!("Scenario '{}': failed to read input: {}", sc_name, e);
             return (0, 0);
