@@ -249,7 +249,11 @@ impl Driver for K6Driver {
         let json_str =
             match eval_module_export_json(&module_source, "options", env, script_dir).await {
                 Ok(Some(s)) => s,
-                _ => return Ok(None),
+                Ok(None) => return Ok(None),
+                // Backlog line 280: propagating script-eval errors as fatal,
+                // matching k6 semantics — a throwing options block aborts the
+                // run rather than silently discarding the load profile.
+                Err(e) => return Err(e),
             };
         let options: K6Options = match serde_json::from_str(&json_str) {
             Ok(o) => o,
@@ -3240,8 +3244,18 @@ async fn eval_module_export_json(
         Ok(Some(s)) => Ok(Some(s)),
         Ok(None) => Ok(None),
         Err(e) => {
-            tracing::warn!("Failed to read k6 export '{}': {}", export, e);
-            Ok(None)
+            // Backlog line 280: a throwing options block was silently
+            // swallowed — eval errors became Ok(None) which the caller
+            // treated as "no options declared", so the run continued with
+            // the CLI profile instead of failing. k6 hard-errors here.
+            // read_module_export_string returns Err only when the module
+            // itself throws during eval (not when the export is missing,
+            // which returns Ok(None)), so propagating is correct.
+            Err(TropelError::Parse(format!(
+                "k6 script throws during evaluation of `export const {}`: {} \
+                 (k6 would abort — fix the error in the options block)",
+                export, e
+            )))
         }
     }
 }
