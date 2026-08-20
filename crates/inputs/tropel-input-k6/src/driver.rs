@@ -2910,7 +2910,7 @@ impl K6DriverInstance {
             // `__tropel_vu_id % len` → NaN).
             let _ = self
                 .js_ctx
-                .set_global_json("__tropel_vu_id", &serde_json::json!(ctx.vu_id))
+                .set_global_int("__tropel_vu_id", ctx.vu_id as i32)
                 .await;
             let _ = self
                 .js_ctx
@@ -2924,7 +2924,7 @@ impl K6DriverInstance {
             // natively (no eval, no string round trip).
             let _ = self
                 .js_ctx
-                .set_global_json("__VU", &serde_json::json!(ctx.vu_id + 1))
+                .set_global_int("__VU", (ctx.vu_id + 1) as i32)
                 .await;
 
             // Set env vars as JS globals. k6 scripts read `__ENV` (and
@@ -2971,11 +2971,11 @@ impl K6DriverInstance {
         // strings (see the __VU comment above).
         let _ = self
             .js_ctx
-            .set_global_json("__tropel_iteration_num", &serde_json::json!(ctx.iteration))
+            .set_global_int("__tropel_iteration_num", ctx.iteration as i32)
             .await;
         let _ = self
             .js_ctx
-            .set_global_json("__ITER", &serde_json::json!(ctx.iteration))
+            .set_global_int("__ITER", ctx.iteration as i32)
             .await;
 
         // Refresh the per-iteration exec.* counters read by the __tropel_exec_*
@@ -3230,7 +3230,7 @@ async fn eval_module_export_json(
     // (e.g. `const baseURL = __ENV.BASE_URL`) resolve instead of silently
     // becoming undefined. Backlog line 142: __VU/__ITER are NUMBERS in k6
     // (script code doing `__ITER === 0` or `__VU + 1` must not see strings).
-    let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
+    let _ = js_ctx.set_global_int("__VU", 0).await;
     let _ = js_ctx
         .set_global_json("__ITER", &serde_json::json!(0))
         .await;
@@ -3308,7 +3308,7 @@ async fn eval_module_handle_summary(
 
     // Minimal globals a k6 script may reference while building its summary.
     // Backlog line 142: numbers, not strings (see options eval above).
-    let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
+    let _ = js_ctx.set_global_int("__VU", 0).await;
     let _ = js_ctx
         .set_global_json("__ITER", &serde_json::json!(0))
         .await;
@@ -3398,7 +3398,7 @@ async fn eval_module_call_export(
     // Minimal globals a k6 script may reference at module top level while
     // defining setup()/teardown() (same set as the options/handleSummary
     // evals). Backlog line 142: numbers, not strings.
-    let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
+    let _ = js_ctx.set_global_int("__VU", 0).await;
     let _ = js_ctx
         .set_global_json("__ITER", &serde_json::json!(0))
         .await;
