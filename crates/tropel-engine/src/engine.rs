@@ -188,8 +188,11 @@ impl Engine {
                     }
                     // Merge script-declared thresholds (CLI/config keys win on
                     // collision — CLI keys are "threshold_N", so no clash).
-                    for (k, v) in &decl.thresholds {
-                        thresholds.entry(k.clone()).or_insert_with(|| v.clone());
+                    // Skip when --no-thresholds is set.
+                    if !config.no_thresholds {
+                        for (k, v) in &decl.thresholds {
+                            thresholds.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
                     }
                     if script_load_profile_allowed {
                         if let Some(scs) = decl.scenarios {

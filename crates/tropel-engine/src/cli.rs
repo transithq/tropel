@@ -148,6 +148,12 @@ pub enum Commands {
         #[arg(long = "no-redirects")]
         no_redirects: bool,
 
+        /// Skip all threshold evaluation — don't fail the run even if
+        /// thresholds would fail. Mid-run abortOnFail is also disabled.
+        /// k6 has no equivalent; this pairs with --no-summary.
+        #[arg(long = "no-thresholds")]
+        no_thresholds: bool,
+
         /// Run mode: constant-vus, ramping-vus, shared-iterations, arrival-rate
         /// (optional — when absent, a k6 script's own `export const options`
         /// drives the load profile; passing this flag makes the CLI profile win)
@@ -361,6 +367,7 @@ async fn run_command(cli: Cli) -> Result<()> {
         verbose: _,
         http_debug,
         no_redirects,
+        no_thresholds,
         mode,
         stages,
         iterations,
@@ -403,6 +410,7 @@ async fn run_command(cli: Cli) -> Result<()> {
     let insecure = *insecure;
     let http_debug = *http_debug;
     let no_redirects = *no_redirects;
+    let no_thresholds = *no_thresholds;
     // `mode` is now optional so we can tell whether the user explicitly chose
     // a load profile (mode/vus/duration/stages/iterations flags). When none of
     // them are set, a k6 script's own `export const options` may drive the run.
@@ -473,16 +481,20 @@ async fn run_command(cli: Cli) -> Result<()> {
 
     // Parse thresholds
     let mut threshold_map: HashMap<String, ThresholdConfig> = HashMap::new();
-    for t in &thresholds {
-        let name = format!("threshold_{}", threshold_map.len());
-        threshold_map.insert(
-            name,
-            ThresholdConfig {
-                expression: t.clone(),
-                abort_on_fail: false,
-                delay_abort_eval: None,
-            },
-        );
+    if no_thresholds {
+        tracing::info!("--no-thresholds: skipping threshold evaluation");
+    } else {
+        for t in &thresholds {
+            let name = format!("threshold_{}", threshold_map.len());
+            threshold_map.insert(
+                name,
+                ThresholdConfig {
+                    expression: t.clone(),
+                    abort_on_fail: false,
+                    delay_abort_eval: None,
+                },
+            );
+        }
     }
 
     // Load data file if provided
@@ -529,6 +541,7 @@ async fn run_command(cli: Cli) -> Result<()> {
             ..Default::default()
         },
         thresholds: threshold_map,
+        no_thresholds,
         tls: TlsConfig {
             insecure_skip_verify: insecure,
             ..Default::default()
@@ -616,7 +629,12 @@ async fn run_command(cli: Cli) -> Result<()> {
     // Evaluate thresholds and drive exit code. Uses the engine's EFFECTIVE
     // threshold set (job thresholds merged with script-declared ones, e.g.
     // k6 `export const options` thresholds) so k6 SLOs are reported too.
-    let threshold_results = evaluate_thresholds(&result.effective_thresholds, &result.metrics);
+    // --no-thresholds skips this entirely.
+    let threshold_results = if no_thresholds {
+        Vec::new()
+    } else {
+        evaluate_thresholds(&result.effective_thresholds, &result.metrics)
+    };
     let mut any_failed = false;
     for tr in &threshold_results {
         if tr.passed {
