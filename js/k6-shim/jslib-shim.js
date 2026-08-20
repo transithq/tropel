@@ -214,3 +214,24 @@ if (typeof htmlReport === 'undefined') {
         );
     };
 }
+
+// ── Stub jslib modules (backlog line 279) ───────────────────────
+// httpx and papaparse imports are stripped by the transpiler but had
+// no binding, so scripts hit a raw ReferenceError. These stubs throw
+// a clear init-time error explaining the limitation.
+if (typeof httpx === 'undefined') {
+    var httpx = new Proxy({}, {
+        get: function(_, prop) {
+            if (prop === '__esModule') return false;
+            throw new Error('k6/httpx jslib is not supported by Tropel yet (import was stripped). Use k6/http instead.');
+        }
+    });
+}
+if (typeof papaparse === 'undefined') {
+    var papaparse = new Proxy({}, {
+        get: function(_, prop) {
+            if (prop === '__esModule') return false;
+            throw new Error('k6/papaparse jslib is not supported by Tropel yet (import was stripped). Use a JS CSV parser instead.');
+        }
+    });
+}
