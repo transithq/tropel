@@ -51,6 +51,10 @@ function open(path, mode) {
     return buf;
 }
 
+// Hoisted regex for SharedArray Proxy traps (line 328/336) — avoid
+// recompiling the literal on every element read.
+var __SA_NUMERIC_KEY = /^\d+$/;
+
 // ── k6/data SharedArray ──
 function SharedArray(name, fn) {
     if (typeof name !== 'string' || name === '') {
@@ -325,7 +329,7 @@ function openDataBase64ToBytes(b64) {
         return new Proxy(view, {
             get: function (target, prop) {
                 if (prop === '_name' || prop === '_offset' || prop === '_data') return undefined;
-                if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+                if (typeof prop === 'string' && __SA_NUMERIC_KEY.test(prop)) {
                     return target._get(Number(prop));
                 }
                 var v = target[prop];
@@ -333,7 +337,7 @@ function openDataBase64ToBytes(b64) {
             },
             has: function (target, prop) {
                 if (prop === '_name' || prop === '_offset' || prop === '_data') return false;
-                if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+                if (typeof prop === 'string' && __SA_NUMERIC_KEY.test(prop)) {
                     var n = Number(prop);
                     return n >= 0 && n < target.length;
                 }
