@@ -463,9 +463,9 @@ impl TrpBridge {
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     st.local_vars.remove(&key);
-                    st.collection_vars.remove(&key);
+                    Arc::make_mut(&mut st.collection_vars).remove(&key);
                     st.environment.remove(&key);
-                    st.globals.remove(&key);
+                    Arc::make_mut(&mut st.globals).remove(&key);
                 }),
             );
 
@@ -529,7 +529,7 @@ impl TrpBridge {
                 "__tropel_pm_collection_vars_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars.insert(key, decode_json_value(&value));
+                    Arc::make_mut(&mut st.collection_vars).insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -538,7 +538,7 @@ impl TrpBridge {
                 "__tropel_pm_collection_vars_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars.remove(&key);
+                    Arc::make_mut(&mut st.collection_vars).remove(&key);
                 }),
             );
 
@@ -578,7 +578,7 @@ impl TrpBridge {
                 "__tropel_pm_globals_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.globals.insert(key, decode_json_value(&value));
+                    Arc::make_mut(&mut st.globals).insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -587,7 +587,7 @@ impl TrpBridge {
                 "__tropel_pm_globals_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.globals.remove(&key);
+                    Arc::make_mut(&mut st.globals).remove(&key);
                 }),
             );
 
