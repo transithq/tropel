@@ -85,11 +85,18 @@ impl ShimBundle {
     pub fn is_default(&self) -> bool {
         let d = Self::default();
         self.0.len() == d.0.len()
-            && self
-                .0
-                .iter()
-                .zip(d.0.iter())
-                .all(|(a, b)| a.0 == b.0 && a.1 == b.1)
+            && self.0.iter().zip(d.0.iter()).all(|(a, b)| {
+                a.0 == b.0
+                    && match (&a.1, &b.1) {
+                        // Both borrowed from the same static: pointer
+                        // equality suffices (line 328 optimization).
+                        (std::borrow::Cow::Borrowed(x), std::borrow::Cow::Borrowed(y)) => {
+                            std::ptr::eq(*x, *y)
+                        }
+                        // Owned or mixed: fall back to content comparison.
+                        _ => a.1 == b.1,
+                    }
+            })
     }
 }
 
