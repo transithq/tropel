@@ -890,8 +890,8 @@ impl HttpClient {
                         headers,
                         raw_headers,
                         body: hop_body,
-                        text_cache: std::cell::OnceCell::new(),
-                        json_cache: std::cell::OnceCell::new(),
+                        text_cache: std::sync::OnceLock::new(),
+                        json_cache: std::sync::OnceLock::new(),
                         response_time: hop_total,
                         timings: Some(hop_timings),
                         cookies,
@@ -992,14 +992,16 @@ impl HttpClient {
                     }
                     body.extend_from_slice(&chunk);
                 }
-                (body.clone(), body.len() as u64)
+                let len = body.len() as u64;
+                (body, len)
             } else {
                 let body = response
                     .bytes()
                     .await
                     .map_err(|e| TropelError::Http(format!("Failed to read response body: {}", e)))?
                     .to_vec();
-                (body.clone(), body.len() as u64)
+                let len = body.len() as u64;
+                (body, len)
             };
             let receiving_duration = receiving_start.elapsed();
 
@@ -1062,8 +1064,8 @@ impl HttpClient {
                 headers,
                 raw_headers,
                 body: body_vec,
-                text_cache: std::cell::OnceCell::new(),
-                json_cache: std::cell::OnceCell::new(),
+                text_cache: std::sync::OnceLock::new(),
+                json_cache: std::sync::OnceLock::new(),
                 response_time: total_duration,
                 timings: Some(timings),
                 cookies,
@@ -1208,9 +1210,9 @@ pub struct HttpResponse {
     pub raw_headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// Memoized UTF-8 decode of `body` (see `body_text()`).
-    pub text_cache: std::cell::OnceCell<Option<String>>,
+    pub text_cache: std::sync::OnceLock<Option<String>>,
     /// Memoized JSON parse of `body` (see `body_json()`).
-    pub json_cache: std::cell::OnceCell<Option<serde_json::Value>>,
+    pub json_cache: std::sync::OnceLock<Option<serde_json::Value>>,
     pub response_time: Duration,
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
@@ -1232,8 +1234,8 @@ impl From<&HttpResponse> for tropel_sdk::types::Response {
             status_text: resp.status_text.clone(),
             headers: resp.headers.clone(),
             body: resp.body.clone(),
-            text_cache: std::cell::OnceCell::new(),
-            json_cache: std::cell::OnceCell::new(),
+            text_cache: std::sync::OnceLock::new(),
+            json_cache: std::sync::OnceLock::new(),
             response_time: resp.response_time,
             timings: resp.timings.clone(),
             cookies: resp.cookies.clone(),
@@ -1242,6 +1244,31 @@ impl From<&HttpResponse> for tropel_sdk::types::Response {
             // Recursively convert the redirect chain so DriverHttpClient / k6
             // driver / pm.response all see per-hop requests (k6 parity).
             redirects: resp.redirects.iter().map(Response::from).collect(),
+        }
+    }
+}
+
+/// By-value conversion: moves all fields instead of cloning them.
+/// Backlog line 312: the hot path (vu_loop.rs:485) drops HttpResponse
+/// immediately after converting, so all the `.clone()`s in the by-ref
+/// impl are pure waste — 16 allocations and two full body copies per
+/// request. Use this instead where ownership is transferred.
+impl From<HttpResponse> for tropel_sdk::types::Response {
+    fn from(resp: HttpResponse) -> Self {
+        tropel_sdk::types::Response {
+            url: resp.url,
+            status_code: resp.status_code,
+            status_text: resp.status_text,
+            headers: resp.headers,
+            body: resp.body,
+            text_cache: std::sync::OnceLock::new(),
+            json_cache: std::sync::OnceLock::new(),
+            response_time: resp.response_time,
+            timings: resp.timings,
+            cookies: resp.cookies,
+            size: resp.size,
+            request_body_size: resp.request_body_size,
+            redirects: resp.redirects.into_iter().map(Response::from).collect(),
         }
     }
 }

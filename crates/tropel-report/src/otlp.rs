@@ -97,7 +97,7 @@ impl OtlpOutput {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            crate::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!("otlp output dropped {n} samples (consumer lag)");
                         }
                     },
@@ -130,6 +130,10 @@ impl OtlpOutput {
 
     /// Drain the buffer, build an `ExportMetricsServiceRequest` JSON payload,
     /// and POST it to `/v1/metrics`. Non-2xx responses are logged, not fatal.
+    ///
+    /// P1 line 335: the CPU-heavy payload build (tag expansion, JSON
+    /// serialization) runs on spawn_blocking to avoid parking the async
+    /// worker while the aggregator needs to drain its channel.
     async fn flush_buffered(&self) -> Result<()> {
         let metrics = {
             let mut guard = self.metrics.lock().unwrap();
@@ -143,12 +147,19 @@ impl OtlpOutput {
             return Ok(());
         }
 
-        let body = build_export_request(&metrics);
+        // Move the CPU-heavy payload build off the async worker.
+        let body_str = tokio::task::spawn_blocking(move || {
+            let body = build_export_request(&metrics);
+            body.to_string()
+        })
+        .await
+        .map_err(|e| TropelError::Other(format!("otlp payload build panicked: {e}")))?;
+
         let resp = self
             .client
             .post(&self.endpoint)
             .header("Content-Type", "application/json")
-            .body(body.to_string())
+            .body(body_str)
             .send()
             .await
             .map_err(|e| TropelError::Http(format!("otlp POST failed: {e}")))?;
@@ -198,9 +209,6 @@ fn normalize_metrics_url(url: &str) -> String {
 /// would be wrong — raw counter samples are per-event increments, not
 /// running totals from process start, and a collector would interpret each
 /// as a cumulative total.
-/// Per-tag-set aggregate: (sorted tag list, summed value, last timestamp nanos).
-type TagAggregate = (Vec<(String, String)>, f64, u64);
-
 fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::Value {
     let mut metric_values = Vec::with_capacity(metrics.len());
 
@@ -210,7 +218,9 @@ fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::V
         let data_points: Vec<serde_json::Value> = if is_counter {
             // Sum per (sorted tag-set). Keep the LAST timestamp seen for a
             // tag-set so the delta point carries the newest time.
-            let mut per_tags: Vec<TagAggregate> = Vec::new();
+            // P-D.2: Use HashMap for O(1) lookup instead of O(n²) linear scan.
+            let mut per_tags: std::collections::HashMap<Vec<(String, String)>, (f64, u64)> =
+                std::collections::HashMap::new();
             for s in samples {
                 let mut tags: Vec<(String, String)> = s
                     .tags
@@ -218,23 +228,24 @@ fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::V
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect();
                 tags.sort();
-                // Nanos since epoch fits comfortably in u64 (≈584 years).
                 let ts_nanos = s
                     .timestamp
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
-                match per_tags.iter_mut().find(|(t, _, _)| *t == tags) {
-                    Some((_, sum, ts)) => {
+                match per_tags.get_mut(&tags) {
+                    Some((sum, ts)) => {
                         *sum += s.value;
                         *ts = ts_nanos;
                     }
-                    None => per_tags.push((tags, s.value, ts_nanos)),
+                    None => {
+                        per_tags.insert(tags, (s.value, ts_nanos));
+                    }
                 }
             }
             per_tags
                 .into_iter()
-                .map(|(tags, sum, ts)| {
+                .map(|(tags, (sum, ts))| {
                     let attrs: Vec<serde_json::Value> = tags
                         .iter()
                         .map(|(k, v)| json!({ "key": k, "value": { "stringValue": v } }))

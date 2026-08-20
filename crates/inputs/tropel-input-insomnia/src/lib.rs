@@ -170,7 +170,10 @@ impl InputAdapter for InsomniaInputAdapter {
         };
         value.get("_type").and_then(|t| t.as_str()) == Some("export")
             && value.get("__export_format").is_some()
-            && value.get("resources").map(|r| r.is_array()).unwrap_or(false)
+            && value
+                .get("resources")
+                .map(|r| r.is_array())
+                .unwrap_or(false)
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
@@ -303,7 +306,10 @@ fn request_to_item(r: &InsomniaResource) -> Result<ScenarioItem> {
     let auth = r.authentication.as_ref().and_then(build_auth);
 
     Ok(ScenarioItem {
-        name: r.name.clone().unwrap_or_else(|| format!("{} {}", method.as_str(), url)),
+        name: r
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{} {}", method.as_str(), url)),
         id: None,
         request: Some(Request {
             url,
@@ -408,10 +414,9 @@ fn build_body(b: &InsomniaBody) -> Option<Body> {
                     .and_then(|q| q.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let variables = v
-                    .get("variables")
-                    .filter(|x| x.is_object())
-                    .and_then(|x| serde_json::from_value::<HashMap<String, serde_json::Value>>(x.clone()).ok());
+                let variables = v.get("variables").filter(|x| x.is_object()).and_then(|x| {
+                    serde_json::from_value::<HashMap<String, serde_json::Value>>(x.clone()).ok()
+                });
                 if !query.is_empty() {
                     return Some(Body::GraphQL { query, variables });
                 }
@@ -546,7 +551,9 @@ mod tests {
         let root = &scenario.items[1];
         let root_req = root.request.as_ref().unwrap();
         assert_eq!(root_req.method, Method::POST);
-        assert!(matches!(root_req.auth, Some(AuthConfig::Bearer { ref token }) if token == "tok-123"));
+        assert!(
+            matches!(root_req.auth, Some(AuthConfig::Bearer { ref token }) if token == "tok-123")
+        );
         match root_req.body.as_ref() {
             Some(Body::Json(_)) => {}
             other => panic!("Expected Body::Json, got {:?}", other),
@@ -568,7 +575,7 @@ mod tests {
         let req = scenario.items[0].request.as_ref().unwrap();
         assert!(req.headers.iter().all(|(k, _)| k != "A"));
         assert!(req.headers.iter().any(|(k, _)| k == "B"));
-        assert!(req.query_params.get("q").is_none());
+        assert!(!req.query_params.contains_key("q"));
         assert_eq!(req.query_params.get("p"), Some(&"2".to_string()));
     }
 

@@ -52,7 +52,7 @@ impl Engine {
         // Forget any unit declarations from a previous run in this process
         // (backlog line 32) — the registry must never leak across runs.
         tropel_metrics::time_metrics::clear();
-        tropel_report::OUTPUT_SAMPLES_DROPPED.store(0, std::sync::atomic::Ordering::Relaxed);
+        tropel_metrics::OUTPUT_SAMPLES_DROPPED.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let registry = Arc::new(self.extension_registry.clone());
         let format_hint = config.input_type.clone();
@@ -188,8 +188,11 @@ impl Engine {
                     }
                     // Merge script-declared thresholds (CLI/config keys win on
                     // collision — CLI keys are "threshold_N", so no clash).
-                    for (k, v) in &decl.thresholds {
-                        thresholds.entry(k.clone()).or_insert_with(|| v.clone());
+                    // Skip when --no-thresholds is set.
+                    if !config.no_thresholds {
+                        for (k, v) in &decl.thresholds {
+                            thresholds.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
                     }
                     if script_load_profile_allowed {
                         if let Some(scs) = decl.scenarios {
@@ -345,7 +348,7 @@ impl Engine {
         // flush() when the stream closes. This replaces the old
         // "extension reporter not supported" dead end.
         for name in &config.output.reporters {
-            if create_reporter(name).is_some() {
+            if create_reporter(name, None).is_some() {
                 continue; // built-in reporters handled above / at the end
             }
             if let Some(mut ext) = self.extension_registry.get_output(name) {
@@ -527,6 +530,7 @@ impl Engine {
                             protocols,
                             control_port,
                             rps_limiter_sc,
+                            &input_path,
                         )
                         .await
                     }
@@ -663,7 +667,7 @@ impl Engine {
     fn create_reporters(&self, config: &OutputConfig) -> Vec<Box<dyn Reporter>> {
         let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
         for name in &config.reporters {
-            if let Some(reporter) = create_reporter(name) {
+            if let Some(reporter) = create_reporter(name, config.output_file.as_deref()) {
                 reporters.push(reporter);
             } else if self
                 .extension_registry

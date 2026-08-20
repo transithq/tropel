@@ -11,10 +11,11 @@ use tropel_sdk::types::{Request, Response, Sample, TagMap};
 pub struct PmState {
     /// Environment variables.
     pub environment: HashMap<String, String>,
-    /// Collection variables.
-    pub collection_vars: HashMap<String, Value>,
-    /// Global variables.
-    pub globals: HashMap<String, Value>,
+    /// Collection variables (backlog line 346: Arc-wrapped to avoid
+    /// deep-cloning the entire HashMap on every build_scope call).
+    pub collection_vars: Arc<HashMap<String, Value>>,
+    /// Global variables (same Arc optimization).
+    pub globals: Arc<HashMap<String, Value>>,
     /// Local variables (pm.variables) — Postman's highest-priority scope.
     /// Backlog line 137: pm.variables.set used to write to collection_vars
     /// while get read data > env > collection, so set-then-get could return
@@ -43,6 +44,12 @@ pub struct PmState {
     /// Postman item ids of all items in order (for setNextRequest id lookup,
     /// which Postman resolves BEFORE names — backlog §4). Same Arc sharing.
     pub request_ids: Arc<Vec<String>>,
+    /// O(1) id → index lookup (backlog line 351). Built once per scenario
+    /// in `set_request_ids`, avoids linear scan on every setNextRequest call.
+    pub id_to_index: HashMap<String, usize>,
+    /// O(1) name → last index lookup (backlog line 351). Postman uses
+    /// last-wins semantics on duplicate names.
+    pub name_to_last_index: HashMap<String, usize>,
     /// Iteration data (from CSV/JSON data file), set per-iteration.
     pub iteration_data: Option<HashMap<String, Value>>,
     /// Backlog line 146: pm.execution.skipRequest() — skip the CURRENT item
@@ -104,8 +111,8 @@ impl PmState {
     pub fn new() -> Self {
         Self {
             environment: HashMap::new(),
-            collection_vars: HashMap::new(),
-            globals: HashMap::new(),
+            collection_vars: Arc::new(HashMap::new()),
+            globals: Arc::new(HashMap::new()),
             local_vars: HashMap::new(),
             response: None,
             request: None,
@@ -116,6 +123,8 @@ impl PmState {
             next_request: None,
             request_names: Arc::new(Vec::new()),
             request_ids: Arc::new(Vec::new()),
+            id_to_index: HashMap::new(),
+            name_to_last_index: HashMap::new(),
             iteration_data: None,
             skip_request: false,
             group_stack: Vec::new(),
@@ -166,12 +175,22 @@ impl PmState {
 
     /// Set the list of request names in order (for resolving setNextRequest by name).
     pub fn set_request_names(&mut self, names: Arc<Vec<String>>) {
+        // Build last-wins index map (backlog line 351).
+        self.name_to_last_index.clear();
+        for (i, name) in names.iter().enumerate() {
+            self.name_to_last_index.insert(name.clone(), i);
+        }
         self.request_names = names;
     }
 
     /// Set the list of item ids in order (for resolving setNextRequest by id,
     /// which Postman prioritizes over name — backlog §4).
     pub fn set_request_ids(&mut self, ids: Arc<Vec<String>>) {
+        // Build id → index map (backlog line 351).
+        self.id_to_index.clear();
+        for (i, id) in ids.iter().enumerate() {
+            self.id_to_index.insert(id.clone(), i);
+        }
         self.request_ids = ids;
     }
 

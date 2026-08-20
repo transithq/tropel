@@ -1571,7 +1571,9 @@ var pm = __tropel_build_binding('pm');
         ? cfg.namespace
         : 'trp';
     var aliases = Array.isArray(cfg.aliases) ? cfg.aliases : [];
-    var canonical = __tropel_build_binding(namespace);
+    // P-A: when namespace === 'pm', reuse the existing pm object instead of
+    // building a second identical object graph (~28KB/VU, ~200 closures).
+    var canonical = (namespace === 'pm') ? pm : __tropel_build_binding(namespace);
     // True alias — identical object, one line, not a proxy (P4b).
     var install = [['pm', pm]];
     // `pm` is the frozen Postman-compat peer view — it owns its name. A

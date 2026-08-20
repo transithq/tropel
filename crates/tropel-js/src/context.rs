@@ -730,6 +730,17 @@ impl JsContext {
         })
     }
 
+    /// Set a global variable to an integer directly (no serialization round-trip).
+    pub async fn set_global_int(&mut self, name: &str, value: i32) -> Result<()> {
+        let name = name.to_string();
+        self.ctx.with(move |ctx| {
+            let globals = ctx.globals();
+            globals
+                .set(name, value)
+                .map_err(|e| JsError::Conversion(format!("set_global_int error: {}", e)))
+        })
+    }
+
     /// Set a global variable from a JSON value.
     pub async fn set_global_json(
         &mut self,
@@ -854,14 +865,26 @@ impl JsContext {
         source: &str,
         source_url: Option<String>,
     ) -> Result<bool> {
-        self.reset_interrupt();
-        let source = source.to_string();
+        self.run_script_cached_with_hash(source, source_url, None)
+            .await
+    }
 
-        let hash = {
+    /// Like `run_script_cached` but accepts a pre-computed hash to avoid
+    /// re-hashing the source on every call (backlog line 347: the same
+    /// iteration wrapper is hashed 1000s of times per VU).
+    pub async fn run_script_cached_with_hash(
+        &mut self,
+        source: &str,
+        source_url: Option<String>,
+        precomputed_hash: Option<u64>,
+    ) -> Result<bool> {
+        self.reset_interrupt();
+
+        let hash = precomputed_hash.unwrap_or_else(|| {
             let mut hasher = DefaultHasher::new();
             source.hash(&mut hasher);
             hasher.finish()
-        };
+        });
 
         // Wrapper format — 2 lines before user source:
         //   Line 1: (async function __tropel_script(){
@@ -895,7 +918,7 @@ impl JsContext {
                         promise,
                         WRAPPER_OFFSET,
                         Some(source_url_str),
-                        Some(&source),
+                        Some(source),
                     )?;
                 }
                 Ok::<_, JsError>(true)
@@ -925,7 +948,7 @@ impl JsContext {
             let script = CachedScript::compile(
                 &ctx,
                 func,
-                &source,
+                source,
                 Some(source_url_str.to_string()),
                 WRAPPER_OFFSET,
             );
@@ -938,7 +961,7 @@ impl JsContext {
                     promise,
                     WRAPPER_OFFSET,
                     Some(source_url_str),
-                    Some(&source),
+                    Some(source),
                 )?;
             }
 

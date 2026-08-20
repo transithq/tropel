@@ -51,6 +51,10 @@ function open(path, mode) {
     return buf;
 }
 
+// Hoisted regex for SharedArray Proxy traps (line 328/336) — avoid
+// recompiling the literal on every element read.
+var __SA_NUMERIC_KEY = /^\d+$/;
+
 // ── k6/data SharedArray ──
 function SharedArray(name, fn) {
     if (typeof name !== 'string' || name === '') {
@@ -69,7 +73,7 @@ function SharedArray(name, fn) {
         // Absent: first VU runs the factory, normalizes to a plain array and
         // stores it natively (parsed once, shared as an Arc).
         var data = fn();
-        if (data === null || data === undefined || typeof data.length !== 'number') {
+        if (data === null || data === undefined || typeof data.length !== 'number' || typeof data === 'string') {
             throw new Error('SharedArray: factory function must return an array-like object');
         }
         // Normalize array-like (incl. non-indexed keys) to a plain array.
@@ -164,16 +168,69 @@ SharedArrayView.prototype.join = function (sep) {
         parts.push(this._get(i));
     }
     return parts.join(sep === undefined ? ',' : sep);
-};
-
-SharedArrayView.prototype.slice = function (start, end) {
+};SharedArrayView.prototype.slice = function (start, end) {
     var s = start === undefined ? 0 : Number(start);
     if (s < 0) s = Math.max(this.length + s, 0);
     var e = end === undefined ? this.length : Number(end);
     if (e < 0) e = Math.max(this.length + e, 0);
     var n = Math.max(Math.min(e, this.length) - s, 0);
+
     var view = new SharedArrayView(this._name, this._offset + s, n);
     return view;
+};
+
+// Backlog line 284: missing filter/reduce/sort/concat + JSON.stringify.
+SharedArrayView.prototype.filter = function (cb, thisArg) {
+    var out = [];
+    for (var i = 0; i < this.length; i++) {
+        var v = this._get(i);
+        if (cb.call(thisArg, v, i, this)) out.push(v);
+    }
+    return out;
+};
+
+SharedArrayView.prototype.reduce = function (cb, initialValue) {
+    var i = 0;
+    var acc;
+    if (arguments.length > 1) {
+        acc = initialValue;
+    } else {
+        if (this.length === 0) throw new TypeError('Reduce of empty SharedArray with no initial value');
+        acc = this._get(0);
+        i = 1;
+    }
+    for (; i < this.length; i++) {
+        acc = cb(acc, this._get(i), i, this);
+    }
+    return acc;
+};
+
+SharedArrayView.prototype.sort = function (compareFn) {
+    // SharedArray is read-only — sort returns a plain sorted array copy.
+    var arr = [];
+    for (var i = 0; i < this.length; i++) arr.push(this._get(i));
+    return arr.sort(compareFn);
+};
+
+SharedArrayView.prototype.concat = function () {
+    var out = [];
+    for (var i = 0; i < this.length; i++) out.push(this._get(i));
+    for (var a = 0; a < arguments.length; a++) {
+        var other = arguments[a];
+        if (other && typeof other.length === 'number') {
+            for (var j = 0; j < other.length; j++) out.push(other[j]);
+        } else {
+            out.push(other);
+        }
+    }
+    return out;
+};
+
+// JSON.stringify(view) must produce a JSON array, not {"length":N}.
+SharedArrayView.prototype.toJSON = function () {
+    var arr = [];
+    for (var i = 0; i < this.length; i++) arr.push(this._get(i));
+    return arr;
 };
 
 function makeSharedIterator(nextFn) {
@@ -272,7 +329,7 @@ function openDataBase64ToBytes(b64) {
         return new Proxy(view, {
             get: function (target, prop) {
                 if (prop === '_name' || prop === '_offset' || prop === '_data') return undefined;
-                if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+                if (typeof prop === 'string' && __SA_NUMERIC_KEY.test(prop)) {
                     return target._get(Number(prop));
                 }
                 var v = target[prop];
@@ -280,7 +337,7 @@ function openDataBase64ToBytes(b64) {
             },
             has: function (target, prop) {
                 if (prop === '_name' || prop === '_offset' || prop === '_data') return false;
-                if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+                if (typeof prop === 'string' && __SA_NUMERIC_KEY.test(prop)) {
                     var n = Number(prop);
                     return n >= 0 && n < target.length;
                 }

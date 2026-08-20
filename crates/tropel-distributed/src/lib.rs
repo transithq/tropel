@@ -138,7 +138,7 @@ pub async fn report_and_thresholds(
 ) -> Result<()> {
     let mut reporters = Vec::new();
     for name in &config.output.reporters {
-        if let Some(r) = create_reporter(name) {
+        if let Some(r) = create_reporter(name, config.output.output_file.as_deref()) {
             reporters.push(r);
         } else {
             tracing::warn!("Unknown reporter: {name}");

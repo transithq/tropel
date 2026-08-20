@@ -197,8 +197,8 @@ fn encode_fatal(msg: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::OnceCell;
     use std::collections::HashMap;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
@@ -211,8 +211,8 @@ mod tests {
             status_text: "OK".into(),
             headers: HashMap::new(),
             body: br#"{"ok":true}"#.to_vec(),
-            text_cache: OnceCell::new(),
-            json_cache: OnceCell::new(),
+            text_cache: OnceLock::new(),
+            json_cache: OnceLock::new(),
             response_time: Duration::from_millis(5),
             timings: Some(Timings::from_measured(
                 Duration::from_millis(2),

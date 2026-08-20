@@ -39,12 +39,7 @@ fn resolve(bytes: &[u8]) -> Option<Box<dyn InputAdapter>> {
     let mut best: Option<(u8, Box<dyn InputAdapter>)> = None;
     for (_, priority, create) in ADAPTERS {
         let adapter = create();
-        if adapter.detect(bytes)
-            && best
-                .as_ref()
-                .map(|(p, _)| *priority > *p)
-                .unwrap_or(true)
-        {
+        if adapter.detect(bytes) && best.as_ref().map(|(p, _)| *priority > *p).unwrap_or(true) {
             best = Some((*priority, adapter));
         }
     }
@@ -64,7 +59,7 @@ pub(crate) fn import_any_impl(bytes: &[u8]) -> Result<Scenario, String> {
     let adapter = resolve(bytes).ok_or_else(|| {
         "Unrecognized import - expected OpenAPI, Swagger 2.0, Postman collection, Insomnia export, Bruno collection, or HAR".to_string()
     })?;
-    adapter.parse(bytes).map_err(|e| err_text(e))
+    adapter.parse(bytes).map_err(err_text)
 }
 
 /// Explicit-format parse → Scenario.
@@ -74,40 +69,33 @@ pub(crate) fn import_by_id_impl(id: &str, bytes: &[u8]) -> Result<Scenario, Stri
         .find(|(adapter_id, _, _)| *adapter_id == id)
         .map(|(_, _, create)| create)
         .ok_or_else(|| format!("unknown import format: {id}"))?;
-    create().parse(bytes).map_err(|e| err_text(e))
+    create().parse(bytes).map_err(err_text)
 }
 
 fn err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&err_text(e))
 }
 
+/// A single (id, priority, factory) slot in the adapter dispatch table.
+type AdapterEntry = (&'static str, u8, fn() -> Box<dyn InputAdapter>);
+
 /// The collection parsers exposed by this slice, in dispatch order.
 /// Priority mirrors each input crate's `with_priority` registration:
 /// postman 40, har 30, insomnia 35, openapi 20, bru 25. `detect` claims must
 /// be mutually exclusive (structural checks, no substring matching) — see
 /// each crate.
-const ADAPTERS: &[(&str, u8, fn() -> Box<dyn InputAdapter>)] = &[
-    (
-        "postman",
-        40,
-        || Box::new(tropel_input_postman::PostmanInputAdapter),
-    ),
+const ADAPTERS: &[AdapterEntry] = &[
+    ("postman", 40, || {
+        Box::new(tropel_input_postman::PostmanInputAdapter)
+    }),
     ("har", 30, || Box::new(tropel_input_har::HarInputAdapter)),
-    (
-        "insomnia",
-        35,
-        || Box::new(tropel_input_insomnia::InsomniaInputAdapter),
-    ),
-    (
-        "openapi",
-        20,
-        || Box::new(tropel_input_openapi::OpenApiInputAdapter),
-    ),
-    (
-        "bru",
-        25,
-        || Box::new(tropel_input_bru::BruInputAdapter),
-    ),
+    ("insomnia", 35, || {
+        Box::new(tropel_input_insomnia::InsomniaInputAdapter)
+    }),
+    ("openapi", 20, || {
+        Box::new(tropel_input_openapi::OpenApiInputAdapter)
+    }),
+    ("bru", 25, || Box::new(tropel_input_bru::BruInputAdapter)),
 ];
 
 /// Detect the input format: returns the adapter id (`"openapi"`, `"postman"`
@@ -213,7 +201,10 @@ mod tests {
         let postman = import_any_impl(POSTMAN).unwrap();
         assert_eq!(postman.info.name, "Test Collection");
         assert_eq!(postman.items.len(), 1);
-        assert_eq!(postman.items[0].request.as_ref().unwrap().method.as_str(), "GET");
+        assert_eq!(
+            postman.items[0].request.as_ref().unwrap().method.as_str(),
+            "GET"
+        );
 
         let openapi = import_any_impl(OPENAPI).unwrap();
         assert_eq!(openapi.info.name, "Pets");
@@ -225,7 +216,10 @@ mod tests {
         let insomnia = import_any_impl(INSOMNIA).unwrap();
         assert_eq!(insomnia.info.name, "Pets API");
         assert_eq!(insomnia.items.len(), 1);
-        assert_eq!(insomnia.items[0].request.as_ref().unwrap().method.as_str(), "GET");
+        assert_eq!(
+            insomnia.items[0].request.as_ref().unwrap().method.as_str(),
+            "GET"
+        );
 
         let bru = import_any_impl(BRU).unwrap();
         assert_eq!(bru.info.name, "Pets API");
@@ -237,7 +231,10 @@ mod tests {
         let s = import_by_id_impl("openapi", OPENAPI).unwrap();
         assert_eq!(s.info.name, "Pets");
         assert!(import_by_id_impl("postman", OPENAPI).is_err());
-        assert_eq!(import_by_id_impl("insomnia", INSOMNIA).unwrap().items.len(), 1);
+        assert_eq!(
+            import_by_id_impl("insomnia", INSOMNIA).unwrap().items.len(),
+            1
+        );
         assert_eq!(import_by_id_impl("bru", BRU).unwrap().items.len(), 1);
         assert!(import_by_id_impl("bogus", OPENAPI).is_err());
     }

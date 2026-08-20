@@ -13,9 +13,11 @@ pub use collector::*;
 pub use histogram::*;
 pub use thresholds::*;
 
-/// Global counter for samples dropped by output consumer lag.
-/// Incremented in each output's `Lagged` handler and surfaced in
-/// `MetricsResult` so the summary can warn operators.
+/// Global atomic counter of samples dropped by output consumers due to
+/// broadcast lag (RecvError::Lagged).  Every streaming output (InfluxDB,
+/// StatsD, JSON-stream, OTLP, Prometheus, extension) increments this on
+/// lag; the stdout reporter and MetricsResult surface it so users can
+/// see how many samples were silently lost.
 pub static OUTPUT_SAMPLES_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

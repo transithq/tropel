@@ -69,6 +69,9 @@ pub struct PrometheusRemoteWriteOutput {
     /// per-window delta would make counters appear to reset every flush and
     /// break `rate()`/`increase()`.
     cumulative: Mutex<HashMap<SeriesKey, f64>>,
+    /// Maximum cumulative series before new entries are dropped (P1: prevents
+    /// unbounded memory growth at high cardinality — ~140 MB at 1M series).
+    max_cumulative: usize,
     /// Number of series currently buffered (fast read without the lock).
     total_buffered: AtomicUsize,
     /// Tag forwarding policy (allowlist + cardinality cap).
@@ -95,17 +98,42 @@ struct SeriesKey {
     labels: Vec<(String, String)>,
 }
 
+/// Sanitize a string to a valid Prometheus label/metric name.
+/// Prometheus requires `[a-zA-Z_][a-zA-Z0-9_]*`; invalid chars
+/// are replaced with `_`.
+fn sanitize_prometheus_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if i == 0 {
+            if c.is_ascii_alphabetic() || c == '_' {
+                out.push(c);
+            } else {
+                out.push('_');
+            }
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
 impl SeriesKey {
     fn from_parts(metric: &str, tags: &tropel_sdk::types::TagMap) -> Self {
         let mut labels: Vec<(String, String)> = tags
             .iter()
             .filter(|(k, _)| k != &"__name__") // avoid duplicate __name__ label
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (sanitize_prometheus_name(k), v.to_string()))
             .collect();
-        labels.push(("__name__".to_string(), metric.to_string()));
+        let metric_name = sanitize_prometheus_name(metric);
+        labels.push(("__name__".to_string(), metric_name.clone()));
         labels.sort();
         Self {
-            metric: metric.to_string(),
+            metric: metric_name,
             labels,
         }
     }
@@ -122,6 +150,7 @@ impl PrometheusRemoteWriteOutput {
             client: reqwest::Client::new(),
             series: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(HashMap::new()),
+            max_cumulative: 100_000,
             total_buffered: AtomicUsize::new(0),
             tag_policy: TagPolicy::default(),
         }
@@ -130,6 +159,12 @@ impl PrometheusRemoteWriteOutput {
     /// Set the tag forwarding policy (allowlist + cardinality cap).
     pub fn with_tag_policy(mut self, policy: TagPolicy) -> Self {
         self.tag_policy = policy;
+        self
+    }
+
+    /// Set the maximum number of cumulative series (default: 100 000).
+    pub fn with_max_cumulative(mut self, max: usize) -> Self {
+        self.max_cumulative = max;
         self
     }
 
@@ -163,7 +198,7 @@ impl PrometheusRemoteWriteOutput {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            crate::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!("prometheus output dropped {n} samples (consumer lag)");
                         }
                     },
@@ -245,16 +280,31 @@ impl PrometheusRemoteWriteOutput {
         // before the POST await below.
         let wire_series: HashMap<SeriesKey, Vec<(f64, i64)>> = {
             let mut cumulative = self.cumulative.lock().unwrap();
+            let at_cap = cumulative.len() >= self.max_cumulative;
+            if at_cap {
+                tracing::warn!(
+                    "prometheus cumulative series cap reached ({}); new series will be dropped",
+                    self.max_cumulative
+                );
+            }
             series
                 .iter()
-                .flat_map(|(key, agg)| expand_series(key, agg, ts_ms, &mut cumulative))
+                .flat_map(|(key, agg)| {
+                    expand_series(key, agg, ts_ms, &mut cumulative, self.max_cumulative)
+                })
                 .collect()
         };
 
-        let payload = encode_write_request(&wire_series);
-        let compressed = snap::raw::Encoder::new()
-            .compress_vec(&payload)
-            .map_err(|e| TropelError::Report(format!("snappy compress failed: {e}")))?;
+        // P1 line 335: move the CPU-heavy encode + compress off the async
+        // worker so the aggregator can keep draining while we serialize.
+        let compressed = tokio::task::spawn_blocking(move || {
+            let payload = encode_write_request(&wire_series);
+            snap::raw::Encoder::new()
+                .compress_vec(&payload)
+                .map_err(|e| TropelError::Report(format!("snappy compress failed: {e}")))
+        })
+        .await
+        .map_err(|e| TropelError::Other(format!("prometheus encode panicked: {e}")))??;
 
         let resp = self
             .client
@@ -271,6 +321,9 @@ impl PrometheusRemoteWriteOutput {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             tracing::warn!("remote-write rejected ({status}): {body}");
+            return Err(TropelError::Report(format!(
+                "prometheus remote-write rejected ({status}): {body}"
+            )));
         }
         Ok(())
     }
@@ -322,9 +375,14 @@ fn expand_series(
     agg: &SeriesAgg,
     ts_ms: i64,
     cumulative: &mut HashMap<SeriesKey, f64>,
+    max_cumulative: usize,
 ) -> Vec<(SeriesKey, Vec<(f64, i64)>)> {
     match agg.sample_type {
         SampleType::Counter | SampleType::Rate => {
+            // P1: cap cumulative series to prevent unbounded memory growth.
+            if cumulative.len() >= max_cumulative && !cumulative.contains_key(key) {
+                return vec![];
+            }
             let total = cumulative.entry(key.clone()).or_insert(0.0);
             *total += agg.sum;
             vec![(key.clone(), vec![(*total, ts_ms)])]
@@ -357,6 +415,14 @@ fn expand_series(
             // Scoped so each `entry` borrow of `cumulative` ends before the
             // next one starts (E0499: cannot borrow `*cumulative` as mutable
             // more than once).
+            // P1: cap cumulative series to prevent unbounded memory growth.
+            // Count both count_key and sum_key as new entries.
+            let count_is_new = !cumulative.contains_key(&count_key);
+            let sum_is_new = !cumulative.contains_key(&sum_key);
+            let at_cap = cumulative.len() >= max_cumulative;
+            if at_cap && (count_is_new || sum_is_new) {
+                return vec![];
+            }
             let count_total = {
                 let e = cumulative.entry(count_key.clone()).or_insert(0.0);
                 *e += agg.count as f64;
@@ -389,7 +455,8 @@ fn expand_series(
 /// message Sample      { double value = 1; int64 timestamp = 2; } // ms
 /// ```
 fn encode_write_request(series: &HashMap<SeriesKey, Vec<(f64, i64)>>) -> Vec<u8> {
-    let mut out = Vec::new();
+    // Pre-allocate: ~100 B per series (labels + samples) on average.
+    let mut out = Vec::with_capacity(series.len() * 100);
     for (key, samples) in series {
         let mut ts = Vec::new();
         for (name, value) in &key.labels {
@@ -598,7 +665,7 @@ mod tests {
         let mut cumulative: HashMap<SeriesKey, f64> = HashMap::new();
         series
             .iter()
-            .flat_map(|(k, a)| expand_series(k, a, ts_ms, &mut cumulative))
+            .flat_map(|(k, a)| expand_series(k, a, ts_ms, &mut cumulative, usize::MAX))
             .collect()
     }
 
@@ -684,7 +751,7 @@ mod tests {
             sum: 500.0,
             last: 1.0,
         };
-        let out1 = expand_series(&key, &w1, 1000, &mut cumulative);
+        let out1 = expand_series(&key, &w1, 1000, &mut cumulative, usize::MAX);
         assert_eq!(
             out1[0].1[0].0, 500.0,
             "first window: cumulative == window sum"
@@ -696,7 +763,7 @@ mod tests {
             sum: 480.0,
             last: 1.0,
         };
-        let out2 = expand_series(&key, &w2, 2000, &mut cumulative);
+        let out2 = expand_series(&key, &w2, 2000, &mut cumulative, usize::MAX);
         assert_eq!(
             out2[0].1[0].0, 980.0,
             "second window must be CUMULATIVE (500+480), not the 480 delta"
@@ -710,14 +777,14 @@ mod tests {
             sum: 300.0,
             last: 100.0,
         };
-        let tout1 = expand_series(&tkey, &tw1, 1000, &mut cumulative);
+        let tout1 = expand_series(&tkey, &tw1, 1000, &mut cumulative, usize::MAX);
         let tw2 = SeriesAgg {
             sample_type: SampleType::Trend,
             count: 2,
             sum: 250.0,
             last: 125.0,
         };
-        let tout2 = expand_series(&tkey, &tw2, 2000, &mut cumulative);
+        let tout2 = expand_series(&tkey, &tw2, 2000, &mut cumulative, usize::MAX);
         let count2 = tout2
             .iter()
             .find(|(k, _)| k.metric.ends_with("_count"))
@@ -772,7 +839,7 @@ mod tests {
             sum: 45.0,
             last: 45.0,
         };
-        let expanded = expand_series(&key, &agg, 1000, &mut HashMap::new());
+        let expanded = expand_series(&key, &agg, 1000, &mut HashMap::new(), usize::MAX);
         assert_eq!(expanded.len(), 2);
         for (k, samples) in &expanded {
             // __custom tag survives on the sub-series.
@@ -948,5 +1015,66 @@ mod tests {
         let series = decoded.values().next().unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].0, 1.0);
+    }
+
+    #[test]
+    fn max_cumulative_cap_drops_new_series() {
+        // When the cumulative map is at capacity, new series are dropped
+        // to prevent unbounded memory growth (~140 MB at 1M series).
+        let mut cumulative = HashMap::new();
+        let cap = 2;
+
+        // Fill to capacity with two distinct counter series.
+        let key_a = SeriesKey::from_parts("req_a", &TagMap::new());
+        let agg_a = SeriesAgg {
+            sample_type: SampleType::Counter,
+            count: 1,
+            sum: 1.0,
+            last: 1.0,
+        };
+        let out1 = expand_series(&key_a, &agg_a, 1000, &mut cumulative, cap);
+        assert_eq!(out1.len(), 1, "first series accepted");
+
+        let key_b = SeriesKey::from_parts("req_b", &TagMap::new());
+        let agg_b = SeriesAgg {
+            sample_type: SampleType::Counter,
+            count: 1,
+            sum: 2.0,
+            last: 2.0,
+        };
+        let out2 = expand_series(&key_b, &agg_b, 1000, &mut cumulative, cap);
+        assert_eq!(out2.len(), 1, "second series accepted");
+
+        // Third NEW series must be dropped.
+        let key_c = SeriesKey::from_parts("req_c", &TagMap::new());
+        let agg_c = SeriesAgg {
+            sample_type: SampleType::Counter,
+            count: 1,
+            sum: 3.0,
+            last: 3.0,
+        };
+        let out3 = expand_series(&key_c, &agg_c, 1000, &mut cumulative, cap);
+        assert!(out3.is_empty(), "third new series must be dropped at cap");
+
+        // Existing series still accumulates (no cap hit).
+        let out4 = expand_series(&key_a, &agg_a, 2000, &mut cumulative, cap);
+        assert_eq!(out4.len(), 1, "existing series still accepted");
+        assert_eq!(out4[0].1[0].0, 2.0, "existing series accumulates (1+1)");
+    }
+
+    #[test]
+    fn sanitize_prometheus_name_invalid_chars() {
+        // Prometheus label names must match [a-zA-Z_][a-zA-Z0-9_]*.
+        assert_eq!(sanitize_prometheus_name("valid_name"), "valid_name");
+        assert_eq!(
+            sanitize_prometheus_name("http_req_duration"),
+            "http_req_duration"
+        );
+        assert_eq!(sanitize_prometheus_name("req.url"), "req_url");
+        assert_eq!(sanitize_prometheus_name("status-code"), "status_code");
+        assert_eq!(sanitize_prometheus_name("1bad"), "_bad");
+        assert_eq!(sanitize_prometheus_name("a b"), "a_b");
+        assert_eq!(sanitize_prometheus_name(""), "_");
+        assert_eq!(sanitize_prometheus_name("my.label/name"), "my_label_name");
     }
 }

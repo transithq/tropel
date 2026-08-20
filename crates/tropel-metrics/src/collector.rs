@@ -43,6 +43,10 @@ const MAX_PENDING_SAMPLES: usize = 100_000;
 /// New series beyond the cap are dropped and counted; existing series keep
 /// recording, and `totals` (keyed by metric NAME) stay complete.
 const MAX_SERIES: usize = 100_000;
+/// Maximum total histogram memory budget (512 MB). Each Trend series
+/// lazily allocates a ~16-64 KB histogram; at 100k series this would be
+/// ~6 GB. The budget caps total allocation across all series.
+const MAX_HISTOGRAM_BYTES: usize = 512 * 1024 * 1024;
 
 /// A hashable metric key that avoids heap-allocated string formatting.
 ///
@@ -135,6 +139,9 @@ pub struct MetricSet {
     /// Histogram ceiling captured at creation; used when the histogram is
     /// lazily allocated on the first Trend sample.
     histogram_max_ms: Option<u64>,
+    /// When histogram budget is exhausted, prevent lazy allocation
+    /// (backlog line 460). count/sum/min/max still tracked.
+    histogram_disabled: bool,
     /// For Counter/Rate: event count; for Gauge/Trend: sample count.
     pub count: f64,
     /// Sum of values (for mean calculation or rate numerator).
@@ -148,11 +155,14 @@ pub struct MetricSet {
 }
 
 impl MetricSet {
-    fn new(metric_type: MetricType, histogram_max_ms: Option<u64>) -> Self {
+    fn new(metric_type: MetricType, histogram_max_ms: Option<u64>, allow_histogram: bool) -> Self {
         Self {
             metric_type,
             histogram: None,
             histogram_max_ms,
+            // When histogram budget is exhausted, prevent lazy allocation
+            // (backlog line 460). count/sum/min/max still tracked.
+            histogram_disabled: !allow_histogram,
             count: 0.0,
             sum: 0.0,
             min: f64::MAX,
@@ -208,10 +218,14 @@ impl MetricSet {
                 // quantized to 1 ms. Raw min/max are tracked as exact f64 so
                 // `min ≤ avg` always holds even when every sample is 0
                 // (histogram clamps 0 to its 1 μs low bound).
-                let h = self
-                    .histogram
-                    .get_or_insert_with(|| LatencyHistogram::with_max(self.histogram_max_ms));
-                h.record_ms(value.max(0.0));
+                // Backlog line 460: skip histogram allocation when budget
+                // exhausted — count/sum/min/max still tracked for thresholds.
+                if !self.histogram_disabled {
+                    let h = self
+                        .histogram
+                        .get_or_insert_with(|| LatencyHistogram::with_max(self.histogram_max_ms));
+                    h.record_ms(value.max(0.0));
+                }
                 if value < self.min {
                     self.min = value;
                 }
@@ -586,6 +600,9 @@ struct Aggregator {
     /// Cardinality cap for the series map (see [`MAX_SERIES`]). A field so
     /// tests can shrink it; production uses the const default.
     max_series: usize,
+    /// Running total of histogram bytes allocated (backlog line 460).
+    /// Capped at [`MAX_HISTOGRAM_BYTES`] to prevent unbounded memory growth.
+    histogram_bytes_used: usize,
     /// When the aggregator came to life. `build_results` reports
     /// `started.elapsed()` as `run_duration` — backlog line 45 (P0): the old
     /// hardcoded `Duration::ZERO` made every MID-RUN rate/avg threshold
@@ -632,6 +649,7 @@ impl Aggregator {
             histogram_max_ms: None,
             retain_histograms: false,
             max_series: MAX_SERIES,
+            histogram_bytes_used: 0,
             started: Instant::now(),
             merged_http_dur: None,
             merged_iter_dur: None,
@@ -728,28 +746,52 @@ impl Aggregator {
         // merged_iter_dur) are NOT tag-keyed, so they must keep recording or
         // the headline percentiles freeze while `http_reqs` keeps climbing
         // (backlog line 53).
-        // Check cardinality BEFORE entry() — entry() holds a mutable
-        // borrow that prevents reading self.data.len().
-        let at_capacity = !self.data.contains_key(&key) && self.data.len() >= self.max_series;
-        if at_capacity {
-            self.series_dropped += 1;
-            if self.series_dropped == 1 {
-                tracing::warn!(
-                    "metrics: series cardinality reached {}; dropping samples for new \
-                     series (check for a high-cardinality url/name tag)",
-                    self.max_series
-                );
+        // P-J: single hash via entry() — avoids the old contains_key + entry
+        // pattern that hashed the MetricKey twice per sample.
+        let current_len = self.data.len();
+        match self.data.entry(key) {
+            indexmap::map::Entry::Occupied(mut e) => {
+                e.get_mut().record(sample.value, &sample.sample_type);
             }
-            self.record_headline_accumulators(&sample);
-            return;
+            indexmap::map::Entry::Vacant(e) => {
+                if current_len >= self.max_series {
+                    self.series_dropped += 1;
+                    if self.series_dropped == 1 {
+                        tracing::warn!(
+                            "metrics: series cardinality reached {}; dropping \
+                             samples for new series (check for a high-cardinality \
+                             url/name tag)",
+                            self.max_series
+                        );
+                    }
+                    self.record_headline_accumulators(&sample);
+                    return;
+                }
+                // Backlog line 460: check histogram memory budget before
+                // allocating. Each histogram is ~16-64 KB; at 100k series
+                // this prevents ~6 GB of unbounded growth.
+                let allow_histogram = self.histogram_bytes_used < MAX_HISTOGRAM_BYTES;
+                if !allow_histogram
+                    && metric_type == MetricType::Trend
+                    && self.histogram_bytes_used == MAX_HISTOGRAM_BYTES
+                {
+                    // One-time log when budget is hit.
+                    self.histogram_bytes_used += 1; // sentinel: don't log again
+                    tracing::warn!(
+                        "metrics: histogram memory budget ({:.0} MB) exhausted — \
+                         new Trend series will track count/sum/min/max but \
+                         no histogram (percentiles unavailable for new series)",
+                        MAX_HISTOGRAM_BYTES as f64 / (1024.0 * 1024.0)
+                    );
+                }
+                e.insert(MetricSet::new(
+                    metric_type,
+                    self.histogram_max_ms,
+                    allow_histogram,
+                ))
+                .record(sample.value, &sample.sample_type);
+            }
         }
-
-        // Use entry() to insert in one hash when the key is new.
-        let metric_set = self
-            .data
-            .entry(key)
-            .or_insert_with(|| MetricSet::new(metric_type, self.histogram_max_ms));
-        metric_set.record(sample.value, &sample.sample_type);
 
         // Maintain the incremental merged accumulators (headline http_req_
         // duration / iteration_duration, per-URL, per-group) on EVERY sample
@@ -768,7 +810,7 @@ impl Aggregator {
             if let Some(url) = sample.tags.get("url").or_else(|| sample.tags.get("name")) {
                 self.merged_per_url
                     .entry(url.to_string())
-                    .or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                    .or_insert_with(|| MetricSet::new(MetricType::Trend, hmax, true))
                     .record(sample.value, &sample.sample_type);
             }
         }
@@ -781,7 +823,7 @@ impl Aggregator {
                 .merged_per_group
                 .entry((sample.metric.to_string(), group.to_string()));
             entry
-                .or_insert_with(|| MetricSet::new(metric_type, hmax))
+                .or_insert_with(|| MetricSet::new(metric_type, hmax, true))
                 .record(sample.value, &sample.sample_type);
         }
     }
@@ -796,11 +838,11 @@ impl Aggregator {
         let hmax = self.histogram_max_ms;
         if sample.metric.as_ref() == "http_req_duration" {
             self.merged_http_dur
-                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax, true))
                 .record(sample.value, &sample.sample_type);
         } else if sample.metric.as_ref() == "iteration_duration" {
             self.merged_iter_dur
-                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax, true))
                 .record(sample.value, &sample.sample_type);
         }
     }
@@ -1158,6 +1200,8 @@ impl Aggregator {
             data_sent,
             errors,
             series_dropped: self.series_dropped,
+            output_samples_dropped: crate::OUTPUT_SAMPLES_DROPPED
+                .load(std::sync::atomic::Ordering::Relaxed),
             dropped_iterations: self
                 .totals
                 .get("dropped_iterations")
@@ -1175,7 +1219,7 @@ impl Aggregator {
             // healthy runs (the engine stamps the final value post-run).
             run_duration: self.started.elapsed(),
             summary_trend_stats: self.summary_trend_stats.clone(),
-            effective_thresholds: self.effective_thresholds.clone(),            output_samples_dropped: super::OUTPUT_SAMPLES_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+            effective_thresholds: self.effective_thresholds.clone(),
         }
     }
 
@@ -1289,6 +1333,7 @@ impl Aggregator {
                         metric_type: s.metric_type,
                         histogram,
                         histogram_max_ms: self.histogram_max_ms,
+                        histogram_disabled: false,
                         count: s.count,
                         sum: s.sum,
                         min: s.min,
@@ -1308,10 +1353,10 @@ impl Aggregator {
         if self.effective_thresholds.is_empty() && !snap.thresholds.is_empty() {
             self.effective_thresholds = snap.thresholds.clone();
         }
-        // Series arrive pre-aggregated here (not through `record()`), so the
-        // incremental merged accumulators must be rebuilt from `self.data` to
-        // keep `build_results`' pre-merged headlines correct.
-        self.rebuild_merged();
+        // NOTE: rebuild_merged() is NOT called here — it is hoisted out of
+        // absorb_snapshot and called once after all snapshots are absorbed
+        // in merge_snapshots (line 338 optimization). Calling it per-snapshot
+        // wasted ~25s CPU and ~30GB churn at 50 agents × 100k series.
         Ok(())
     }
 
@@ -1334,7 +1379,7 @@ impl Aggregator {
             if key.metric.as_ref() == "http_req_duration" {
                 let merged = self
                     .merged_http_dur
-                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
+                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax, true));
                 merged.merge_from(set);
                 if let Some(url) = key
                     .tags
@@ -1345,13 +1390,13 @@ impl Aggregator {
                 {
                     self.merged_per_url
                         .entry(url.to_string())
-                        .or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                        .or_insert_with(|| MetricSet::new(MetricType::Trend, hmax, true))
                         .merge_from(set);
                 }
             } else if key.metric.as_ref() == "iteration_duration" {
                 let merged = self
                     .merged_iter_dur
-                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
+                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax, true));
                 merged.merge_from(set);
             } else if key.metric.as_ref() == "http_req_failed" {
                 self.http_req_failed_requests += set.count as u64;
@@ -1360,7 +1405,7 @@ impl Aggregator {
             if let Some(group) = key.tags.iter().find(|(k, _)| k.as_ref() == "group") {
                 self.merged_per_group
                     .entry((key.metric.to_string(), group.1.as_ref().to_string()))
-                    .or_insert_with(|| MetricSet::new(set.metric_type, hmax))
+                    .or_insert_with(|| MetricSet::new(set.metric_type, hmax, true))
                     .merge_from(set);
             }
         }
@@ -1442,6 +1487,9 @@ pub fn merge_snapshots(
     for snap in &snapshots {
         agg.absorb_snapshot(snap)?;
     }
+    // P-D (line 338): rebuild merged accumulators once after all snapshots
+    // are absorbed, instead of per-snapshot inside absorb_snapshot.
+    agg.rebuild_merged();
     let mut result = agg.build_results();
     // W0 P0#2: the fresh Aggregator's `started` is the merge instant, so
     // build_results stamps run_duration = merge time. Override with the
@@ -1566,6 +1614,9 @@ pub struct MetricsResult {
     /// (backlog line 53: previously counted and read nowhere — now surfaced
     /// so reporters can warn on truncated per-URL stats).
     pub series_dropped: u64,
+    /// Samples dropped by streaming output consumers due to broadcast lag
+    /// (P0: backlog line 332). Surfaced so reporters warn on data loss.
+    pub output_samples_dropped: u64,
     /// Iterations dropped because the VU pool was saturated (arrival-rate mode).
     pub dropped_iterations: u64,
     /// HTTP request failure rate (0.0 - 1.0).
@@ -1586,10 +1637,6 @@ pub struct MetricsResult {
     /// Reporters evaluate and display pass/fail against this set.
     pub effective_thresholds:
         std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
-    /// Samples dropped by output consumer lag (broadcast channel overflow).
-    /// Incremented in each output's `Lagged` handler; surfaced here so the
-    /// summary can warn operators about invisible data loss.
-    pub output_samples_dropped: u64,
 }
 
 impl Default for MetricsResult {
@@ -1608,6 +1655,7 @@ impl Default for MetricsResult {
             data_sent: 0.0,
             errors: 0,
             series_dropped: 0,
+            output_samples_dropped: 0,
             dropped_iterations: 0,
             http_req_failed: 0.0,
             iterations: 0,
@@ -1615,7 +1663,6 @@ impl Default for MetricsResult {
             run_duration: Duration::ZERO,
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),
-            output_samples_dropped: 0,
         }
     }
 }
@@ -2004,7 +2051,7 @@ mod tests {
         // Pooled keep-alive reuse makes sub-timings (blocked/dns/connecting)
         // 0 for most requests, so percentiles were computed over a smaller
         // biased population → `min > avg` (arithmetically impossible).
-        let mut set = MetricSet::new(MetricType::Trend, None);
+        let mut set = MetricSet::new(MetricType::Trend, None, true);
         let trend = SampleType::Trend;
 
         // Simulate 10 k requests where only 10 actually connected (~25 ms):
@@ -2048,7 +2095,7 @@ mod tests {
         // Counter arm (count+=1, sum+=1000, no histogram, no min/max) →
         // avg > max and p95 from a partial population. The set's
         // metric_type is authoritative.
-        let mut set = MetricSet::new(MetricType::Trend, None);
+        let mut set = MetricSet::new(MetricType::Trend, None, true);
         let trend = SampleType::Trend;
         let counter = SampleType::Counter;
         set.record(10.0, &trend);
@@ -2074,7 +2121,7 @@ mod tests {
         // used to report min=1 max=1 med=1 p(95)=1 (integer-ms floor) while
         // avg=0.34 — impossible, and `p(95) < 1` could never pass. Sub-ms
         // samples must land in their true µs bucket and surface as f64 ms.
-        let mut set = MetricSet::new(MetricType::Trend, None);
+        let mut set = MetricSet::new(MetricType::Trend, None, true);
         let trend = SampleType::Trend;
         for _ in 0..1000 {
             set.record(0.3, &trend); // 300 µs
@@ -2112,7 +2159,7 @@ mod tests {
         // `myTrend.add(0.25)` (ms) recorded 0 µs → p(95)=0, max=0 while
         // avg stayed meaningful. Values ≥ 0.5 µs must round into the
         // histogram instead of vanishing.
-        let mut set = MetricSet::new(MetricType::Trend, None);
+        let mut set = MetricSet::new(MetricType::Trend, None, true);
         let trend = SampleType::Trend;
 
         set.record(0.25, &trend); // truncation would drop this to 0
@@ -2141,7 +2188,7 @@ mod tests {
         // 1 µs (= 0.001 ms) hdrhistogram floor, count fully populated. The
         // RAW min/max tracking (backlog line 57) keeps `min ≤ avg` true even
         // though the histogram's own min is 0.001 ms.
-        let mut set = MetricSet::new(MetricType::Trend, None);
+        let mut set = MetricSet::new(MetricType::Trend, None, true);
         let trend = SampleType::Trend;
         for _ in 0..100 {
             set.record(0.0, &trend);
@@ -2850,28 +2897,28 @@ mod tests {
         // Regression (backlog line 110): every series allocated a ~16 KB
         // LatencyHistogram regardless of type. Counter/Rate/Gauge series must
         // keep `histogram: None` — only Trend records allocate.
-        let mut counter = MetricSet::new(MetricType::Counter, None);
+        let mut counter = MetricSet::new(MetricType::Counter, None, true);
         counter.record(5.0, &SampleType::Counter);
         assert!(
             counter.histogram.is_none(),
             "Counter must not allocate a histogram"
         );
 
-        let mut rate = MetricSet::new(MetricType::Rate, None);
+        let mut rate = MetricSet::new(MetricType::Rate, None, true);
         rate.record(1.0, &SampleType::Rate);
         assert!(
             rate.histogram.is_none(),
             "Rate must not allocate a histogram"
         );
 
-        let mut gauge = MetricSet::new(MetricType::Gauge, None);
+        let mut gauge = MetricSet::new(MetricType::Gauge, None, true);
         gauge.record(3.0, &SampleType::Point);
         assert!(
             gauge.histogram.is_none(),
             "Gauge must not allocate a histogram"
         );
 
-        let mut trend = MetricSet::new(MetricType::Trend, None);
+        let mut trend = MetricSet::new(MetricType::Trend, None, true);
         trend.record(1.5, &SampleType::Trend);
         assert!(
             trend.histogram.is_some(),

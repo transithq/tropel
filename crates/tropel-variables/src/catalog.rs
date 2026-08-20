@@ -252,6 +252,13 @@ impl DynamicCatalog {
         if !s.contains('$') {
             return s.to_string();
         }
+        // Second fast path: a bare `$` without `{{` cannot be a dynamic
+        // variable (all Postman dynamic vars use `{{$...}}` syntax), so
+        // skip the 44 marker scans. Common in URLs with prices, JSONPath
+        // refs, and Stripe/GitHub-style query params.
+        if !s.contains("{{") {
+            return s.to_string();
+        }
         let mut result = s.to_string();
         let mut rng = rand::rng();
 

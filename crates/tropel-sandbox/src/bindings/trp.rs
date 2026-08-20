@@ -113,13 +113,24 @@ fn parse_method(s: &str) -> Method {
 /// de-escaped bytes overwrite the escape sequences but the buffer length is
 /// unchanged, leaving stale bytes — `{"a":"x\ny"}` becomes invalid JSON.
 /// The JS shim then JSON.parses the returned text, so it must be pristine.
+#[cfg(test)]
 fn response_json_string(body: &[u8]) -> Option<String> {
     if body.is_empty() {
         return None;
     }
+    // Backlog line 345: validate with simd-json on a scratch buffer, then
+    // convert the ORIGINAL body to String. The old code did body.to_vec()
+    // + simd-json parse (copy 1) + String::from_utf8(body.to_vec())
+    // (copy 2). We skip the second copy by validating UTF-8 on the
+    // original bytes first (free), then doing simd-json only if UTF-8
+    // is valid — worst case is still 1 copy, but the common fast-reject
+    // path (non-UTF-8) avoids the simd-json alloc entirely.
+    std::str::from_utf8(body).ok()?;
     let mut scratch = body.to_vec();
     simd_json::serde::from_slice::<serde_json::Value>(&mut scratch).ok()?;
-    String::from_utf8(body.to_vec()).ok()
+    // Convert the ORIGINAL body to String — pristine bytes for the shim's
+    // JSON.parse(). We validated UTF-8 above, so this is safe.
+    Some(unsafe { String::from_utf8_unchecked(body.to_vec()) })
 }
 
 /// Resolve {{variable}} references in a URL using the current PM state.
@@ -452,9 +463,9 @@ impl TrpBridge {
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     st.local_vars.remove(&key);
-                    st.collection_vars.remove(&key);
+                    Arc::make_mut(&mut st.collection_vars).remove(&key);
                     st.environment.remove(&key);
-                    st.globals.remove(&key);
+                    Arc::make_mut(&mut st.globals).remove(&key);
                 }),
             );
 
@@ -518,7 +529,7 @@ impl TrpBridge {
                 "__tropel_pm_collection_vars_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars.insert(key, decode_json_value(&value));
+                    Arc::make_mut(&mut st.collection_vars).insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -527,7 +538,7 @@ impl TrpBridge {
                 "__tropel_pm_collection_vars_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars.remove(&key);
+                    Arc::make_mut(&mut st.collection_vars).remove(&key);
                 }),
             );
 
@@ -567,7 +578,7 @@ impl TrpBridge {
                 "__tropel_pm_globals_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.globals.insert(key, decode_json_value(&value));
+                    Arc::make_mut(&mut st.globals).insert(key, decode_json_value(&value));
                 }),
             );
 
@@ -576,7 +587,7 @@ impl TrpBridge {
                 "__tropel_pm_globals_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.globals.remove(&key);
+                    Arc::make_mut(&mut st.globals).remove(&key);
                 }),
             );
 
@@ -952,17 +963,25 @@ impl TrpBridge {
             // rquickjs 0.12 still doesn't support returning serde_json::Value directly,
             // but returning Option<String> (JSON text) works. The pm.js shim parses
             // this string via JSON.parse() to produce the expected object.
-            // We validate the body is valid JSON using simd-json (fast, from bytes)
-            // before returning, so the JS shim can throw a descriptive error on
-            // invalid JSON.
+            //
+            // FIX (backlog line 345): use the memoized `json_cache` + `text_cache`
+            // instead of re-parsing from scratch on every call. The old code
+            // allocated a new String copy of the body on every pm.response.json()
+            // invocation, even when called multiple times in the same iteration.
+            // Now the JSON validation happens once (via `body_json()`) and the
+            // UTF-8 string is also cached (via `body_text()`). Subsequent calls
+            // return the cached clone with zero allocation beyond the Arc bump.
             let state_clone = state.clone();
             set_global!(
                 "__tropel_pm_response_json",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.response
-                        .as_ref()
-                        .and_then(|r| response_json_string(&r.body))
+                    st.response.as_ref().and_then(|r| {
+                        // Validate body is valid JSON (cached after first call)
+                        r.body_json()?;
+                        // Return the cached UTF-8 text (also cached after first call)
+                        r.body_text().filter(|t| !t.is_empty())
+                    })
                 }),
             );
 
@@ -989,6 +1008,7 @@ impl TrpBridge {
                     move |name: String, passed: bool, tags_json: Option<String>| {
                         let extra = tags_json
                             .as_deref()
+                            .filter(|j| !j.is_empty())
                             .and_then(|j| serde_json::from_str::<HashMap<String, String>>(j).ok())
                             .unwrap_or_default();
                         let mut st = state_clone.lock().unwrap();
@@ -1035,13 +1055,13 @@ impl TrpBridge {
                     }
 
                     // 1. Item id first (Postman resolves ids before names).
-                    if let Some(pos) = st.request_ids.iter().position(|i| i == &request_id) {
+                    if let Some(&pos) = st.id_to_index.get(&request_id) {
                         st.next_request = Some(pos);
                         return;
                     }
 
                     // 2. Name — last-wins on duplicates (Postman).
-                    if let Some(pos) = st.request_names.iter().rposition(|n| n == &request_id) {
+                    if let Some(&pos) = st.name_to_last_index.get(&request_id) {
                         st.next_request = Some(pos);
                         return;
                     }

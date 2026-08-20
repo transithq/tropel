@@ -251,7 +251,9 @@ impl InputAdapter for BruInputAdapter {
 
         let items = build_items(&col.items);
         if items.is_empty() {
-            return Err(TropelError::Parse("Bruno collection contains no HTTP requests".into()));
+            return Err(TropelError::Parse(
+                "Bruno collection contains no HTTP requests".into(),
+            ));
         }
 
         let variables: HashMap<String, serde_json::Value> = col
@@ -341,7 +343,11 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
             .iter()
             .filter(|p| p.enabled.unwrap_or(true))
             .filter(|p| p.param_type.as_deref() == Some("query"))
-            .filter_map(|p| p.name.clone().map(|n| (n, p.value.clone().unwrap_or_default()))),
+            .filter_map(|p| {
+                p.name
+                    .clone()
+                    .map(|n| (n, p.value.clone().unwrap_or_default()))
+            }),
     );
 
     let body = request.body.as_ref().and_then(build_body);
@@ -363,7 +369,10 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
         .unwrap_or_default();
 
     Ok(ScenarioItem {
-        name: item.name.clone().unwrap_or_else(|| format!("{} {}", method.as_str(), request.url)),
+        name: item
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{} {}", method.as_str(), request.url)),
         id: None,
         request: Some(Request {
             url: request.url.clone(),
@@ -388,19 +397,47 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
 fn build_auth(a: &BruAuth) -> Option<AuthConfig> {
     match a.mode.as_deref().unwrap_or("") {
         "basic" => Some(AuthConfig::Basic {
-            username: a.basic.as_ref().and_then(|b| b.username.clone()).unwrap_or_default(),
-            password: a.basic.as_ref().and_then(|b| b.password.clone()).unwrap_or_default(),
+            username: a
+                .basic
+                .as_ref()
+                .and_then(|b| b.username.clone())
+                .unwrap_or_default(),
+            password: a
+                .basic
+                .as_ref()
+                .and_then(|b| b.password.clone())
+                .unwrap_or_default(),
         }),
         "bearer" => Some(AuthConfig::Bearer {
-            token: a.bearer.as_ref().and_then(|b| b.token.clone()).unwrap_or_default(),
+            token: a
+                .bearer
+                .as_ref()
+                .and_then(|b| b.token.clone())
+                .unwrap_or_default(),
         }),
         "digest" => Some(AuthConfig::Digest {
-            username: a.digest.as_ref().and_then(|d| d.username.clone()).unwrap_or_default(),
-            password: a.digest.as_ref().and_then(|d| d.password.clone()).unwrap_or_default(),
+            username: a
+                .digest
+                .as_ref()
+                .and_then(|d| d.username.clone())
+                .unwrap_or_default(),
+            password: a
+                .digest
+                .as_ref()
+                .and_then(|d| d.password.clone())
+                .unwrap_or_default(),
         }),
         "wsse" => Some(AuthConfig::Basic {
-            username: a.wsse.as_ref().and_then(|w| w.username.clone()).unwrap_or_default(),
-            password: a.wsse.as_ref().and_then(|w| w.password.clone()).unwrap_or_default(),
+            username: a
+                .wsse
+                .as_ref()
+                .and_then(|w| w.username.clone())
+                .unwrap_or_default(),
+            password: a
+                .wsse
+                .as_ref()
+                .and_then(|w| w.password.clone())
+                .unwrap_or_default(),
         }),
         // Bruno "apikey" → KnockPort apikey (header or queryparams).
         "apikey" => {
@@ -409,8 +446,16 @@ fn build_auth(a: &BruAuth) -> Option<AuthConfig> {
                 _ => ApiKeyLocation::Header,
             };
             Some(AuthConfig::ApiKey {
-                key: a.apikey.as_ref().and_then(|k| k.key.clone()).unwrap_or_default(),
-                value: a.apikey.as_ref().and_then(|k| k.value.clone()).unwrap_or_default(),
+                key: a
+                    .apikey
+                    .as_ref()
+                    .and_then(|k| k.key.clone())
+                    .unwrap_or_default(),
+                value: a
+                    .apikey
+                    .as_ref()
+                    .and_then(|k| k.value.clone())
+                    .unwrap_or_default(),
                 location,
             })
         }
@@ -468,11 +513,7 @@ fn build_body(b: &BruBody) -> Option<Body> {
                     let is_file = p.part_type.as_deref() == Some("file");
                     FormDataPart {
                         name: p.name.clone().unwrap_or_default(),
-                        value: if is_file {
-                            None
-                        } else {
-                            p.value.clone()
-                        },
+                        value: if is_file { None } else { p.value.clone() },
                         filename: if is_file { p.value.clone() } else { None },
                         mime: p.content_type.clone(),
                         data: None,
@@ -587,7 +628,10 @@ mod tests {
         assert_eq!(req.method, Method::GET);
         assert_eq!(req.url, "https://api.example.com/users");
         assert_eq!(req.query_params.get("limit"), Some(&"10".to_string()));
-        assert_eq!(folder.items[0].prerequest, vec!["pm.variables.set('a', 1);".to_string()]);
+        assert_eq!(
+            folder.items[0].prerequest,
+            vec!["pm.variables.set('a', 1);".to_string()]
+        );
         assert_eq!(
             folder.items[0].test,
             vec!["pm.test('ok', () => pm.response.to.be.ok);".to_string()]
@@ -625,9 +669,11 @@ mod tests {
         let req = scenario.items[0].request.as_ref().unwrap();
         assert!(req.headers.iter().all(|(k, _)| k != "A"));
         assert!(req.headers.iter().any(|(k, _)| k == "B"));
-        assert!(req.query_params.get("q").is_none());
+        assert!(!req.query_params.contains_key("q"));
         assert_eq!(req.query_params.get("p"), Some(&"2".to_string()));
-        assert!(matches!(req.auth, Some(AuthConfig::Basic { ref username, .. }) if username == "u"));
+        assert!(
+            matches!(req.auth, Some(AuthConfig::Basic { ref username, .. }) if username == "u")
+        );
     }
 
     #[test]

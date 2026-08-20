@@ -77,6 +77,9 @@ pub struct InfluxdbOutput {
     total_buffered: AtomicUsize,
     /// Tag forwarding policy (allowlist + cardinality cap).
     tag_policy: TagPolicy,
+    /// Reused HTTP client — created once, not per-flush.
+    /// Only `Some` when `target` is `InfluxTarget::Http`.
+    http_client: Option<reqwest::Client>,
 }
 
 impl InfluxdbOutput {
@@ -100,11 +103,17 @@ impl InfluxdbOutput {
                 })?;
             InfluxTarget::Udp(sock)
         };
+        let http_client = if matches!(target, InfluxTarget::Http { .. }) {
+            Some(reqwest::Client::new())
+        } else {
+            None
+        };
         Ok(Self {
             target,
             buffer: Mutex::new(Vec::new()),
             total_buffered: AtomicUsize::new(0),
             tag_policy: TagPolicy::default(),
+            http_client,
         })
     }
 
@@ -144,7 +153,7 @@ impl InfluxdbOutput {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            crate::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!("influxdb dropped {n} samples (consumer lag)");
                         }
                     },
@@ -165,15 +174,24 @@ impl InfluxdbOutput {
     }
 
     /// Escape a line-protocol component per InfluxDB rules.
-    fn escape(s: &str, in_quotes: bool) -> String {
+    fn escape(s: &str, in_quotes: bool) -> std::borrow::Cow<'_, str> {
+        // Backlog line 339: return Cow::Borrowed when no characters need
+        // escaping, avoiding a String allocation on the hot path.
+        let needs_escape = s.chars().any(|c| {
+            matches!(c, ' ' | ',' | '=' if !in_quotes)
+                || (in_quotes && c == '"')
+                || c == '\\'
+                || matches!(c, '\n' | '\r' | '\t')
+        });
+        if !needs_escape {
+            return std::borrow::Cow::Borrowed(s);
+        }
         let mut out = String::with_capacity(s.len());
         for c in s.chars() {
             match c {
                 ' ' | ',' | '=' if !in_quotes => out.push('\\'),
                 '"' if in_quotes => out.push('\\'),
                 '\\' => out.push('\\'),
-                // Newlines/tabs in tag values inject extra lines into the
-                // line protocol, causing silent metric corruption.
                 '\n' | '\r' | '\t' => {
                     out.push('\\');
                     let esc = match c {
@@ -189,7 +207,7 @@ impl InfluxdbOutput {
             }
             out.push(c);
         }
-        out
+        std::borrow::Cow::Owned(out)
     }
 
     /// Encode a sample as one line-protocol line and buffer it. HTTP
@@ -198,7 +216,8 @@ impl InfluxdbOutput {
     fn buffer(&self, sample: &Sample) {
         // measurement[,tag=val,...] field=value — no stray space between
         // the measurement and the tag set (line protocol is strict).
-        let mut line = Self::escape(&sample.metric, false);
+        let escaped_metric = Self::escape(&sample.metric, false);
+        let mut line = escaped_metric.into_owned();
         let tags = self.tag_policy.apply(&sample.tags);
         if !tags.is_empty() {
             let tag_list: Vec<String> = tags
@@ -275,7 +294,10 @@ impl InfluxdbOutput {
                 user,
                 password,
             } => {
-                let client = reqwest::Client::new();
+                let client = self
+                    .http_client
+                    .as_ref()
+                    .expect("http_client must be Some for HTTP target");
                 let (url, builder) = if let (Some(org), Some(bucket)) = (org, bucket) {
                     // v2 write endpoint.
                     let url = format!("{base}/api/v2/write?org={org}&bucket={bucket}&precision=ns");

@@ -109,7 +109,7 @@ impl StatsdOutput {
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            crate::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!("statsd dropped {n} samples (consumer lag)");
                         }
                     },
@@ -208,20 +208,25 @@ impl StatsdOutput {
 /// sample-rate delimiter (`|@0.5`) — we never emit sample rate, but a
 /// literal `@` in a name/value would be misread by a DogStatsD agent as a
 /// rate marker.
-fn sanitize_component(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if matches!(c, ':' | '|' | ',' | '#' | '@') {
-                '_'
-            } else if c.is_control() {
-                // Newlines/tabs/control chars in tag values inject extra
-                // lines into the UDP datagram, causing metric corruption.
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect()
+fn sanitize_component(s: &str) -> std::borrow::Cow<'_, str> {
+    // Backlog line 339: return Cow::Borrowed when no characters need
+    // replacement, avoiding a String allocation on the hot path.
+    if s.chars()
+        .all(|c| !matches!(c, ':' | '|' | ',' | '#' | '@') && !c.is_control())
+    {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if matches!(c, ':' | '|' | ',' | '#' | '@') || c.is_control() {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
 }
 
 #[async_trait]

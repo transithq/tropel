@@ -31,12 +31,13 @@
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tropel_sdk::{
-    Body, Protocol, ProtocolOutcome, ProtocolRegistration, Request, Response, Result, Sample,
-    SampleType, TagMap, TropelError,
+    tag_keys, Body, Protocol, ProtocolOutcome, ProtocolRegistration, Request, Response, Result,
+    Sample, SampleType, TagMap, TropelError,
 };
 
 /// Default time to wait for responses after sending messages.
@@ -205,8 +206,8 @@ impl Protocol for WebSocketProtocol {
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect(),
             body: body.clone(),
-            text_cache: std::cell::OnceCell::new(),
-            json_cache: std::cell::OnceCell::new(),
+            text_cache: std::sync::OnceLock::new(),
+            json_cache: std::sync::OnceLock::new(),
             response_time: duration,
             timings: None,
             cookies: vec![],
@@ -218,11 +219,11 @@ impl Protocol for WebSocketProtocol {
         // ── Metrics ──
         let now = std::time::SystemTime::now();
         let mut tags = TagMap::with_capacity(5);
-        tags.insert("url", req.url.clone());
-        tags.insert("method", "GET");
-        tags.insert("status", session_status.to_string());
-        tags.insert("name", req.url.clone());
-        tags.insert("group", "ws");
+        tags.insert(Arc::clone(&tag_keys::URL), req.url.clone());
+        tags.insert(Arc::clone(&tag_keys::METHOD), "GET");
+        tags.insert(Arc::clone(&tag_keys::STATUS), session_status.to_string());
+        tags.insert(Arc::clone(&tag_keys::NAME), req.url.clone());
+        tags.insert(Arc::clone(&tag_keys::GROUP), "ws");
         let tags = std::sync::Arc::new(tags);
 
         let samples = vec![

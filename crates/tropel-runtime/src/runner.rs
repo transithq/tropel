@@ -10,7 +10,7 @@ use tropel_sandbox::state::{PmState, SharedPmState};
 use tropel_sdk::config::ExpectedStatus;
 use tropel_sdk::scenario::{Scenario, ScenarioItem};
 use tropel_sdk::traits::{DriverHttpClient, Protocol};
-use tropel_sdk::types::{Sample, SampleType, TagMap};
+use tropel_sdk::types::{tag_keys, Sample, SampleType, TagMap};
 use tropel_sdk::Result;
 
 /// Result of running a VU iteration.
@@ -119,7 +119,7 @@ impl ScenarioRunner {
             // scenario.variables) so `{{var}}` references in URLs, headers,
             // and bodies resolve. CLI env vars were already merged into
             // scenario.variables by the engine before this point.
-            state.collection_vars.extend(scenario.variables.clone());
+            Arc::make_mut(&mut state.collection_vars).extend(scenario.variables.clone());
         }
         Self {
             scenario,
@@ -165,7 +165,9 @@ impl ScenarioRunner {
 
     /// Set expected status codes/ranges for http_req_failed evaluation.
     pub fn with_expected_statuses(mut self, expected: Vec<ExpectedStatus>) -> Self {
-        self.expected_statuses = expected;
+        // Backlog line 353: pre-parse Range strings into bounds so
+        // matches() avoids re-parsing on every HTTP response.
+        self.expected_statuses = expected.iter().map(|e| e.pre_parse()).collect();
         self
     }
 
@@ -226,12 +228,15 @@ impl ScenarioRunner {
             // iteration ran exactly one request. Jumps are per-iteration in
             // Postman; clear any stale pending jump at iteration start.
             state.next_request = None;
+            // Newman scopes pm.variables per request — clear accumulated
+            // local_vars from the previous iteration so they don't grow
+            // monotonically (backlog line 353).
+            state.local_vars.clear();
         }
 
         // Walk through the flattened execution list (folders descended).
 
-        // Build variable scope for this iteration
-        let _scope = self.build_scope(data_row.clone(), env_vars);
+        // Variable scope is built per-item below (line 334).
         let resolver = tropel_variables::VariableResolver::new();
 
         // Walk through the flattened execution list in order
@@ -569,13 +574,22 @@ impl ScenarioRunner {
                                     .iter()
                                     .chain(std::iter::once(&http_response));
                                 for resp in chain {
-                                    // Build tags for all request-level metrics
+                                    // Build tags for all request-level metrics.
+                                    // Use static interned keys (tropel_sdk::types::tag_keys)
+                                    // to avoid re-allocating Arc<str> from &str literals
+                                    // on every hop (backlog line 352).
                                     let mut tags = TagMap::with_capacity(5);
-                                    tags.insert("url", resp.url.clone());
-                                    tags.insert("method", resolved_req.method.to_string());
-                                    tags.insert("status", resp.status_code.to_string());
-                                    tags.insert("name", resp.url.clone());
-                                    tags.insert("group", "http");
+                                    tags.insert(Arc::clone(&tag_keys::URL), resp.url.clone());
+                                    tags.insert(
+                                        Arc::clone(&tag_keys::METHOD),
+                                        resolved_req.method.to_string(),
+                                    );
+                                    tags.insert(
+                                        Arc::clone(&tag_keys::STATUS),
+                                        resp.status_code.to_string(),
+                                    );
+                                    tags.insert(Arc::clone(&tag_keys::NAME), resp.url.clone());
+                                    tags.insert(Arc::clone(&tag_keys::GROUP), "http");
                                     // Share one Arc so all ~12 per-request samples bump a
                                     // refcount instead of copying the whole map.
                                     let tags = Arc::new(tags);
@@ -646,12 +660,13 @@ impl ScenarioRunner {
                                     // reuse no connector call happens, so
                                     // blocked/dns/connecting are 0.
                                     if let Some(timings) = &resp.timings {
+                                        // Backlog line 459: omit tls_handshaking and sending
+                                        // — always zero (folded into connecting/waiting by
+                                        // reqwest). Saves 2 MetricKey builds per request.
                                         let sub_timing_metrics = [
                                             ("http_req_blocked", timings.blocked),
                                             ("http_req_dns", timings.dns),
                                             ("http_req_connecting", timings.connecting),
-                                            ("http_req_tls_handshaking", timings.tls_handshaking),
-                                            ("http_req_sending", timings.sending),
                                             ("http_req_waiting", timings.waiting),
                                             ("http_req_receiving", timings.receiving),
                                         ];
@@ -823,8 +838,8 @@ impl ScenarioRunner {
             local: state.local_vars.clone(),
             data,
             env,
-            collection: state.collection_vars.clone(),
-            globals: state.globals.clone(),
+            collection: Arc::clone(&state.collection_vars),
+            globals: Arc::clone(&state.globals),
         }
     }
 
@@ -1118,7 +1133,8 @@ mod tests {
         ) -> Result<tropel_sdk::types::Response> {
             let signer = req.auth.as_ref().and_then(|a| self.0.get_signer(a));
             let resp = self.0.execute(req, signer.as_deref()).await?;
-            Ok(tropel_sdk::types::Response::from(&resp))
+            // Backlog line 312: use by-value conversion to avoid 16 clones.
+            Ok(tropel_sdk::types::Response::from(resp))
         }
     }
 
@@ -2156,8 +2172,8 @@ mod tests {
                     status_text: "OK".into(),
                     headers: HashMap::new(),
                     body: br#"{"id":1}"#.to_vec(),
-                    text_cache: std::cell::OnceCell::new(),
-                    json_cache: std::cell::OnceCell::new(),
+                    text_cache: std::sync::OnceLock::new(),
+                    json_cache: std::sync::OnceLock::new(),
                     response_time: Duration::from_millis(1),
                     timings: None,
                     cookies: vec![],

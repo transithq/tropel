@@ -38,6 +38,12 @@ pub struct TagPolicy {
 impl TagPolicy {
     /// Apply the policy to a sample's tags: allowlist first, then the cap.
     pub fn apply(&self, tags: &TagMap) -> TagMap {
+        // P-D (line 334): when the policy is a no-op (empty allowlist, no cap),
+        // clone the original TagMap instead of copying each entry. Clone only
+        // bumps Arc refcounts (~10 allocs→0 allocs per sample per output).
+        if self.allowlist.is_empty() && self.max_tags.is_none() {
+            return tags.clone();
+        }
         let mut out = TagMap::new();
         if self.allowlist.is_empty() {
             for (k, v) in tags.iter() {
@@ -139,8 +145,8 @@ impl StreamingStdoutOutput {
                         Ok(sample) => state.record(&sample),
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            crate::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!("Streaming output dropped {} samples (consumer lag)", n);
+                            tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!("extension output dropped {n} samples (consumer lag)");
                         }
                     },
                     _ = ticker.tick() => {

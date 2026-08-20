@@ -1,6 +1,7 @@
 use crate::catalog::DynamicCatalog;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Variable scope.
 #[derive(Debug, Clone, Default)]
@@ -12,10 +13,11 @@ pub struct VariableScope {
     pub data: HashMap<String, serde_json::Value>,
     /// Environment variables.
     pub env: HashMap<String, String>,
-    /// Collection variables.
-    pub collection: HashMap<String, serde_json::Value>,
-    /// Global variables.
-    pub globals: HashMap<String, serde_json::Value>,
+    /// Collection variables (backlog line 346: wrapped in Arc to avoid
+    /// deep-cloning the entire HashMap on every build_scope call).
+    pub collection: Arc<HashMap<String, serde_json::Value>>,
+    /// Global variables (same Arc optimization).
+    pub globals: Arc<HashMap<String, serde_json::Value>>,
 }
 
 /// The `{{var}}` placeholder regex, compiled ONCE per process. `VariableResolver`
@@ -85,7 +87,7 @@ impl VariableResolver {
     /// stays literal `{{name}}` in every mode.
     fn resolve_with(&self, input: &str, scope: &VariableScope, mode: EscapeMode) -> String {
         if !input.contains("{{") {
-            return input.to_string();
+            return input.to_owned();
         }
 
         // First resolve dynamic variables ({{$xxx}})
@@ -129,7 +131,9 @@ impl VariableResolver {
             }
         });
 
-        result.to_string()
+        // Backlog line 349: .to_string() on Cow::Owned allocates a fresh
+        // String + memcpy; .into_owned() is free for Cow::Owned.
+        result.into_owned()
     }
 
     /// Resolve a single variable name against the scope.
@@ -204,6 +208,11 @@ impl VariableResolver {
         max_passes: usize,
         mode: EscapeMode,
     ) -> String {
+        // Fast path: no {{ means no variable reference — return unchanged
+        // without allocating.
+        if !input.contains("{{") {
+            return input.to_string();
+        }
         let mut result = input.to_string();
         for _ in 0..max_passes {
             if !result.contains("{{") {
@@ -335,14 +344,14 @@ mod tests {
             local: HashMap::new(),
             data: HashMap::from([("key".into(), serde_json::Value::String("data-value".into()))]),
             env: HashMap::from([("key".into(), "env-value".into())]),
-            collection: HashMap::from([(
+            collection: Arc::new(HashMap::from([(
                 "key".into(),
                 serde_json::Value::String("col-value".into()),
-            )]),
-            globals: HashMap::from([(
+            )])),
+            globals: Arc::new(HashMap::from([(
                 "key".into(),
                 serde_json::Value::String("global-value".into()),
-            )]),
+            )])),
         };
 
         // Data takes priority
@@ -360,8 +369,14 @@ mod tests {
             local: HashMap::from([("key".into(), serde_json::Value::String("local".into()))]),
             data: HashMap::from([("key".into(), serde_json::Value::String("data".into()))]),
             env: HashMap::from([("key".into(), "env".into())]),
-            collection: HashMap::from([("key".into(), serde_json::Value::String("col".into()))]),
-            globals: HashMap::from([("key".into(), serde_json::Value::String("global".into()))]),
+            collection: Arc::new(HashMap::from([(
+                "key".into(),
+                serde_json::Value::String("col".into()),
+            )])),
+            globals: Arc::new(HashMap::from([(
+                "key".into(),
+                serde_json::Value::String("global".into()),
+            )])),
         };
         assert_eq!(resolver.resolve("{{key}}", &scope), "local");
     }
@@ -410,14 +425,14 @@ mod tests {
     fn test_collection_then_globals_priority() {
         let resolver = VariableResolver::new();
         let scope = VariableScope {
-            collection: HashMap::from([(
+            collection: Arc::new(HashMap::from([(
                 "key".into(),
                 serde_json::Value::String("col-value".into()),
-            )]),
-            globals: HashMap::from([(
+            )])),
+            globals: Arc::new(HashMap::from([(
                 "key".into(),
                 serde_json::Value::String("global-value".into()),
-            )]),
+            )])),
             ..Default::default()
         };
 
@@ -426,7 +441,7 @@ mod tests {
 
         // Collection value type is preserved through the value form.
         let scope_num = VariableScope {
-            collection: HashMap::from([("n".into(), serde_json::json!(42))]),
+            collection: Arc::new(HashMap::from([("n".into(), serde_json::json!(42))])),
             ..Default::default()
         };
         assert_eq!(resolver.resolve("n={{n}}", &scope_num), "n=42");

@@ -1545,18 +1545,27 @@ if (typeof b64decode === 'undefined') { var b64decode = k6B64Decode; }
 var __tropel_timers = {};
 var __tropel_timer_seq = 0;
 
-// Backlog line 99: timers leaked across iterations. __tropel_timers is
-// module-scope and had no per-iteration reset, so a setInterval armed in
-// every iteration accumulated 3 live intervals all firing on every
-// subsequent pump — linear growth in callbacks and retained closures for
-// the VU's life. The driver calls __tropel_reset_timers() at the start of
-// each iteration so only the CURRENT iteration's timers are live: ones
-// armed in iteration N fire at the N boundary pump, then are cleared.
-// NOTE: the id sequence is NOT reset — a user-held timer id from an earlier
-// iteration must never collide with a fresh timer's id (stale clearInterval
-// would kill the wrong timer). Only the live table is cleared.
+// Backlog line 278: timers with non-zero delay never fired because
+// __tropel_reset_timers() wiped ALL timers at iteration start — a
+// setTimeout(cb, 100) in a 5ms iteration was pumped once (not yet due),
+// then cleared by the next iteration's reset.
+//
+// Fix: only clean up expired one-shots (past their due time, never fired).
+// This prevents stale timers from leaking across VU lifetime while letting
+// cross-iteration timers (setTimeout with delay > iteration duration) fire
+// on a subsequent pump. Intervals persist until explicitly cleared — same
+// as k6. If the user arms setInterval in a loop, that's a user bug.
 function __tropel_reset_timers() {
-    __tropel_timers = {};
+    var now = Date.now();
+    for (var id in __tropel_timers) {
+        var t = __tropel_timers[id];
+        if (!t) continue;
+        // Only remove one-shots that are past their due time (expired).
+        // Intervals and not-yet-due one-shots survive.
+        if (!t.interval && now >= t.at) {
+            delete __tropel_timers[id];
+        }
+    }
 }
 
 function setTimeout(fn, ms) {
@@ -1893,16 +1902,16 @@ if (typeof getAltNames === 'undefined') { var getAltNames = x509.getAltNames; }
 // Helpers
 // ══════════════════════════════════════════════════════════════════
 
+var __STATUS_TEXTS = {
+    200: 'OK', 201: 'Created', 204: 'No Content',
+    301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
+    400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
+    404: 'Not Found', 405: 'Method Not Allowed', 408: 'Request Timeout',
+    409: 'Conflict', 413: 'Payload Too Large', 415: 'Unsupported Media Type',
+    422: 'Unprocessable Entity', 429: 'Too Many Requests',
+    500: 'Internal Server Error', 502: 'Bad Gateway',
+    503: 'Service Unavailable', 504: 'Gateway Timeout'
+};
 function getStatusText(code) {
-    var texts = {
-        200: 'OK', 201: 'Created', 204: 'No Content',
-        301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
-        400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
-        404: 'Not Found', 405: 'Method Not Allowed', 408: 'Request Timeout',
-        409: 'Conflict', 413: 'Payload Too Large', 415: 'Unsupported Media Type',
-        422: 'Unprocessable Entity', 429: 'Too Many Requests',
-        500: 'Internal Server Error', 502: 'Bad Gateway',
-        503: 'Service Unavailable', 504: 'Gateway Timeout'
-    };
-    return texts[code] || '';
+    return __STATUS_TEXTS[code] || '';
 }

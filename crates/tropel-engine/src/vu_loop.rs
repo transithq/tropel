@@ -23,7 +23,7 @@ use tropel_core::config::{
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_http::client::{HttpClient, VuCookieClient};
 use tropel_metrics::collector::MetricsCollector;
-use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
+use tropel_metrics::thresholds::evaluate_thresholds;
 use tropel_runtime::ScenarioRunner;
 use tropel_sandbox::config::SandboxConfig;
 use tropel_scheduler::{VUScheduler, VuLease};
@@ -173,25 +173,38 @@ async fn run_vu_loop(
             }
 
             let now = std::time::SystemTime::now();
-            let empty_tags = Arc::new(TagMap::new());
+            // P-C: build scenario-tagged base once instead of sharing an
+            // empty Arc and mutating via make_mut (which deep-clones on the
+            // second sample when refcount > 1).
+            let base_tags = if shared.sc_tags.is_empty() {
+                Arc::new(TagMap::new())
+            } else {
+                Arc::new(TagMap::from_pairs(
+                    shared.sc_tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                ))
+            };
             let mut iter_samples = outcome.samples;
             iter_samples.push(Sample {
                 metric: "iterations".into(),
                 value: 1.0,
-                tags: empty_tags.clone(),
+                tags: Arc::clone(&base_tags),
                 timestamp: now,
                 sample_type: tropel_sdk::types::SampleType::Counter,
             });
             iter_samples.push(Sample {
                 metric: "iteration_duration".into(),
                 value: iter_dur.as_secs_f64() * 1000.0,
-                tags: empty_tags,
+                tags: base_tags,
                 timestamp: now,
                 sample_type: tropel_sdk::types::SampleType::Trend,
             });
-            // Merge per-scenario tags into every sample so tag-scoped
-            // thresholds (e.g. {scenario=load}) work end-to-end.
-            merge_scenario_tags(&mut iter_samples, &shared.sc_tags);
+            // Note: merge_scenario_tags is no longer needed here for these
+            // two samples — they already carry the scenario tags. However,
+            // samples from the runner (outcome.samples) may not have them,
+            // so we still merge for those.
+            if !shared.sc_tags.is_empty() {
+                merge_scenario_tags(&mut iter_samples, &shared.sc_tags);
+            }
             shared.metrics.record_batch(&iter_samples).await;
 
             if let Some(msg) = outcome.abort_message {
@@ -482,7 +495,8 @@ impl DriverHttpClient for DriverHttpClientImpl {
         // digest on ONE request don't need the whole scenario to share it.
         let signer = req.auth.as_ref().and_then(|a| self.client.get_signer(a));
         let http_resp = self.client.execute(req, signer.as_deref()).await?;
-        Ok(Response::from(&http_resp))
+        // Backlog line 312: use by-value conversion to avoid 16 clones.
+        Ok(Response::from(http_resp))
     }
 }
 /// Pick the per-VU HTTP client for a VU spawn.
@@ -543,6 +557,7 @@ pub(crate) async fn run_scenario_vus(
     protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
+    input_path: &str,
 ) -> (u32, u64) {
     // Expected statuses are read by every VU's ScenarioRunner — snapshot them once
     // and share (the closure no longer captures the whole HttpConfig, which
@@ -589,6 +604,13 @@ pub(crate) async fn run_scenario_vus(
     let names_c: Arc<Vec<String>> =
         Arc::new(flattened_c.iter().map(|item| item.name.clone()).collect());
 
+    // P-B: source-gated bundle split — scan the script once per scenario
+    // and build a minimal shim bundle (skipping cryptojs/lodash when unused).
+    // This is shared across all VUs — one scan, one bundle, ~120KB/VU saved.
+    let shim = Arc::new(ShimBundle::from_script_path(std::path::Path::new(
+        input_path,
+    )));
+
     run_vus(
         sc_name,
         start_delay,
@@ -613,6 +635,8 @@ pub(crate) async fn run_scenario_vus(
             let flattened_vu = flattened_c.clone();
             let names_vu = names_c.clone();
             let expected_statuses_vu = expected_statuses_c.clone();
+            // P-B: cheap Arc clone per-VU instead of deep-copying the shim bundle.
+            let shim_vu = shim.clone();
 
             // 1-VU-per-task: pin this VU to its own dedicated worker thread so
             // a blocking script `sleep()` (std::thread::sleep) never freezes a
@@ -663,7 +687,7 @@ pub(crate) async fn run_scenario_vus(
                     vu_id,
                     &pm_state,
                     &bridge_client,
-                    &ShimBundle::default(),
+                    &shim_vu,
                     &SandboxConfig::default(),
                     sched.force_stop_flag(),
                 )
@@ -719,7 +743,7 @@ pub(crate) async fn run_driver_vus(
 ) -> (u32, u64) {
     let driver_id = driver.id().to_string();
     let input_bytes = match std::fs::read(input_path) {
-        Ok(b) => b,
+        Ok(b) => Arc::new(b),
         Err(e) => {
             tracing::error!("Scenario '{}': failed to read input: {}", sc_name, e);
             return (0, 0);
@@ -976,13 +1000,26 @@ fn spawn_abort_coordinator(
                 // k6 `tainted`: ANY failed threshold (abortOnFail or not)
                 // marks the run so the control API status doc reports
                 // `tainted: true` (backlog line 154).
+                // Single-pass: evaluate all thresholds once and check both
+                // tainted + abortOnFail in the same loop.
+                let mut should_abort = false;
                 for tr in evaluate_thresholds(&thresholds, &results) {
                     if !tr.passed {
                         sched.set_tainted();
-                        break;
+                        if tr.abort_on_fail {
+                            // Respect delayAbortEval grace period.
+                            let in_grace = tr.delay_abort_eval.is_some_and(|grace| elapsed < grace);
+                            if !in_grace {
+                                tracing::error!(
+                                    "Threshold '{}' ({}) breached with abortOnFail -- aborting test",
+                                    tr.name, tr.expression
+                                );
+                                should_abort = true;
+                            }
+                        }
                     }
                 }
-                if check_abort_on_fail(&thresholds, &results, elapsed) {
+                if should_abort {
                     sched.request_stop();
                     break;
                 }
