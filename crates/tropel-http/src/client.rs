@@ -1246,6 +1246,31 @@ impl From<&HttpResponse> for tropel_sdk::types::Response {
     }
 }
 
+/// By-value conversion: moves all fields instead of cloning them.
+/// Backlog line 312: the hot path (vu_loop.rs:485) drops HttpResponse
+/// immediately after converting, so all the `.clone()`s in the by-ref
+/// impl are pure waste — 16 allocations and two full body copies per
+/// request. Use this instead where ownership is transferred.
+impl From<HttpResponse> for tropel_sdk::types::Response {
+    fn from(resp: HttpResponse) -> Self {
+        tropel_sdk::types::Response {
+            url: resp.url,
+            status_code: resp.status_code,
+            status_text: resp.status_text,
+            headers: resp.headers,
+            body: resp.body,
+            text_cache: std::cell::OnceCell::new(),
+            json_cache: std::cell::OnceCell::new(),
+            response_time: resp.response_time,
+            timings: resp.timings,
+            cookies: resp.cookies,
+            size: resp.size,
+            request_body_size: resp.request_body_size,
+            redirects: resp.redirects.into_iter().map(Response::from).collect(),
+        }
+    }
+}
+
 impl HttpResponse {
     /// Decode the body as UTF-8 text (lazy — decodes once, then memoized).
     ///
