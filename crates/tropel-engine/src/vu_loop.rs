@@ -173,25 +173,38 @@ async fn run_vu_loop(
             }
 
             let now = std::time::SystemTime::now();
-            let empty_tags = Arc::new(TagMap::new());
+            // P-C: build scenario-tagged base once instead of sharing an
+            // empty Arc and mutating via make_mut (which deep-clones on the
+            // second sample when refcount > 1).
+            let base_tags = if shared.sc_tags.is_empty() {
+                Arc::new(TagMap::new())
+            } else {
+                Arc::new(TagMap::from_pairs(
+                    shared.sc_tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                ))
+            };
             let mut iter_samples = outcome.samples;
             iter_samples.push(Sample {
                 metric: "iterations".into(),
                 value: 1.0,
-                tags: empty_tags.clone(),
+                tags: Arc::clone(&base_tags),
                 timestamp: now,
                 sample_type: tropel_sdk::types::SampleType::Counter,
             });
             iter_samples.push(Sample {
                 metric: "iteration_duration".into(),
                 value: iter_dur.as_secs_f64() * 1000.0,
-                tags: empty_tags,
+                tags: base_tags,
                 timestamp: now,
                 sample_type: tropel_sdk::types::SampleType::Trend,
             });
-            // Merge per-scenario tags into every sample so tag-scoped
-            // thresholds (e.g. {scenario=load}) work end-to-end.
-            merge_scenario_tags(&mut iter_samples, &shared.sc_tags);
+            // Note: merge_scenario_tags is no longer needed here for these
+            // two samples — they already carry the scenario tags. However,
+            // samples from the runner (outcome.samples) may not have them,
+            // so we still merge for those.
+            if !shared.sc_tags.is_empty() {
+                merge_scenario_tags(&mut iter_samples, &shared.sc_tags);
+            }
             shared.metrics.record_batch(&iter_samples).await;
 
             if let Some(msg) = outcome.abort_message {
@@ -720,7 +733,7 @@ pub(crate) async fn run_driver_vus(
 ) -> (u32, u64) {
     let driver_id = driver.id().to_string();
     let input_bytes = match std::fs::read(input_path) {
-        Ok(b) => b,
+        Ok(b) => Arc::new(b),
         Err(e) => {
             tracing::error!("Scenario '{}': failed to read input: {}", sc_name, e);
             return (0, 0);
