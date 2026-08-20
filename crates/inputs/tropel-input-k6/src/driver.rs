@@ -3590,7 +3590,12 @@ fn install_iteration_global(
             .finish::<()>()
             .map_err(|e| TropelError::Other(format!("k6 script module resolve error: {}", e)))?;
 
-        let entry = exec.filter(|e| !e.is_empty()).unwrap_or("default");
+        // P-E: whitespace-only exec strings (e.g. Postman's exec:["",""]) pass
+        // is_empty() but fail the module lookup. Trim first.
+        let entry = exec
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .unwrap_or("default");
         match module.get::<_, rquickjs::Function>(entry) {
             Ok(entry_fn) => {
                 rq_ctx
