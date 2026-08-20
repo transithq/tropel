@@ -62,6 +62,13 @@ Notable limitations today:
   use host-imported http/sleep/metrics, but the API is a subset of the
   in-process k6 driver's (no full scripting runtime inside the module).
 - **JMeter and Locust adapters are not started** (planned §11.6).
+- **4096 VU concurrency ceiling** — each VU owns a dedicated OS thread
+  (thread-per-core model), capped at `MAX_WORKERS = 4096`. A run requesting
+  10,000 VUs wraps onto existing workers past the cap, delivering the
+  throughput of 4,096 effective VUs. This is a structural limit of the
+  synchronous QuickJS host-call bridge (host functions must be synchronous
+  and park the calling thread). Lifting it requires async host-call support
+  (Promise-returning host functions + job-queue pumping) or a fiber VU model.
 
 ## Architecture
 
