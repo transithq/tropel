@@ -209,16 +209,23 @@ fn env_execution(
         ));
     }
 
-    if stages.is_some() {
-        let stage_list = stages.and_then(|s| serde_json::from_str::<Vec<Stage>>(s).ok())?;
-        if !stage_list.is_empty() {
-            return Some(ExecutionConfig::RampingVus {
-                stages: stage_list,
-                start_vus: vus.unwrap_or(1),
-                graceful_ramp_down: Some("30s".to_string()),
-                graceful_stop: Some("30s".to_string()),
-                think_time,
-            });
+    if let Some(stages_str) = stages {
+        match serde_json::from_str::<Vec<Stage>>(stages_str) {
+            Ok(stage_list) if !stage_list.is_empty() => {
+                return Some(ExecutionConfig::RampingVus {
+                    stages: stage_list,
+                    start_vus: vus.unwrap_or(1),
+                    graceful_ramp_down: Some("30s".to_string()),
+                    graceful_stop: Some("30s".to_string()),
+                    think_time,
+                });
+            }
+            Ok(_) => {
+                tracing::warn!("K6_STAGES parsed but is empty — ignoring");
+            }
+            Err(e) => {
+                tracing::warn!("K6_STAGES is malformed ({}): {}", stages_str, e);
+            }
         }
     }
 
