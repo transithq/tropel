@@ -192,6 +192,7 @@ impl Protocol for WebSocketProtocol {
 
         // ── Build the response for pm.response ──
         let body = serde_json::to_vec(&received).unwrap_or_default();
+        let body_size = body.len() as u64;
         let response = Response {
             url: req.url.clone(),
             status_code: session_status,
@@ -205,13 +206,13 @@ impl Protocol for WebSocketProtocol {
                 .iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect(),
-            body: body.clone(),
+            body,
             text_cache: std::sync::OnceLock::new(),
             json_cache: std::sync::OnceLock::new(),
             response_time: duration,
             timings: None,
             cookies: vec![],
-            size: body.len() as u64,
+            size: body_size,
             request_body_size: 0,
             redirects: vec![],
         };
