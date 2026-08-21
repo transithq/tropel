@@ -4545,7 +4545,6 @@ dependencies = [
  "inventory",
  "serde",
  "serde_json",
- "tracing",
  "tropel-sdk",
  "yaml_serde",
 ]
