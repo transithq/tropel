@@ -276,6 +276,20 @@ impl HttpClient {
         // for plaintext where the server supports it).
         if !config.http2 {
             builder = builder.http1_only();
+        } else {
+            // Line 372: h2 tuning — the highest-value knob for long-running
+            // connections. Without keepalive PINGs a dead-but-open h2
+            // connection stalls every VU silently (k6 sends no h2 PINGs at all).
+            builder = builder
+                .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10)))
+                .http2_keep_alive_timeout(std::time::Duration::from_secs(5))
+                .http2_keep_alive_while_idle(true)
+                .http2_adaptive_window(true)
+                // 16 MiB connection window: shared by all streams on one h2
+                // conn. The default (65 KiB) is the binding constraint at
+                // 100+ concurrent streams — this is the single biggest h2
+                // throughput knob after connection count.
+                .http2_initial_connection_window_size(16 * 1024 * 1024);
         }
 
         // DNS resolver: k6-compatible options (hosts map, blacklist, TTL
