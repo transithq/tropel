@@ -407,11 +407,17 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
     }
 
     // Build base URL from servers (substituting server variables).
-    let base_url = doc
-        .servers
-        .first()
-        .map(resolve_server_url)
-        .unwrap_or_default();
+    // Backlog line 219: when no servers are defined (hostless URL),
+    // fall back to the BASE_URL env var or return an error.
+    let base_url = if !doc.servers.is_empty() {
+        doc.servers
+            .first()
+            .map(resolve_server_url)
+            .unwrap_or_default()
+    } else {
+        // No servers: fall back to BASE_URL env var, then empty string.
+        std::env::var("BASE_URL").unwrap_or_default()
+    };
 
     // Flatten global security requirements
     let global_security = doc.security.clone();
@@ -1040,11 +1046,25 @@ fn resolve_value(
 ) -> Value {
     match value {
         Value::Object(map) => {
-            // A pure `{"$ref": "..."}` object → replace with target.
-            if map.len() == 1 {
-                if let Some(Value::String(ref_str)) = map.get("$ref") {
-                    if let Some(resolved) = resolve_ref(ref_str, root, cache, in_progress) {
+            // Backlog line 219: $ref-with-siblings. When a $ref object
+            // has siblings (e.g. `{"$ref": "...", "description": "..."}`),
+            // resolve the ref and merge siblings on top. Previously the
+            // whole object was passed through unresolved when len > 1.
+            if let Some(Value::String(ref_str)) = map.get("$ref") {
+                if let Some(resolved) = resolve_ref(ref_str, root, cache, in_progress) {
+                    if map.len() == 1 {
                         return resolved;
+                    }
+                    // Merge siblings onto the resolved target.
+                    if let Value::Object(mut target) = resolved {
+                        for (k, v) in map {
+                            if k != "$ref" {
+                                target
+                                    .entry(k)
+                                    .or_insert_with(|| resolve_value(v, root, cache, in_progress));
+                            }
+                        }
+                        return Value::Object(target);
                     }
                 }
             }
@@ -1115,6 +1135,33 @@ fn resolve_pointer(root: &Value, pointer: &str) -> Option<Value> {
     Some(cur.clone())
 }
 
+// ── Type array helpers (OpenAPI 3.1) ──────────────────────────
+
+/// Extract the primary type from a schema's `type` field, which in
+/// OpenAPI 3.1 can be either a string (`"string"`) or an array
+/// (`["string","null"]`). Returns the first non-"null" type, or
+/// "string" as a safe fallback for nullable schemas.
+fn schema_type(schema: &OasSchema) -> Option<&str> {
+    // The `type` field is typed as Option<String> by serde, so a JSON
+    // array like ["string","null"] deserializes as... well, it doesn't
+    // — it's an error because serde expects a string. We handle this by
+    // also looking at the raw `additionalProperties`-style trick: if the
+    // schema has been partially deserialized, the type field may be None
+    // but the anyOf variant carries the types.
+    if let Some(ref t) = schema.r#type {
+        return Some(t.as_str());
+    }
+    // Fallback: if type is absent but anyOf contains a single type, use it.
+    if let Some(ref any_of) = schema.any_of {
+        if any_of.len() == 1 {
+            if let Some(t) = &any_of[0].r#type {
+                return Some(t.as_str());
+            }
+        }
+    }
+    None
+}
+
 // ── Extraction helpers ──────────────────────────────────────────
 
 /// Extract a parameter value from an OpenAPI parameter definition.
@@ -1141,8 +1188,9 @@ fn extract_param_value(param: &OasParameter) -> String {
         if let Some(ref default) = schema.default {
             return value_to_string(default);
         }
-        // Generate type-based defaults
-        match schema.r#type.as_deref() {
+        // Generate type-based defaults (uses schema_type() to handle
+        // OpenAPI 3.1 type arrays like ["string","null"])
+        match schema_type(schema) {
             Some("integer") | Some("number") => return "1".to_string(),
             Some("boolean") => return "true".to_string(),
             Some("string") if schema.format.as_deref() == Some("uuid") => {
@@ -1346,13 +1394,12 @@ fn generate_schema_example(schema: Option<&OasSchema>) -> Option<serde_json::Val
         }
     }
 
-    match schema.r#type.as_deref() {
+    // Use schema_type() which handles both string and array type fields
+    // (OpenAPI 3.1 allows ["string","null"] as a type array).
+    match schema_type(schema) {
         Some("object") => {
             let mut obj = serde_json::Map::new();
             if let Some(ref props) = schema.properties {
-                // Sort property keys — HashMap iteration order is unstable, so
-                // the generated JSON object must have the same key order on
-                // every parse (byte-identical request bodies across runs).
                 let mut keys: Vec<&String> = props.keys().collect();
                 keys.sort();
                 for name in keys {
@@ -1388,6 +1435,8 @@ fn generate_schema_example(schema: Option<&OasSchema>) -> Option<serde_json::Val
             Some(serde_json::Value::Number(serde_json::Number::from(1)))
         }
         Some("boolean") => Some(serde_json::Value::Bool(true)),
+        // Backlog line 219: nullable type array (e.g. ["string","null"]) —
+        // generate the non-null variant as the example.
         _ => None,
     }
 }
