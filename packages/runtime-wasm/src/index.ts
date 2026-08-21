@@ -198,22 +198,29 @@ export async function createExecWasm(options: ExecWasmOptions): Promise<ExecWasm
   };
 
   const hostHttp = (reqPtr: number, reqLen: number): bigint => {
-    const instance = instanceRef!;
-    const exports = instance.exports as unknown as WasmExports;
-    const mem = () => new Uint8Array(exports.memory.buffer);
+    // Backlog line 247: try/catch so decoder or transport errors return
+    // 0 (the wasm contract for "error") instead of trapping the instance.
+    try {
+      const instance = instanceRef!;
+      const exports = instance.exports as unknown as WasmExports;
+      const mem = () => new Uint8Array(exports.memory.buffer);
 
-    // Copy the postcard Request out of linear memory.
-    const reqBytes = mem().slice(reqPtr, reqPtr + reqLen);
-    const req: HttpRequest = decodeHttpRequest(reqBytes);
+      // Copy the postcard Request out of linear memory.
+      const reqBytes = mem().slice(reqPtr, reqPtr + reqLen);
+      const req: HttpRequest = decodeHttpRequest(reqBytes);
 
-    const resp: HttpResponse = options.transport(req);
-    const respBytes = encodeResponse(resp);
+      const resp: HttpResponse = options.transport(req);
+      const respBytes = encodeResponse(resp);
 
-    // Allocate the reply via the module's own tropel_alloc (re-entrant call,
-    // the same pattern the Rust harness and the JS host use) and write it.
-    const outPtr = exports.tropel_alloc(respBytes.length);
-    mem().set(respBytes, outPtr);
-    return (BigInt(outPtr) << 32n) | BigInt(respBytes.length);
+      // Allocate the reply via the module's own tropel_alloc (re-entrant call,
+      // the same pattern the Rust harness and the JS host use) and write it.
+      const outPtr = exports.tropel_alloc(respBytes.length);
+      mem().set(respBytes, outPtr);
+      return (BigInt(outPtr) << 32n) | BigInt(respBytes.length);
+    } catch (e) {
+      console.error("[tropel-wasm] hostHttp bridge error:", e);
+      return 0n;
+    }
   };
 
   const imports: WebAssembly.Imports = {
