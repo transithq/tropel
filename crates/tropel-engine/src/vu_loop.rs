@@ -228,7 +228,12 @@ async fn run_vu_loop(
             && !sched.is_stop_requested()
             && !sched.is_force_stop_requested()
         {
-            apply_think_time(&shared.think_time, Some(iter_start.elapsed())).await;
+            apply_think_time(
+                &shared.think_time,
+                Some(iter_start.elapsed()),
+                Some(&sched.stop_signal()),
+            )
+            .await;
         }
 
         if shared.total_iterations != u64::MAX

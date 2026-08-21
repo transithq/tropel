@@ -4,6 +4,7 @@
 //! Split out of the former `vu_loop.rs` god-file.
 
 use rand::RngExt;
+use std::sync::Arc;
 use std::time::Duration;
 use tropel_core::config::{ExecutionConfig, ThinkTimeConfig};
 use tropel_sdk::Result;
@@ -32,14 +33,35 @@ pub(crate) fn parse_duration_str(s: &str) -> Result<Duration> {
 
 // ── Think time ──
 
-pub(crate) async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Option<Duration>) {
+pub(crate) async fn apply_think_time(
+    config: &ThinkTimeConfig,
+    iter_duration: Option<Duration>,
+    stop: Option<&Arc<tokio::sync::Notify>>,
+) {
+    // Helper: sleep that can be interrupted by a stop signal.
+    async fn interruptible_sleep(dur: Duration, stop: Option<&Arc<tokio::sync::Notify>>) {
+        match stop {
+            Some(s) => {
+                let notified = s.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    _ = tokio::time::sleep(dur) => {}
+                    _ = notified => {}
+                }
+            }
+            None => {
+                tokio::time::sleep(dur).await;
+            }
+        }
+    }
+
     if let Some(pacing_str) = &config.iteration_pacing {
         if let Ok(pacing) = parse_duration_str(pacing_str) {
             if let Some(actual_dur) = iter_duration {
                 if actual_dur < pacing {
                     let remaining = pacing - actual_dur;
                     if remaining > Duration::from_millis(1) {
-                        tokio::time::sleep(remaining).await;
+                        interruptible_sleep(remaining, stop).await;
                     }
                 }
             }
@@ -50,7 +72,7 @@ pub(crate) async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Op
     if let Some(delay_str) = &config.delay {
         if let Ok(delay) = parse_duration_str(delay_str) {
             if delay > Duration::from_millis(1) {
-                tokio::time::sleep(delay).await;
+                interruptible_sleep(delay, stop).await;
                 return;
             }
         }
@@ -61,7 +83,7 @@ pub(crate) async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Op
             if max > Duration::ZERO && max > min {
                 let range_ms = (max - min).as_millis() as u64;
                 let rand_ms = rand::rng().random_range(0..=range_ms);
-                tokio::time::sleep(min + Duration::from_millis(rand_ms)).await;
+                interruptible_sleep(min + Duration::from_millis(rand_ms), stop).await;
             }
         }
     }
