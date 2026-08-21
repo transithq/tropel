@@ -107,8 +107,9 @@ pub fn create_wasm_engine() -> std::result::Result<Engine, anyhow::Error> {
 
     // DoS guard: fuel metering gives every call a bounded instruction budget.
     // An infinite WASM loop traps with Trap::OutOfFuel instead of hanging the
-    // host. (Epoch interruption was considered but its trap handler aborts the
-    // process with a non-unwinding panic on Windows.)
+    // host. Epoch interruption was considered but requires a background thread
+    // to increment the epoch counter — fuel is simpler and works correctly on
+    // all platforms with wasmtime 47+.
     config.consume_fuel(true);
 
     // Pooling allocator (per C3): reuse memory/table/stack slots across
@@ -127,11 +128,22 @@ pub fn create_wasm_engine() -> std::result::Result<Engine, anyhow::Error> {
     // guard to 64 KiB) so the pool holds 4096 concurrent instances at the
     // SAME ~64 GiB of virtual address space. Runs that exhaust the pool now
     // fail LOUDLY in the engine instead of silently truncating the VU count.
-    config.memory_reservation(MAX_MEMORY_BYTES as u64);
-    config.memory_guard_size(64 * 1024);
+    // Bounds-check elision: cranelift elides the per-load/store bounds
+    // check when reservation + guard >= 4 GiB (the virtual address range
+    // wraps around, so a single unsigned compare catches all out-of-bounds).
+    // With 16 MiB reservation + 64 KiB guard, every guest load/store pays
+    // a compare+trap (~10–30 % overhead). Set reservation to 4 GiB and
+    // guard to 256 KiB: 4 GiB virtual per slot, at 4096 slots = 16 TiB of
+    // address space (free on 64-bit; no physical pages committed).
+    config.memory_reservation(4_u64 * 1024 * 1024 * 1024); // 4 GiB for bounds-check elision
+    config.memory_guard_size(256 * 1024); // 256 KiB guard page
 
     let mut pooling = PoolingAllocationConfig::default();
     pooling.total_memories(4096).total_tables(4096);
+    // Line 439: total_core_instances must match total_memories — the default
+    // is 1000, silently capping VUs at 1000 even though the comment says
+    // 4096. Set it explicitly so VU #1001+ can instantiate.
+    pooling.total_core_instances(4096);
     // Cap linear memory to 16 MiB for ALL instances — imported AND exported
     // memories alike (memory_pages was removed in wasmtime 47; max_memory_size
     // is the modern engine-level ceiling and it covers exported memories). A
