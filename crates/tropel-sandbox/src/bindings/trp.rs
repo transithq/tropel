@@ -1203,6 +1203,26 @@ impl TrpBridge {
                 "__tropel_pm_custom_metric_add",
                 Func::from(
                     move |name: String, value: f64, tags_json: String, metric_type_str: String| {
+                        // Backlog line 158: reserved-name guard — built-in
+                        // metrics (http_reqs, http_req_duration, checks, etc.)
+                        // must not be overwritten by script-defined custom
+                        // metrics. A new Counter('http_reqs') would mint a
+                        // Gauge whose p50..p99 are hardcoded 0.
+                        const RESERVED: &[&str] = &[
+                            "http_reqs", "http_req_duration", "http_req_failed",
+                            "http_req_blocked", "http_req_connecting", "http_req_tls_handshaking",
+                            "http_req_receiving", "http_req_sending", "http_req_waiting",
+                            "iterations", "iteration_duration", "dropped_iterations",
+                            "checks", "group_duration", "vus", "vus_max",
+                            "data_received", "data_sent",
+                        ];
+                        if RESERVED.iter().any(|&r| name == r) {
+                            tracing::warn!(
+                                "Custom metric '{}' clashes with built-in metric name — ignoring",
+                                name
+                            );
+                            return;
+                        }
                         let mut st = state_clone.lock().unwrap();
                         // Parse tags from JSON string
                         let mut tags = if tags_json.is_empty() || tags_json == "{}" {
