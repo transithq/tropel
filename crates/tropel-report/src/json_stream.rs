@@ -72,8 +72,10 @@ impl JsonStreamOutput {
     /// Spawn a consumer task that appends samples as NDJSON lines.
     /// Returns a `JoinHandle` that completes when the stream closes.
     pub fn spawn(mut rx: broadcast::Receiver<Sample>, path: String) -> tokio::task::JoinHandle<()> {
+        // Line 444: wrap the output in Arc so flushes can be dispatched to
+        // spawn_blocking without moving the output out of the loop.
+        let output = std::sync::Arc::new(JsonStreamOutput::new(path));
         tokio::spawn(async move {
-            let output = JsonStreamOutput::new(path);
             let mut tick = tokio::time::interval(FLUSH_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -83,9 +85,12 @@ impl JsonStreamOutput {
                         Ok(sample) => {
                             output.buffer(&sample);
                             if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SAMPLES {
-                                if let Err(e) = output.flush_buffered() {
-                                    tracing::warn!("json-stream write failed: {e}");
-                                }
+                                let o = output.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(e) = o.flush_buffered() {
+                                        tracing::warn!("json-stream write failed: {e}");
+                                    }
+                                }).await.ok();
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
@@ -96,17 +101,26 @@ impl JsonStreamOutput {
                     },
                     _ = tick.tick() => {
                         if output.total_buffered.load(Ordering::Relaxed) > 0 {
-                            if let Err(e) = output.flush_buffered() {
-                                tracing::warn!("json-stream write failed: {e}");
-                            }
+                            let o = output.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = o.flush_buffered() {
+                                    tracing::warn!("json-stream write failed: {e}");
+                                }
+                            }).await.ok();
                         }
                     }
                 }
             }
 
-            if let Err(e) = output.flush_buffered() {
-                tracing::warn!("json-stream final write failed: {e}");
-            }
+            // Final flush on shutdown.
+            let o = output.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = o.flush_buffered() {
+                    tracing::warn!("json-stream final write failed: {e}");
+                }
+            })
+            .await
+            .ok();
         })
     }
 
