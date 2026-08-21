@@ -660,7 +660,12 @@ fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix:
             key.push_str(&set_prefix);
             key.push('|');
             key.push_str(&name);
-            if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+            // Backlog line 418: use simd-json (2-4x faster) for the bulk
+            // SharedArray parse instead of serde_json.
+            let mut json_bytes = json.into_bytes();
+            if let Ok(parsed) =
+                simd_json::serde::from_slice::<Vec<serde_json::Value>>(&mut json_bytes)
+            {
                 if let Ok(mut c) = shared_array_cache().write() {
                     // Clone the small map and swap it in (the snapshot model);
                     // per-name writes are rare (once per SharedArray).

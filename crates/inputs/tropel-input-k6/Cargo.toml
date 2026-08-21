@@ -30,6 +30,7 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 http.workspace = true
 flate2.workspace = true
+simd-json.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
