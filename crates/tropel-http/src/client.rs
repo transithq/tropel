@@ -553,6 +553,8 @@ impl HttpClient {
             // Each redirect hop is checked too — a Location header pointing
             // at a blacklisted literal must not slip past the resolver.
             check_literal_blacklist(&self.blacklist, &current_url)?;
+            // Line 454: parse once per hop, reuse for cookie jar + redirect.
+            let hop_url = reqwest::Url::parse(&current_url).ok();
             let hop_start = std::time::Instant::now();
             // Per-request slot: concurrent requests (http.batch) interleave on
             // one thread and futures migrate threads on the shared io_rt, so
@@ -644,8 +646,8 @@ impl HttpClient {
                         .iter()
                         .any(|(k, _)| k.eq_ignore_ascii_case("cookie"));
                     if !has_explicit_cookie {
-                        if let Ok(url) = reqwest::Url::parse(&current_url) {
-                            if let Some(value) = jar.cookies(&url) {
+                        if let Some(ref url) = hop_url {
+                            if let Some(value) = jar.cookies(url) {
                                 req_builder = req_builder.header(reqwest::header::COOKIE, value);
                             }
                         }
@@ -821,10 +823,10 @@ impl HttpClient {
             // EVERY hop (including redirect hops), so a session cookie set by
             // an intermediate redirect is available to the next hop.
             if let Some(jar) = jar {
-                if let Ok(url) = reqwest::Url::parse(&current_url) {
+                if let Some(ref url) = hop_url {
                     for v in response.headers().get_all(reqwest::header::SET_COOKIE) {
                         if let Ok(s) = v.to_str() {
-                            jar.add_cookie_str(s, &url);
+                            jar.add_cookie_str(s, url);
                         }
                     }
                 }
@@ -901,8 +903,8 @@ impl HttpClient {
                     });
 
                     // Resolve the Location header against the current URL.
-                    let base = reqwest::Url::parse(&current_url).map_err(|e| {
-                        TropelError::Http(format!("Invalid request URL '{}': {}", current_url, e))
+                    let base = hop_url.ok_or_else(|| {
+                        TropelError::Http(format!("Invalid request URL '{}'", current_url))
                     })?;
                     let next = base.join(&location).map_err(|e| {
                         TropelError::Http(format!(
