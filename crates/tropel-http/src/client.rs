@@ -639,6 +639,25 @@ impl HttpClient {
                 {
                     req_builder = req_builder.header("Content-Type", content_type);
                 }
+            } else if let Some(body) = &request.body {
+                // Backlog line 240: default Content-Type for body types that
+                // need one. Without this, OAuth1's is_form_urlencoded returns
+                // false and form params are omitted from the signature base.
+                if !request
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                {
+                    let ct = match body {
+                        Body::Json(_) => "application/json",
+                        Body::UrlEncoded(_) => "application/x-www-form-urlencoded",
+                        Body::GraphQL { .. } => "application/json",
+                        Body::Binary(_) => "application/octet-stream",
+                        Body::FormData(_) => unreachable!("handled above"),
+                        Body::Raw(_) => "text/plain",
+                    };
+                    req_builder = req_builder.header("Content-Type", ct);
+                }
             }
             for (key, value) in &request.headers {
                 // Cross-origin redirect hops must not leak credentials to
