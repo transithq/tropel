@@ -92,11 +92,18 @@ async fn run_vu_loop(
             }
         }
 
-        // Externally-controlled pause gate: level-triggered — the loop
-        // re-checks is_paused each wake, so an edge-triggered resume notify
-        // can't be missed.
+        // Externally-controlled pause gate: event-driven instead of the
+        // old 10 ms busy-poll (10k paused VUs = 1 M wakeups/sec).
+        // `control_notify` fires on every control PATCH (pause/resume/
+        // scale), so we await it in a loop — level-triggered by
+        // re-checking `is_paused` each wake.
         while sched.is_paused() && !sched.is_stop_requested() && !sched.is_force_stop_requested() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let notify = sched.control_notify();
+            let stop = sched.stop_signal();
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = stop.notified() => {}
+            }
         }
         if sched.is_stop_requested() || sched.is_force_stop_requested() {
             break;
