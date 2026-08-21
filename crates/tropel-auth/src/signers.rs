@@ -25,6 +25,17 @@ use tropel_sdk::types::{ApiKeyLocation, AuthConfig};
 use tropel_sdk::Result;
 use tropel_sdk::TropelError;
 
+/// Cache for derived SigV4 signing keys, keyed by a hash of
+/// (secret, date, region, service). The key only changes at UTC
+/// midnight, so this eliminates 4 chained HMAC-SHA256 + 5 allocs
+/// per request (backlog line 443).
+static SIGNING_KEY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>,
+> = std::sync::OnceLock::new();
+fn signing_key_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>> {
+    SIGNING_KEY_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// RFC 3986 unreserved characters: `A-Z a-z 0-9 - . _ ~` stay unencoded.
 const UNRESERVED: AsciiSet = NON_ALPHANUMERIC
     .remove(b'-')
@@ -414,10 +425,35 @@ fn bracket_host(host: &str) -> String {
 }
 
 fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    // Backlog line 443: cache the derived key — it only changes at UTC
+    // midnight, but was recomputed (4 chained HMAC-SHA256 + 5 allocs)
+    // on every signed request.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    secret.hash(&mut hasher);
+    date.hash(&mut hasher);
+    region.hash(&mut hasher);
+    service.hash(&mut hasher);
+    let h = hasher.finish();
+    {
+        let cache = signing_key_cache().lock().unwrap();
+        if let Some(cached) = cache.get(&h) {
+            return cached.clone();
+        }
+    }
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
-    hmac_sha256(&k_service, b"aws4_request")
+    let derived = hmac_sha256(&k_service, b"aws4_request");
+    let mut cache = signing_key_cache().lock().unwrap();
+    // Evict stale entries when a new date arrives (at most 2 entries
+    // in normal operation — today and yesterday).
+    if cache.len() > 4 {
+        cache.clear();
+    }
+    cache.insert(h, derived.clone());
+    derived
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
