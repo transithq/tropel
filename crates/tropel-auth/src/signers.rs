@@ -496,7 +496,12 @@ fn sigv4_canonical_uri(path: &str, service: &str) -> String {
     if path.is_empty() {
         return "/".to_string();
     }
-    let encoded: Vec<String> = path.split('/').map(enc).collect();
+    // Backlog line 240: normalize consecutive slashes — AWS's official
+    // test suite expects //prod/users → /prod/users. Without this, the
+    // classic base-URL-ends-in-/ join produces a double-slash that fails
+    // signature verification with a 403.
+    let normalized = path.replace("//", "/");
+    let encoded: Vec<String> = normalized.split('/').map(enc).collect();
     encoded.join("/")
 }
 
@@ -1536,8 +1541,9 @@ mod tests {
         );
         // Empty path → "/".
         assert_eq!(sigv4_canonical_uri("", "execute-api"), "/");
-        // Empty segments (leading/trailing slash) are preserved.
-        assert_eq!(sigv4_canonical_uri("/a//b/", "execute-api"), "/a//b/");
+        // Backlog line 240: consecutive slashes are normalized for non-S3
+        // services (AWS test suite expects //prod/users → /prod/users).
+        assert_eq!(sigv4_canonical_uri("/a//b/", "execute-api"), "/a/b/");
     }
 
     #[test]
