@@ -23,6 +23,8 @@ members = [
     "crates/inputs/tropel-input-k6",
     "crates/inputs/tropel-input-har",
     "crates/inputs/tropel-input-openapi",
+    "crates/inputs/tropel-input-insomnia",
+    "crates/inputs/tropel-input-bru",
     "crates/inputs/tropel-input-subprocess",
     "crates/inputs/tropel-input-http",
     "crates/extensions/tropel-x-grpc",
@@ -31,6 +33,7 @@ members = [
     "crates/tropel-wasm",
     "crates/tropel-web",
     "crates/tropel-core-wasm",
+    "crates/tropel-input-wasm",
     "crates/tropel-distributed",
     "crates/tropel-bench",
 ]
@@ -242,6 +245,8 @@ tropel-input-postman = { path = "crates/inputs/tropel-input-postman" }
 tropel-input-k6 = { path = "crates/inputs/tropel-input-k6" }
 tropel-input-har = { path = "crates/inputs/tropel-input-har" }
 tropel-input-openapi = { path = "crates/inputs/tropel-input-openapi" }
+tropel-input-insomnia = { path = "crates/inputs/tropel-input-insomnia" }
+tropel-input-bru = { path = "crates/inputs/tropel-input-bru" }
 tropel-input-subprocess = { path = "crates/inputs/tropel-input-subprocess" }
 tropel-input-http = { path = "crates/inputs/tropel-input-http" }
 tropel-x-grpc = { path = "crates/extensions/tropel-x-grpc" }

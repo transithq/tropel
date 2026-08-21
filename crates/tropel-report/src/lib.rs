@@ -23,6 +23,12 @@ pub use prometheus::*;
 pub use statsd::*;
 pub use stdout::*;
 
+/// Global counter for samples dropped by output consumer lag.
+/// Incremented in each output's `Lagged` handler and surfaced in
+/// `MetricsResult` so the summary can warn operators.
+pub static OUTPUT_SAMPLES_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 use async_trait::async_trait;
 use tropel_metrics::collector::MetricsResult;
 use tropel_sdk::Result;
