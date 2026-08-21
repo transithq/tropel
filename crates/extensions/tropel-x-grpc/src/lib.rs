@@ -246,25 +246,29 @@ impl Protocol for GrpcProtocol {
         // `Arc<dyn Protocol>` to all VUs).
         let pool = {
             let key = (proto_src.clone(), proto_dir.clone());
-            let cached = self.pools.lock().unwrap().get(&key).cloned();
-            match cached {
-                Some(p) => p,
-                None => {
-                    let compiled = Arc::new(compile_proto(&proto_src, proto_dir.as_deref())?);
-                    let mut pools = self.pools.lock().unwrap();
-                    let mut order = self.pool_order.lock().unwrap();
-                    // Bounded: a caller that varies the inline proto per
-                    // request can never retain more than MAX_CACHED_POOLS
-                    // compiled pools (FIFO eviction of the oldest).
-                    cache_insert_bounded(
-                        &mut pools,
-                        &mut order,
-                        key,
-                        compiled.clone(),
-                        MAX_CACHED_POOLS,
-                    );
-                    compiled
-                }
+            // Line 358: hold the lock across compilation to prevent a cold-start
+            // stampede — without this, N VUs starting together all miss the
+            // cache, all call compile_proto concurrently (CPU-bound "tens of ms"
+            // + blocking fs::write of a temp file), and all open separate
+            // connections. Holding the mutex serializes the first compilation;
+            // subsequent VUs get the cached result immediately.
+            let mut pools = self.pools.lock().unwrap();
+            let mut order = self.pool_order.lock().unwrap();
+            if let Some(p) = pools.get(&key).cloned() {
+                p
+            } else {
+                let compiled = Arc::new(compile_proto(&proto_src, proto_dir.as_deref())?);
+                // Bounded: a caller that varies the inline proto per
+                // request can never retain more than MAX_CACHED_POOLS
+                // compiled pools (FIFO eviction of the oldest).
+                cache_insert_bounded(
+                    &mut pools,
+                    &mut order,
+                    key,
+                    compiled.clone(),
+                    MAX_CACHED_POOLS,
+                );
+                compiled
             }
         };
         let service = pool.get_service_by_name(service_full).ok_or_else(|| {
