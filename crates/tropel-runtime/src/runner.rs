@@ -80,6 +80,12 @@ pub struct ScenarioRunner {
     /// collection promptly instead of finishing it (backlog: gracefulStop
     /// force-stop was advisory only).
     force_stop: Arc<AtomicBool>,
+    /// Per-scenario tags that every emitted Sample must carry (k6 semantics:
+    /// scenario tags apply to every metric the scenario emits). Merged into
+    /// the TagMap BEFORE wrapping in Arc to avoid Arc::make_mut deep-clones
+    /// when the Arc is shared across ~12 per-request samples (backlog line
+    //  450).
+    scenario_tags: Arc<HashMap<String, String>>,
     // ── Execution context (k6 exec.* API) ──
     /// Unique VU identifier.
     pub vu_id: u32,
@@ -132,9 +138,17 @@ impl ScenarioRunner {
             // Default: 2xx-3xx = success (matches k6 behavior)
             expected_statuses: vec![ExpectedStatus::Range("200-399".to_string())],
             force_stop: Arc::new(AtomicBool::new(false)),
+            scenario_tags: Arc::new(HashMap::new()),
             vu_id,
             scenario_name,
         }
+    }
+
+    /// Set per-scenario tags that will be merged into every Sample's
+    /// TagMap before the Arc is shared across per-request samples.
+    pub fn with_scenario_tags(mut self, tags: HashMap<String, String>) -> Self {
+        self.scenario_tags = Arc::new(tags);
+        self
     }
 
     /// Attach a JS context for script execution.
@@ -590,6 +604,15 @@ impl ScenarioRunner {
                                     );
                                     tags.insert(Arc::clone(&tag_keys::NAME), resp.url.clone());
                                     tags.insert(Arc::clone(&tag_keys::GROUP), "http");
+                                    // Backlog line 450: merge scenario tags BEFORE the
+                                    // Arc::new so all ~12 per-request samples share ONE
+                                    // Arc (refcount bump) instead of Arc::make_mut
+                                    // deep-cloning the map for each sample.
+                                    if !self.scenario_tags.is_empty() {
+                                        for (k, v) in self.scenario_tags.iter() {
+                                            tags.insert(Arc::from(k.as_str()), v.clone());
+                                        }
+                                    }
                                     // Share one Arc so all ~12 per-request samples bump a
                                     // refcount instead of copying the whole map.
                                     let tags = Arc::new(tags);
