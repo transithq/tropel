@@ -503,18 +503,19 @@ impl Protocol for GrpcProtocol {
 
         // ── Build the outcome: response + samples ──
         let body_bytes = serde_json::to_vec(&response_value).unwrap_or_default();
+        let body_size = body_bytes.len() as u64;
         let response = Response {
             url: req.url.clone(),
             status_code: http_status,
             status_text: if ok { "OK".into() } else { "ERROR".into() },
             headers: HashMap::new(),
-            body: body_bytes.clone(),
+            body: body_bytes,
             text_cache: std::sync::OnceLock::new(),
             json_cache: std::sync::OnceLock::new(),
             response_time: duration,
             timings: None,
             cookies: vec![],
-            size: body_bytes.len() as u64,
+            size: body_size,
             request_body_size: 0,
             redirects: vec![],
         };
@@ -565,7 +566,7 @@ impl Protocol for GrpcProtocol {
             },
             Sample {
                 metric: "data_received".into(),
-                value: body_bytes.len() as f64,
+                value: body_size as f64,
                 tags,
                 timestamp: now,
                 sample_type: SampleType::Counter,
