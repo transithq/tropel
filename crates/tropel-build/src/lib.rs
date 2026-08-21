@@ -739,6 +739,13 @@ edition = "2021"
 # privileges.
 [workspace]
 
+# Inherit the standard tropel release profile so custom binaries get
+# the same LTO / codegen / strip settings as the stock binary.
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+
 [dependencies]
 {}
 

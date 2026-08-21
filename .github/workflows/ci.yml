@@ -11,7 +11,7 @@
 #    code (mach task_info on macOS, /proc on Linux, GetProcessMemoryInfo +
 #    a past LNK1140 link failure on Windows). fail-fast is off so one flaky
 #    platform doesn't mask the others.
-#  - `msrv` enforces the declared rust-version = "1.85"; nothing did before.
+#  - `msrv` enforces the declared rust-version = "1.94"; nothing did before.
 #  - `smoke` is the important one: it runs the built BINARY end-to-end against
 #    the repo's example samples (k6, postman, openapi, har) and asserts metrics
 #    were actually produced. Unit tests can pass while the binary silently does
@@ -119,7 +119,7 @@ jobs:
         run: cargo test --workspace -- --nocapture
 
   msrv:
-    name: MSRV 1.85
+    name: MSRV 1.94
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -128,7 +128,7 @@ jobs:
           # crates/tropel-sdk is a git submodule of transithq/tropel-sdk
           # (see .gitmodules) — every cargo job needs it populated.
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
