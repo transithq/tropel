@@ -49,7 +49,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tropel_sdk::InputAdapter;
 use tropel_sdk::{Result, TropelError};
-use tropel_sdk::{Scenario, ScenarioInfo};
+use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
 /// Default per-call timeout for the subprocess. A child that outlives this
 /// is killed (DoS guard — a hanging adapter must not hang the host).
@@ -347,14 +347,30 @@ impl InputAdapter for SubprocessAdapter {
         }
 
         // Not a full Scenario — try array of items.
-        let items: Vec<serde_json::Value> = serde_json::from_slice(&output).map_err(|e| {
-            TropelError::Parse(format!(
-                "Subprocess '{}' returned invalid JSON: {}. Raw output: {}",
-                self.command,
-                e,
-                String::from_utf8_lossy(&output[..output.len().min(200)])
-            ))
-        })?;
+        // Backlog line 362: deserialize directly into Vec<ScenarioItem>
+        // instead of Vec<Value> + per-item from_value(v.clone()) — the old
+        // path parsed the JSON twice (once into Value tree, once into the
+        // typed struct) and deep-cloned every array element.
+        let items: Vec<ScenarioItem> = serde_json::from_slice::<Vec<ScenarioItem>>(&output)
+            .or_else(|_| {
+                // If direct deserialization fails (e.g. items have extra fields),
+                // fall back to Value-then-convert for robustness.
+                let values: Vec<serde_json::Value> =
+                    serde_json::from_slice(&output).map_err(|e2| {
+                        TropelError::Parse(format!(
+                            "Subprocess '{}' returned invalid JSON: {}. Raw output: {}",
+                            self.command,
+                            e2,
+                            String::from_utf8_lossy(&output[..output.len().min(200)])
+                        ))
+                    })?;
+                Ok::<_, TropelError>(
+                    values
+                        .into_iter()
+                        .filter_map(|v| serde_json::from_value(v).ok())
+                        .collect(),
+                )
+            })?;
 
         // Treat a JSON array as items, auto-generate a name
         Ok(Scenario {
@@ -366,20 +382,7 @@ impl InputAdapter for SubprocessAdapter {
                 )),
                 schema: None,
             },
-            items: items
-                .iter()
-                .map(|v| {
-                    serde_json::from_value(v.clone()).unwrap_or_else(|_| tropel_sdk::ScenarioItem {
-                        name: "Imported item".to_string(),
-                        id: None,
-                        request: None,
-                        prerequest: vec![],
-                        test: vec![],
-                        assertions: vec![],
-                        items: vec![],
-                    })
-                })
-                .collect(),
+            items,
             variables: HashMap::new(),
             auth: None,
         })
