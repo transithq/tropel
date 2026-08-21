@@ -634,7 +634,9 @@ impl Engine {
         if !config.distributed_worker {
             let reporters = self.create_reporters(&config.output);
             for reporter in &reporters {
-                reporter.report(&results).await?;
+                if let Err(e) = reporter.report(&results).await {
+                    tracing::error!("Reporter '{}' failed: {} — continuing with remaining reporters and handleSummary", reporter.name(), e);
+                }
             }
 
             // k6 `handleSummary(data)`: let the script emit custom summaries
