@@ -31,6 +31,11 @@ export class Writer {
   private out: number[] = [];
 
   varint(v: number): void {
+    // Backlog line 247: NaN/undefined coerce to 0 silently, Infinity
+    // hangs the loop forever. Validate before truncation.
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      throw new Error(`postcard: varint requires a finite number, got ${v}`);
+    }
     let x = Math.trunc(v);
     if (x < 0) throw new Error("postcard: negative varint");
     while (x >= 0x80) {
