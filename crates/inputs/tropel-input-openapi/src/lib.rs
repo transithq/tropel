@@ -168,6 +168,11 @@ struct OasOperation {
     request_body: Option<OasRequestBody>,
     #[serde(default)]
     responses: HashMap<String, OasResponse>,
+    // Swagger 2.0 `consumes` — list of MIME types the operation accepts.
+    // When present, the first entry is used as the Content-Type if the
+    // request body doesn't already specify one.
+    #[serde(default)]
+    consumes: Vec<String>,
     #[serde(default)]
     security: Option<Vec<HashMap<String, Vec<String>>>>,
     #[serde(default)]
@@ -456,17 +461,34 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                     "path" => {
                         path_params.insert(param.name.clone(), val);
                     }
+                    // Swagger 2.0 cookie params -> Cookie header
+                    "cookie" => {
+                        let cookie_line = format!("{}={}", param.name, val);
+                        if let Some(existing) = headers
+                            .iter_mut()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("Cookie"))
+                        {
+                            existing.1.push_str("; ");
+                            existing.1.push_str(&cookie_line);
+                        } else {
+                            headers.push(("Cookie".to_string(), cookie_line));
+                        }
+                    }
                     _ => {}
                 }
             }
 
-            // Resolve path template parameters (e.g. /users/{userId})
+            // Resolve path template parameters (e.g. /users/{userId}).
+            // Sort for deterministic output — path-param substitution is
+            // the one non-deterministic spot in a file that sorts everything
+            // else with comments explaining why (backlog line 219).
             let resolved_url = if !path_params.is_empty() {
+                let mut sorted_params: Vec<_> = path_params.iter().collect();
+                sorted_params.sort_by_key(|(k, _)| k.as_str());
                 let mut resolved = url.clone();
-                for (key, val) in &path_params {
+                for (key, val) in sorted_params {
                     resolved = resolved.replace(&format!("{{{}}}", key), val);
                     resolved = resolved.replace(&format!("{{{{{}}}}}", key), val);
-                    // double-brace
                 }
                 resolved
             } else {
@@ -487,6 +509,15 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                     .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
                 if !has_ct {
                     headers.push(("Content-Type".to_string(), ct));
+                }
+            } else if !operation.consumes.is_empty() {
+                // Swagger 2.0 fallback: operation-level `consumes` provides
+                // the Content-Type when no requestBody media type is present.
+                let has_ct = headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+                if !has_ct {
+                    headers.push(("Content-Type".to_string(), operation.consumes[0].clone()));
                 }
             }
 
@@ -1378,58 +1409,64 @@ fn resolve_auth(
         return None;
     }
 
-    // Take the first security requirement; pick its scheme deterministically
-    // (HashMap iteration order is unstable — sorting keeps the generated auth
-    // identical across runs).
+    // Backlog line 219: AND security requirements like
+    // {"apiKey":[],"appId":[]} must try ALL schemes in the requirement,
+    // not just the first one. Iterate deterministically (sorted) and use
+    // the first scheme that resolves to a concrete auth config.
     let first_sec = &sec_requirements[0];
     let mut scheme_names: Vec<&String> = first_sec.keys().collect();
     scheme_names.sort();
-    let scheme_name = *scheme_names.first()?;
 
     // Look up the scheme in components
     let schemes = components
         .as_ref()
         .and_then(|c| c.security_schemes.as_ref())?;
-    let scheme = schemes.get(scheme_name)?;
 
-    match scheme {
-        OasSecurityScheme::Http {
-            scheme: http_scheme,
-            ..
-        } => match http_scheme.to_lowercase().as_str() {
-            "bearer" => Some(AuthConfig::Bearer {
-                token: "__token__".to_string(),
-            }),
-            "basic" => Some(AuthConfig::Basic {
-                username: "__username__".to_string(),
-                password: "__password__".to_string(),
-            }),
-            _ => None,
-        },
-        OasSecurityScheme::ApiKey { name, location, .. } => {
-            let key_name = name.clone().unwrap_or_else(|| "api_key".to_string());
-            let loc = location.as_deref().unwrap_or("header");
-            let api_location = if loc == "query" {
-                ApiKeyLocation::Query
-            } else {
-                ApiKeyLocation::Header
+    let mut result: Option<AuthConfig> = None;
+    for scheme_name in &scheme_names {
+        if let Some(scheme) = schemes.get(*scheme_name) {
+            let resolved = match scheme {
+                OasSecurityScheme::Http {
+                    scheme: http_scheme,
+                    ..
+                } => match http_scheme.to_lowercase().as_str() {
+                    "bearer" => Some(AuthConfig::Bearer {
+                        token: "__token__".to_string(),
+                    }),
+                    "basic" => Some(AuthConfig::Basic {
+                        username: "__username__".to_string(),
+                        password: "__password__".to_string(),
+                    }),
+                    _ => None,
+                },
+                OasSecurityScheme::ApiKey { name, location, .. } => {
+                    let key_name = name.clone().unwrap_or_else(|| "api_key".to_string());
+                    let loc = location.as_deref().unwrap_or("header");
+                    let api_location = if loc == "query" {
+                        ApiKeyLocation::Query
+                    } else {
+                        ApiKeyLocation::Header
+                    };
+                    Some(AuthConfig::ApiKey {
+                        key: key_name,
+                        value: "__api_key__".to_string(),
+                        location: api_location,
+                    })
+                }
+                OasSecurityScheme::OAuth2 { .. } => Some(AuthConfig::Bearer {
+                    token: "__access_token__".to_string(),
+                }),
+                OasSecurityScheme::OpenIdConnect { .. } => Some(AuthConfig::Bearer {
+                    token: "__id_token__".to_string(),
+                }),
             };
-            Some(AuthConfig::ApiKey {
-                key: key_name,
-                value: "__api_key__".to_string(),
-                location: api_location,
-            })
+            if resolved.is_some() {
+                result = resolved;
+                break;
+            }
         }
-        // OAuth2 flows → bearer token placeholder. The token itself can't be
-        // generated from a static spec — the placeholder is substituted by
-        // the environment/variables at run time.
-        OasSecurityScheme::OAuth2 { .. } => Some(AuthConfig::Bearer {
-            token: "__access_token__".to_string(),
-        }),
-        OasSecurityScheme::OpenIdConnect { .. } => Some(AuthConfig::Bearer {
-            token: "__id_token__".to_string(),
-        }),
     }
+    result
 }
 
 // ── Tests ───────────────────────────────────────────────────────
