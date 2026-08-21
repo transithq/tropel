@@ -1618,11 +1618,34 @@ impl VUScheduler {
                 // Shrink: reuse the ramp-down claim mechanism so exactly
                 // `spawned - target` VUs exit. Each claim decrements
                 // `control_spawned`, so this is armed ONLY while the previous
-                // surplus is fully drained (remaining == 0) — re-arming every
+                // surplus is fully drained (remaining == 0) — rearming every
                 // tick against the lagging `active` counter used to inflate
                 // the surplus and overshoot below target.
-                if self.ramp_down_remaining.load(Ordering::Relaxed) == 0 {
+                let remaining = self.ramp_down_remaining.load(Ordering::Relaxed);
+                if remaining == 0 {
                     self.set_ramp_down_target(target, spawned);
+                } else {
+                    // Backlog line 259: if VUs died for unrelated reasons
+                    // (crash, OOM, JS error), they never claimed a ramp-down
+                    // slot so `remaining` stays inflated and the shrink wedges
+                    // permanently. Detect this by checking if the live pool
+                    // has already dropped below what `remaining` expects:
+                    //   remaining = spawned_at_arm - claimed
+                    //   actual_active = spawned_at_arm - (claimed + crashed)
+                    // If actual_active <= target, all surplus VUs are already
+                    // gone (crashed + claimed = spawned - target) and we can
+                    // safely reset.
+                    let active = self.active_vus.load(Ordering::Acquire);
+                    if active <= target {
+                        tracing::debug!(
+                            "Externally-controlled: VU pool already at or below target 
+                             (active={}, target={}, remaining={}) — resetting stale ramp-down",
+                            active,
+                            target,
+                            remaining
+                        );
+                        self.clear_ramp_down();
+                    }
                 }
                 tracing::debug!(
                     "Externally-controlled: shrinking pool {} → {}",
