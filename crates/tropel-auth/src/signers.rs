@@ -292,13 +292,16 @@ impl AuthSigner for AwsSigV4Auth {
         let canonical_request = format!(
             "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
         );
-        let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
+        // Backlog line 240: s3-control's signing name is "s3", not
+        // "s3-control" — botocore's own model says signingName = "s3".
+        let sn = signing_name(&service);
+        let scope = format!("{date_stamp}/{region}/{sn}/aws4_request");
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
             hex_sha256(canonical_request.as_bytes())
         );
 
-        let signing_key = derive_signing_key(&self.secret_key, &date_stamp, &region, &service);
+        let signing_key = derive_signing_key(&self.secret_key, &date_stamp, &region, sn);
         let signature = hex_hmac_sha256(&signing_key, string_to_sign.as_bytes());
 
         let authorization = format!(
@@ -394,6 +397,16 @@ fn default_service(host: &str) -> String {
         }
     }
     host.split('.').next().unwrap_or(host).to_string()
+}
+
+/// Map a service name to its SigV4 signing name. Most services sign with
+/// their own name, but AWS S3 Control uses `s3` as the signing name despite
+/// the endpoint prefix being `s3-control` (backlog line 240).
+fn signing_name(service: &str) -> &str {
+    match service {
+        "s3-control" | "s3control" => "s3",
+        other => other,
+    }
 }
 
 /// `host[:port]` — omit the port when it is the scheme default. IPv6 hosts
