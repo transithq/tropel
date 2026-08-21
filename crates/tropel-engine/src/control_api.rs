@@ -22,13 +22,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tropel_scheduler::VUScheduler;
-use tropel_sdk::Result;
+use tropel_sdk::{Result, TropelError};
 
 /// Ceiling for a control request body. A status patch is a few hundred
 /// bytes; `Content-Length` is attacker-controlled, so without this cap a
 /// hostile `Content-Length: 68719476736` forced a 64 GiB `Vec::resize`
 /// (backlog line 164).
 const MAX_BODY_SIZE: usize = 64 * 1024;
+/// Backlog line 256: max length for a single header line (including
+/// request line). Without this, a hostile client can send a multi-GB
+/// single line that exhausts memory before the body ceiling kicks in.
+const MAX_HEADER_LINE_LEN: usize = 8 * 1024;
 /// Per-connection read timeout — a client that stalls mid-request must not
 /// hold its handler (and a connection slot) forever (backlog line 164).
 const CONN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -131,6 +135,15 @@ where
     if reader.read_line(&mut request_line).await? == 0 {
         return Ok(());
     }
+    // Backlog line 256: cap header line length to prevent memory exhaustion
+    // from a single multi-GB line (MAX_BODY_SIZE only guards the body).
+    if request_line.len() > MAX_HEADER_LINE_LEN {
+        return Err(TropelError::Http(format!(
+            "control API: request line too long ({} > {})",
+            request_line.len(),
+            MAX_HEADER_LINE_LEN
+        )));
+    }
     let request_line = request_line.trim_end().to_string();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
@@ -142,6 +155,14 @@ where
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
             break;
+        }
+        // Backlog line 256: cap individual header line length.
+        if line.len() > MAX_HEADER_LINE_LEN {
+            return Err(TropelError::Http(format!(
+                "control API: header line too long ({} > {})",
+                line.len(),
+                MAX_HEADER_LINE_LEN
+            )));
         }
         let line = line.trim_end();
         if line.is_empty() {
