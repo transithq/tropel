@@ -425,6 +425,20 @@ fn shared_array_cache() -> &'static SharedArrayCache {
     SHARED_ARRAY_CACHE.get_or_init(|| RwLock::new(Arc::new(HashMap::new())))
 }
 
+/// File cache for `k6 open()` — k6 calls `open()` at module top level and
+/// inside `SharedArray` factories, so the same file is read once per VU
+/// context. Caching avoids O(VUs) disk reads for a common pattern:/// ```js
+/// const data = JSON.parse(open('./data.json'));
+/// export default function() { ... }
+/// ```
+type FileCache = RwLock<HashMap<PathBuf, Arc<Vec<u8>>>>;
+
+static FILE_CACHE: OnceLock<FileCache> = OnceLock::new();
+
+fn file_cache() -> &'static FileCache {
+    FILE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 /// Register the k6 file-access native bridges on a JS context:
 ///
 /// - `__tropel_k6_open(path, mode)` — reads a file (relative to the script's
@@ -471,21 +485,34 @@ fn register_k6_file_bridges(ctx: &mut JsContext, script_dir: Option<PathBuf>) {
                             None => p.to_path_buf(),
                         }
                     };
-                    match std::fs::read(&full) {
-                        Ok(bytes) => {
-                            if mode == "b" {
-                                use base64::Engine;
-                                Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
-                            } else {
-                                Ok(String::from_utf8_lossy(&bytes).into_owned())
+                    // Backlog line 443: cache file contents so repeated open()
+                    // calls from multiple VUs read disk once, not VUs times.
+                    let cached_bytes = file_cache().read().unwrap().get(&full).cloned();
+                    let bytes = if let Some(cached) = cached_bytes {
+                        cached
+                    } else {
+                        match std::fs::read(&full) {
+                            Ok(b) => {
+                                let arc = Arc::new(b);
+                                file_cache()
+                                    .write()
+                                    .unwrap()
+                                    .insert(full.clone(), arc.clone());
+                                arc
+                            }
+                            Err(e) => {
+                                let msg = format!("open('{}'): {}", path, e);
+                                let exc = rquickjs::Exception::from_message(ctx.clone(), &msg)
+                                    .map_err(|_| rquickjs::Error::Exception)?;
+                                return Err(ctx.throw(exc.into_object().into_value()));
                             }
                         }
-                        Err(e) => {
-                            let msg = format!("open('{}'): {}", path, e);
-                            let exc = rquickjs::Exception::from_message(ctx.clone(), &msg)
-                                .map_err(|_| rquickjs::Error::Exception)?;
-                            Err(ctx.throw(exc.into_object().into_value()))
-                        }
+                    };
+                    if mode == "b" {
+                        use base64::Engine;
+                        Ok(base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()))
+                    } else {
+                        Ok(String::from_utf8_lossy(bytes.as_ref()).into_owned())
                     }
                 },
             ),
