@@ -56,35 +56,68 @@ pub(crate) async fn apply_think_time(
     }
 
     if let Some(pacing_str) = &config.iteration_pacing {
-        if let Ok(pacing) = parse_duration_str(pacing_str) {
-            if let Some(actual_dur) = iter_duration {
-                if actual_dur < pacing {
-                    let remaining = pacing - actual_dur;
-                    if remaining > Duration::from_millis(1) {
-                        interruptible_sleep(remaining, stop).await;
+        match parse_duration_str(pacing_str) {
+            Ok(pacing) => {
+                if let Some(actual_dur) = iter_duration {
+                    if actual_dur < pacing {
+                        let remaining = pacing - actual_dur;
+                        if remaining > Duration::from_millis(1) {
+                            interruptible_sleep(remaining, stop).await;
+                        }
                     }
                 }
+                return;
             }
-            return;
+            Err(e) => {
+                tracing::warn!(
+                    "Malformed iterationPacing '{}' ({}): ignoring",
+                    pacing_str,
+                    e
+                );
+            }
         }
     }
 
     if let Some(delay_str) = &config.delay {
-        if let Ok(delay) = parse_duration_str(delay_str) {
-            if delay > Duration::from_millis(1) {
-                interruptible_sleep(delay, stop).await;
-                return;
+        match parse_duration_str(delay_str) {
+            Ok(delay) => {
+                if delay > Duration::from_millis(1) {
+                    interruptible_sleep(delay, stop).await;
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Malformed thinkTime.delay '{}' ({}): using zero think time",
+                    delay_str,
+                    e
+                );
             }
         }
     }
 
     if let (Some(min_str), Some(max_str)) = (&config.min_delay, &config.max_delay) {
-        if let (Ok(min), Ok(max)) = (parse_duration_str(min_str), parse_duration_str(max_str)) {
-            if max > Duration::ZERO && max > min {
+        match (parse_duration_str(min_str), parse_duration_str(max_str)) {
+            (Ok(min), Ok(max)) if max > Duration::ZERO && max > min => {
                 let range_ms = (max - min).as_millis() as u64;
                 let rand_ms = rand::rng().random_range(0..=range_ms);
                 interruptible_sleep(min + Duration::from_millis(rand_ms), stop).await;
             }
+            (Err(e), _) => {
+                tracing::warn!(
+                    "Malformed thinkTime.minDelay '{}' ({}): ignoring",
+                    min_str,
+                    e
+                );
+            }
+            (_, Err(e)) => {
+                tracing::warn!(
+                    "Malformed thinkTime.maxDelay '{}' ({}): ignoring",
+                    max_str,
+                    e
+                );
+            }
+            _ => {}
         }
     }
 }
