@@ -893,11 +893,12 @@ impl Aggregator {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
 
-            // Build type-appropriate summary
+            // Build type-appropriate summary. Only one arm executes, so
+            // summary_tags is moved (not cloned) into whichever arm fires.
             let summary = match set.metric_type {
                 MetricType::Counter => MetricSummary {
                     key: key_str,
-                    tags: summary_tags.clone(),
+                    tags: summary_tags,
                     metric_type: MetricType::Counter,
                     // k6 semantics: a Counter's `count` IS the accumulated
                     // value (myCounter.add(5)x5 -> count 25, not 5). The
@@ -918,7 +919,7 @@ impl Aggregator {
                 },
                 MetricType::Rate => MetricSummary {
                     key: key_str,
-                    tags: summary_tags.clone(),
+                    tags: summary_tags,
                     metric_type: MetricType::Rate,
                     count: set.count as u64,
                     sum: set.sum,
@@ -935,7 +936,7 @@ impl Aggregator {
                 },
                 MetricType::Gauge => MetricSummary {
                     key: key_str,
-                    tags: summary_tags.clone(),
+                    tags: summary_tags,
                     metric_type: MetricType::Gauge,
                     count: set.count as u64,
                     sum: set.sum,
