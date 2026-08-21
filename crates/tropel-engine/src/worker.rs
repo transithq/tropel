@@ -63,6 +63,10 @@ pub struct VUWorkerPool {
     /// How long `Drop` waits for a worker to exit before detaching it. 30s by
     /// default (matching the engine's drain bound); short in tests.
     join_bound: Duration,
+    /// Backlog line 425: once make_worker fails (e.g. OS thread cap hit),
+    /// memoize the failure so every subsequent VU skips the expensive
+    /// runtime+thread creation attempt.
+    growth_failed: AtomicBool,
 }
 
 struct WorkerInner {
@@ -137,6 +141,7 @@ impl VUWorkerPool {
             busy: Mutex::new(busy),
             next_idx: AtomicUsize::new(0),
             join_bound,
+            growth_failed: AtomicBool::new(false),
         }
     }
 
@@ -244,6 +249,15 @@ impl VUWorkerPool {
             if current >= Self::MAX_WORKERS {
                 return Slot::Wrapped((vu_id as usize) % current);
             }
+            // Backlog line 425: once make_worker fails, skip the expensive
+            // runtime+thread creation for every subsequent VU.
+            if self.growth_failed.load(Ordering::Acquire) {
+                return if current > 0 {
+                    Slot::Wrapped((vu_id as usize) % current)
+                } else {
+                    Slot::Inline
+                };
+            }
             // Build the worker outside the lock (runtime + thread creation).
             // A failed build degrades (backlog line 163): wrap onto an
             // existing worker if the pool has one, else run the VU inline on
@@ -251,6 +265,9 @@ impl VUWorkerPool {
             let worker = match Self::make_worker(current) {
                 Some(w) => w,
                 None => {
+                    // Backlog line 425: memoize the failure so we never
+                    // retry the expensive runtime+thread creation.
+                    self.growth_failed.store(true, Ordering::Release);
                     if current > 0 {
                         return Slot::Wrapped((vu_id as usize) % current);
                     }
