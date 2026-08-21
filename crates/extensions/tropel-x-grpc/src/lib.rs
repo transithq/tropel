@@ -524,6 +524,7 @@ impl Protocol for GrpcProtocol {
             url: req.url.clone(),
             status_code: http_status,
             status_text: if ok { "OK".into() } else { "ERROR".into() },
+            protocol: "HTTP/2".into(),
             headers: HashMap::new(),
             body: body_bytes,
             text_cache: std::sync::OnceLock::new(),

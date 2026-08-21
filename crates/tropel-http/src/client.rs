@@ -62,6 +62,20 @@ fn http_request_error(e: &dyn std::error::Error) -> TropelError {
 /// `X-Request-Id`. The `http`/reqwest crate lowercases every `HeaderName`,
 /// so without this every k6/Postman doc idiom (`res.headers['Content-Type']`,
 /// `pm.response.header('Content-Type')`) would see `undefined`.
+///
+/// Format reqwest::Version as a human-readable protocol string.
+fn format_http_version(v: reqwest::Version) -> String {
+    let debug = format!("{:?}", v);
+    if debug.starts_with("Http(") {
+        let inner = &debug[5..debug.len() - 1];
+        let parts: Vec<&str> = inner.split(", ").collect();
+        if parts.len() == 2 {
+            return format!("HTTP/{}.{}", parts[0], parts[1]);
+        }
+    }
+    debug
+}
+
 fn canonical_header_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut upper = true;
@@ -806,6 +820,12 @@ impl HttpClient {
                 .canonical_reason()
                 .unwrap_or("Unknown")
                 .to_string();
+            // Line 368/369: capture the actual protocol version from the response
+            // instead of hardcoding "HTTP/1.1" in the JS shim. reqwest exposes
+            // the negotiated version after the TLS/ALPN handshake.
+            // reqwest::Version is a re-export of http::Version; it has no
+            // Display impl, but Debug outputs e.g. "Http(2, 0)" for HTTP/2.
+            let protocol = format_http_version(response.version());
 
             // Collect response headers — canonicalized to Go's MIME form
             // (Content-Type, X-Request-Id) because reqwest's HeaderName is
@@ -903,6 +923,7 @@ impl HttpClient {
                         url: current_url.clone(),
                         status_code,
                         status_text,
+                        protocol: format_http_version(response.version()),
                         headers,
                         raw_headers,
                         body: hop_body,
@@ -1077,6 +1098,7 @@ impl HttpClient {
                 url: current_url,
                 status_code,
                 status_text,
+                protocol,
                 headers,
                 raw_headers,
                 body: body_vec,
@@ -1217,6 +1239,9 @@ pub struct HttpResponse {
     pub url: String,
     pub status_code: u16,
     pub status_text: String,
+    /// Actual protocol version from the response (e.g. "HTTP/1.1", "HTTP/2").
+    /// Previously hardcoded to "HTTP/1.1" in the JS shim (Line 368/369).
+    pub protocol: String,
     pub headers: HashMap<String, String>,
     /// Every response header in ARRIVAL ORDER with duplicate names preserved
     /// (unlike the `headers` map, where the last line wins). Consumers that
@@ -1248,6 +1273,7 @@ impl From<&HttpResponse> for tropel_sdk::types::Response {
             url: resp.url.clone(),
             status_code: resp.status_code,
             status_text: resp.status_text.clone(),
+            protocol: resp.protocol.clone(),
             headers: resp.headers.clone(),
             body: resp.body.clone(),
             text_cache: std::sync::OnceLock::new(),
@@ -1275,6 +1301,7 @@ impl From<HttpResponse> for tropel_sdk::types::Response {
             url: resp.url,
             status_code: resp.status_code,
             status_text: resp.status_text,
+            protocol: resp.protocol,
             headers: resp.headers,
             body: resp.body,
             text_cache: std::sync::OnceLock::new(),
@@ -1795,6 +1822,7 @@ mod tests {
                 url: String::new(),
                 status_code: 200,
                 status_text: "OK".into(),
+                protocol: "HTTP/1.1".into(),
                 headers: Default::default(),
                 raw_headers: Default::default(),
                 body,
