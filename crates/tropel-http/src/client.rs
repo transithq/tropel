@@ -497,11 +497,9 @@ impl HttpClient {
         signer: Option<&dyn AuthSigner>,
         jar: Option<&reqwest::cookie::Jar>,
     ) -> Result<HttpResponse> {
-        // Global RPS pacing happens BEFORE the request timer starts, so the
-        // wait never inflates http_req_duration / TTFB.
-        if let Some(limiter) = &self.rps {
-            limiter.acquire().await;
-        }
+        // RPS pacing is done per-hop inside the redirect loop (line 580)
+        // so each redirect hop is rate-limited. Without this, rps:1000
+        // against a 302 chain sends 2000/s (backlog line 240).
 
         // Serialize the request body ONCE. The resulting bytes feed BOTH the
         // data_sent accounting (exact wire size) and the reqwest body — the
@@ -578,6 +576,12 @@ impl HttpClient {
         let mut signed_headers: Vec<(String, String)> = Vec::new();
 
         loop {
+            // Backlog line 240: RPS pacing per hop — each redirect hop
+            // must be rate-limited so rps:1000 against a 302 chain doesn't
+            // send 2000/s.
+            if let Some(limiter) = &self.rps {
+                limiter.acquire().await;
+            }
             // Each redirect hop is checked too — a Location header pointing
             // at a blacklisted literal must not slip past the resolver.
             check_literal_blacklist(&self.blacklist, &current_url)?;
