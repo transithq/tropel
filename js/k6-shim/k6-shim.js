@@ -324,6 +324,12 @@ function k6FileToBytes(file) {
 }
 
 function bytesToBase64(bytes) {
+    // Line 442: route through native base64 encoder when available.
+    // The shim always used the pure-JS loop even though
+    // __tropel_native_base64_encode is registered by tropel-native.
+    if (typeof __tropel_native_base64_encode === 'function') {
+        return __tropel_native_base64_encode(bytes);
+    }
     var out = '';
     for (var i = 0; i < bytes.length; i += 3) {
         var b0 = bytes[i];

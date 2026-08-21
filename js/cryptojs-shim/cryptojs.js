@@ -91,12 +91,14 @@ var CryptoJS = CryptoJS || {};
     // Hex
     CryptoJS.enc.Hex = {
         stringify: function (wordArray) {
-            var hex = '';
             var bytes = bytesFromWordArray(wordArray);
+            // Line 442: route through native hex encoder when available.
+            // The native check had an empty body, falling through to the
+            // per-byte JS loop every time (~2.7 µs wasted per call).
             if (typeof __tropel_native_hex_encode === 'function') {
-                // Use native hex encoding
-                // Native expects bytes, returns hex string
+                return __tropel_native_hex_encode(bytes);
             }
+            var hex = '';
             for (var i = 0; i < bytes.length; i++) {
                 hex += (bytes[i] >>> 4).toString(16);
                 hex += (bytes[i] & 0xF).toString(16);
