@@ -246,6 +246,12 @@ impl ScenarioRunner {
             // local_vars from the previous iteration so they don't grow
             // monotonically (backlog line 353).
             state.local_vars.clear();
+            // Line 445: clear group_stack at iteration start — a throw
+            // inside a group() callback, test.abort(), or interrupt unwind
+            // leaks a frame permanently. The joined path is stamped as a
+            // tag value onto every emitted sample, so per-sample memory
+            // AND downstream cardinality grow without bound.
+            state.group_stack.clear();
         }
 
         // Walk through the flattened execution list (folders descended).
