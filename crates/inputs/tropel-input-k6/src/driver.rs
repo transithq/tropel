@@ -666,10 +666,21 @@ fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix:
             if let Ok(parsed) =
                 simd_json::serde::from_slice::<Vec<serde_json::Value>>(&mut json_bytes)
             {
-                if let Ok(mut c) = shared_array_cache().write() {
-                    // Clone the small map and swap it in (the snapshot model);
-                    // per-name writes are rare (once per SharedArray).
-                    Arc::make_mut(&mut c).insert(key, Arc::new(parsed));
+                // Backlog line 415: the compute-once guarantee was a race
+                // (JS checked len < 0, ran factory, called set — but multiple
+                // VUs could all see -1 simultaneously on a fast ramp). Using
+                // entry().or_insert() ensures only the first VU's result is
+                // stored; subsequent VUs' results are silently discarded.
+                if let Ok(mut guard) = shared_array_cache().write() {
+                    use std::collections::hash_map::Entry as HEntry;
+                    match Arc::make_mut(&mut guard).entry(key) {
+                        HEntry::Vacant(e) => {
+                            e.insert(Arc::new(parsed));
+                        }
+                        HEntry::Occupied(_) => {
+                            // Another VU already computed this - discard.
+                        }
+                    }
                 }
             }
         }),
