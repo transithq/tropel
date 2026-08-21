@@ -336,7 +336,28 @@ impl VUWorkerPool {
                 let _release = BusyGuard(flag);
                 future.await
             }),
-            Slot::Wrapped(idx) => self.spawn_on(idx, future),
+            Slot::Wrapped(idx) => {
+                // Line 387: warn once when wrapping begins so the user knows
+                // the reported VU count exceeds the pool capacity. At 10,000
+                // VUs with MAX_WORKERS=4096, workers 0–1,807 host 3 VUs each
+                // and 1,808–4,095 host 2, tripling iteration periods for
+                // co-located VUs.
+                use std::sync::Once;
+                static WRAP_WARNED: Once = Once::new();
+                let current = self.workers.lock().unwrap().len();
+                WRAP_WARNED.call_once(|| {
+                    tracing::warn!(
+                        "VU pool wrapping: {} VUs requested but only {} workers \
+                         available (MAX_WORKERS={}). Co-located VUs share a \
+                         single-threaded runtime and block each other. The \
+                         reported concurrency exceeds the actual throughput.",
+                        vu_id + 1,
+                        current,
+                        Self::MAX_WORKERS,
+                    );
+                });
+                self.spawn_on(idx, future)
+            }
             // No worker available (resource exhaustion during growth): run on
             // the CALLER's runtime. `tokio::spawn` requires a runtime context;
             // `spawn_vu` is only reachable from inside one (the ramp loops).
