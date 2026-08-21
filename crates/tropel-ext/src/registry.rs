@@ -251,6 +251,14 @@ impl ExtensionRegistry {
                     .unwrap_or(true)
             {
                 best = Some((registration.priority, driver));
+                // Line 361: short-circuit — priority 0 is the maximum;
+                // no later registration can beat it, so stop scanning.
+                // Without this, a 400 MB HAR is parsed by har's detect,
+                // then again by openapi's (it IS valid JSON), then
+                // postman's, then a fourth time by the winner's parse().
+                if registration.priority == 0 {
+                    break;
+                }
             }
         }
         best.map(|(_, driver)| driver)
