@@ -156,11 +156,11 @@ impl Protocol for WebSocketProtocol {
         let mut received: Vec<String> = Vec::new();
         let mut bytes_received: u64 = 0;
         loop {
-            if tokio::time::Instant::now() >= session_deadline {
-                break;
-            }
-            let remaining = session_deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, ws.next()).await {
+            // Line 360: use timeout_at to avoid two Instant::now() reads
+            // and a fresh Timeout allocation per frame. At 10k frames x
+            // 1000 VUs this eliminates 20M clock reads and 10M timer
+            // registrations.
+            match tokio::time::timeout_at(session_deadline, ws.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => {
                     let s = t.to_string();
                     bytes_received += s.len() as u64;
