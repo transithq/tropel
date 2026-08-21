@@ -271,8 +271,9 @@ impl HttpClient {
         }
 
         // HTTP/2 toggle: when disabled, force HTTP/1.1. When enabled (default)
-        // reqwest negotiates HTTP/2 over TLS via ALPN (and h2c prior knowledge
-        // for plaintext where the server supports it).
+        // reqwest negotiates HTTP/2 over TLS via ALPN. For plaintext (http://)
+        // connections, reqwest uses HTTP/1.1 unless http2_prior_knowledge() is
+        // called — which is NOT done here, so plaintext is always HTTP/1.1.
         if !config.http2 {
             builder = builder.http1_only();
         } else {
