@@ -567,31 +567,38 @@ pub(crate) async fn run_scenario_vus(
     let sc_name_c = sc_name.clone();
 
     // Build ONE HttpClient per scenario and share it (Arc) across every VU.
-    // HttpClient::with_tls_and_rps constructs TWO reqwest::Clients (primary +
-    // no-redirect twin), each with its own connection pool, DNS resolver and
-    // TLS context — ~2-3 fds and significant state before a socket even
-    // opens. reqwest::Client is an Arc-backed handle designed for concurrent
-    // use, so a per-VU build duplicated all of that VU-times for zero benefit
-    // (the old per-VU `HttpClient::with_tls_and_rps` in the spawn closure).
-    // The per-VU cost is now a cheap struct clone (Arc bumps + small config
-    // snapshots) sharing the pooled clients. Thread-per-VU itself is
-    // deliberate (a blocking script `sleep()` must never freeze a co-located
-    // VU — there is no co-located VU), so this cuts the client/RSS/fd part of
-    // the per-VU cost without touching the scheduling model.
-    let shared_client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone())
-    {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::error!(
-                "Scenario '{}': Failed to create shared HTTP client: {}",
-                sc_name,
-                e
-            );
-            // Signal a VU-init failure so the engine fails the run loudly
-            // instead of treating this as a clean zero-work run.
-            return (1, 0);
+    // P1 · Connection lanes — build N independent HttpClient instances, each
+    // owning its own reqwest::Client + connection pool + DNS resolver + TLS
+    // context. VUs are assigned to lanes round-robin by `vu_id % N`. This
+    // spreads load across N independent h2 connections, hiding per-connection
+    // server limits and parallelizing the single-core frame demux. k6 cannot
+    // do this at all. When `http2_connections == 1` (default) this collapses
+    // to the old single-client path.
+    let lane_count = http_cfg.http2_connections.max(1);
+    let mut lanes: Vec<Arc<HttpClient>> = Vec::with_capacity(lane_count);
+    for lane_idx in 0..lane_count {
+        match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone()) {
+            Ok(c) => lanes.push(Arc::new(c)),
+            Err(e) => {
+                tracing::error!(
+                    "Scenario '{}': Failed to create HTTP lane {}/{}: {}",
+                    sc_name,
+                    lane_idx + 1,
+                    lane_count,
+                    e
+                );
+                return (1, 0);
+            }
         }
-    };
+    }
+    if lane_count > 1 {
+        tracing::info!(
+            "Scenario '{}': {} HTTP connection lanes (VUs assigned round-robin by vu_id % {})",
+            sc_name,
+            lane_count,
+            lane_count
+        );
+    }
 
     // Pre-flatten the item tree ONCE per scenario and share the Arcs with
     // every VU — a large collection must not be re-flattened/re-cloned per
@@ -623,7 +630,9 @@ pub(crate) async fn run_scenario_vus(
         control_port,
         move |sched, vu_id, shared| {
             let shared = shared.clone();
-            let http_client_vu = vu_http_client(&shared_client, &http_cfg, &tls_cfg, &rps_limiter);
+            let lane_idx = vu_id as usize % lanes.len();
+            let http_client_vu =
+                vu_http_client(&lanes[lane_idx], &http_cfg, &tls_cfg, &rps_limiter);
             let scenario = scenario_c.clone();
             let protocols_vu = protocols_c.clone();
             let pool = pool_c.clone();
@@ -759,26 +768,32 @@ pub(crate) async fn run_driver_vus(
     let sc_name_c = sc_name.clone();
     let protocols_c = protocols.clone();
 
-    // Build ONE HttpClient per scenario and share it (Arc) across every VU
-    // (same rationale as run_scenario_vus): the two reqwest::Clients inside
-    // it carry connection pools / DNS resolver / TLS context — Arc-backed
-    // handles designed for concurrent use, so per-VU construction would
-    // duplicate all of that VU-times. Per-VU cost is now a cheap struct clone.
-    let shared_client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone())
-    {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::error!(
-                "Scenario '{}': Failed to create shared HTTP client: {}",
-                sc_name,
-                e
-            );
-            // Signal a VU-init failure so the engine fails the run loudly
-            // instead of treating this as a clean zero-work run.
-            return (1, 0);
+    // P1 · Connection lanes (same pattern as run_scenario_vus above).
+    let lane_count = http_cfg.http2_connections.max(1);
+    let mut lanes: Vec<Arc<HttpClient>> = Vec::with_capacity(lane_count);
+    for lane_idx in 0..lane_count {
+        match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone()) {
+            Ok(c) => lanes.push(Arc::new(c)),
+            Err(e) => {
+                tracing::error!(
+                    "Scenario '{}': Failed to create HTTP lane {}/{}: {}",
+                    sc_name,
+                    lane_idx + 1,
+                    lane_count,
+                    e
+                );
+                return (1, 0);
+            }
         }
-    };
-
+    }
+    if lane_count > 1 {
+        tracing::info!(
+            "Scenario '{}': {} HTTP connection lanes (VUs assigned round-robin by vu_id % {})",
+            sc_name,
+            lane_count,
+            lane_count
+        );
+    }
     // k6 lifecycle: run the script's `setup()` ONCE per scenario, BEFORE any
     // VU spawns. The serialized return value is threaded into every VU's
     // context (so `export default function (data)` receives it) and later
@@ -787,15 +802,10 @@ pub(crate) async fn run_driver_vus(
     // the same merged env the VUs run with (base + scenario overrides).
     let mut setup_env = base_env.clone();
     setup_env.extend(sc_env.clone());
-    // k6 §4 (backlog line 119): setup()/teardown() may make HTTP calls —
-    // the throwaway contexts need the shared client + a sink, and their
-    // samples must count in the run totals (k6 records setup http_reqs).
-    // Build ONE lifecycle client (shared_client is MOVED into the run_vus
-    // closure below, so this must be taken before it) and drain each sink
-    // into metrics right after its call.
+    // Lifecycle client for setup()/teardown() — uses lane 0 (arbitrary).
     let lifecycle_client: Arc<dyn DriverHttpClient + Send + Sync> =
         Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(shared_client.as_ref().clone()),
+            client: VuCookieClient::new(lanes[0].as_ref().clone()),
         });
     let setup_sink: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
     let setup_data = driver
@@ -835,7 +845,9 @@ pub(crate) async fn run_driver_vus(
             let input_p = input_p_c.clone();
             let registry = registry_c.clone();
             let sc_exec = sc_exec_c.clone();
-            let http_client_vu = vu_http_client(&shared_client, &http_cfg, &tls_cfg, &rps_limiter);
+            let lane_idx = vu_id as usize % lanes.len();
+            let http_client_vu =
+                vu_http_client(&lanes[lane_idx], &http_cfg, &tls_cfg, &rps_limiter);
             let pool = pool_c.clone();
             let sc_name_vu = sc_name_c.clone();
             let executor_name = shared.executor_name.clone();

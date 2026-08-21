@@ -32,6 +32,13 @@ pub struct HttpConfig {
     pub request_timeout: Option<String>,
     /// Whether to enable HTTP/2.
     pub http2: bool,
+    /// Number of HTTP/2 connection lanes (default 1). Each lane is an
+    /// independent reqwest::Client with its own connection pool. VUs are
+    /// assigned to lanes round-robin by vu_id % N. Spreading load across
+    /// N h2 connections hides per-connection server limits and parallelizes
+    /// the single-core frame demux. k6 cannot do this at all.
+    #[serde(default = "default_http2_connections", alias = "http2Connections")]
+    pub http2_connections: usize,
     /// User-agent header value.
     pub user_agent: String,
     /// Whether to decompress response bodies.
@@ -111,6 +118,10 @@ fn default_expected_statuses() -> Vec<ExpectedStatus> {
     vec![ExpectedStatus::Range("200-399".to_string())]
 }
 
+fn default_http2_connections() -> usize {
+    1
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -127,6 +138,7 @@ impl Default for HttpConfig {
             idle_connection_timeout: Some("30s".to_string()),
             request_timeout: None,
             http2: true,
+            http2_connections: 1,
             user_agent: "Tropel/0.1.0".to_string(),
             decompress: true,
             max_redirects: 10,
@@ -174,5 +186,13 @@ mod tests {
         assert!(!cfg.expected_statuses.iter().any(|e| e.matches(404)));
         assert_eq!(cfg.max_redirects, 10);
         assert!(cfg.http2);
+        assert_eq!(cfg.http2_connections, 1);
+    }
+
+    #[test]
+    fn http2_connections_camel_case_alias() {
+        let json = r#"{"http2Connections": 4}"#;
+        let cfg: HttpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.http2_connections, 4);
     }
 }
