@@ -198,13 +198,11 @@ async fn run_vu_loop(
                 timestamp: now,
                 sample_type: tropel_sdk::types::SampleType::Trend,
             });
-            // Note: merge_scenario_tags is no longer needed here for these
-            // two samples — they already carry the scenario tags. However,
-            // samples from the runner (outcome.samples) may not have them,
-            // so we still merge for those.
-            if !shared.sc_tags.is_empty() {
-                merge_scenario_tags(&mut iter_samples, &shared.sc_tags);
-            }
+            // Scenario tags are now merged into every Sample's TagMap
+            // BEFORE the Arc is shared (backlog line 450) — both the
+            // iteration-level samples (built above with base_tags) and the
+            // runner's per-request samples already carry them. No post-hoc
+            // merge needed.
             shared.metrics.record_batch(&iter_samples).await;
 
             if let Some(msg) = outcome.abort_message {
@@ -680,7 +678,8 @@ pub(crate) async fn run_scenario_vus(
                     sched.active_vus_handle(),
                     sched.total_iterations_handle(),
                 )
-                .with_force_stop_flag(sched.force_stop_flag());
+                .with_force_stop_flag(sched.force_stop_flag())
+                .with_scenario_tags(shared.sc_tags.clone());
                 let pm_state = runner.state_handle();
 
                 let js_ctx = create_vu_js_context(
@@ -1026,19 +1025,6 @@ fn spawn_abort_coordinator(
             }
         }
     }))
-}
-
-fn merge_scenario_tags(samples: &mut [Sample], tags: &HashMap<String, String>) {
-    if tags.is_empty() {
-        return;
-    }
-    for sample in samples.iter_mut() {
-        for (k, v) in tags {
-            // tags is Arc<TagMap> — mutate through make_mut (cheap here: the
-            // fresh per-request Arc has refcount 1).
-            Arc::make_mut(&mut sample.tags).insert(k.clone(), v.clone());
-        }
-    }
 }
 
 /// The single scheduler-wide vus/vus_max sampler task (backlog line 165).

@@ -39,7 +39,7 @@ members = [
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/transithq/tropel"
-rust-version = "1.85"
+rust-version = "1.94"
 
 # Native release profile. Optimized for load generation: thin LTO for
 # size, single codegen unit for best optimization, symbols stripped.

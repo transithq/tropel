@@ -568,7 +568,7 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u
             "AES-CBC iv must be 16 bytes".into(),
         ));
     }
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
         return Err(tropel_sdk::TropelError::Crypto(
             "AES-CBC ciphertext must be non-empty and block-aligned (16 bytes)".into(),
         ));

@@ -145,7 +145,7 @@ async fn start_echo_server_with_latency_tail() -> std::net::SocketAddr {
                         }
                     }
                     let n = req_no.fetch_add(1, Ordering::SeqCst);
-                    if n % 6 == 0 {
+                    if n.is_multiple_of(6) {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     } else {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
