@@ -121,6 +121,9 @@ pub struct VUScheduler {
     /// threshold (with or without abortOnFail) fails. Sticky — once tainted,
     /// the run stays tainted.
     control_tainted: Arc<AtomicBool>,
+    /// Backlog line 424: throttle the O(n) retain scan in `reap_and_respawn`
+    /// to once per 100 ms to avoid ~50M atomic loads on a 10k ramp.
+    last_reap: Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 /// RAII guard for the arrival-rate idle count. Marks the VU idle on
@@ -201,6 +204,7 @@ impl VUScheduler {
             control_paused: Arc::new(AtomicBool::new(false)),
             control_notify: Arc::new(tokio::sync::Notify::new()),
             control_tainted: Arc::new(AtomicBool::new(false)),
+            last_reap: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         }
     }
 
@@ -1715,6 +1719,17 @@ impl VUScheduler {
         if self.ramp_down_target.load(Ordering::Acquire) != u32::MAX {
             return;
         }
+        // Backlog line 424: the retain scan is O(n) on every ramp step,
+        // yielding ~50M atomic loads on a 10k ramp (125 ms). The arrival
+        // path already gates this to 100 ms — apply the same throttle.
+        {
+            let mut last = self.last_reap.lock().unwrap();
+            if last.elapsed() < Duration::from_millis(100) {
+                return;
+            }
+            *last = std::time::Instant::now();
+        }
+
         // Single pass: count AND reap in the retain closure, so handles that
         // finish between a separate count and retain can't shrink the pool by
         // the window delta (they'd be dropped without a respawn).
@@ -1807,6 +1822,7 @@ impl VUScheduler {
             control_paused: self.control_paused.clone(),
             control_notify: self.control_notify.clone(),
             control_tainted: self.control_tainted.clone(),
+            last_reap: self.last_reap.clone(),
         })
     }
 

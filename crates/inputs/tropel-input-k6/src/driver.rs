@@ -485,6 +485,12 @@ fn register_k6_file_bridges(ctx: &mut JsContext, script_dir: Option<PathBuf>) {
                             None => p.to_path_buf(),
                         }
                     };
+                    // Backlog line 414: guard against files that won't fit in the
+                    // QuickJS heap (hard-capped at 10 MiB). Practical ceiling is
+                    // ~3-4 MB because the factory needs headroom for the parsed
+                    // array AND the JSON.stringify output in the same budget.
+                    const OPEN_FILE_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
                     // Backlog line 443: cache file contents so repeated open()
                     // calls from multiple VUs read disk once, not VUs times.
                     let cached_bytes = file_cache().read().unwrap().get(&full).cloned();
@@ -492,6 +498,19 @@ fn register_k6_file_bridges(ctx: &mut JsContext, script_dir: Option<PathBuf>) {
                         cached
                     } else {
                         match std::fs::read(&full) {
+                            Ok(b) if b.len() > OPEN_FILE_MAX_BYTES => {
+                                let msg = format!(
+                                    "open('{}'): file is {} bytes (max {} bytes / 4 MiB). \
+                                     The QuickJS heap is capped at 10 MiB; files larger \
+                                     than ~4 MiB will OOM during factory evaluation.",
+                                    path,
+                                    b.len(),
+                                    OPEN_FILE_MAX_BYTES
+                                );
+                                let exc = rquickjs::Exception::from_message(ctx.clone(), &msg)
+                                    .map_err(|_| rquickjs::Error::Exception)?;
+                                return Err(ctx.throw(exc.into_object().into_value()));
+                            }
                             Ok(b) => {
                                 let arc = Arc::new(b);
                                 file_cache()
@@ -585,7 +604,10 @@ fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix:
     let _ = globals.set(
         "__tropel_k6_shared_array_len",
         Func::from(move |name: String| -> i32 {
-            let key = format!("{}|{}", len_prefix, name);
+            let mut key = String::with_capacity(len_prefix.len() + 1 + name.len());
+            key.push_str(&len_prefix);
+            key.push('|');
+            key.push_str(&name);
             let snapshot = shared_array_cache()
                 .read()
                 .map(|c| c.clone())
@@ -598,12 +620,21 @@ fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix:
     // `undefined` when absent/out-of-range. The shim consumes the value
     // directly (no `JSON.parse` per element), so no context ever materializes
     // the whole array or re-parses it.
+    // Backlog line 417: the element accessor builds a cache key with
+    // `format!` on every read (~21 allocs for a 20-field CSV row x
+    // map() over 100k rows = 2.1M QuickJS allocs). Use pre-built
+    // prefix + "|" + name instead of format!.
     let get_prefix = cache_prefix.clone();
     let _ = globals.set(
         "__tropel_k6_shared_array_get",
         Func::from(
             move |ctx: rquickjs::Ctx<'js>, name: String, i: i32| -> rquickjs::Value<'js> {
-                let key = format!("{}|{}", get_prefix, name);
+                // Build key without format! -- prefix is a fixed string,
+                // separator is literal "|", name is the variable part.
+                let mut key = String::with_capacity(get_prefix.len() + 1 + name.len());
+                key.push_str(&get_prefix);
+                key.push('|');
+                key.push_str(&name);
                 // Snapshot: one shared read lock to clone the Arc (refcount
                 // bump), then drop the guard and read lock-free.
                 let snapshot = shared_array_cache()
@@ -625,7 +656,10 @@ fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix:
     let _ = globals.set(
         "__tropel_k6_shared_array_set",
         Func::from(move |name: String, json: String| {
-            let key = format!("{}|{}", set_prefix, name);
+            let mut key = String::with_capacity(set_prefix.len() + 1 + name.len());
+            key.push_str(&set_prefix);
+            key.push('|');
+            key.push_str(&name);
             if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
                 if let Ok(mut c) = shared_array_cache().write() {
                     // Clone the small map and swap it in (the snapshot model);
