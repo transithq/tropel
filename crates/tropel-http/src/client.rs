@@ -158,23 +158,22 @@ impl HttpClient {
         rps: Option<Arc<RpsLimiter>>,
     ) -> Result<Self> {
         let identity = Self::load_global_identity(tls)?;
-        let redirect = if config.max_redirects > 0 {
-            reqwest::redirect::Policy::limited(config.max_redirects as usize)
-        } else {
-            reqwest::redirect::Policy::none()
-        };
-        let inner = Self::build_client(config, tls, identity.clone(), redirect)?;
-        // When the primary client follows redirects, a second client with
-        // `Policy::none()` backs `follow_redirects: false` requests. When
-        // `max_redirects == 0` the primary already never follows, so both
-        // request shapes reuse `inner`.
+        // Both clients use Policy::none() because Tropel always manually
+        // follows redirects (k6 parity — every hop counts as a request).
+        // The old code built `inner` with Policy::limited(N), but tracing
+        // every path shows it was NEVER selected when max_redirects > 0 —
+        // dead weight: an extra ClientConfig + pool + DNS resolver + TLS
+        // context + resumption cache. Building both with Policy::none()
+        // eliminates that waste. The no_redirect twin is still needed for
+        // per-request `follow_redirects: false` when max_redirects > 0.
+        let inner = Self::build_client(
+            config,
+            tls,
+            identity.clone(),
+            reqwest::redirect::Policy::none(),
+        )?;
         let no_redirect = if config.max_redirects > 0 {
-            Some(Self::build_client(
-                config,
-                tls,
-                identity,
-                reqwest::redirect::Policy::none(),
-            )?)
+            Some(inner.clone())
         } else {
             None
         };
