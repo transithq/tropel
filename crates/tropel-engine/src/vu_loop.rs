@@ -320,6 +320,63 @@ where
     // before the engine computes `results()` (backlog line 163).
     let _stop_on_drop = StopOnDrop(executor.control_handle());
 
+    // SIGINT / SIGTERM handling (backlog line 256): a Ctrl-C or kill
+    // signal now triggers a graceful stop instead of leaving the process
+    // stranded. The handler calls `request_stop()` which the scheduler
+    // observes at its next polling point, ramps VUs down, and lets the
+    // summary/thresholds run before exit.
+    let signal_handle = executor.control_handle();
+    let signal_handle2 = executor.control_handle();
+    let _signal_guard = tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        // On Unix, also listen for SIGTERM.
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = &mut ctrl_c => {
+                    tracing::warn!("Received SIGINT — shutting down gracefully");
+                }
+                _ = sigterm.recv() => {
+                    tracing::warn!("Received SIGTERM — shutting down gracefully");
+                }
+            }
+        }
+        // On non-Unix (Windows), only Ctrl-C is available.
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+            tracing::warn!("Received Ctrl-C — shutting down gracefully");
+        }
+        signal_handle.request_stop();
+        // Second signal: force-stop (skip the drain, abort immediately).
+        #[cfg(unix)]
+        {
+            let ctrl_c2 = tokio::signal::ctrl_c();
+            tokio::pin!(ctrl_c2);
+            let mut sigterm2 =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = &mut ctrl_c2 => {
+                    tracing::warn!("Received second SIGINT — forcing stop");
+                }
+                _ = sigterm2.recv() => {
+                    tracing::warn!("Received second SIGTERM — forcing stop");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::warn!("Received second Ctrl-C — forcing stop");
+        }
+        signal_handle2.request_force_stop();
+    });
+
     // Runtime control API (k6 /v1/status parity): when the executor is
     // externally-controlled and a control port is configured, serve the
     // endpoint so VUs can be scaled mid-run. The task aborts when the
