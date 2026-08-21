@@ -1297,39 +1297,60 @@ impl VUScheduler {
             data
         };
 
+        // Line 443: prefix-sum precomputation for O(1) tokens_at lookup.
+        // The old code recomputed the full piecewise integral from t=0 on
+        // every 1ms tick — O(stages) per tick, burning 20-40% of a core
+        // at 200 stages. Precompute prefix sums of completed stage areas
+        // so we only need to compute the partial stage integral.
+        let prefix_sums: Vec<f64> = {
+            let mut sums = Vec::with_capacity(stage_data.len() + 1);
+            sums.push(0.0);
+            let mut cumulative = 0.0;
+            for &(dur_secs, s, e) in &stage_data {
+                cumulative += (s + e) * dur_secs / 2.0;
+                sums.push(cumulative);
+            }
+            sums
+        };
+        let cumulative_duration: Vec<f64> = {
+            let mut cum = Vec::with_capacity(stage_data.len() + 1);
+            cum.push(0.0);
+            let mut d = 0.0;
+            for &(dur_secs, _, _) in &stage_data {
+                d += dur_secs;
+                cum.push(d);
+            }
+            cum
+        };
+
         // Helper to compute the exact token count at a given elapsed time.
-        // Uses the integral of the piecewise-linear rate function:
-        // - For a completed stage: (start + end) * duration / 2 (trapezoid area)
-        // - For a partial stage: d * (s*p + (e-s)*p²/2) where p = remaining/d
-        // This avoids the burst bug from point-sampling `elapsed * current_rate`
-        // at stage boundaries.
+        // Uses prefix sums + partial-stage integral: O(log n) via binary
+        // search instead of O(n) linear scan per 1ms tick.
         let tokens_at = |elapsed_secs: f64| -> f64 {
             if stage_data.is_empty() {
                 return elapsed_secs * start_rate;
             }
-            let mut remaining = elapsed_secs;
-            let mut total = 0.0_f64;
-            for &(dur_secs, s, e) in &stage_data {
-                if remaining <= 0.0 {
-                    break;
-                }
-                if remaining >= dur_secs {
-                    // Completed stage: trapezoid area
-                    total += (s + e) * dur_secs / 2.0;
-                    remaining -= dur_secs;
-                } else {
-                    // Partial stage: linear ramp integral
-                    let p = remaining / dur_secs;
-                    total += dur_secs * (s * p + (e - s) * p * p / 2.0);
-                    remaining = 0.0;
-                }
-            }
-            // Any remaining time after the last stage uses the final rate
-            if remaining > 0.0 {
+            // Binary search for the stage containing elapsed_secs
+            let idx = match cumulative_duration.partition_point(|&d| d <= elapsed_secs) {
+                0 => 0,
+                i => i - 1,
+            };
+            let area_before = prefix_sums[idx];
+            let time_before_stage = cumulative_duration[idx];
+            let remaining = elapsed_secs - time_before_stage;
+            if idx >= stage_data.len() {
+                // Past all stages — use the final rate
                 let final_rate = stages.last().map(|s| s.target).unwrap_or(start_rate);
-                total += remaining * final_rate;
+                return area_before + remaining * final_rate;
             }
-            total
+            let (dur_secs, s, e) = stage_data[idx];
+            if remaining >= dur_secs {
+                area_before + (s + e) * dur_secs / 2.0
+            } else {
+                // Partial stage: linear ramp integral
+                let p = remaining / dur_secs;
+                area_before + dur_secs * (s * p + (e - s) * p * p / 2.0)
+            }
         };
 
         let start = time::Instant::now();
