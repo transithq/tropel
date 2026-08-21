@@ -80,6 +80,7 @@ export interface HttpResponse {
   url: string;
   statusCode: number;
   statusText?: string;
+  protocol?: string;
   headers: Record<string, string>;
   body: Uint8Array;
   responseTimeMs: number;

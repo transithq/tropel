@@ -366,6 +366,7 @@ export function encodeResponse(resp: HttpResponse): Uint8Array {
   w.str(resp.url);
   w.varint(resp.statusCode);
   w.str(resp.statusText ?? "");
+  w.str(resp.protocol ?? "HTTP/1.1");
   w.strMap(resp.headers);
   w.bytes(resp.body);
   writeDurationMs(w, resp.responseTimeMs);
