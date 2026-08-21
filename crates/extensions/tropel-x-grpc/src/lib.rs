@@ -53,6 +53,8 @@ const MAX_INLINE_PROTO: usize = 1024 * 1024;
 /// caches make both one-time per (proto, authority) pair, shared across all
 /// VUs of a scenario (the engine resolves the protocol once and shares the
 /// Compiled descriptor pools, keyed by `(proto source, include dir)`.
+/// Line 357: precompute a u64 hash outside the lock so the SipHash over
+/// up to 1 MiB of proto source doesn't happen while holding the mutex.
 type PoolKey = (String, Option<String>);
 
 /// Max compiled proto pools and tonic channels kept per scenario protocol.
@@ -70,14 +72,28 @@ const MAX_CACHED_CHANNELS: usize = 128;
 /// `Arc<dyn Protocol>`).
 #[derive(Default)]
 pub struct GrpcProtocol {
-    /// Compiled descriptor pools, keyed by `(proto source, include dir)`.
-    pools: Mutex<HashMap<PoolKey, Arc<DescriptorPool>>>,
+    /// Compiled descriptor pools, keyed by precomputed hash of
+    /// `(proto source, include dir)`. Line 357: the proto source can be
+    /// up to 1 MiB — precomputing the hash outside the lock avoids
+    /// SipHashing the full text while holding the mutex.
+    pools: Mutex<HashMap<u64, (PoolKey, Arc<DescriptorPool>)>>,
     /// Insertion order for the pool cache (FIFO eviction key).
-    pool_order: Mutex<VecDeque<PoolKey>>,
+    pool_order: Mutex<VecDeque<u64>>,
     /// Tonic channels pooled by authority (`scheme://host:port`).
     channels: Mutex<HashMap<String, Channel>>,
     /// Insertion order for the channel cache (FIFO eviction key).
     channel_order: Mutex<VecDeque<String>>,
+}
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+/// Precompute a hash of the pool key outside any lock. The proto source
+/// can be up to 1 MiB — hashing it inside the mutex is the bottleneck.
+fn pool_hash(key: &PoolKey) -> u64 {
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
 }
 
 /// Insert into a bounded cache: when the map is at capacity, evict the oldest
@@ -246,28 +262,28 @@ impl Protocol for GrpcProtocol {
         // `Arc<dyn Protocol>` to all VUs).
         let pool = {
             let key = (proto_src.clone(), proto_dir.clone());
-            // Line 358: hold the lock across compilation to prevent a cold-start
-            // stampede — without this, N VUs starting together all miss the
-            // cache, all call compile_proto concurrently (CPU-bound "tens of ms"
-            // + blocking fs::write of a temp file), and all open separate
-            // connections. Holding the mutex serializes the first compilation;
-            // subsequent VUs get the cached result immediately.
+            // Line 357/358: precompute the hash BEFORE acquiring the lock so the
+            // SipHash over up to 1 MiB of proto source doesn't happen while
+            // holding the mutex. Then hold the lock across compilation to
+            // prevent a cold-start stampede.
+            let hash = pool_hash(&key);
             let mut pools = self.pools.lock().unwrap();
             let mut order = self.pool_order.lock().unwrap();
-            if let Some(p) = pools.get(&key).cloned() {
-                p
+            if let Some((_, p)) = pools.get(&hash) {
+                p.clone()
             } else {
                 let compiled = Arc::new(compile_proto(&proto_src, proto_dir.as_deref())?);
                 // Bounded: a caller that varies the inline proto per
                 // request can never retain more than MAX_CACHED_POOLS
                 // compiled pools (FIFO eviction of the oldest).
-                cache_insert_bounded(
-                    &mut pools,
-                    &mut order,
-                    key,
-                    compiled.clone(),
-                    MAX_CACHED_POOLS,
-                );
+                if !pools.contains_key(&hash) && pools.len() >= MAX_CACHED_POOLS {
+                    if let Some(oldest) = order.pop_front() {
+                        pools.remove(&oldest);
+                    }
+                }
+                if pools.insert(hash, (key, compiled.clone())).is_none() {
+                    order.push_back(hash);
+                }
                 compiled
             }
         };
