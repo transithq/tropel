@@ -46,6 +46,7 @@ fn fixture_response(req: &Request) -> Result<Response> {
         url: req.url.clone(),
         status_code: 200,
         status_text: "OK".into(),
+        protocol: "HTTP/1.1".into(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: br#"{"ok":true}"#.to_vec(),
         text_cache: std::sync::OnceLock::new(),

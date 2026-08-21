@@ -2199,6 +2199,7 @@ mod tests {
                     url: "http://example.com/ok".into(),
                     status_code: 200,
                     status_text: "OK".into(),
+                    protocol: "HTTP/1.1".into(),
                     headers: HashMap::new(),
                     body: br#"{"id":1}"#.to_vec(),
                     text_cache: std::sync::OnceLock::new(),

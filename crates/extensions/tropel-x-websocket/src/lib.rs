@@ -201,6 +201,7 @@ impl Protocol for WebSocketProtocol {
             } else {
                 "ERROR".into()
             },
+            protocol: "HTTP/1.1".into(),
             headers: handshake_resp
                 .headers()
                 .iter()

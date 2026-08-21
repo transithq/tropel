@@ -1487,6 +1487,7 @@ fn build_k6_response_object<'js>(
     error_code: i32,
     response_type: &str,
     cookies: &[Cookie],
+    protocol: &str,
 ) -> rquickjs::Result<rquickjs::Object<'js>> {
     // Backlog line 46 (P0): allocation failures must NOT `.expect()`-panic
     // across the QuickJS FFI boundary — a server-controlled binary body can
@@ -1501,6 +1502,7 @@ fn build_k6_response_object<'js>(
     let _ = obj.set("status_text", status_text);
     let _ = obj.set("error", error);
     let _ = obj.set("error_code", error_code);
+    let _ = obj.set("proto", protocol);
     let headers_obj = rquickjs::Object::new(ctx.clone())?;
     for (k, v) in headers {
         let _ = headers_obj.set(k.as_str(), v.as_str());
@@ -1857,6 +1859,7 @@ fn register_http_bridges<'js>(
                         1000,
                         &response_type,
                         &[],
+                        "HTTP/1.1",
                     );
                 }
                 let extra_tags = params.tags;
@@ -1927,6 +1930,7 @@ fn register_http_bridges<'js>(
                             0,
                             &response_type,
                             &resp.cookies,
+                            &resp.protocol,
                         )
                     }
                     Err(e) => {
@@ -1956,6 +1960,7 @@ fn register_http_bridges<'js>(
                             k6_error_code(&err),
                             &response_type,
                             &[],
+                            "HTTP/1.1",
                         )
                     }
                 }
@@ -2125,6 +2130,7 @@ fn register_http_bridges<'js>(
                                     0,
                                     &response_type,
                                     &resp.cookies,
+                                    &resp.protocol,
                                 )?
                             }
                             Err(e) => {
@@ -2154,6 +2160,7 @@ fn register_http_bridges<'js>(
                                     k6_error_code(&err),
                                     &response_type,
                                     &[],
+                                    "HTTP/1.1",
                                 )?
                             }
                         };
@@ -8081,6 +8088,7 @@ mod tests {
                 0,
                 "binary",
                 &[],
+                "HTTP/1.1",
             )
             .expect("status-0 envelope build must succeed");
             let code: i32 = obj.get("code").expect("code field");
@@ -8117,6 +8125,7 @@ mod tests {
                 0,
                 "",
                 &[],
+                "HTTP/1.1",
             )
             .expect("status-0 envelope build must succeed");
             let code: i32 = obj.get("code").expect("code field");
@@ -9410,6 +9419,7 @@ mod tests {
                 url: req.url.clone(),
                 status_code: 200,
                 status_text: "OK".into(),
+                protocol: "HTTP/1.1".into(),
                 headers: HashMap::new(),
                 body: b"ok".to_vec(),
                 text_cache: std::sync::OnceLock::new(),
@@ -10172,6 +10182,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 0,
                 "binary",
                 &[],
+                "HTTP/1.1",
             )
             .expect("pre-guard returns degraded status-0 Ok; 32 MB body never reaches the alloc");
             let code: i32 = resp.get("code").unwrap();
