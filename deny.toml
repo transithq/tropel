@@ -41,6 +41,22 @@ ignore = [
     # Add temporary advisory ignores here with expiry dates.
 ]
 
+[bans]
+# Backlog line 428: warn on duplicate crate versions so new ones are caught
+# early. Known intentional straddles (RustCrypto 0.10/0.11 for md4, syn
+# 2/3 for proc-macro crates) are skipped; everything else is noise.
+multiple-versions = "warn"
+skip = [
+    # RustCrypto straddle: md4 is still on digest 0.10, k6 needs hmac(md4)
+    "digest",
+    "hmac",
+    "md5",
+    # proc-macro ecosystem: syn 2 (stable) and 3 (nightly/next-gen)
+    "syn",
+    "proc-macro2",
+    "quote",
+]
+
 [sources]
 # Old allow-unknown-registries = false + unknown-registry-fallback = "deny"
 # collapsed into a single severity key; crates.io stays allowed by default.
