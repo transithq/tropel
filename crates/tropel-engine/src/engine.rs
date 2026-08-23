@@ -609,7 +609,14 @@ impl Engine {
         metrics.set_sample_sink(None);
         drop(sample_tx);
         for handle in output_handles {
-            let _ = handle.await;
+            match handle.await {
+                Ok(()) => {}
+                Err(e) => {
+                    if e.is_panic() {
+                        tracing::error!("Output task panicked: {e} — some samples may be lost");
+                    }
+                }
+            }
         }
 
         // Raw snapshot (build_results now clones the summary config into
