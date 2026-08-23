@@ -1165,6 +1165,11 @@ impl HttpClient {
 pub struct VuCookieClient {
     inner: HttpClient,
     jar: Arc<reqwest::cookie::Jar>,
+    /// Backlog line 244: cache signers per-VU so stateful signers (Digest)
+    /// persist their session maps across requests. Uses `Box::leak` to get
+    /// a `&'static dyn AuthSigner` that the VU's execute loop can borrow.
+    /// The cache key is a serialized form of the auth config.
+    signer_cache: Mutex<HashMap<String, &'static dyn AuthSigner>>,
 }
 
 impl VuCookieClient {
@@ -1172,24 +1177,17 @@ impl VuCookieClient {
     pub fn new(inner: HttpClient) -> Self {
         Self {
             inner,
-            // `Jar` derives `Default` (its only constructor in reqwest 0.13).
             jar: Arc::new(reqwest::cookie::Jar::default()),
+            signer_cache: Mutex::new(HashMap::new()),
         }
     }
 
     /// Clone the shared inner client while REUSING this client's jar.
-    ///
-    /// Backlog line 159: the scenario runner and the PM bridge used to each
-    /// construct a fresh `VuCookieClient::new`, giving every VU TWO empty
-    /// jars. The canonical Postman auth pattern — prerequest
-    /// `pm.sendRequest` → `/login` → `Set-Cookie` — landed the session
-    /// cookie in the BRIDGE jar, while every collection request went out
-    /// through the RUNNER jar with no session → 401 for the whole run. Both
-    /// must observe the same jar, so derive one client from the other.
     pub fn clone_with_shared_jar(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             jar: self.jar.clone(),
+            signer_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1198,7 +1196,23 @@ impl VuCookieClient {
         &self.inner
     }
 
-    /// Auth-signer builder (passthrough to the shared client).
+    /// Get a cached signer for this auth config. Digest signers are cached
+    /// so their session maps persist across requests within the same VU.
+    /// Stateless signers (Bearer, Basic, ApiKey) are also cached for
+    /// consistency, though the benefit is marginal.
+    pub fn get_signer_ref(&self, auth: &AuthConfig) -> Option<&'static dyn AuthSigner> {
+        let key = auth_cache_key(auth);
+        let mut cache = self.signer_cache.lock().unwrap();
+        if let Some(&signer) = cache.get(&key) {
+            return Some(signer);
+        }
+        let boxed = self.inner.get_signer(auth)?;
+        let static_ref: &'static dyn AuthSigner = Box::leak(boxed);
+        cache.insert(key, static_ref);
+        Some(static_ref)
+    }
+
+    /// Auth-signer builder (passthrough to the shared client, returns owned Box).
     pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
         self.inner.get_signer(auth)
     }
@@ -1214,6 +1228,26 @@ impl VuCookieClient {
         self.inner
             .execute_with_jar(request, signer, Some(self.jar.as_ref()))
             .await
+    }
+}
+
+/// Cache key for an auth config — used by [`VuCookieClient::get_signer_ref`]
+/// to persist stateful signers (Digest) across requests within a VU.
+fn auth_cache_key(auth: &AuthConfig) -> String {
+    match auth {
+        AuthConfig::Bearer { token } => format!("bearer:{token}"),
+        AuthConfig::Basic { username, password } => format!("basic:{username}:{password}"),
+        AuthConfig::ApiKey {
+            key,
+            value,
+            location,
+        } => format!("apikey:{key}:{value}:{location:?}"),
+        AuthConfig::Digest { username, password } => format!("digest:{username}:{password}"),
+        AuthConfig::NoAuth => "noauth".to_string(),
+        AuthConfig::OAuth2 { access_token, .. } => format!("oauth2:{access_token}"),
+        AuthConfig::AwsSigV4 { access_key, .. } => format!("sigv4:{access_key}"),
+        AuthConfig::OAuth1 { consumer_key, .. } => format!("oauth1:{consumer_key}"),
+        AuthConfig::Hawk { auth_id, .. } => format!("hawk:{auth_id}"),
     }
 }
 
