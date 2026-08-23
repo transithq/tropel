@@ -678,8 +678,12 @@ impl HttpClient {
             // origin. Applied AFTER the base headers so a signer that
             // overrode a header (e.g. replaced a user-supplied Authorization)
             // wins on every hop, not just hop 0.
+            // Backlog line 246: skip Cookie in signed_headers — the cookie jar
+            // below handles injection on each hop, so re-applying a stale
+            // Cookie from hop 0 produces duplicate headers with the stale
+            // value first.
             if !strip_sensitive {
-                for (key, value) in &signed_headers {
+                for (key, value) in signed_headers.iter().filter(|(k, _)| k != "cookie") {
                     req_builder = req_builder.header(key.as_str(), value.as_str());
                 }
             }
@@ -977,9 +981,11 @@ impl HttpClient {
                     let same_origin = base.scheme() == next.scheme()
                         && base.host_str() == next.host_str()
                         && base.port_or_known_default() == next.port_or_known_default();
-                    if !same_origin {
-                        strip_sensitive = true;
-                    }
+                    // Backlog line 246: the latch must be RESET on same-origin
+                    // hops so a cross→same→cross redirect chain re-applies
+                    // credentials on the middle hop instead of permanently
+                    // stripping them after the first cross-origin hop.
+                    strip_sensitive = !same_origin;
 
                     // RFC 7231 method rewrite (matches reqwest/k6):
                     //   303 → GET (drop body), except HEAD stays HEAD

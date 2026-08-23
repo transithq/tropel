@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -1065,10 +1065,12 @@ fn build_digest_authorization(
     let algorithm = server_algorithm
         .clone()
         .unwrap_or_else(|| "MD5".to_string());
-    // RFC 7616 §3.4.4: the "-sess" variants (MD5-sess / SHA-256-sess)
-    // only change how HA1 is derived (nonce + cnonce are folded in); the
-    // hash function itself is always the base algorithm (MD5 or SHA-256).
-    let base_algorithm = if algorithm.starts_with("SHA-256") {
+    // RFC 7616 §3.4.4: the "-sess" variants (MD5-sess / SHA-256-sess /
+    // SHA-512-256-sess) only change how HA1 is derived (nonce + cnonce are
+    // folded in); the hash function itself is always the base algorithm.
+    let base_algorithm = if algorithm.starts_with("SHA-512-256") {
+        "SHA-512-256"
+    } else if algorithm.starts_with("SHA-256") {
         "SHA-256"
     } else {
         "MD5"
@@ -1163,9 +1165,16 @@ fn build_digest_authorization(
 /// Digest a string with the algorithm chosen by the server's challenge.
 fn digest_with(input: &str, algorithm: &str) -> String {
     match algorithm {
-        "SHA-256" => hex_sha256(input.as_bytes()),
+        "SHA-256" | "SHA-256-SESS" => hex_sha256(input.as_bytes()),
+        "SHA-512-256" | "SHA-512-256-SESS" => hex_sha512_256(input.as_bytes()),
         _ => hex_md5(input.as_bytes()),
     }
+}
+
+fn hex_sha512_256(bytes: &[u8]) -> String {
+    // SHA-512/256 is the leftmost 256 bits of SHA-512 truncated to 32 bytes.
+    let hash = Sha512::digest(bytes);
+    hex::encode(&hash[..32])
 }
 
 fn hex_md5(bytes: &[u8]) -> String {

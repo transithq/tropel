@@ -131,6 +131,12 @@ async fn run_vu_loop(
             let arrival_notify = sched.arrival_notify();
             let stop = sched.stop_signal();
             let mut got_token = false;
+            // Backlog line 260: pin the notified() future BEFORE the
+            // first try_acquire check so a notify_waiters() that fires
+            // between the check and the select registration is not lost.
+            // Re-register after each wake to stay level-triggered.
+            let mut arrival_ready = std::pin::pin!(arrival_notify.notified());
+            let mut stop_ready = std::pin::pin!(stop.notified());
             loop {
                 if sched.is_stop_requested() || sched.is_force_stop_requested() {
                     break;
@@ -140,8 +146,12 @@ async fn run_vu_loop(
                     break;
                 }
                 tokio::select! {
-                    _ = arrival_notify.notified() => {}
-                    _ = stop.notified() => {}
+                    _ = &mut arrival_ready => {
+                        arrival_ready.set(arrival_notify.notified());
+                    }
+                    _ = &mut stop_ready => {
+                        stop_ready.set(stop.notified());
+                    }
                 }
             }
             if !got_token {
@@ -438,6 +448,13 @@ where
         last_active_vus.clone(),
         sc_tags.clone(),
     ));
+    // Backlog line 262: continuous dropped_iterations sampler so drops
+    // are visible as a time-series, not just an end-of-run total.
+    let dropped_sampler = tokio::spawn(dropped_sampler_task(
+        executor.control_handle(),
+        metrics.clone(),
+        sc_tags.clone(),
+    ));
 
     let shared = VuRunShared {
         metrics: metrics.clone(),
@@ -485,6 +502,7 @@ where
         monitor.abort();
     }
     vus_sampler.abort();
+    dropped_sampler.abort();
 
     // Emit a guaranteed final vus/vus_max sample. The single scheduler-wide
     // sampler runs on a 2s cadence (backlog line 165), so a run shorter than
@@ -1130,6 +1148,42 @@ async fn vus_sampler_task(
         let peak = sched.peak_vus();
         last_active_vus.store(active, std::sync::atomic::Ordering::Relaxed);
         utils_emit_vus_metrics(&metrics, active, peak, &sc_tags).await;
+    }
+}
+
+/// Backlog line 262: emit dropped_iterations continuously on a 2s cadence
+/// so you can see WHEN drops happened (burst vs steady), not just the
+/// end-of-run total. k6 emits this metric continuously; a single
+/// end-of-run sample hides arrival-token starvation bursts.
+async fn dropped_sampler_task(
+    sched: Arc<VUScheduler>,
+    metrics: Arc<MetricsCollector>,
+    sc_tags: HashMap<String, String>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut prev_total: u64 = 0;
+    loop {
+        ticker.tick().await;
+        let total = sched.total_dropped_iterations();
+        let delta = total.saturating_sub(prev_total);
+        prev_total = total;
+        if delta > 0 {
+            let now = std::time::SystemTime::now();
+            let mut tags = TagMap::new();
+            for (k, v) in &sc_tags {
+                tags.insert(k.clone(), v.clone());
+            }
+            metrics
+                .record(&Sample {
+                    metric: "dropped_iterations".into(),
+                    value: delta as f64,
+                    tags: Arc::new(tags),
+                    timestamp: now,
+                    sample_type: tropel_sdk::types::SampleType::Counter,
+                })
+                .await;
+        }
     }
 }
 

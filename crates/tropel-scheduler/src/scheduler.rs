@@ -463,6 +463,12 @@ impl VUScheduler {
         self.arrival_dropped.swap(0, Ordering::Relaxed)
     }
 
+    /// Read the total dropped iterations counter without resetting.
+    /// Used by the periodic sampler (backlog line 262).
+    pub fn total_dropped_iterations(&self) -> u64 {
+        self.arrival_dropped.load(Ordering::Relaxed)
+    }
+
     /// Get active VU count.
     pub async fn active_vus(&self) -> u32 {
         self.active_vus.load(Ordering::Acquire)
@@ -1092,12 +1098,17 @@ impl VUScheduler {
     {
         let queued = self.arrival_tokens.load(Ordering::Relaxed);
         let idle = self.idle_vus.load(Ordering::Relaxed);
-        if queued == 0 || idle != 0 || *current_vus >= max_vus {
+        // Backlog line 260: the old guard `idle != 0` blocked pool growth
+        // whenever ANY VU was parked — even if 100 tokens were queued and
+        // only 1 VU was idle. Now grow when queued tokens exceed idle VUs
+        // that could consume them.
+        if queued == 0 || queued <= idle as u64 || *current_vus >= max_vus {
             return 0;
         }
-        let grow_cap = (max_vus - *current_vus) as u64;
-        const MAX_SPAWN_PER_TICK: u64 = 32;
-        let grow_by = queued.min(grow_cap).min(MAX_SPAWN_PER_TICK) as u32;
+        let needed = (queued - idle as u64) as u32;
+        let grow_cap = (max_vus - *current_vus).min(needed);
+        const MAX_SPAWN_PER_TICK: u32 = 32;
+        let grow_by = grow_cap.min(MAX_SPAWN_PER_TICK);
         if grow_by == 0 {
             return 0;
         }
@@ -2482,6 +2493,10 @@ mod tests {
                     // token wait ONLY (it must drop before the simulated work,
                     // or the pool would see every VU as idle and never grow).
                     let _idle_guard = sched.idle_guard();
+                    // Backlog line 260: pin notified() before the first check
+                    // to avoid the lost-wakeup race.
+                    let mut arrival_ready = std::pin::pin!(arrival_notify.notified());
+                    let mut stop_ready = std::pin::pin!(stop.notified());
                     loop {
                         if sched.is_stop_requested() || sched.is_force_stop_requested() {
                             break;
@@ -2491,8 +2506,12 @@ mod tests {
                             break;
                         }
                         tokio::select! {
-                            _ = arrival_notify.notified() => {}
-                            _ = stop.notified() => {}
+                            _ = &mut arrival_ready => {
+                                arrival_ready.set(arrival_notify.notified());
+                            }
+                            _ = &mut stop_ready => {
+                                stop_ready.set(stop.notified());
+                            }
                         }
                     }
                 }
@@ -2536,6 +2555,8 @@ mod tests {
                     let mut got = false;
                     {
                         let _idle_guard = sched.idle_guard();
+                        let mut arrival_ready = std::pin::pin!(arrival_notify.notified());
+                        let mut stop_ready = std::pin::pin!(stop.notified());
                         loop {
                             if sched.is_stop_requested() || sched.is_force_stop_requested() {
                                 break;
@@ -2545,8 +2566,12 @@ mod tests {
                                 break;
                             }
                             tokio::select! {
-                                _ = arrival_notify.notified() => {}
-                                _ = stop.notified() => {}
+                                _ = &mut arrival_ready => {
+                                    arrival_ready.set(arrival_notify.notified());
+                                }
+                                _ = &mut stop_ready => {
+                                    stop_ready.set(stop.notified());
+                                }
                             }
                         }
                     }
@@ -2600,6 +2625,8 @@ mod tests {
                     let mut got = false;
                     {
                         let _idle_guard = sched.idle_guard();
+                        let mut arrival_ready = std::pin::pin!(arrival_notify.notified());
+                        let mut stop_ready = std::pin::pin!(stop.notified());
                         loop {
                             if sched.is_stop_requested() || sched.is_force_stop_requested() {
                                 break;
@@ -2609,8 +2636,12 @@ mod tests {
                                 break;
                             }
                             tokio::select! {
-                                _ = arrival_notify.notified() => {}
-                                _ = stop.notified() => {}
+                                _ = &mut arrival_ready => {
+                                    arrival_ready.set(arrival_notify.notified());
+                                }
+                                _ = &mut stop_ready => {
+                                    stop_ready.set(stop.notified());
+                                }
                             }
                         }
                     }
