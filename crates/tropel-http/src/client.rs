@@ -725,11 +725,10 @@ impl HttpClient {
             // Build the request, then apply auth IN PLACE. Signers need the
             // final method/URL/body (SigV4, OAuth1, Hawk), which a
             // RequestBuilder cannot expose, so the auth happens on the built
-            // Request. Auth is applied ONLY to the first hop: signing the
-            // redirect target would be wrong (the signature is for the
-            // original URL). The signer-added headers are captured and
-            // re-applied on same-origin hops (see above); cross-origin hops
-            // strip them, matching reqwest's redirect policy.
+            // Request. Auth is applied on EVERY hop (not just hop 0) so the
+            // signature is valid for the current method+URL. The signer-added
+            // headers are captured at hop 0 for signer-less replay on hops
+            // where no signer is available; cross-origin hops strip them.
             let mut built_request = req_builder
                 .build()
                 .map_err(|e| TropelError::Http(format!("Failed to build request: {}", e)))?;
