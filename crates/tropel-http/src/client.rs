@@ -587,13 +587,6 @@ impl HttpClient {
             check_literal_blacklist(&self.blacklist, &current_url)?;
             // Line 454: parse once per hop, reuse for cookie jar + redirect.
             let hop_url = reqwest::Url::parse(&current_url).ok();
-            let hop_start = std::time::Instant::now();
-            // Per-request slot: concurrent requests (http.batch) interleave on
-            // one thread and futures migrate threads on the shared io_rt, so
-            // phases can no longer live in a single thread-local. Each hop
-            // gets its own slot; the TimedRequest wrapper below makes the
-            // DNS/connector hooks attribute to THIS request during every poll.
-            let slot = crate::subtimings::begin_request(hop_start);
 
             // Build the reqwest request for THIS hop (URL/method/body may
             // have been rewritten by a redirect). Match by reference: the
@@ -672,17 +665,11 @@ impl HttpClient {
                 }
                 req_builder = req_builder.header(key.as_str(), value.as_str());
             }
-            // Same-origin hops re-apply the signer-added headers captured at
-            // hop 0 (Authorization, x-amz-*, …). Cross-origin hops
-            // (strip_sensitive) drop them — credentials never leak to another
-            // origin. Applied AFTER the base headers so a signer that
-            // overrode a header (e.g. replaced a user-supplied Authorization)
-            // wins on every hop, not just hop 0.
-            // Backlog line 246: skip Cookie in signed_headers — the cookie jar
-            // below handles injection on each hop, so re-applying a stale
-            // Cookie from hop 0 produces duplicate headers with the stale
-            // value first.
-            if !strip_sensitive {
+            // Backlog line 246: On redirect hops WITH a signer, skip replaying
+            // stale signed_headers — the signing block below will re-sign the
+            // request for the new URL. Without a signer (or on hop 0), replay
+            // the captured headers as before. Cross-origin hops always strip.
+            if !strip_sensitive && signer.is_none() {
                 for (key, value) in signed_headers.iter().filter(|(k, _)| k != "cookie") {
                     req_builder = req_builder.header(key.as_str(), value.as_str());
                 }
@@ -746,30 +733,32 @@ impl HttpClient {
             let mut built_request = req_builder
                 .build()
                 .map_err(|e| TropelError::Http(format!("Failed to build request: {}", e)))?;
-            if hop_index == 0 {
+            // Backlog line 246: Sign on EVERY hop (not just hop 0) so the
+            // Authorization signature is valid for the current method+URL.
+            // Hop 0 captures what the signer added so the replay block above
+            // can apply it on signer-less hops. Redirect hops re-sign from
+            // scratch — the old signature is bound to the previous URL.
+            if !strip_sensitive {
                 if let Some(signer) = signer {
                     signer
                         .sign(&mut built_request)
                         .map_err(|e| TropelError::Http(format!("Auth signing failed: {}", e)))?;
-                    // Capture what the signer added/changed vs the original
-                    // headers so same-origin redirect hops re-apply them.
-                    // Filtered to the credential header names (the same set
-                    // the strip_sensitive check uses) so hop-0-only headers
-                    // like reqwest's injected `Accept: */*` or the code's own
-                    // multipart Content-Type are NOT carried to hops where
-                    // the body/method may have been rewritten.
-                    for (name, value) in built_request.headers().iter() {
-                        let key = name.as_str().to_ascii_lowercase();
-                        if !is_credential_header(&key) {
-                            continue;
-                        }
-                        let value_str = value.to_str().unwrap_or("");
-                        let identical_in_original = request
-                            .headers
-                            .iter()
-                            .any(|(k, v)| k.eq_ignore_ascii_case(&key) && v == value_str);
-                        if !identical_in_original {
-                            signed_headers.push((key, value_str.to_string()));
+                    if hop_index == 0 {
+                        // Capture what the signer added/changed vs the original
+                        // headers so signer-less hops can replay them.
+                        for (name, value) in built_request.headers().iter() {
+                            let key = name.as_str().to_ascii_lowercase();
+                            if !is_credential_header(&key) {
+                                continue;
+                            }
+                            let value_str = value.to_str().unwrap_or("");
+                            let identical_in_original = request
+                                .headers
+                                .iter()
+                                .any(|(k, v)| k.eq_ignore_ascii_case(&key) && v == value_str);
+                            if !identical_in_original {
+                                signed_headers.push((key, value_str.to_string()));
+                            }
                         }
                     }
                 }
@@ -783,6 +772,12 @@ impl HttpClient {
             // ═══════════════════════════════════════════════════════
             // Phase 1: Send request → receive response head (TTFB)
             // ═══════════════════════════════════════════════════════
+            // Backlog line 246: stamp the timing slot AFTER the request is
+            // fully built and signed so build+sign overhead is excluded from
+            // blocked/waiting, and total = Σphases actually holds.
+            let hop_start = std::time::Instant::now();
+            let slot = crate::subtimings::begin_request(hop_start);
+
             // The response head (status line + headers) is received when this
             // resolves. The measured "waiting" time includes everything up to
             // this point: blocked + DNS + TCP connect + TLS handshake + sending +
