@@ -417,6 +417,20 @@ where
         ExecutionConfig::PerVUIterations { iterations, .. } => *iterations,
         _ => u64::MAX,
     };
+    // Backlog line 261: cap iterations to prevent OOM from absurdly large
+    // values. 0xFFFFFFFF on wasm32 truncates to capacity 0 but the loop
+    // still runs 4.29B times. 10 billion is ~110× k6's max tested value.
+    const MAX_ITERATIONS: u64 = 10_000_000_000;
+    let total_iterations = if total_iterations > MAX_ITERATIONS {
+        tracing::warn!(
+            "iterations {} capped to {} (would exceed memory budget)",
+            total_iterations,
+            MAX_ITERATIONS
+        );
+        MAX_ITERATIONS
+    } else {
+        total_iterations
+    };
 
     let is_per_vu_iterations = matches!(exec_cfg, ExecutionConfig::PerVUIterations { .. });
     let think_time_cfg = extract_think_time(&exec_cfg);
