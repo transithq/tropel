@@ -717,6 +717,20 @@ pub(crate) async fn run_scenario_vus(
         input_path,
     )));
 
+    // Backlog line 426: pre-warm connections during the serial startup
+    // window. Extract every distinct URL from the flattened scenario items
+    // and fire HEAD requests to each unique host — the pool caches the
+    // TLS session so the first real request skips the cold-start penalty.
+    {
+        let warm_urls: Vec<String> = flattened_c
+            .iter()
+            .filter_map(|item| item.request.as_ref().map(|r| r.url.clone()))
+            .collect();
+        if !warm_urls.is_empty() {
+            lanes[0].pre_warm(&warm_urls).await;
+        }
+    }
+
     run_vus(
         sc_name,
         start_delay,
@@ -895,6 +909,19 @@ pub(crate) async fn run_driver_vus(
             lane_count
         );
     }
+    // Backlog line 426: pre-warm connections during the serial startup window.
+    // For the driver path, we don't know the URLs ahead of time (they're
+    // determined by JS code), but we CAN pre-warm the static hosts map entries
+    // since those are known at config time.
+    if !http_cfg.hosts.is_empty() {
+        let warm_urls: Vec<String> = http_cfg
+            .hosts
+            .keys()
+            .map(|host| format!("http://{host}"))
+            .collect();
+        lanes[0].pre_warm(&warm_urls).await;
+    }
+
     // k6 lifecycle: run the script's `setup()` ONCE per scenario, BEFORE any
     // VU spawns. The serialized return value is threaded into every VU's
     // context (so `export default function (data)` receives it) and later

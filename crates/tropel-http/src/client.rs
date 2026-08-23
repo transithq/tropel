@@ -383,6 +383,78 @@ impl HttpClient {
         })
     }
 
+    /// Backlog line 426: pre-warm connections during the serial startup window.
+    ///
+    /// Send a lightweight HEAD request to each distinct host to trigger DNS
+    /// resolution and TCP+TLS handshake before VUs start ramping. The
+    /// connection pool caches the result so the first real request skips the
+    /// cold-start penalty (~50–150 ms per host on TLS). This runs during the
+    /// `start_delay` dead time — zero overhead once VUs are live.
+    ///
+    /// Failures are logged but never fatal — pre-warming is best-effort.
+    pub async fn pre_warm(&self, urls: &[String]) {
+        use std::collections::HashSet;
+        // Deduplicate by (scheme, host, port) — only one connection per
+        // distinct origin needs the handshake.
+        let mut seen = HashSet::new();
+        let mut warm_urls = Vec::new();
+        for url in urls {
+            if let Ok(parsed) = reqwest::Url::parse(url) {
+                let key = (
+                    parsed.scheme().to_string(),
+                    parsed.host_str().unwrap_or("").to_string(),
+                    parsed.port_or_known_default().unwrap_or(80),
+                );
+                if seen.insert(key) {
+                    warm_urls.push(url.clone());
+                }
+            }
+        }
+        if warm_urls.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "Pre-warming {} distinct host(s) during startup",
+            warm_urls.len()
+        );
+        // Fire all HEAD requests concurrently — bounded to avoid fd
+        // exhaustion on high-host-count configs.
+        let limit = warm_urls.len().min(32);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+        let mut handles = Vec::with_capacity(warm_urls.len());
+        for url in warm_urls {
+            let sem = semaphore.clone();
+            let client = self.inner.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                let resp = client
+                    .head(&url)
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) => {
+                        tracing::debug!("Pre-warm {} → {}", url, r.status());
+                        // Drop the response to release the connection back
+                        // to the pool (the pool keeps the TLS session).
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Pre-warm {} failed: {} — will retry on first request",
+                            url,
+                            e
+                        );
+                    }
+                }
+            }));
+        }
+        // Wait for all pre-warm requests to complete (or timeout).
+        for h in handles {
+            let _ = h.await;
+        }
+        tracing::info!("Pre-warm complete — connections ready for VU start");
+    }
+
     /// Pick the `reqwest::Client` for a request, honoring the per-request
     /// `follow_redirects` and `certificate` overrides that reqwest bakes in at
     /// client-build time:
