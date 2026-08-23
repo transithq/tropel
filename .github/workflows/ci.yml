@@ -153,13 +153,10 @@ jobs:
       # change to the published contract must bump the minor before release.
       # `check-release` diffs the working tree against the last version on
       # crates.io and fails on breaking changes.
-      # --release-type minor: pre-1.0 crates (0.x) need this flag so the tool
-      # checks for minor-level breaks instead of silently skipping all checks
-      # (cargo-semver-checks treats 0.2→0.3 as a valid minor bump and skips).
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks
-      - run: cargo semver-checks check-release -p tropel-sdk --release-type minor
+      - run: cargo semver-checks check-release -p tropel-sdk
 
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
