@@ -80,10 +80,10 @@ pub struct HttpConfig {
     /// connection, which trades latency for isolation.
     #[serde(default, alias = "noConnectionReuse")]
     pub no_connection_reuse: bool,
-    /// k6 `noVUConnectionReuse` parity. Tropel already gives every VU its own
-    /// client with its own connection pool, so connections are never shared
-    /// across VUs regardless of this flag; it is accepted for script
-    /// compatibility and currently a no-op.
+    /// k6 `noVUConnectionReuse` parity. When true, forces a fresh client
+    /// (own connection pool) per VU. Default false: every VU shares one
+    /// pooled client via Arc clone, keeping connections warm and TLS
+    /// sessions reusable.
     #[serde(default, alias = "noVUConnectionReuse")]
     pub no_vu_connection_reuse: bool,
     /// Global request-rate cap in requests/second (k6 `rps`). When set, the

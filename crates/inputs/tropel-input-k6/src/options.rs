@@ -55,8 +55,8 @@ pub struct K6Options {
     /// Close the connection after every request (k6 `noConnectionReuse`).
     #[serde(alias = "noConnectionReuse")]
     pub no_connection_reuse: Option<bool>,
-    /// k6 `noVUConnectionReuse` — accepted for compatibility; Tropel already
-    /// gives each VU its own client/pool, so it is effectively always on.
+    /// k6 `noVUConnectionReuse` — when true, forces a fresh client (own
+    /// connection pool) per VU. Default false: VUs share one pooled client.
     #[serde(alias = "noVUConnectionReuse")]
     pub no_vu_connection_reuse: Option<bool>,
     /// Global request-rate cap in requests/second (k6 `rps`).
