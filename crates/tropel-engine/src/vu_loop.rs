@@ -483,6 +483,66 @@ where
         script_failures: script_failures.clone(),
     };
 
+    // Backlog line 423: warn when per-VU JS init cost makes the ramp
+    // physically impossible. At ~1ms per VU init, a 0→10000 ramp in 1s
+    // requires ≥10s of CPU — 2-3× the wall time on 8 cores. The gap
+    // between "spawned" and "first request" is invisible to the scheduler.
+    {
+        let (target_vus, ramp_secs) = match &exec_cfg {
+            ExecutionConfig::ConstantVus { vus, .. } => (*vus, None),
+            ExecutionConfig::RampingVus {
+                stages, start_vus, ..
+            } => {
+                let target = stages.iter().map(|s| s.target).max().unwrap_or(*start_vus);
+                let ramp_secs: f64 = stages
+                    .iter()
+                    .map(|s| {
+                        crate::pacing::parse_duration_str(&s.duration)
+                            .map(|d| d.as_secs_f64())
+                            .unwrap_or(0.0)
+                    })
+                    .sum();
+                (target, Some(ramp_secs))
+            }
+            ExecutionConfig::ConstantArrivalRate { pre_alloc_vus, .. }
+            | ExecutionConfig::RampingArrivalRate { pre_alloc_vus, .. } => (*pre_alloc_vus, None),
+            ExecutionConfig::SharedIterations { vus, .. } => (*vus, None),
+            ExecutionConfig::PerVUIterations { vus, .. } => (*vus, None),
+            ExecutionConfig::ExternallyControlled { .. } => (0, None),
+        };
+        if target_vus > 100 {
+            // ~1ms per VU JS init, parallelized across available cores.
+            let estimated_cpu_secs = target_vus as f64 * 0.001;
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get() as f64)
+                .unwrap_or(4.0);
+            let wall_secs = estimated_cpu_secs / cores;
+            if let Some(ramp_secs) = ramp_secs {
+                if ramp_secs > 0.0 && wall_secs > ramp_secs * 1.5 {
+                    tracing::warn!(
+                        "Scenario '{}': per-VU JS init estimated at {:.1}s CPU \
+                         ({:.2}s wall on {:.0} cores) but the ramp is only {:.1}s. \
+                         A 0→{} ramp cannot complete in {:.1}s — expect {:.0}s+ to reach target. \
+                         Consider a slower ramp or pre-warming the VU pool.",
+                        sc_name,
+                        estimated_cpu_secs,
+                        wall_secs,
+                        cores,
+                        ramp_secs,
+                        target_vus,
+                        ramp_secs,
+                        wall_secs
+                    );
+                }
+            } else {
+                tracing::info!(
+                    "Scenario '{}': {} VUs — per-VU JS init estimated at {:.2}s wall on {:.0} cores",
+                    sc_name, target_vus, wall_secs, cores
+                );
+            }
+        }
+    }
+
     // Backlog line 53: `executor.run(...).await.ok()` used to DISCARD the
     // scheduler's error — a rejected execution config (e.g. a malformed
     // duration) ran zero VUs and exited 0 with http_reqs: 0. Any executor
