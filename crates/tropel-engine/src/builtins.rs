@@ -54,3 +54,36 @@ pub fn register_builtins() {
     let count = link_builtins();
     tracing::debug!("Force-linked {count} built-in adapter/driver type(s)");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tropel_ext::registry::ExtensionRegistry;
+
+    /// TR-007: every adapter shipped in this workspace must be reachable from
+    /// the CLI. A new adapter that is never force-linked (or never wired into
+    /// `link_builtins`) registers in `inventory` but gets dead-stripped from
+    /// the binary, so `tropel run file` reports "no input adapter recognized".
+    /// This test walks the real `collect_inventory()` path the CLI uses.
+    #[test]
+    fn every_builtin_adapter_is_reachable_from_the_cli() {
+        register_builtins();
+        let registry = ExtensionRegistry::new();
+        let inputs = registry.list_inputs();
+        for expected in [
+            "postman",
+            "har",
+            "openapi",
+            "k6",
+            "http",
+            "bru",
+            "insomnia",
+        ] {
+            assert!(
+                inputs.iter().any(|id| id == expected),
+                "adapter '{expected}' is not reachable from the CLI — it must be added to \
+                 builtins::link_builtins() or the binary dead-strips its registration"
+            );
+        }
+    }
+}

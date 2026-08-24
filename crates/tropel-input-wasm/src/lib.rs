@@ -85,9 +85,11 @@ type AdapterEntry = (&'static str, u8, fn() -> Box<dyn InputAdapter>);
 
 /// The collection parsers exposed by this slice, in dispatch order.
 /// Priority mirrors each input crate's `with_priority` registration:
-/// postman 40, har 30, insomnia 35, openapi 20, bru 25. `detect` claims must
+/// postman 40, har 30, insomnia 35, openapi 20, bru 26. `detect` claims must
 /// be mutually exclusive (structural checks, no substring matching) — see
-/// each crate.
+/// each crate. bru is 26, NOT 25, so it does not tie with the `http` file
+/// adapter (TR-007: both registering at 25 made the tie-break
+/// link-order-dependent).
 // P1 line 152: sorted by priority DESCENDING so the highest-priority
 // adapter (postman=40) is probed first. The old order was arbitrary
 // and har(30)/bru(25) were checked before postman(40) for no reason.
@@ -99,7 +101,7 @@ const ADAPTERS: &[AdapterEntry] = &[
         Box::new(tropel_input_insomnia::InsomniaInputAdapter)
     }),
     ("har", 30, || Box::new(tropel_input_har::HarInputAdapter)),
-    ("bru", 25, || Box::new(tropel_input_bru::BruInputAdapter)),
+    ("bru", 26, || Box::new(tropel_input_bru::BruInputAdapter)),
     ("openapi", 20, || {
         Box::new(tropel_input_openapi::OpenApiInputAdapter)
     }),
@@ -244,5 +246,29 @@ mod tests {
         );
         assert_eq!(import_by_id_impl("bru", BRU).unwrap().items.len(), 1);
         assert!(import_by_id_impl("bogus", OPENAPI).is_err());
+    }
+
+    /// TR-007: the wasm dispatch table must mirror each crate's `with_priority`
+    /// registration, and priorities must be pairwise distinct. `bru` and `http`
+    /// both used to register at 25 (tie-break link-order-dependent); bru is now
+    /// 26 everywhere — here AND in tropel-input-bru.
+    #[test]
+    fn dispatch_table_priorities_are_distinct_and_mirror_native() {
+        let mut priorities: Vec<u8> = ADAPTERS.iter().map(|(_, p, _)| *p).collect();
+        let before = priorities.len();
+        priorities.sort_unstable();
+        priorities.dedup();
+        assert_eq!(
+            priorities.len(),
+            before,
+            "dispatch priorities must be distinct: {:?}",
+            ADAPTERS.iter().map(|(id, p, _)| (*id, *p)).collect::<Vec<_>>()
+        );
+        let bru_prio = ADAPTERS
+            .iter()
+            .find(|(id, _, _)| *id == "bru")
+            .map(|(_, p, _)| *p)
+            .expect("bru in dispatch table");
+        assert_eq!(bru_prio, 26, "bru must be 26, distinct from http's 25");
     }
 }

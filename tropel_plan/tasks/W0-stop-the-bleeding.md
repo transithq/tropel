@@ -22,11 +22,11 @@ What remains is narrow, and it is the part that makes the counter trustworthy ra
 
 ### Acceptance criteria
 - [x] Per-output dropped-sample count is counted and reaches the summary
-- [ ] It is printed **always, including when zero** — today `stdout.rs:86` and `:98` are both gated on `> 0`, so a clean run cannot distinguish "no drops" from "counter not wired"
-- [ ] The count is available to `handleSummary` and to every reporter (JSON, JUnit, CSV) — JSON carries `seriesDropped`; confirm the others
-- [ ] A non-zero drop count marks the run **unverified** in the summary, in plain language
-- [ ] `dropped_iterations` is emitted **continuously**, not as one end-of-run sample — k6 emits it per tick, and "when did drops happen" is exactly the question the arrival-token starvation raises
-- [ ] Documented: which subsystems can drop, and what a user does about each
+- [x] It is printed **always, including when zero** — today `stdout.rs:86` and `:98` are both gated on `> 0`, so a clean run cannot distinguish "no drops" from "counter not wired"
+- [x] The count is available to `handleSummary` and to every reporter (JSON, JUnit, CSV) — JSON carries `seriesDropped`; confirm the others
+- [x] A non-zero drop count marks the run **unverified** in the summary, in plain language
+- [x] `dropped_iterations` is emitted **continuously**, not as one end-of-run sample — k6 emits it per tick, and "when did drops happen" is exactly the question the arrival-token starvation raises
+- [x] Documented: which subsystems can drop, and what a user does about each
 
 ### Tests required
 - A test that forces a slow output, asserts a non-zero summary drop count, and asserts the run is marked unverified
@@ -42,11 +42,11 @@ What remains is narrow, and it is the part that makes the counter trustworthy ra
 
 ### Acceptance criteria
 - [x] Per-iteration CPU, per-VU memory at spawn
-- [ ] Benchmarks for: **samples/s egress per output**, **aggregator duty cycle**, **ramp wall-clock**, **request-path allocations**
-- [ ] Each emits a machine-readable number CI can compare against a committed baseline
-- [ ] Release profile only — a debug measurement is not a measurement (see `TROPEL_PERF_VS_K6.md` §1: debug runs the serde/alloc/QuickJS path 3–10× slower, and the original 22 % gap was measured debug-vs-release)
-- [ ] The harness records the machine, so ✅MEAS claims are reproducible
-- [ ] A regression over threshold fails the build
+- [x] Benchmarks for: **samples/s egress per output**, **aggregator duty cycle**, **ramp wall-clock**, **request-path allocations**
+- [x] Each emits a machine-readable number CI can compare against a committed baseline
+- [x] Release profile only — a debug measurement is not a measurement (see `TROPEL_PERF_VS_K6.md` §1: debug runs the serde/alloc/QuickJS path 3–10× slower, and the original 22 % gap was measured debug-vs-release)
+- [x] The harness records the machine, so ✅MEAS claims are reproducible
+- [x] A regression over threshold fails the build
 
 ## TR-003 · The declared MSRV is false and the CI gate cannot pass
 **Effort:** S · **Blocked by:** none
@@ -72,10 +72,10 @@ What remains is narrow, and it is the part that makes the counter trustworthy ra
 This is invariant #1 in one line of code.
 
 ### Acceptance criteria
-- [ ] The parse is fallible; a malformed range is a **startup error naming the offending string**, never a default
-- [ ] Overflow, `"200-"`, `"2XX"`, and reversed ranges each produce a distinct, actionable message
-- [ ] Every sibling call site of the same function is fixed in the same PR — name them in the PR body
-- [ ] k6's default range is 200–399 **inclusive**, and `null` suppresses `http_req_failed` entirely — match both
+- [x] The parse is fallible; a malformed range is a **startup error naming the offending string**, never a default
+- [x] Overflow, `"200-"`, `"2XX"`, and reversed ranges each produce a distinct, actionable message
+- [x] Every sibling call site of the same function is fixed in the same PR — name them in the PR body
+- [x] k6's default range is 200–399 **inclusive**, and `null` suppresses `http_req_failed` entirely — match both
 
 ### Tests required
 - Each of the five ✅EXEC strings asserts a startup error, not a match
@@ -90,26 +90,26 @@ These are one story: the newest adapters do not work, and the npm side does not 
 ## TR-005 · `tropel-input-bru` rejects every real Bruno export
 **Effort:** M · **Blocked by:** none
 
-- [ ] `lib.rs:302` matches `Some("http-request")`; Bruno's exporter rewrites the type, so no real export matches
+- [x] `lib.rs:302` matches `Some("http-request")`; Bruno's exporter rewrites the type, so no real export matches
 - [ ] Test fixtures are **exports produced by Bruno**, not hand-written JSON — this is exactly the gap that let it ship
-- [ ] Bruno path params are preserved (`:345` currently keeps only `param_type == "query"`)
-- [ ] Duplicate query keys survive — `merge_pairs` joins with `", "`, collapsing `[{ids,1},{ids,2}]` into one
-- [ ] A request that fails to convert is **reported**, not skipped: `if let Ok(child)` currently drops bad requests silently, contradicting the adapter's own docs
+- [x] Bruno path params are preserved (`:345` currently keeps only `param_type == "query"`)
+- [x] Duplicate query keys survive — `merge_pairs` joins with `", "`, collapsing `[{ids,1},{ids,2}]` into one
+- [x] A request that fails to convert is **reported**, not skipped: `if let Ok(child)` currently drops bad requests silently, contradicting the adapter's own docs
 
 ## TR-006 · `tropel-input-insomnia` fails on any drag-reordered workspace
 **Effort:** S · **Blocked by:** none
 
-- [ ] `lib.rs:71` types `metaSortKey` as `Option<i64>`; Insomnia assigns sort keys by **midpoint averaging**, so they go fractional the first time a user drags anything. Type it as a float
-- [ ] Fixture: a workspace exported *after* reordering
-- [ ] Same silent-drop and duplicate-query-key fixes as `TR-005`
+- [x] `lib.rs:71` types `metaSortKey` as `Option<i64>`; Insomnia assigns sort keys by **midpoint averaging**, so they go fractional the first time a user drags anything. Type it as a float
+- [x] Fixture: a workspace exported *after* reordering
+- [x] Same silent-drop and duplicate-query-key fixes as `TR-005`
 
 ## TR-007 · Bruno and Insomnia are compiled out of the CLI entirely
 **Effort:** S · **Blocked by:** TR-005, TR-006
 
-- [ ] `tropel-engine/Cargo.toml:32-37` depends on postman, k6, har, openapi, subprocess and http — **not** insomnia, not bru. The adapters exist and are unreachable
-- [ ] Add both to the inventory and the dispatch table
-- [ ] Resolve the priority collision: `http` and `bru` both register at priority 25, so the tie-break is **link-order-dependent**
-- [ ] A test asserts every adapter in the workspace is reachable from the CLI — otherwise the next one ships unwired too
+- [x] `tropel-engine/Cargo.toml:32-37` depends on postman, k6, har, openapi, subprocess and http — **not** insomnia, not bru. The adapters exist and are unreachable
+- [x] Add both to the inventory and the dispatch table
+- [x] Resolve the priority collision: `http` and `bru` both register at priority 25, so the tie-break is **link-order-dependent**
+- [x] A test asserts every adapter in the workspace is reachable from the CLI — otherwise the next one ships unwired too
 
 ## TR-008 · `packages/input-wasm/package.json` was never committed
 **Effort:** S · **Blocked by:** none · **Blocks:** knockport install
@@ -118,25 +118,25 @@ These are one story: the newest adapters do not work, and the npm side does not 
 Root `.gitignore:33` is a blanket `*.json`. This is its **third** victim — the file's own comments record the prior two. Four reproduced consequences: the directory is not a workspace member (npm silently skips manifest-less dirs); its own `scripts/build.sh:50` fails `npm pack --dry-run` with `ENOENT` *after* producing `pkg/`; the README's `npm run build` reports `Missing script`; and **knockport's `file:` dep cannot resolve**, so `pnpm install` fails there.
 
 ### Acceptance criteria
-- [ ] **Scope the ignore rule** — do not add a fifth exception
-- [ ] Delete the two dead `!packages/exec-wasm/*` lines left from the rename to `runtime-wasm`
-- [ ] A CI check asserts every `packages/*` directory has a committed manifest and is a workspace member
-- [ ] A clean clone runs `npm install` at the root with no missing-manifest error
+- [x] **Scope the ignore rule** — do not add a fifth exception
+- [x] Delete the two dead `!packages/exec-wasm/*` lines left from the rename to `runtime-wasm`
+- [x] A CI check asserts every `packages/*` directory has a committed manifest and is a workspace member
+- [x] A clean clone runs `npm install` at the root with no missing-manifest error
 
 ## TR-009 · `@tropel/core-wasm` cannot be imported without a prior Rust build
 **Effort:** S · **Blocked by:** none · **Blocks:** knockport boot
 
-- [ ] `packages/core-wasm/src/index.js:21` is a **static top-level** `import CATALOG_META from "../pkg/meta.js"`, and `pkg/` is gitignored and build-generated → **module load** fails, not the call
-- [ ] knockport depends on the source directory via `file:`, so `packages/core/src/tropel.ts:10` and `oauth2.ts:8` break the whole app
-- [ ] The glue is already lazily `await import`ed — make `meta.js` lazy the same way, or commit it
-- [ ] A CI job imports the package from a clean clone with **no Rust toolchain present** and asserts it loads
+- [x] `packages/core-wasm/src/index.js:21` is a **static top-level** `import CATALOG_META from "../pkg/meta.js"`, and `pkg/` is gitignored and build-generated → **module load** fails, not the call
+- [x] knockport depends on the source directory via `file:`, so `packages/core/src/tropel.ts:10` and `oauth2.ts:8` break the whole app
+- [x] The glue is already lazily `await import`ed — make `meta.js` lazy the same way, or commit it
+- [x] A CI job imports the package from a clean clone with **no Rust toolchain present** and asserts it loads
 
 ## TR-010 · `ci.yml` `paths:` omits `packages/**` and the root manifest
 **Effort:** S · **Blocked by:** none
 
-- [ ] A PR touching only `packages/core-wasm/src/index.js`, either smoke test, either build script, or the workspace manifest runs **no CI at all** — which is how `TR-008` and `TR-009` reached `master`
-- [ ] Add `packages/**` and the root `package.json`
-- [ ] Assert the negative: a PR touching only a package triggers the JS jobs
+- [x] A PR touching only `packages/core-wasm/src/index.js`, either smoke test, either build script, or the workspace manifest runs **no CI at all** — which is how `TR-008` and `TR-009` reached `master`
+- [x] Add `packages/**` and the root `package.json`
+- [x] Assert the negative: a PR touching only a package triggers the JS jobs
 
 ---
 
@@ -153,26 +153,26 @@ The advice was *"emit fewer samples — `tls_handshaking`/`sending` are always 0
 Emitting the two zero samples was correct and cheap.
 
 ### Acceptance criteria
-- [ ] Both samples emitted again, **or** `aggregate_series` grows arms that return 0 for a metric with no observations — pick one and say why
+- [x] Both samples emitted again, **or** `aggregate_series` grows arms that return 0 for a metric with no observations — pick one and say why
 - [ ] A missing series never renders as `FAIL`; "no data" and "failed" are distinct verdicts (see `TR-111`)
-- [ ] `res.timings` and the emitted metrics agree — a test asserts it
-- [ ] k6 also declares `looking_up` and never assigns it; emit it as 0 for byte-compat
+- [x] `res.timings` and the emitted metrics agree — a test asserts it
+- [x] k6 also declares `looking_up` and never assigns it; emit it as 0 for byte-compat
 
 ## TR-012 · The pause-gate lost wakeup
 **Effort:** S · **Blocked by:** none
 
-- [ ] `vu_loop.rs:100-107` creates `Notified` **after** reading `is_paused()`, registering only on first poll, while `set_paused` uses edge-triggered `notify_waiters()` (`scheduler.rs:426-427`)
-- [ ] A resume PATCH landing in that window is dropped, and **the `select!` has no timeout** → the VU parks for the rest of the run while the control API returns 200 and reports `paused: false`
-- [ ] Fix: construct and pin `notified()` *before* the check, **or** keep a `sleep(100ms)` backstop
-- [ ] `worker.rs:413-419` documents why edge-triggered `Notify` is wrong, 40 lines away. Fix the **sibling** too: the arrival-token bucket has the same shape in all three legs
-- [ ] A test pauses and resumes inside the race window and asserts the VU makes progress
+- [x] `vu_loop.rs:100-107` creates `Notified` **after** reading `is_paused()`, registering only on first poll, while `set_paused` uses edge-triggered `notify_waiters()` (`scheduler.rs:426-427`)
+- [x] A resume PATCH landing in that window is dropped, and **the `select!` has no timeout** → the VU parks for the rest of the run while the control API returns 200 and reports `paused: false`
+- [x] Fix: construct and pin `notified()` *before* the check, **or** keep a `sleep(100ms)` backstop
+- [x] `worker.rs:413-419` documents why edge-triggered `Notify` is wrong, 40 lines away. Fix the **sibling** too: the arrival-token bucket has the same shape in all three legs
+- [x] A test pauses and resumes inside the race window and asserts the VU makes progress
 
 ## TR-013 · The shared deep-equal is structurally blind
 **Effort:** S · **Blocked by:** none
 
-- [ ] Consolidating the three copies was right; the implementation is not. `js/shared/deep-equal.js:126-139` compares `Object.keys(a).sort()` — so it cannot see a key present in `b` and absent in `a` when counts match, among other holes
-- [ ] The asymmetric `Date` compare throws: `:31-35` guards `b instanceof Date` then calls `a.getTime()`
-- [ ] Property test over generated object pairs, asserting agreement with a reference implementation
+- [x] Consolidating the three copies was right; the implementation is not. `js/shared/deep-equal.js:126-139` compares `Object.keys(a).sort()` — so it cannot see a key present in `b` and absent in `a` when counts match, among other holes
+- [x] The asymmetric `Date` compare throws: `:31-35` guards `b instanceof Date` then calls `a.getTime()`
+- [x] Property test over generated object pairs, asserting agreement with a reference implementation
 
 ---
 
@@ -187,11 +187,11 @@ Emitting the two zero samples was correct and cheap.
 It is undetectable from inside the tool. On a multiplexed stream the connector never runs, so `blocked`/`dns`/`connecting` are all 0 and the entire stream-queueing wait lands in `http_req_waiting`, indistinguishable from server latency. (k6 has the mirror bug — it folds h2 queueing into `http_req_sending`.)
 
 ### Acceptance criteria
-- [ ] A `protocol` tag on every sample, from `Response::version()` — this also closes the `res.proto` lie and gives protocol on *failed* requests, which beats k6
-- [ ] The k6 shim stops hardcoding `'HTTP/1.1'` (the Rust path is fixed; the shim string remains)
-- [ ] h2 stream-queueing time is **not** reported as server latency — either its own timing or an explicit documented divergence
-- [ ] Typed h2 error classification, replacing the substring match on error text at `driver.rs:1022`
-- [ ] h2 keep-alive tuning: interval 10 s ✅landed, plus `timeout=5s` and `while_idle=true`
+- [x] A `protocol` tag on every sample, from `Response::version()` — this also closes the `res.proto` lie and gives protocol on *failed* requests, which beats k6
+- [x] The k6 shim stops hardcoding `'HTTP/1.1'` (the Rust path is fixed; the shim string remains)
+- [x] h2 stream-queueing time is **not** reported as server latency — either its own timing or an explicit documented divergence
+- [x] Typed h2 error classification, replacing the substring match on error text at `driver.rs:1022`
+- [x] h2 keep-alive tuning: interval 10 s ✅landed, plus `timeout=5s` and `while_idle=true`
 - [ ] A benchmark against an h2 server with a low `MAX_CONCURRENT_STREAMS` proves the cap is gone or is documented
 
 ### Do not re-file

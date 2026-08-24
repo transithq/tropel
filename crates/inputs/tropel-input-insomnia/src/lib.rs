@@ -641,4 +641,45 @@ mod tests {
         let scenario = adapter.parse(data).unwrap();
         assert!(scenario.variables.is_empty());
     }
+
+    /// TR-006: Insomnia assigns sort keys by midpoint averaging, so they go
+    /// FRACTIONAL the first time a user drags anything. The old `Option<i64>`
+    /// type rejected the whole resource (parse error) on any drag-reordered
+    /// export. This fixture is exactly what a reordered workspace exports.
+    #[test]
+    fn parse_reordered_workspace_with_fractional_sort_keys() {
+        let adapter = InsomniaInputAdapter;
+        let data = br#"{
+            "_type": "export",
+            "__export_format": 4,
+            "resources": [
+                {"_type": "workspace", "_id": "wrk", "name": "W"},
+                {"_type": "request", "_id": "r1", "parentId": "wrk", "name": "First", "method": "GET", "url": "https://x.io/1", "metaSortKey": -0.5},
+                {"_type": "request", "_id": "r2", "parentId": "wrk", "name": "Second", "method": "GET", "url": "https://x.io/2", "metaSortKey": 0.25},
+                {"_type": "request", "_id": "r3", "parentId": "wrk", "name": "Third", "method": "GET", "url": "https://x.io/3", "metaSortKey": 1.5}
+            ]
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        let names: Vec<&str> = scenario.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["First", "Second", "Third"]);
+    }
+
+    /// TR-006 (sibling of TR-005): duplicate query keys must not be silently
+    /// dropped — `[{ids,1},{ids,2}]` joins to `"1, 2"` (the SDK's
+    /// `HashMap` cannot hold duplicate keys, so the data is preserved, not lost).
+    #[test]
+    fn parse_duplicate_query_keys_join_not_drop() {
+        let adapter = InsomniaInputAdapter;
+        let data = br#"{
+            "_type": "export",
+            "__export_format": 4,
+            "resources": [
+                {"_type": "workspace", "_id": "wrk", "name": "W"},
+                {"_type": "request", "_id": "r", "parentId": "wrk", "name": "R", "method": "GET", "url": "https://x.io/", "parameters": [{"name": "ids", "value": "1"}, {"name": "ids", "value": "2"}]}
+            ]
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.query_params.get("ids"), Some(&"1, 2".to_string()));
+    }
 }
