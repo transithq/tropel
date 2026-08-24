@@ -28,11 +28,16 @@ export function isCoreWasmReady(): boolean;
  */
 export function resolveDynamicVariables(template: string): string;
 
-/** Catalog metadata `[{"name":"$guid","description":…}]` for editor UIs. */
-export function getPredefinedVariablesMeta(): PredefinedVariableMeta[];
+/**
+ * Catalog metadata `[{"name":"$guid","description":…}]` for editor UIs.
+ * Async: `pkg/meta.js` is generated at package build time and is loaded lazily
+ * so the package can be imported (without throwing) before the build runs.
+ */
+export function getPredefinedVariablesMeta(): Promise<PredefinedVariableMeta[]>;
 
-/** Just the `$`-prefixed catalog names (autocomplete lists). */
-export function getPredefinedVariableNames(): string[];
+/** Just the `$`-prefixed catalog names (autocomplete lists). Async — see
+ * {@link getPredefinedVariablesMeta}. */
+export function getPredefinedVariableNames(): Promise<string[]>;
 
 // ── OAuth2 flows (RFC 6749 + RFC 7636 PKCE, pure — the embedder sends) ──────
 
