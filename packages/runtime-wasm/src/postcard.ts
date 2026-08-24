@@ -333,10 +333,12 @@ function writeOptionI64(w: Writer, v: number | null | undefined): void {
   if (v == null) w.optionNone();
   else {
     w.optionSome();
-    // Cookie.max_age is Option<i64> seconds; postcard encodes i64 as a
-    // varint of the two's-complement bits. Seconds values are far inside the
-    // JS safe-integer range and non-negative in practice.
-    w.varint(v);
+    // P1 line 153: postcard uses zigzag encoding for i64, NOT plain
+    // varint. The old code sent raw varint(v), so 3600 decoded as 1800,
+    // 1 decoded as -1, and -1 (cookie deletion) threw and killed the
+    // whole request. Zigzag: encode = (n << 1) ^ (n >> 63).
+    const zigzag = (v << 1) ^ (v >= 0 ? 0 : -1);
+    w.varint(zigzag);
   }
 }
 
