@@ -1010,7 +1010,7 @@ fn k6_error_envelope<'js>(
     // contract — error_code mapped via k6_error_code (was hardcoded 1000),
     // and a binary response keeps an empty ArrayBuffer body so
     // res.body.byteLength doesn't see a type change (was String "").
-    let _ = e.set("error_code", k6_error_code(msg));
+    let _ = e.set("error_code", k6_error_code_message(msg));
     let _ = e.set("headers", rquickjs::Object::new(ctx.clone()).ok()?);
     if binary {
         match rquickjs::ArrayBuffer::new(ctx.clone(), Vec::<u8>::new()) {
@@ -1260,10 +1260,16 @@ fn compress_k6_body(kind: &str, data: &[u8]) -> Option<Vec<u8>> {
 /// k6-style error codes for `res.error_code`. k6 defines a 1xxx series:
 /// 1000 generic, 1010 non-TCP network error, 1020 malformed HTTP, 1050
 /// timeout, 1100 DNS, 1200 TCP connect, 1300 TLS, 1600 HTTP/2, 1990
-/// unknown. reqwest surfaces most failures as strings, so we map by
-/// substring (best-effort, k6 parity for the common `if (res.error)` idiom
-/// plus `res.error_code` for programmatic branching).
-fn k6_error_code(msg: &str) -> i32 {
+/// unknown. Typed HTTP/2 failures are classified directly; other errors use
+/// the existing message-based mapping for common transport categories.
+fn k6_error_code(error: &tropel_sdk::TropelError) -> i32 {
+    if matches!(error, tropel_sdk::TropelError::Http2(_)) {
+        return 1600;
+    }
+    k6_error_code_message(&error.to_string())
+}
+
+fn k6_error_code_message(msg: &str) -> i32 {
     let m = msg.to_ascii_lowercase();
     if m.contains("dns") || m.contains("nodename") || m.contains("resolve") {
         1100
@@ -1323,9 +1329,10 @@ fn push_http_failure(
     elapsed: Duration,
     sent: usize,
     error_msg: &str,
+    protocol: &str,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
-    let mut tags = http_tags(req, "0", scenario, extra_tags, group, "");
+    let mut tags = http_tags(req, "0", scenario, extra_tags, group, protocol);
     // TR-204: error tag is populated on transport failures (k6 semantics).
     // The error tag is empty on success; error_code is 0 on success.
     if !error_msg.is_empty() {
@@ -1643,12 +1650,16 @@ fn build_k6_response_object<'js>(
         let timings_obj = rquickjs::Object::new(ctx.clone())?;
         let _ = timings_obj.set("blocked", t.blocked.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("dns", t.dns.as_secs_f64() * 1000.0);
+        // k6 declares looking_up but never assigns it; retain the key for
+        // byte-compatible response objects and keep it aligned with metrics.
+        let _ = timings_obj.set("looking_up", 0.0);
         let _ = timings_obj.set("connecting", t.connecting.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("tls_handshaking", t.tls_handshaking.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("sending", t.sending.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("waiting", t.waiting.as_secs_f64() * 1000.0);
         let _ = timings_obj.set("receiving", t.receiving.as_secs_f64() * 1000.0);
-        let _ = timings_obj.set("duration", response_time_ms);
+        let duration_ms = (t.sending + t.waiting + t.receiving).as_secs_f64() * 1000.0;
+        let _ = timings_obj.set("duration", duration_ms);
         let _ = obj.set("timings", timings_obj);
     }
     // `responseType: "binary"` → native ArrayBuffer body (raw bytes survive);
@@ -1946,7 +1957,7 @@ fn register_http_bridges<'js>(
                         1000,
                         &response_type,
                         &[],
-                        "HTTP/1.1",
+                        "",
                     );
                 }
                 let extra_tags = params.tags;
@@ -2044,6 +2055,11 @@ fn register_http_bridges<'js>(
                             start.elapsed(),
                             sent,
                             &err,
+                            if matches!(e, tropel_sdk::TropelError::Http2(_)) {
+                                "HTTP/2"
+                            } else {
+                                ""
+                            },
                         );
                         build_k6_response_object(
                             &ctx,
@@ -2054,10 +2070,14 @@ fn register_http_bridges<'js>(
                             0.0,
                             None,
                             &err,
-                            k6_error_code(&err),
+                            k6_error_code(&e),
                             &response_type,
                             &[],
-                            "HTTP/1.1",
+                            if matches!(e, tropel_sdk::TropelError::Http2(_)) {
+                                "HTTP/2"
+                            } else {
+                                ""
+                            },
                         )
                     }
                 }
@@ -2251,6 +2271,11 @@ fn register_http_bridges<'js>(
                                     start.elapsed(),
                                     sent,
                                     &err,
+                                    if matches!(e, tropel_sdk::TropelError::Http2(_)) {
+                                        "HTTP/2"
+                                    } else {
+                                        ""
+                                    },
                                 );
                                 build_k6_response_object(
                                     &ctx,
@@ -2261,10 +2286,14 @@ fn register_http_bridges<'js>(
                                     0.0,
                                     None,
                                     &err,
-                                    k6_error_code(&err),
+                                    k6_error_code(&e),
                                     &response_type,
                                     &[],
-                                    "HTTP/1.1",
+                                    if matches!(e, tropel_sdk::TropelError::Http2(_)) {
+                                        "HTTP/2"
+                                    } else {
+                                        ""
+                                    },
                                 )?
                             }
                         };
@@ -4624,7 +4653,7 @@ mod tests {
                 out,
                 concat!(
                     "[\"abc123\",true,\"GET\",\"https://example.com/\",",
-                    "\"req-7\",\"HTTP/1.1\",\"string\",\"Hello\",\"World\"]"
+                    "\"req-7\",\"\",\"string\",\"Hello\",\"World\"]"
                 ),
                 "res.cookies/request/proto/remote_ip/html() mismatch: {out}"
             );
@@ -7825,6 +7854,8 @@ mod tests {
                 globalThis.__t_waiting = res1.timings.waiting;
                 globalThis.__t_blocked = res1.timings.blocked;
                 globalThis.__t_receiving = res1.timings.receiving;
+                globalThis.__t_looking_up = res1.timings.looking_up;
+                globalThis.__t_duration = res1.timings.duration;
                 globalThis.__err = res1.error;
                 globalThis.__ecode = res1.error_code;
 
@@ -7893,6 +7924,16 @@ mod tests {
                 ctx.eval::<f64, _>("__t_receiving").unwrap(),
                 50.0,
                 "res.timings.receiving must carry the real body-receive value"
+            );
+            assert_eq!(
+                ctx.eval::<f64, _>("__t_looking_up").unwrap(),
+                0.0,
+                "res.timings.looking_up must exist as k6's declared zero field"
+            );
+            assert_eq!(
+                ctx.eval::<f64, _>("__t_duration").unwrap(),
+                150.0,
+                "res.timings.duration must agree with sending + waiting + receiving"
             );
             assert_eq!(
                 ctx.eval::<String, _>("__err").unwrap(),
@@ -7993,9 +8034,8 @@ mod tests {
             "http_req_blocked",
             "http_req_dns",
             "http_req_connecting",
-            // http_req_tls_handshaking and http_req_sending are always 0
-            // (folded into connecting/waiting by reqwest) and omitted to
-            // save 2 MetricKey builds per request (backlog line 459).
+            "http_req_tls_handshaking",
+            "http_req_sending",
             "http_req_waiting",
             "http_req_receiving",
         ] {
@@ -8013,6 +8053,42 @@ mod tests {
             .find(|s| s.metric == "http_req_blocked")
             .unwrap();
         assert_eq!(blocked.value, 0.1, "blocked must carry the pool-wait in ms");
+        let emitted_duration = samples
+            .iter()
+            .find(|s| s.metric == "http_req_duration")
+            .expect("duration sample");
+        assert_eq!(emitted_duration.value, 4.5);
+
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let response = build_k6_response_object(
+                &ctx,
+                200,
+                "OK".to_string(),
+                Vec::new(),
+                &HashMap::new(),
+                5.1,
+                Some(&timings),
+                "",
+                0,
+                "text",
+                &[],
+                "HTTP/1.1",
+            )
+            .expect("response object");
+            let response_timings: rquickjs::Object = response.get("timings").unwrap();
+            let script_duration: f64 = response_timings.get("duration").unwrap();
+            assert_eq!(
+                script_duration, emitted_duration.value,
+                "res.timings.duration and http_req_duration must use the same phase sum"
+            );
+            assert_eq!(
+                response_timings.get::<_, f64>("looking_up").unwrap(),
+                0.0,
+                "looking_up must exist as k6's declared zero field"
+            );
+        });
         // 5 base + 7 sub-timing samples (all 8 sub-timings emitted)
         assert_eq!(samples.len(), 12, "5 base + 7 sub-timing samples");
     }
@@ -8048,6 +8124,7 @@ mod tests {
             Duration::from_millis(1500),
             7,
             "connection refused",
+            "",
         );
         let samples = sink.lock().unwrap();
         let duration = samples
@@ -10302,7 +10379,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             let err_code: i32 = obj.get("error_code").unwrap();
             assert_eq!(
                 err_code,
-                k6_error_code("binary response body allocation failed"),
+                k6_error_code_message("binary response body allocation failed"),
                 "error_code must mirror k6_error_code(msg), not a hardcoded 1000"
             );
             // The body stays an ArrayBuffer (empty) so scripts probing
@@ -10342,7 +10419,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             let err_code: i32 = resp.get("error_code").unwrap();
             assert_eq!(
                 err_code,
-                k6_error_code("response body exceeds the per-VU JS heap cap"),
+                k6_error_code_message("response body exceeds the per-VU JS heap cap"),
                 "degraded envelope carries the mapped k6 error code"
             );
             let body: rquickjs::Value = resp.get("body").unwrap();
@@ -10394,11 +10471,15 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         // 1100 DNS, 1200 TCP connect, 1300 TLS, 1600 HTTP/2.
 
         // Transport error codes (unchanged)
-        assert_eq!(k6_error_code("dns resolution failed"), 1100);
-        assert_eq!(k6_error_code("connection timed out"), 1050);
-        assert_eq!(k6_error_code("tls handshake error"), 1300);
-        assert_eq!(k6_error_code("connect refused"), 1200);
-        assert_eq!(k6_error_code("unknown error"), 1000);
+        assert_eq!(k6_error_code_message("dns resolution failed"), 1100);
+        assert_eq!(k6_error_code_message("connection timed out"), 1050);
+        assert_eq!(k6_error_code_message("tls handshake error"), 1300);
+        assert_eq!(k6_error_code_message("connect refused"), 1200);
+        assert_eq!(k6_error_code_message("unknown error"), 1000);
+        assert_eq!(
+            k6_error_code(&tropel_sdk::TropelError::Http2("stream reset".into())),
+            1600
+        );
 
         // HTTP status codes are NOT k6_error_code's responsibility —
         // they are computed at the call site as 1000 + status.
