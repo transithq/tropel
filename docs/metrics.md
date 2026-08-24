@@ -50,3 +50,24 @@ the same threshold behaves inside a k6 script.
 See [Outputs & reporters](outputs.md). The hot path is lock-free — per-VU
 thread-local sample buffers flushed over an MPSC channel to a single
 aggregator with bounded buffering (no unbounded queue growth).
+
+## Dropped data and verification
+
+Every summary reports `dropped_iterations`, `series_dropped`, and
+`samples_dropped`, including zero values. A run is marked `verified` only when
+all three are zero. Any non-zero value marks the result `unverified` because
+the reported population is incomplete.
+
+- `dropped_iterations`: the arrival-rate scheduler could not start an
+  iteration before its token deadline. Reduce the arrival rate, increase
+  `preAllocatedVUs`/`maxVUs`, or use a less expensive iteration.
+- `series_dropped`: the cardinality limit rejected a new metric/tag series.
+  Remove unbounded URL or user identifiers from tags, or reduce workload
+  cardinality before increasing the limit.
+- `samples_dropped`: a streaming output consumer lagged behind the broadcast
+  channel. Increase output capacity, use a local batch-friendly output, or
+  remove the slow output from the run.
+
+JSON and CSV carry the counts and verification state; stdout always prints
+the counts and a plain-language verification line. `handleSummary` exposes
+`state.unverified` and `state.verification` as well.

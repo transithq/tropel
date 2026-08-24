@@ -149,6 +149,37 @@ fn stdout_summary_snapshot() {
 }
 
 #[test]
+fn zero_drops_are_reported_as_verified_by_all_reporters() {
+    let mut result = fixture();
+    result.dropped_iterations = 0;
+    let stdout = StdoutReporter.render(&result);
+    assert!(stdout.contains("Samples dropped0"));
+    assert!(stdout.contains("verified: no samples or iterations were dropped"));
+    let json: serde_json::Value =
+        serde_json::from_str(&JsonReporter::new(None).render(&result).unwrap()).unwrap();
+    assert_eq!(json["samples_dropped"], 0);
+    assert_eq!(json["unverified"], false);
+    assert!(CsvReporter::new(None)
+        .render(&result)
+        .starts_with("# unverified=false"));
+}
+
+#[test]
+fn dropped_samples_mark_all_reporters_unverified() {
+    let mut result = fixture();
+    result.output_samples_dropped = 3;
+    assert!(result.is_unverified());
+    assert!(StdoutReporter.render(&result).contains("UNVERIFIED"));
+    let json: serde_json::Value =
+        serde_json::from_str(&JsonReporter::new(None).render(&result).unwrap()).unwrap();
+    assert_eq!(json["samples_dropped"], 3);
+    assert_eq!(json["unverified"], true);
+    assert!(CsvReporter::new(None)
+        .render(&result)
+        .starts_with("# unverified=true"));
+}
+
+#[test]
 fn json_report_snapshot() {
     let rendered = JsonReporter::new(None).render(&fixture()).unwrap();
     insta::assert_snapshot!("json_report", rendered);

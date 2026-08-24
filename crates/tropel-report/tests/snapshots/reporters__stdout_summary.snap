@@ -11,6 +11,7 @@ expression: rendered
     Iterations    1024
     Max VUs       4
     Dropped       2
+    Verification   UNVERIFIED: samples or iterations were dropped
     Samples dropped0
     Series dropped0
 

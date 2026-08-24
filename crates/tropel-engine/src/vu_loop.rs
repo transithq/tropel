@@ -114,6 +114,9 @@ async fn run_vu_loop(
                 _ = &mut stop_ready => {
                     stop_ready.set(stop.notified());
                 }
+                // Notify is edge-triggered; re-check the level even if a
+                // control update lands before the future is registered.
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
         if sched.is_stop_requested() || sched.is_force_stop_requested() {
@@ -163,6 +166,9 @@ async fn run_vu_loop(
                     _ = &mut stop_ready => {
                         stop_ready.set(stop.notified());
                     }
+                    // The token count is the source of truth. This backstop
+                    // closes the notify_waiters registration race.
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
             }
             if !got_token {

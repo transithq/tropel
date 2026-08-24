@@ -11,6 +11,7 @@ expression: rendered
   },
   "data_received": 12500000.0,
   "data_sent": 2000000.0,
+  "dropped_iterations": 2,
   "errors": 0,
   "http_reqs": 1000,
   "metrics": {
@@ -58,5 +59,8 @@ expression: rendered
       "p99": 900.0,
       "sum": 250000.0
     }
-  }
+  },
+  "samples_dropped": 0,
+  "series_dropped": 0,
+  "unverified": true
 }

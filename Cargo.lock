@@ -4462,6 +4462,7 @@ dependencies = [
 name = "tropel-http"
 version = "0.1.0"
 dependencies = [
+ "h2",
  "reqwest",
  "serde",
  "serde_json",

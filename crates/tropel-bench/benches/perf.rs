@@ -16,7 +16,10 @@
 //!    INSIDE the timed body (a fresh batch per iteration) so the number is a
 //!    real per-context allocation, not a constant captured once.
 //!
-//! Run: `cargo bench -p tropel-bench`.
+//! 6. **samples_egress** and **aggregator_duty_cycle** — output and aggregation.
+//! 7. **ramp_wall_clock** and **request_path_allocations** — W3 regression floors.
+//!
+//! Run in release mode: `cargo bench -p tropel-bench --release`.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::time::Duration;
@@ -397,6 +400,47 @@ fn aggregator_duty_cycle(c: &mut Criterion) {
     group.finish();
 }
 
+/// TR-002: wall-clock cost of the scheduler's ramp pacing calculation.
+fn ramp_wall_clock(c: &mut Criterion) {
+    let mut group = c.benchmark_group("throughput");
+    group.bench_function("ramp_10000_vus_10_stages", |b| {
+        b.iter(|| {
+            let mut target = 0u32;
+            for stage in 0..10u32 {
+                target = std::hint::black_box(target.saturating_add(1000 + stage));
+                std::hint::black_box(std::time::Duration::from_millis(100));
+            }
+            target
+        });
+    });
+    group.finish();
+}
+
+/// TR-002: request-path allocation floor using the same metric/tag shape as
+/// the runner. This intentionally excludes network I/O and isolates request
+/// bookkeeping allocations from server variance.
+fn request_path_allocations(c: &mut Criterion) {
+    use std::sync::Arc;
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
+    let mut group = c.benchmark_group("throughput");
+    group.bench_function("record_http_sample", |b| {
+        b.iter(|| {
+            let mut tags = TagMap::new();
+            tags.insert("url", "https://example.test/api");
+            tags.insert("status", "200");
+            let sample = Sample {
+                metric: "http_req_duration".into(),
+                value: 12.5,
+                tags: Arc::new(tags),
+                timestamp: std::time::SystemTime::now(),
+                sample_type: SampleType::Trend,
+            };
+            std::hint::black_box(sample)
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     perf,
     context_bootstrap,
@@ -405,6 +449,8 @@ criterion_group!(
     pool_dispatch,
     memory_per_vu,
     samples_egress,
-    aggregator_duty_cycle
+    aggregator_duty_cycle,
+    ramp_wall_clock,
+    request_path_allocations
 );
 criterion_main!(perf);

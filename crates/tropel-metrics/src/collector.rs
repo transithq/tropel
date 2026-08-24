@@ -1654,6 +1654,14 @@ pub struct MetricsResult {
         std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
 }
 
+impl MetricsResult {
+    /// Any lost iteration, series, or output sample makes the measurement
+    /// incomplete and therefore unverified.
+    pub fn is_unverified(&self) -> bool {
+        self.dropped_iterations > 0 || self.series_dropped > 0 || self.output_samples_dropped > 0
+    }
+}
+
 impl Default for MetricsResult {
     fn default() -> Self {
         Self {

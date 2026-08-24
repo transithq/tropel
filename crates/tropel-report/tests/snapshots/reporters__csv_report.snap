@@ -2,6 +2,7 @@
 source: crates/tropel-report/tests/reporters.rs
 expression: rendered
 ---
+# unverified=true,dropped_iterations=2,series_dropped=0,samples_dropped=0
 key,count,sum,mean,min,max,p50,p90,p95,p99
 custom_counter,42,42,1.00,1,1,1,1,1,1
 custom_gauge,9,45,5.00,1,9,5,9,9,9
