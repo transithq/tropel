@@ -1735,27 +1735,23 @@ pub(crate) fn stat_needs_histogram(stat: &str) -> bool {
     let s = stat.trim();
     if matches!(
         s,
-        "avg"
-            | "mean"
-            | "min"
-            | "max"
-            | "count"
-            | "sum"
-            | "rate"
-            | "last"
-            | "p50"
-            | "median"
-            | "med"
-            | "p90"
-            | "p95"
-            | "p99"
+        "avg" | "mean" | "min" | "max" | "count" | "sum" | "rate" | "last"
     ) {
         return false;
     }
+    // P1 line 141: ALL percentile stats need histograms, including the
+    // "tracked" ones (p50/p90/p95/p99). Without histograms, merged_percentile
+    // falls back to fold(NEG_INFINITY, max) — worst-of-series — instead of
+    // computing the actual cross-series merged percentile. The old code
+    // returned false for tracked percentiles because they are "exact" per
+    // series, but cross-series merging still requires the histogram.
+    // "median" and "med" are aliases for p50 but parse_percentile
+    // only recognizes p-prefixed forms.
+    if matches!(s, "median" | "med" | "p50" | "p90" | "p95" | "p99") {
+        return true;
+    }
     match parse_percentile(s) {
-        // Non-tracked percentile values need the histogram for exactness;
-        // tracked values (50/90/95/99) in any syntax are already exact.
-        Some(pct) => !(pct == 50.0 || pct == 90.0 || pct == 95.0 || pct == 99.0),
+        Some(_pct) => true,
         None => false,
     }
 }
@@ -1878,21 +1874,24 @@ mod tests {
 
     #[test]
     fn test_stat_needs_histogram() {
-        // Tracked buckets + aliases — no histogram needed.
-        for tracked in [
-            "avg", "min", "max", "count", "sum", "rate", "last", "p50", "median", "med", "p90",
-            "p95", "p99",
-        ] {
+        // Non-percentile tracked stats — no histogram needed.
+        for tracked in ["avg", "min", "max", "count", "sum", "rate", "last"] {
             assert!(
                 !stat_needs_histogram(tracked),
                 "{tracked} should not need a histogram"
             );
         }
-        // Tracked values in any syntax (incl. k6 p(NN) form) — exact already.
-        assert!(!stat_needs_histogram("p(90)"));
-        assert!(!stat_needs_histogram("p(99)"));
-        assert!(!stat_needs_histogram("p(50)"));
-        // Non-tracked percentiles — need the histogram for exactness.
+        // P1 line 141: ALL percentiles need histograms for cross-series merging.
+        // The old code returned false for tracked percentiles (p50/p90/p95/p99)
+        // causing merged_percentile to fall back to worst-of-series.
+        for tracked_pct in [
+            "p50", "median", "med", "p90", "p95", "p99", "p(50)", "p(90)", "p(95)", "p(99)",
+        ] {
+            assert!(
+                stat_needs_histogram(tracked_pct),
+                "{tracked_pct} should need a histogram for merging"
+            );
+        }
         assert!(stat_needs_histogram("p75"));
         assert!(stat_needs_histogram("p(75)"));
         assert!(stat_needs_histogram("p99.9"));
@@ -1916,7 +1915,8 @@ mod tests {
                 delay_abort_eval: None,
             },
         );
-        assert!(!config_needs_histograms(
+        // P1 line 141: p95 now needs a histogram for cross-series merging.
+        assert!(config_needs_histograms(
             &k6_default_trend_stats(),
             &thresholds
         ));
@@ -1970,10 +1970,8 @@ mod tests {
             &k6_default_trend_stats(),
             &thresholds
         ));
-        // A compound where EVERY clause is tracked stays false (no histogram
-        // clone on the hot path). Use a FRESH map — the accumulated
-        // `thresholds` above still holds the p(75)/p(90.5) entries, which
-        // would (correctly) keep retention on.
+        // P1 line 141: ALL percentiles need histograms, so even a compound
+        // where every clause is a tracked percentile now triggers retention.
         let mut all_tracked = std::collections::HashMap::new();
         all_tracked.insert(
             "all-tracked".into(),
@@ -1983,7 +1981,7 @@ mod tests {
                 delay_abort_eval: None,
             },
         );
-        assert!(!config_needs_histograms(
+        assert!(config_needs_histograms(
             &k6_default_trend_stats(),
             &all_tracked
         ));
