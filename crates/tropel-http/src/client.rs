@@ -44,7 +44,7 @@ fn is_credential_header(key: &str) -> bool {
 /// clean 403 "target address is blocked") detect the root cause from the
 /// message string instead of every blocked target degrading to a generic
 /// "upstream request failed".
-fn http_request_error(e: &dyn std::error::Error) -> TropelError {
+fn http_request_error<E: std::error::Error + 'static>(e: &E) -> TropelError {
     let mut msg = format!("Request failed: {e}");
     let mut src = std::error::Error::source(e);
     for _ in 0..8 {
@@ -52,6 +52,13 @@ fn http_request_error(e: &dyn std::error::Error) -> TropelError {
         msg.push_str(" -> ");
         msg.push_str(&s.to_string());
         src = std::error::Error::source(s);
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = source {
+        if err.downcast_ref::<h2::Error>().is_some() {
+            return TropelError::Http2(msg);
+        }
+        source = std::error::Error::source(err);
     }
     TropelError::Http(msg)
 }
@@ -538,7 +545,9 @@ impl HttpClient {
     ///   is included here)    /// - **waiting** (TTFB): from the request being sent to response headers
     ///   received, EXCLUDING the connection phases (blocked + dns + connecting)
     ///   — subtracted from the raw elapsed so the breakdown sums to `total`,
-    ///   matching k6's `http_req_waiting` semantics.
+    ///   matching k6's `http_req_waiting` semantics. HTTP/2 stream admission
+    ///   queueing is included here because reqwest does not expose it as a
+    ///   separate phase; it is a documented transport limitation.
     /// - **receiving**: from response headers to full body bytes received
     /// - **total**: entire `execute()` duration
     ///

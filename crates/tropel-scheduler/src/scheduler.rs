@@ -2516,6 +2516,9 @@ mod tests {
                             _ = &mut stop_ready => {
                                 stop_ready.set(stop.notified());
                             }
+                            // The atomics are level-triggered; periodically
+                            // re-check them if an edge-triggered wake is lost.
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                         }
                     }
                 }
@@ -2526,6 +2529,49 @@ mod tests {
                 tokio::time::sleep(latency).await;
             }
         })
+    }
+
+    /// Regression for the arrival-token lost-wakeup window: deliver a
+    /// notify_waiters wake before making the token visible, then rely on the
+    /// level-triggered timeout recheck to release the waiter. Without the
+    /// timeout arm this task parks indefinitely because Notify stores no
+    /// permit for a notification sent before registration.
+    #[tokio::test(start_paused = true)]
+    async fn arrival_waiter_makes_progress_after_early_wakeup() {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
+            rate: 1.0,
+            time_unit: "1s".to_string(),
+            duration: "1s".to_string(),
+            pre_alloc_vus: 1,
+            max_vus: 1,
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+        let handle = arrival_test_vu(sched.clone(), Duration::ZERO);
+
+        while sched.idle_vu_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        // This wake carries no token and is intentionally sent before the
+        // subsequent token update. The waiter must not depend on this edge.
+        sched.arrival_notify().notify_waiters();
+        sched.arrival_tokens.fetch_add(1, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..10 {
+            if sched.idle_vu_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sched.idle_vu_count(),
+            0,
+            "arrival waiter must acquire a token after an early wake"
+        );
+
+        sched.request_stop();
+        handle.await.expect("arrival test VU must stop cleanly");
     }
 
     /// W0 P0#1: a non-identity `timeUnit` must divide the rate —
@@ -2576,6 +2622,7 @@ mod tests {
                                 _ = &mut stop_ready => {
                                     stop_ready.set(stop.notified());
                                 }
+                                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                             }
                         }
                     }
@@ -2646,6 +2693,7 @@ mod tests {
                                 _ = &mut stop_ready => {
                                     stop_ready.set(stop.notified());
                                 }
+                                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                             }
                         }
                     }
