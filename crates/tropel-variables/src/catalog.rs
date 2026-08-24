@@ -26,6 +26,13 @@ macro_rules! cached_re {
 /// of killing the run.
 const MAX_DYNAMIC_LENGTH: usize = 10_000;
 
+/// Maximum total output length from a single resolve() call.
+/// P1 line 151: 460 k chars in → 200 M chars out (×435) in 3.9 s;
+/// wasm memory 1.2 MB → 627.6 MB, and it never shrinks. At 6.9 MB input
+/// it traps with a bare "unreachable". This cap prevents unbounded
+/// memory expansion.
+const MAX_TOTAL_OUTPUT: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Names of Postman dynamic variables that are NOT in the catalog — used to
 /// warn ONCE per distinct name (backlog line 141). Never cleared: a catalog
 /// miss is a static property of the code, not of the run.
@@ -593,7 +600,18 @@ impl DynamicCatalog {
             // Append text before this match
             result.push_str(&input[last_end..m.start()]);
             // Append replacement
-            result.push_str(&f(&caps));
+            let replacement = f(&caps);
+            // P1 line 151: stop expanding if total output exceeds cap
+            if result.len() + replacement.len() > MAX_TOTAL_OUTPUT {
+                tracing::warn!(
+                    "dynamic variable expansion capped at {} bytes (input: {} bytes)",
+                    MAX_TOTAL_OUTPUT,
+                    input.len()
+                );
+                result.push_str(&input[last_end..]);
+                return result;
+            }
+            result.push_str(&replacement);
             last_end = m.end();
         }
 

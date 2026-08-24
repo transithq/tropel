@@ -161,12 +161,17 @@ pub async fn run_request(req: RunRequest) -> RunOutcome {
     // here — the web ABI has no namespace/alias plumbing yet) and a
     // caller-held force-stop flag, so the engine's force-stop checks are not
     // dead in the web slice.
+    // P1 line 140: retain the force_stop binding so the caller can set it,
+    // and wire it into the runner so force-stop checks are not dead.
     let force_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let force_stop_for_js = force_stop.clone();
     if let Some(ctx) =
-        bootstrap::create_web_js_context(&pm_state, &SandboxConfig::default(), force_stop).await
+        bootstrap::create_web_js_context(&pm_state, &SandboxConfig::default(), force_stop_for_js)
+            .await
     {
         runner = runner.with_js_context(Box::new(ctx));
     }
+    runner = runner.with_force_stop_flag(force_stop);
 
     let mut iterations = Vec::with_capacity(req.iterations as usize);
     for i in 0..req.iterations {
