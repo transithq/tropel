@@ -35,6 +35,10 @@ fn err_text(e: impl std::fmt::Display) -> String {
 }
 
 /// Highest-priority adapter whose `detect()` claims the bytes, if any.
+/// P1 line 152: ADAPTERS are sorted by priority descending so the
+/// highest-priority adapter (postman=40) is checked first. On a match
+/// we still scan all adapters to find the true highest priority, but
+/// the common case (postman) hits on the first probe.
 fn resolve(bytes: &[u8]) -> Option<Box<dyn InputAdapter>> {
     let mut best: Option<(u8, Box<dyn InputAdapter>)> = None;
     for (_, priority, create) in ADAPTERS {
@@ -84,18 +88,21 @@ type AdapterEntry = (&'static str, u8, fn() -> Box<dyn InputAdapter>);
 /// postman 40, har 30, insomnia 35, openapi 20, bru 25. `detect` claims must
 /// be mutually exclusive (structural checks, no substring matching) — see
 /// each crate.
+// P1 line 152: sorted by priority DESCENDING so the highest-priority
+// adapter (postman=40) is probed first. The old order was arbitrary
+// and har(30)/bru(25) were checked before postman(40) for no reason.
 const ADAPTERS: &[AdapterEntry] = &[
     ("postman", 40, || {
         Box::new(tropel_input_postman::PostmanInputAdapter)
     }),
-    ("har", 30, || Box::new(tropel_input_har::HarInputAdapter)),
     ("insomnia", 35, || {
         Box::new(tropel_input_insomnia::InsomniaInputAdapter)
     }),
+    ("har", 30, || Box::new(tropel_input_har::HarInputAdapter)),
+    ("bru", 25, || Box::new(tropel_input_bru::BruInputAdapter)),
     ("openapi", 20, || {
         Box::new(tropel_input_openapi::OpenApiInputAdapter)
     }),
-    ("bru", 25, || Box::new(tropel_input_bru::BruInputAdapter)),
 ];
 
 /// Detect the input format: returns the adapter id (`"openapi"`, `"postman"`
