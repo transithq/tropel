@@ -970,6 +970,19 @@ impl HttpClient {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
             let is_redirect = matches!(status_code, 301 | 302 | 303 | 307 | 308);
+            // P1 line 155: when max_redirects is exceeded, return an error
+            // instead of treating the 3xx as success. k6 errors with
+            // "stopped after N redirects" — an infinite redirect loop would
+            // otherwise report a 100% green run (the default
+            // expected_statuses [200-399] matches 3xx).
+            if manual_follow && is_redirect && redirects.len() >= max_hops {
+                return Err(TropelError::Http(format!(
+                    "stopped after {} redirect{} (max {})",
+                    redirects.len(),
+                    if redirects.len() == 1 { "" } else { "s" },
+                    max_hops,
+                )));
+            }
             if manual_follow && redirects.len() < max_hops && is_redirect {
                 if let Some(location) = location {
                     // Capture the hop as its own response (own duration). The
