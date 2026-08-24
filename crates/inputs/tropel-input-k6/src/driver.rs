@@ -3127,9 +3127,11 @@ impl K6DriverInstance {
             .js_ctx
             .set_global_int("__tropel_iteration_num", ctx.iteration as i32)
             .await;
+        // TR-209: __ITER must be a number (not string) for `__ITER === 0`
+        // to work. Use JSON number to avoid i32 truncation past 2^31.
         let _ = self
             .js_ctx
-            .set_global_int("__ITER", ctx.iteration as i32)
+            .set_global_json("__ITER", &serde_json::json!(ctx.iteration))
             .await;
 
         // Refresh the per-iteration exec.* counters read by the __tropel_exec_*
