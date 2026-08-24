@@ -444,7 +444,14 @@ pub fn build_token_request(params: &TokenRequestParams) -> Result<TokenRequest> 
             form.push(("client_id".into(), params.client_id.clone()));
             form.push(("client_secret".into(), secret.to_string()));
         }
-        _ => {
+        (Some(secret), ClientAuthMethod::Basic) => {
+            // P1 line 149: when client_id is empty but client_secret is
+            // provided, still include the secret. The old code silently
+            // dropped it, causing 401 invalid_client with no diagnostic.
+            form.push(("client_id".into(), params.client_id.clone()));
+            basic_auth_header = Some(basic(&params.client_id, secret));
+        }
+        (None, _) => {
             if !params.client_id.is_empty() {
                 form.push(("client_id".into(), params.client_id.clone()));
             }

@@ -12,6 +12,8 @@ description = "Criterion benchmark suite for Tropel: context bootstrap, per-iter
 tropel-js.workspace = true
 tropel-native.workspace = true
 tropel-engine.workspace = true
+tropel-metrics.workspace = true
+tropel-sdk.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

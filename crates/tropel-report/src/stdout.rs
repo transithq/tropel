@@ -78,29 +78,22 @@ impl StdoutReporter {
 
         // Execution overview — aligned two-column block
         out.push_str("  ── Execution ─────────────────────────────────────────────\n");
-        let mut exec_rows = vec![
+        let exec_rows = vec![
             ("Iterations", result.iterations.to_string()),
             ("Max VUs", result.vus_max.to_string()),
             ("Dropped", result.dropped_iterations.to_string()),
         ];
-        if result.output_samples_dropped > 0 {
-            exec_rows.push(("Samples lost", result.output_samples_dropped.to_string()));
-        }
         for (label, value) in exec_rows {
             out.push_str(&format!("    {:<14}{}\n", label, value));
         }
-        if result.output_samples_dropped > 0 {
-            out.push_str(&format!(
-                "    {:<14}{}\n",
-                "Samples dropped", result.output_samples_dropped
-            ));
-        }
-        if result.series_dropped > 0 {
-            out.push_str(&format!(
-                "    {:<14}{}\n",
-                "Series dropped", result.series_dropped
-            ));
-        }
+        out.push_str(&format!(
+            "    {:<14}{}\n",
+            "Samples dropped", result.output_samples_dropped
+        ));
+        out.push_str(&format!(
+            "    {:<14}{}\n",
+            "Series dropped", result.series_dropped
+        ));
 
         // HTTP requests — aligned two-column block
         out.push_str("\n  ── HTTP requests ─────────────────────────────────────────\n");
