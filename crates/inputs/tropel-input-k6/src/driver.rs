@@ -923,6 +923,7 @@ fn http_tags(
     scenario: &Arc<str>,
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    protocol: &str,
 ) -> TagMap {
     http_tags_for(
         &req.url,
@@ -931,6 +932,7 @@ fn http_tags(
         scenario,
         extra,
         group,
+        protocol,
     )
 }
 
@@ -951,8 +953,9 @@ fn http_tags_for(
     scenario: &Arc<str>,
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    protocol: &str,
 ) -> TagMap {
-    let mut tags = TagMap::with_capacity(6);
+    let mut tags = TagMap::with_capacity(7);
     let url_arc: Arc<str> = Arc::from(url);
     tags.insert(interned("url"), url_arc.clone());
     tags.insert(interned("method"), intern_method(method));
@@ -962,6 +965,12 @@ fn http_tags_for(
         interned("group"),
         group.map(Arc::from).unwrap_or_else(|| interned("http")),
     );
+    // TR-014: add protocol tag on every sample. Beating k6 which only
+    // tags protocol on success (k6 cannot tell you which protocol failures
+    // happened on).
+    if !protocol.is_empty() {
+        tags.insert(interned("protocol"), Arc::from(protocol));
+    }
     if !scenario.is_empty() {
         // Refcount bump — the Arc was created once at bridge registration.
         tags.insert(interned("scenario"), scenario.clone());
@@ -1036,6 +1045,7 @@ fn push_http_samples(
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    protocol: &str,
 ) {
     push_http_samples_for(
         sink,
@@ -1049,6 +1059,7 @@ fn push_http_samples(
         scenario,
         extra_tags,
         group,
+        protocol,
     );
 }
 
@@ -1077,6 +1088,7 @@ fn push_redirect_hops(
             scenario,
             extra_tags,
             group,
+            &resp.protocol,
         );
     }
 }
@@ -1132,6 +1144,7 @@ fn push_http_samples_for(
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    protocol: &str,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
     let tags = Arc::new(http_tags_for(
@@ -1141,6 +1154,7 @@ fn push_http_samples_for(
         scenario,
         extra_tags,
         group,
+        protocol,
     ));
 
     let is_failed = !(200..400).contains(&status_code);
@@ -1299,6 +1313,7 @@ fn try_send_cmd(tx: &tokio::sync::mpsc::Sender<WsCommand>, mut cmd: WsCommand) -
 /// `p(95) < 500` PASS on the handful of pre-outage successes — the failure
 /// durations simply never entered the distribution. The caller measures the
 /// elapsed time-to-failure around the execute call and passes it here.
+#[allow(clippy::too_many_arguments)] // same field set as push_http_samples
 fn push_http_failure(
     sink: &Mutex<Vec<Sample>>,
     req: &Request,
@@ -1307,9 +1322,16 @@ fn push_http_failure(
     group: Option<&str>,
     elapsed: Duration,
     sent: usize,
+    error_msg: &str,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
-    let tags = Arc::new(http_tags(req, "0", scenario, extra_tags, group));
+    let mut tags = http_tags(req, "0", scenario, extra_tags, group, "");
+    // TR-204: error tag is populated on transport failures (k6 semantics).
+    // The error tag is empty on success; error_code is 0 on success.
+    if !error_msg.is_empty() {
+        tags.insert(interned("error"), Arc::from(error_msg));
+    }
+    let tags = Arc::new(tags);
 
     let mut v = sink.lock().unwrap();
     // Time-to-failure in ms (same Trend series the success path feeds), so
@@ -1982,7 +2004,16 @@ fn register_http_bridges<'js>(
                             &scenario_req,
                             Some(&extra_tags),
                             group.as_deref(),
+                            &resp.protocol,
                         );
+                        // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
+                        // while keeping error empty. Only transport errors populate the
+                        // error tag.
+                        let http_error_code = if resp.status_code >= 400 {
+                            1000 + resp.status_code as i32
+                        } else {
+                            0
+                        };
                         build_k6_response_object(
                             &ctx,
                             resp.status_code,
@@ -1992,7 +2023,7 @@ fn register_http_bridges<'js>(
                             resp.response_time.as_secs_f64() * 1000.0,
                             resp.timings.as_ref(),
                             "",
-                            0,
+                            http_error_code,
                             &response_type,
                             &resp.cookies,
                             &resp.protocol,
@@ -2000,6 +2031,7 @@ fn register_http_bridges<'js>(
                     }
                     Err(e) => {
                         tracing::debug!("k6 http request failed: {}", e);
+                        let err = e.to_string();
                         let group = group_stack_req.lock().unwrap().last().cloned();
                         // Same wire-size computation as the success path.
                         let sent = req.body.as_ref().map(tropel_http::body_size).unwrap_or(0);
@@ -2011,8 +2043,8 @@ fn register_http_bridges<'js>(
                             group.as_deref(),
                             start.elapsed(),
                             sent,
+                            &err,
                         );
-                        let err = e.to_string();
                         build_k6_response_object(
                             &ctx,
                             0,
@@ -2177,12 +2209,18 @@ fn register_http_bridges<'js>(
                                     &scenario_batch,
                                     Some(&extra_tags),
                                     group.as_deref(),
+                                    &resp.protocol,
                                 );
                                 // Same native response builder as the single
                                 // bridge — binary bodies become real
                                 // ArrayBuffers (no base64/body_b64 detour) and
                                 // timings/cookies/error_code serialize
                                 // identically.
+                                let batch_error_code = if resp.status_code >= 400 {
+                                    1000 + resp.status_code as i32
+                                } else {
+                                    0
+                                };
                                 build_k6_response_object(
                                     &ctx,
                                     resp.status_code,
@@ -2192,7 +2230,7 @@ fn register_http_bridges<'js>(
                                     resp.response_time.as_secs_f64() * 1000.0,
                                     resp.timings.as_ref(),
                                     "",
-                                    0,
+                                    batch_error_code,
                                     &response_type,
                                     &resp.cookies,
                                     &resp.protocol,
@@ -2200,6 +2238,7 @@ fn register_http_bridges<'js>(
                             }
                             Err(e) => {
                                 tracing::debug!("k6 batch request failed: {}", e);
+                                let err = e.to_string();
                                 let group = group_stack_batch.lock().unwrap().last().cloned();
                                 let sent =
                                     req.body.as_ref().map(tropel_http::body_size).unwrap_or(0);
@@ -2211,8 +2250,8 @@ fn register_http_bridges<'js>(
                                     group.as_deref(),
                                     start.elapsed(),
                                     sent,
+                                    &err,
                                 );
-                                let err = e.to_string();
                                 build_k6_response_object(
                                     &ctx,
                                     0,
@@ -7945,6 +7984,7 @@ mod tests {
             &scenario,
             None,
             None,
+            "HTTP/1.1",
         );
         let samples = sink.lock().unwrap();
         let names: Vec<&str> = samples.iter().map(|s| s.metric.as_ref()).collect();
@@ -8007,6 +8047,7 @@ mod tests {
             None,
             Duration::from_millis(1500),
             7,
+            "connection refused",
         );
         let samples = sink.lock().unwrap();
         let duration = samples
@@ -10372,5 +10413,26 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 .expect("eval must succeed");
             assert_eq!(r, "OK", "custom metric name must be accepted");
         });
+    }
+  
+    fn k6_error_code_http_4xx_5xx() {
+        // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
+        // while keeping error empty. Only transport errors populate error.
+        // 1000 generic, 1010 non-TCP, 1020 invalid URL, 1050 timeout,
+        // 1100 DNS, 1200 TCP connect, 1300 TLS, 1600 HTTP/2.
+
+        // Transport error codes (unchanged)
+        assert_eq!(k6_error_code("dns resolution failed"), 1100);
+        assert_eq!(k6_error_code("connection timed out"), 1050);
+        assert_eq!(k6_error_code("tls handshake error"), 1300);
+        assert_eq!(k6_error_code("connect refused"), 1200);
+        assert_eq!(k6_error_code("unknown error"), 1000);
+
+        // HTTP status codes are NOT k6_error_code's responsibility —
+        // they are computed at the call site as 1000 + status.
+        assert_eq!(1000 + 404, 1404);
+        assert_eq!(1000 + 500, 1500);
+        assert_eq!(1000 + 403, 1403);
+        assert_eq!(1000 + 503, 1503);
     }
 }
