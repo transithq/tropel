@@ -306,12 +306,78 @@ fn memory_per_vu(c: &mut Criterion) {
     }
 }
 
+/// TR-002: Throughput benchmark — samples/s egress.
+/// Pushes samples through the metrics collector at rate, measuring the
+/// aggregator's capacity to absorb and flush samples.
+fn samples_egress(c: &mut Criterion) {
+    use std::sync::Arc;
+    use tropel_metrics::collector::{MetricCollector, Sample, SampleType};
+    use tropel_metrics::MetricKey;
+
+    let mut group = c.benchmark_group("throughput");
+    group.throughput(Throughput::Elements(10_000));
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("samples_per_sec_10k", |b| {
+        let collector = MetricCollector::new(100_000);
+        b.iter(|| {
+            for i in 0..10_000 {
+                let key = MetricKey::new(
+                    format!("http_req_duration_{}", i % 100),
+                    std::collections::HashMap::new(),
+                );
+                collector.record(Sample {
+                    key,
+                    value: (i as f64) * 0.1,
+                    sample_type: SampleType::Trend,
+                });
+            }
+            std::hint::black_box(&collector);
+        });
+    });
+
+    group.finish();
+}
+
+/// TR-002: Aggregator duty cycle — build_results under load.
+/// Measures how long it takes to build results from a populated collector.
+fn aggregator_duty_cycle(c: &mut Criterion) {
+    use tropel_metrics::collector::{MetricCollector, Sample, SampleType};
+    use tropel_metrics::MetricKey;
+
+    let mut group = c.benchmark_group("throughput");
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("build_results_1000_series", |b| {
+        let collector = MetricCollector::new(100_000);
+        // Pre-populate with 1000 series
+        for i in 0..1_000 {
+            let key = MetricKey::new(format!("metric_{}", i), std::collections::HashMap::new());
+            for j in 0..100 {
+                collector.record(Sample {
+                    key: key.clone(),
+                    value: j as f64,
+                    sample_type: SampleType::Trend,
+                });
+            }
+        }
+        b.iter(|| {
+            let results = collector.build_results();
+            std::hint::black_box(results);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     perf,
     context_bootstrap,
     script_iteration,
     native_vs_js,
     pool_dispatch,
-    memory_per_vu
+    memory_per_vu,
+    samples_egress,
+    aggregator_duty_cycle
 );
 criterion_main!(perf);
