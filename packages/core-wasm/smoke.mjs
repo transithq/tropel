@@ -22,11 +22,13 @@ import {
 } from "./src/index.js";
 
 // Metadata comes from pkg/meta.js (build-time extraction from the compiled
-// catalog) — it must be available BEFORE and WITHOUT init.
+// catalog) — it must be available BEFORE and WITHOUT init. Async because
+// pkg/meta.js is loaded lazily (so a clean-clone `node -e "import('./src/index.js')"`
+// does not throw ENOENT before the wasm has been built).
 if (!existsSync(new URL("./pkg/meta.js", import.meta.url))) {
   throw new Error("pkg/meta.js missing — run scripts/build.sh");
 }
-const preMeta = getPredefinedVariablesMeta();
+const preMeta = await getPredefinedVariablesMeta();
 if (preMeta.length < 30) throw new Error(`metadata too small: ${preMeta.length}`);
 for (const m of preMeta) {
   if (!m.name.startsWith("$") || !m.description) throw new Error(`bad meta entry: ${JSON.stringify(m)}`);
@@ -67,7 +69,7 @@ const ts = Number(resolveDynamicVariables("{{$timestamp}}"));
 if (!(ts > 1_700_000_000)) throw new Error(`bad timestamp: ${ts}`);
 
 // Metadata still served after init (same build-time payload).
-const meta = getPredefinedVariablesMeta();
+const meta = await getPredefinedVariablesMeta();
 if (meta.length < 30) throw new Error(`metadata too small after init: ${meta.length}`);
 if (meta !== preMeta) throw new Error("metadata must be the stable build-time payload");
 
