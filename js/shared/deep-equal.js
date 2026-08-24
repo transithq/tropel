@@ -28,8 +28,10 @@ if (typeof globalThis.__tropelDeepEqual !== 'function') {
         if (a === null || b === null || a === undefined || b === undefined) return a === b;
         if (typeof a !== typeof b) return false;
         // Date: compare by epoch time; two invalid dates compare equal.
+        // TR-013: guard that BOTH are Date before calling getTime() —
+        // the old code threw TypeError when a was non-Date and b was Date.
         if (a instanceof Date || b instanceof Date) {
-            if (!(b instanceof Date)) return false;
+            if (!(a instanceof Date && b instanceof Date)) return false;
             var ta = a.getTime(), tb = b.getTime();
             return (isNaN(ta) && isNaN(tb)) || ta === tb;
         }
@@ -38,6 +40,29 @@ if (typeof globalThis.__tropelDeepEqual !== 'function') {
         if (a instanceof RegExp || b instanceof RegExp) {
             if (!(b instanceof RegExp)) return false;
             return String(a) === String(b);
+        }
+        // ArrayBuffer: compare byte-by-byte.
+        if (a instanceof ArrayBuffer || b instanceof ArrayBuffer) {
+            if (!(a instanceof ArrayBuffer) || !(b instanceof ArrayBuffer)) return false;
+            if (a.byteLength !== b.byteLength) return false;
+            var va = new Uint8Array(a), vb = new Uint8Array(b);
+            for (var i = 0; i < va.length; i++) {
+                if (va[i] !== vb[i]) return false;
+            }
+            return true;
+        }
+        // TypedArray: same constructor, same length, byte-by-byte.
+        if (ArrayBuffer.isView(a) && !(a instanceof DataView) ||
+            ArrayBuffer.isView(b) && !(b instanceof DataView)) {
+            if (!ArrayBuffer.isView(a) || !ArrayBuffer.isView(b)) return false;
+            if (a.constructor !== b.constructor) return false;
+            if (a.byteLength !== b.byteLength) return false;
+            var ta = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+            var tb = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+            for (var i = 0; i < ta.length; i++) {
+                if (ta[i] !== tb[i]) return false;
+            }
+            return true;
         }
         if (Array.isArray(a)) {
             if (!Array.isArray(b) || a.length !== b.length) return false;
@@ -116,6 +141,20 @@ if (typeof globalThis.__tropelDeepEqual !== 'function') {
                 }
                 seen.pop();
                 return true;
+            }
+            // Error: compare by constructor + message + name.
+            if (a instanceof Error || b instanceof Error) {
+                if (!(a instanceof Error) || !(b instanceof Error)) return false;
+                return a.constructor === b.constructor &&
+                    a.message === b.message &&
+                    a.name === b.name;
+            }
+            // Non-plain objects (Promise, WeakMap, WeakSet, DataView, etc.):
+            // reference equality only. Two distinct Promise objects are never
+            // deep-equal, even if they resolve to the same value.
+            if (Object.getPrototypeOf(a) !== Object.prototype ||
+                Object.getPrototypeOf(b) !== Object.prototype) {
+                return a === b;
             }
             // Plain object: key-set comparison with a cycle guard.
             seen = seen || [];

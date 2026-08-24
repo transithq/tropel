@@ -64,7 +64,7 @@ pub fn validate_thresholds(thresholds: &HashMap<String, ThresholdConfig>) -> Res
         // Compound AND/OR: validate every clause the same way a single
         // threshold is validated.
         for clause in compound_clauses(expr) {
-            let parts: Vec<&str> = clause.split_whitespace().collect();
+            let parts: Vec<&str> = brace_aware_split(clause);
             if parts.len() != 3 {
                 return Err(format!(
                     "threshold '{}': clause '{}' in '{}' — expected '<metric> <op> <value>' \
@@ -147,12 +147,81 @@ fn compound_clauses(expression: &str) -> Vec<&str> {
     if !expression.contains("&&") && !expression.contains("||") {
         return vec![expression];
     }
-    expression
-        .split("||")
-        .flat_map(|group| group.split("&&"))
-        .map(|c| c.trim())
-        .filter(|c| !c.is_empty())
-        .collect()
+    // P1 line 142: split on && / || outside braces so tag values like
+    // {check:status is 200} are not split on the space.
+    let mut result = Vec::new();
+    let mut depth = 0u32;
+    let mut start = 0;
+    let bytes = expression.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'&' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                let clause = expression[start..i].trim();
+                if !clause.is_empty() {
+                    result.push(clause);
+                }
+                start = i + 2;
+                i += 1; // skip second &
+            }
+            b'|' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                // Split on || — treat each group, then split on &&
+                let group = expression[start..i].trim();
+                if !group.is_empty() {
+                    result.extend(compound_clauses(group));
+                }
+                start = i + 2;
+                i += 1; // skip second |
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let rest = expression[start..].trim();
+    if !rest.is_empty() {
+        result.push(rest);
+    }
+    if result.is_empty() {
+        return vec![expression];
+    }
+    result
+}
+
+/// Brace-aware whitespace split: tokenize on whitespace only outside `{}`.
+/// So `checks{check:status is 200} > 0.9` → [`checks{check:status is 200}`, `>`, `0.9`].
+/// P1 line 142: k6 accepts tag values with spaces inside braces.
+fn brace_aware_split(clause: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut depth = 0u32;
+    let mut start = 0;
+    let bytes = clause.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b' ' | b'\t' if depth == 0 => {
+                if start < i {
+                    tokens.push(&clause[start..i]);
+                }
+                // skip whitespace
+                i += 1;
+                while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    i += 1;
+                }
+                start = i;
+                continue; // don't increment i again
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < clause.len() {
+        tokens.push(&clause[start..]);
+    }
+    tokens
 }
 
 /// Check if any abort-on-fail threshold has been breached (mid-run evaluation).
@@ -851,9 +920,13 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
             // `errors < N` the top-level counter IS the merged total, while
             // the helper's default arm would return the worst per-series
             // mean (1.0 for value-1 Counter samples) and pass spuriously.
-            if let Some(v) = stat.and_then(|_| aggregate_series(metrics, "errors", stat)) {
+            // P2 line 181: use aggregate_series for all stat forms of
+            // errors (count, rate, etc.) to keep bare `errors` and
+            // `errors.count` reading the same population.
+            if let Some(v) = aggregate_series(metrics, "errors", stat) {
                 Some(v)
             } else {
+                // Fallback: no tagged sub-series, use the headline total.
                 let secs = metrics.run_duration.as_secs_f64();
                 match stat {
                     Some("rate") | Some("avg") => Some(if secs > 0.0 {
