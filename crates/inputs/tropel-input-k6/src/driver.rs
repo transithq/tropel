@@ -971,6 +971,13 @@ fn http_tags_for(
             tags.insert(k.clone(), v.clone());
         }
     }
+    // TR-205: k6 overwrites the url tag with the name value at emit time.
+    // This is k6's entire cardinality-control mechanism — high-cardinality
+    // URLs cannot leak into the series space when name is set.
+    // TR-205: k6 overwrites url with name value — cardinality control.
+    if let Some(name) = tags.get("name") {
+        tags.insert(interned("url"), Arc::from(name.to_string()));
+    }
     tags
 }
 
