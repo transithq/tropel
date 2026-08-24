@@ -1329,9 +1329,16 @@ fn push_http_failure(
     group: Option<&str>,
     elapsed: Duration,
     sent: usize,
+    error_msg: &str,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
-    let tags = Arc::new(http_tags(req, "0", scenario, extra_tags, group, ""));
+    let mut tags = http_tags(req, "0", scenario, extra_tags, group, "");
+    // TR-204: error tag is populated on transport failures (k6 semantics).
+    // The error tag is empty on success; error_code is 0 on success.
+    if !error_msg.is_empty() {
+        tags.insert(interned("error"), Arc::from(error_msg));
+    }
+    let tags = Arc::new(tags);
 
     let mut v = sink.lock().unwrap();
     // Time-to-failure in ms (same Trend series the success path feeds), so
@@ -2023,6 +2030,7 @@ fn register_http_bridges<'js>(
                     }
                     Err(e) => {
                         tracing::debug!("k6 http request failed: {}", e);
+                        let err = e.to_string();
                         let group = group_stack_req.lock().unwrap().last().cloned();
                         // Same wire-size computation as the success path.
                         let sent = req.body.as_ref().map(tropel_http::body_size).unwrap_or(0);
@@ -2034,8 +2042,8 @@ fn register_http_bridges<'js>(
                             group.as_deref(),
                             start.elapsed(),
                             sent,
+                            &err,
                         );
-                        let err = e.to_string();
                         build_k6_response_object(
                             &ctx,
                             0,
@@ -2224,6 +2232,7 @@ fn register_http_bridges<'js>(
                             }
                             Err(e) => {
                                 tracing::debug!("k6 batch request failed: {}", e);
+                                let err = e.to_string();
                                 let group = group_stack_batch.lock().unwrap().last().cloned();
                                 let sent =
                                     req.body.as_ref().map(tropel_http::body_size).unwrap_or(0);
@@ -2235,8 +2244,8 @@ fn register_http_bridges<'js>(
                                     group.as_deref(),
                                     start.elapsed(),
                                     sent,
+                                    &err,
                                 );
-                                let err = e.to_string();
                                 build_k6_response_object(
                                     &ctx,
                                     0,
@@ -8032,6 +8041,7 @@ mod tests {
             None,
             Duration::from_millis(1500),
             7,
+            "connection refused",
         );
         let samples = sink.lock().unwrap();
         let duration = samples

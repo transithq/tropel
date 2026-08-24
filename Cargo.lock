@@ -4292,6 +4292,7 @@ dependencies = [
  "tokio",
  "tropel-engine",
  "tropel-js",
+ "tropel-metrics",
  "tropel-native",
  "windows-sys 0.61.2",
 ]
@@ -4396,8 +4397,10 @@ dependencies = [
  "tropel-es",
  "tropel-ext",
  "tropel-http",
+ "tropel-input-bru",
  "tropel-input-har",
  "tropel-input-http",
+ "tropel-input-insomnia",
  "tropel-input-k6",
  "tropel-input-openapi",
  "tropel-input-postman",
