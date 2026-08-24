@@ -18,7 +18,20 @@
 // WebAssembly) the resolver degrades to a no-op passthrough — `{{$…}}`
 // survive literal and the embedder's own {{var}} map still resolves.
 
-import CATALOG_META from "../pkg/meta.js";
+// The name/description metadata for the predefined dynamic variables is
+// generated at package build time into `pkg/meta.js`. It is loaded lazily
+// (dynamic import) so the package can be imported in environments where the
+// wasm has not yet been built — CI runs `node -e "import('@tropel/core-wasm')"`
+// from a clean clone without a Rust toolchain, and a static top-level import
+// here would break module resolution with ENOENT before any consumer code
+// runs. The first call memoizes the result; subsequent calls are sync.
+let catalogMetaPromise = null;
+async function loadCatalogMeta() {
+  if (!catalogMetaPromise) {
+    catalogMetaPromise = import("../pkg/meta.js").then((m) => m.default ?? m);
+  }
+  return catalogMetaPromise;
+}
 
 let wasmInstance = null;
 let glue = null;
@@ -65,16 +78,19 @@ export function resolveDynamicVariables(template) {
 
 /**
  * Catalog metadata `[{"name":"$guid","description":…}]` for editor UIs.
- * Synchronous and init-free: extracted from the compiled catalog at package
- * build time (single source of truth — the Rust PREDEFINED_VARIABLE_META).
+ * Async and init-free: extracted from the compiled catalog at package build
+ * time (single source of truth — the Rust PREDEFINED_VARIABLE_META table in
+ * crates/tropel-core-wasm). Lazy because pkg/meta.js is build-generated and
+ * may be absent in dev / CI-from-a-clean-clone.
  */
-export function getPredefinedVariablesMeta() {
-  return CATALOG_META;
+export async function getPredefinedVariablesMeta() {
+  return await loadCatalogMeta();
 }
 
 /** Just the `$`-prefixed catalog names (autocomplete lists). */
-export function getPredefinedVariableNames() {
-  return CATALOG_META.map((m) => m.name);
+export async function getPredefinedVariableNames() {
+  const meta = await loadCatalogMeta();
+  return meta.map((m) => m.name);
 }
 
 // ── OAuth2 flows (RFC 6749 + RFC 7636 PKCE, pure — the embedder sends) ──────
