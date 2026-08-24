@@ -40,7 +40,7 @@ This is what makes a k6 dashboard pointed at tropel *correct* rather than plausi
 
 k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `blocked`, `connecting` and `tls_handshaking` (`lib/netext/httpext/tracer.go:381`). If tropel sums wall-clock, **every duration threshold ported from a k6 script is wrong by one connection setup** — and wrong in the direction that hides regressions on a warm pool.
 
-- [ ] Adopt the exact formula
+- [x] Adopt the exact formula
 - [ ] `sending` and `tls_handshaking` stop being hardcoded 0 — both are real Trends *and* real `res.timings` fields, and because `duration` includes `sending`, hardcoding it **deflates `http_req_duration`**
 - [ ] Port the three subtleties from `tracer.go`: the reused-connection stamp overwrite (`:271-293`), the TLS-vs-plain `sending` basis selection (`:346-359`), and the `gotFirstResponseByte > wroteRequest` guard (`:364`) that prevents a negative `waiting` on HTTP/2
 - [ ] A conformance fixture runs the same script through k6 and tropel against one server and asserts the durations agree within tolerance
