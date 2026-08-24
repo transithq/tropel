@@ -35,10 +35,10 @@ if (typeof globalThis.__tropelDeepEqual !== 'function') {
             var ta = a.getTime(), tb = b.getTime();
             return (isNaN(ta) && isNaN(tb)) || ta === tb;
         }
-        // RegExp: canonical toString (normalizes flag order — /gi vs /ig are
-        // the same expression, matching chai's deep-eql).
+        // RegExp: compare only RegExps, then use canonical toString (which
+        // normalizes flag order — /gi vs /ig are the same expression).
         if (a instanceof RegExp || b instanceof RegExp) {
-            if (!(b instanceof RegExp)) return false;
+            if (!(a instanceof RegExp && b instanceof RegExp)) return false;
             return String(a) === String(b);
         }
         // ArrayBuffer: compare byte-by-byte.
@@ -51,7 +51,19 @@ if (typeof globalThis.__tropelDeepEqual !== 'function') {
             }
             return true;
         }
-        // TypedArray: same constructor, same length, byte-by-byte.
+        // DataView: it is an ArrayBuffer view but has no indexed elements.
+        // Compare the viewed bytes, not the backing buffer's unrelated bytes.
+        if (a instanceof DataView || b instanceof DataView) {
+            if (!(a instanceof DataView && b instanceof DataView)) return false;
+            if (a.byteLength !== b.byteLength) return false;
+            var da = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+            var db = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+            for (var i = 0; i < da.length; i++) {
+                if (da[i] !== db[i]) return false;
+            }
+            return true;
+        }
+        // TypedArray: same constructor, same byte length, byte-by-byte.
         if (ArrayBuffer.isView(a) && !(a instanceof DataView) ||
             ArrayBuffer.isView(b) && !(b instanceof DataView)) {
             if (!ArrayBuffer.isView(a) || !ArrayBuffer.isView(b)) return false;
@@ -142,14 +154,37 @@ if (typeof globalThis.__tropelDeepEqual !== 'function') {
                 seen.pop();
                 return true;
             }
-            // Error: compare by constructor + message + name.
+            // Error: compare its identifying fields and enumerable own fields.
+            // The latter covers custom metadata and nested/circular causes while
+            // retaining the existing constructor/message/name semantics.
             if (a instanceof Error || b instanceof Error) {
                 if (!(a instanceof Error) || !(b instanceof Error)) return false;
-                return a.constructor === b.constructor &&
-                    a.message === b.message &&
-                    a.name === b.name;
+                if (a.constructor !== b.constructor || a.message !== b.message || a.name !== b.name) {
+                    return false;
+                }
+                seen = seen || [];
+                for (var e = 0; e < seen.length; e++) {
+                    if (seen[e][0] === a && seen[e][1] === b) return true;
+                }
+                seen.push([a, b]);
+                var errorKeysA = Object.keys(a).sort();
+                var errorKeysB = Object.keys(b).sort();
+                if (errorKeysA.length !== errorKeysB.length) {
+                    seen.pop();
+                    return false;
+                }
+                for (var ei = 0; ei < errorKeysA.length; ei++) {
+                    if (errorKeysA[ei] !== errorKeysB[ei] ||
+                        !__tropelDeepEqual(a[errorKeysA[ei]], b[errorKeysB[ei]], seen)) {
+                        seen.pop();
+                        return false;
+                    }
+                }
+                seen.pop();
+                return true;
             }
-            // Non-plain objects (Promise, WeakMap, WeakSet, DataView, etc.):
+            // Non-plain objects (Promise, WeakMap, WeakSet, and other host
+            // objects):
             // reference equality only. Two distinct Promise objects are never
             // deep-equal, even if they resolve to the same value.
             if (Object.getPrototypeOf(a) !== Object.prototype ||
