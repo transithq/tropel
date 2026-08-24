@@ -300,8 +300,16 @@ fn build_items(items: &[BruItem]) -> Vec<ScenarioItem> {
                 items: build_items(&item.items),
             }),
             Some("http-request") => {
-                if let Ok(child) = http_item_to_item(item) {
-                    out.push(child);
+                match http_item_to_item(item) {
+                    Ok(child) => out.push(child),
+                    Err(e) => {
+                        // TR-005: report conversion errors instead of silently dropping
+                        eprintln!(
+                            "bru: skipping item {}: {}",
+                            item.name.as_deref().unwrap_or("?"),
+                            e
+                        );
+                    }
                 }
             }
             _ => {}
@@ -337,6 +345,7 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
         })
         .collect();
 
+    // TR-005: collect BOTH query AND path params (was query-only)
     let query_params: HashMap<String, String> = merge_pairs(
         request
             .params
@@ -349,6 +358,20 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
                     .map(|n| (n, p.value.clone().unwrap_or_default()))
             }),
     );
+
+    // Substitute path params: /users/:id → /users/123
+    let mut url = request.url.clone();
+    for param in request
+        .params
+        .iter()
+        .filter(|p| p.enabled.unwrap_or(true))
+        .filter(|p| p.param_type.as_deref() == Some("path"))
+    {
+        if let Some(name) = &param.name {
+            let value = param.value.clone().unwrap_or_default();
+            url = url.replace(&format!(":{}", name), &value);
+        }
+    }
 
     let body = request.body.as_ref().and_then(build_body);
     let auth = request.auth.as_ref().and_then(build_auth);
@@ -375,7 +398,7 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
             .unwrap_or_else(|| format!("{} {}", method.as_str(), request.url)),
         id: None,
         request: Some(Request {
-            url: request.url.clone(),
+            url,
             method,
             headers,
             query_params,
