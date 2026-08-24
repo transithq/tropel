@@ -97,12 +97,23 @@ async fn run_vu_loop(
         // `control_notify` fires on every control PATCH (pause/resume/
         // scale), so we await it in a loop — level-triggered by
         // re-checking `is_paused` each wake.
+        //
+        // CRITICAL: pin the notified() future BEFORE the is_paused()
+        // check so a resume that fires between the check and the select
+        // registration is not lost. Re-register after each wake to stay
+        // level-triggered. (Same shape as the arrival-token path at line 138.)
+        let notify = sched.control_notify();
+        let stop = sched.stop_signal();
+        let mut notify_ready = std::pin::pin!(notify.notified());
+        let mut stop_ready = std::pin::pin!(stop.notified());
         while sched.is_paused() && !sched.is_stop_requested() && !sched.is_force_stop_requested() {
-            let notify = sched.control_notify();
-            let stop = sched.stop_signal();
             tokio::select! {
-                _ = notify.notified() => {}
-                _ = stop.notified() => {}
+                _ = &mut notify_ready => {
+                    notify_ready.set(notify.notified());
+                }
+                _ = &mut stop_ready => {
+                    stop_ready.set(stop.notified());
+                }
             }
         }
         if sched.is_stop_requested() || sched.is_force_stop_requested() {
@@ -652,8 +663,16 @@ impl DriverHttpClient for DriverHttpClientImpl {
         // Backlog line 140: honor Request.auth (k6 params.auth). Build the
         // signer from the per-request config so bearer/basic/oauth2/sigv4/
         // digest on ONE request don't need the whole scenario to share it.
-        let signer = req.auth.as_ref().and_then(|a| self.client.get_signer(a));
-        let http_resp = self.client.execute(req, signer.as_deref()).await?;
+        // P1 line 145: use cached signer via VuCookieClient so stateful
+        // signers (Digest) persist their session maps across requests.
+        // The old code called get_signer() which builds a fresh DigestAuth
+        // with an empty session map per request -- the cache could never hit,
+        // causing 2 wire requests per 1 recorded sample.
+        let signer = req
+            .auth
+            .as_ref()
+            .and_then(|a| self.client.get_signer_ref(a));
+        let http_resp = self.client.execute(req, signer).await?;
         // Backlog line 312: use by-value conversion to avoid 16 clones.
         Ok(Response::from(http_resp))
     }
