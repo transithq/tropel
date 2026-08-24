@@ -86,6 +86,11 @@ impl StdoutReporter {
         for (label, value) in exec_rows {
             out.push_str(&format!("    {:<14}{}\n", label, value));
         }
+        if result.is_unverified() {
+            out.push_str("    Verification   UNVERIFIED: samples or iterations were dropped\n");
+        } else {
+            out.push_str("    Verification   verified: no samples or iterations were dropped\n");
+        }
         out.push_str(&format!(
             "    {:<14}{}\n",
             "Samples dropped", result.output_samples_dropped
