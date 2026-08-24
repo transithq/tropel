@@ -1288,6 +1288,18 @@ fn k6_error_code_message(msg: &str) -> i32 {
     }
 }
 
+/// k6-style `res.error_code` for an HTTP response: `1000 + status` for
+/// status >= 400, else 0. This is distinct from `k6_error_code` (transport
+/// failures) — k6 sets the HTTP code at the call site and keeps the `error`
+/// tag empty for status failures.
+fn k6_http_error_code(status: u16) -> i32 {
+    if status >= 400 {
+        1000 + status as i32
+    } else {
+        0
+    }
+}
+
 /// Send a ws command to the session's writer task without silently dropping
 /// frames. `try_send` + a short bounded retry: the writer task lives on the
 /// separate I/O runtime (not the VU's reactor), so parking this VU thread for
@@ -2020,11 +2032,7 @@ fn register_http_bridges<'js>(
                         // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
                         // while keeping error empty. Only transport errors populate the
                         // error tag.
-                        let http_error_code = if resp.status_code >= 400 {
-                            1000 + resp.status_code as i32
-                        } else {
-                            0
-                        };
+                        let http_error_code = k6_http_error_code(resp.status_code);
                         build_k6_response_object(
                             &ctx,
                             resp.status_code,
@@ -2236,11 +2244,7 @@ fn register_http_bridges<'js>(
                                 // ArrayBuffers (no base64/body_b64 detour) and
                                 // timings/cookies/error_code serialize
                                 // identically.
-                                let batch_error_code = if resp.status_code >= 400 {
-                                    1000 + resp.status_code as i32
-                                } else {
-                                    0
-                                };
+                                let batch_error_code = k6_http_error_code(resp.status_code);
                                 build_k6_response_object(
                                     &ctx,
                                     resp.status_code,
@@ -10464,6 +10468,35 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
     }
 
     #[test]
+    fn test_reserved_metric_name_guard() {
+        // W1 line 24-26: user code cannot create custom metrics with builtin
+        // names like http_reqs, checks, etc. — the guard throws a clear error.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let shim = include_str!("../../../../js/k6-shim/k6-shim.js");
+            ctx.eval::<(), _>(shim).expect("k6-shim must eval");
+            // Built-in names must throw
+            for name in ["http_reqs", "http_req_duration", "checks", "vus"] {
+                let code = format!(
+                    "try {{ new Counter('{}'); 'FAIL' }} catch(e) {{ e.message }}",
+                    name
+                );
+                let msg: String = ctx.eval(code.as_str()).expect("eval must succeed");
+                assert!(
+                    msg.contains("built-in metric"),
+                    "'{name}' should throw about built-in metric, got: {msg}"
+                );
+            }
+            // Custom names must succeed
+            let r: String = ctx
+                .eval("try { new Counter('my_custom'); 'OK' } catch(e) { e.message }")
+                .expect("eval must succeed");
+            assert_eq!(r, "OK", "custom metric name must be accepted");
+        });
+    }
+
+    #[test]
     fn k6_error_code_http_4xx_5xx() {
         // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
         // while keeping error empty. Only transport errors populate error.
@@ -10481,11 +10514,13 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             1600
         );
 
-        // HTTP status codes are NOT k6_error_code's responsibility —
-        // they are computed at the call site as 1000 + status.
-        assert_eq!(1000 + 404, 1404);
-        assert_eq!(1000 + 500, 1500);
-        assert_eq!(1000 + 403, 1403);
-        assert_eq!(1000 + 503, 1503);
+        // HTTP status codes are computed at the call site as 1000 + status
+        // (k6_http_error_code), NOT via k6_error_code_message.
+        assert_eq!(k6_http_error_code(200), 0);
+        assert_eq!(k6_http_error_code(399), 0);
+        assert_eq!(k6_http_error_code(400), 1400);
+        assert_eq!(k6_http_error_code(404), 1404);
+        assert_eq!(k6_http_error_code(500), 1500);
+        assert_eq!(k6_http_error_code(503), 1503);
     }
 }

@@ -40,7 +40,7 @@ This is what makes a k6 dashboard pointed at tropel *correct* rather than plausi
 
 k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `blocked`, `connecting` and `tls_handshaking` (`lib/netext/httpext/tracer.go:381`). If tropel sums wall-clock, **every duration threshold ported from a k6 script is wrong by one connection setup** — and wrong in the direction that hides regressions on a warm pool.
 
-- [ ] Adopt the exact formula
+- [x] Adopt the exact formula
 - [ ] `sending` and `tls_handshaking` stop being hardcoded 0 — both are real Trends *and* real `res.timings` fields, and because `duration` includes `sending`, hardcoding it **deflates `http_req_duration`**
 - [ ] Port the three subtleties from `tracer.go`: the reused-connection stamp overwrite (`:271-293`), the TLS-vs-plain `sending` basis selection (`:346-359`), and the `gotFirstResponseByte > wroteRequest` guard (`:364`) that prevents a negative `waiting` on HTTP/2
 - [ ] A conformance fixture runs the same script through k6 and tropel against one server and asserts the durations agree within tolerance
@@ -148,7 +148,7 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 - [ ] **[SILENT]** Counter `rate` means **per-second**; tropel returns the total for `http_reqs` and a per-series mean for custom counters
 - [ ] **[SILENT]** An unknown stat must be a **startup error**, never a silent resolve to the mean
 - [ ] **[SILENT]** Tag-scoped thresholds never match — the key renderer and the matcher disagree on format
-- [ ] A threshold whose tag value contains a space currently kills the run at startup — fix in the same pass
+- [x]  A threshold whose tag value contains a space currently kills the run at startup — fix in the same pass
 - [ ] **[GAP]** Adopt `metrics/units.go`'s model (`Time` = ms, `Data` = bytes, `Default`). This is the clean fix for the systemic µs/ms confusion. Note it is byte-identical to k6 v1.8 — ancient k6, not a v2 feature
 - [ ] Threshold expressions are re-parsed every tick and it runs twice — cache while you are here
 
@@ -219,7 +219,7 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 - [ ] **[GAP]** `k6/encoding` — only `b64encode`/`b64decode`, but they appear in a huge fraction of real scripts. `b64decode` returns a **string only when `format === "s"`**, else an ArrayBuffer; unknown encodings silently fall back to `std`
 - [ ] **[GAP]** `k6/crypto` **API shape** — scripts write `crypto.sha256(s,'hex')` and `crypto.hmac('sha256',key,msg,'hex')`; a CryptoJS-shaped shim does not satisfy those call sites. 14 functions, five output encodings including **`"binary"` → ArrayBuffer** and `base64rawurl`, plus stateful `createHash`/`createHMAC` → `Hasher{update,digest}`, plus `k6/crypto/x509` (4 functions)
-- [ ] Fix the CryptoJS edges in the same pass: `CryptoJS.MD5`/`SHA1` with a cfg object **silently return an empty-key HMAC** — the `SHA256` guard exists and its siblings never got it
+- [x]  Fix the CryptoJS edges in the same pass: `CryptoJS.MD5`/`SHA1` with a cfg object **silently return an empty-key HMAC** — the `SHA256` guard exists and its siblings never got it
 - [ ] **[GAP]** WebCrypto is the **global `crypto`** object, not an import path — `import … from 'k6/webcrypto'` fails in real k6 too
 
 ## TR-242 · Timers, `randomSeed`, and the globals
