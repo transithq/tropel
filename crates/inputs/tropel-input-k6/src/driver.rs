@@ -2013,6 +2013,14 @@ fn register_http_bridges<'js>(
                             group.as_deref(),
                             &resp.protocol,
                         );
+                        // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
+                        // while keeping error empty. Only transport errors populate the
+                        // error tag.
+                        let http_error_code = if resp.status_code >= 400 {
+                            1000 + resp.status_code as i32
+                        } else {
+                            0
+                        };
                         build_k6_response_object(
                             &ctx,
                             resp.status_code,
@@ -2022,7 +2030,7 @@ fn register_http_bridges<'js>(
                             resp.response_time.as_secs_f64() * 1000.0,
                             resp.timings.as_ref(),
                             "",
-                            0,
+                            http_error_code,
                             &response_type,
                             &resp.cookies,
                             &resp.protocol,
@@ -2215,6 +2223,11 @@ fn register_http_bridges<'js>(
                                 // ArrayBuffers (no base64/body_b64 detour) and
                                 // timings/cookies/error_code serialize
                                 // identically.
+                                let batch_error_code = if resp.status_code >= 400 {
+                                    1000 + resp.status_code as i32
+                                } else {
+                                    0
+                                };
                                 build_k6_response_object(
                                     &ctx,
                                     resp.status_code,
@@ -2224,7 +2237,7 @@ fn register_http_bridges<'js>(
                                     resp.response_time.as_secs_f64() * 1000.0,
                                     resp.timings.as_ref(),
                                     "",
-                                    0,
+                                    batch_error_code,
                                     &response_type,
                                     &resp.cookies,
                                     &resp.protocol,
@@ -10378,5 +10391,27 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 "base64ToBytes must be k6-shim's Uint8Array variant in the production bundle order"
             );
         });
+    }
+
+    #[test]
+    fn k6_error_code_http_4xx_5xx() {
+        // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
+        // while keeping error empty. Only transport errors populate error.
+        // 1000 generic, 1010 non-TCP, 1020 invalid URL, 1050 timeout,
+        // 1100 DNS, 1200 TCP connect, 1300 TLS, 1600 HTTP/2.
+
+        // Transport error codes (unchanged)
+        assert_eq!(k6_error_code("dns resolution failed"), 1100);
+        assert_eq!(k6_error_code("connection timed out"), 1050);
+        assert_eq!(k6_error_code("tls handshake error"), 1300);
+        assert_eq!(k6_error_code("connect refused"), 1200);
+        assert_eq!(k6_error_code("unknown error"), 1000);
+
+        // HTTP status codes are NOT k6_error_code's responsibility —
+        // they are computed at the call site as 1000 + status.
+        assert_eq!(1000 + 404, 1404);
+        assert_eq!(1000 + 500, 1500);
+        assert_eq!(1000 + 403, 1403);
+        assert_eq!(1000 + 503, 1503);
     }
 }

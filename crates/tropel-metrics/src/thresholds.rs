@@ -920,9 +920,13 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
             // `errors < N` the top-level counter IS the merged total, while
             // the helper's default arm would return the worst per-series
             // mean (1.0 for value-1 Counter samples) and pass spuriously.
-            if let Some(v) = stat.and_then(|_| aggregate_series(metrics, "errors", stat)) {
+            // P2 line 181: use aggregate_series for all stat forms of
+            // errors (count, rate, etc.) to keep bare `errors` and
+            // `errors.count` reading the same population.
+            if let Some(v) = aggregate_series(metrics, "errors", stat) {
                 Some(v)
             } else {
+                // Fallback: no tagged sub-series, use the headline total.
                 let secs = metrics.run_duration.as_secs_f64();
                 match stat {
                     Some("rate") | Some("avg") => Some(if secs > 0.0 {
