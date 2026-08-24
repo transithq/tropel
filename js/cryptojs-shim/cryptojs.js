@@ -430,7 +430,18 @@ var CryptoJS = CryptoJS || {};
     }
 
     // ── Exposed Hash Functions ──
+    // P1 line 154: MD5/SHA1 with a config object (e.g. {outputLength:128})
+    // must NOT be treated as an HMAC key. Real CryptoJS accepts
+    // MD5('abc', {outputLength:128}) and ignores the config for MD5/SHA1
+    // (only SHA256/SHA512 respect outputLength). Without this guard,
+    // MD5('abc', {outputLength:128}) calls hmac-md5(key='','abc') =
+    // dd2701993d29fdd0b032c233cec63403 instead of the correct
+    // 900150983cd24fb0d6963f7d28e17f72.
     CryptoJS.MD5 = function (message, key) {
+        if (key && typeof key === 'object' && !key.words) {
+            var hasher = createHasher('MD5');
+            return hasher.finalize(message);
+        }
         var hasher = createHasher('MD5');
         var result = hasher.finalize(message);
         if (key) {
@@ -440,6 +451,10 @@ var CryptoJS = CryptoJS || {};
     };
 
     CryptoJS.SHA1 = function (message, key) {
+        if (key && typeof key === 'object' && !key.words) {
+            var hasher = createHasher('SHA1');
+            return hasher.finalize(message);
+        }
         var hasher = createHasher('SHA1');
         var result = hasher.finalize(message);
         if (key) {

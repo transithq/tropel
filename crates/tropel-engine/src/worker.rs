@@ -242,6 +242,10 @@ impl VUWorkerPool {
     /// lock is only held for the final insert.
     fn acquire_slot(&self, vu_id: u32) -> Slot {
         if let Some((idx, flag)) = self.find_idle_slot() {
+            // P2 line 170: reset growth_failed when an idle slot is found.
+            // Thread-cap exhaustion is transient (VUs exit, threads free)
+            // but the old code permanently pinned every later VU to Wrapped.
+            self.growth_failed.store(false, Ordering::Release);
             return Slot::Idle(idx, flag);
         }
         loop {
