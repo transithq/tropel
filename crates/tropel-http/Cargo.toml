@@ -16,6 +16,7 @@ tropel-sdk.workspace = true
 tropel-auth = { workspace = true, features = ["reqwest"] }
 serde.workspace = true
 reqwest.workspace = true
+h2.workspace = true
 tower.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true

@@ -20,7 +20,8 @@
   ],
   "scripts": {
     "build": "bash scripts/build.sh",
-    "test": "node smoke.mjs",
+    "test": "node deep-equal.test.mjs && node smoke.mjs",
+    "test:deep-equal": "node deep-equal.test.mjs",
     "pack:dry": "bash scripts/build.sh && npm pack --dry-run"
   },
   "engines": {

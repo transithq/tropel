@@ -127,6 +127,8 @@ function k6HTTPRequest(method, url, body, params) {
     // when a legacy/PM bridge returns no timings object.
     var timings = result.timings || {
         blocked: 0,
+        dns: 0,
+        looking_up: 0,
         connecting: 0,
         tls_handshaking: 0,
         sending: 0,
@@ -137,13 +139,15 @@ function k6HTTPRequest(method, url, body, params) {
     // Ensure every k6 key exists (native timings include Tropel's extra dns).
     if (typeof timings === 'object') {
         timings = {
-            blocked: timings.blocked || 0,
-            connecting: timings.connecting || 0,
-            tls_handshaking: timings.tls_handshaking || 0,
-            sending: timings.sending || 0,
-            waiting: timings.waiting || respTime,
-            receiving: timings.receiving || 0,
-            duration: timings.duration || respTime
+            blocked: timings.blocked !== undefined ? timings.blocked : 0,
+            dns: timings.dns !== undefined ? timings.dns : 0,
+            looking_up: 0,
+            connecting: timings.connecting !== undefined ? timings.connecting : 0,
+            tls_handshaking: timings.tls_handshaking !== undefined ? timings.tls_handshaking : 0,
+            sending: timings.sending !== undefined ? timings.sending : 0,
+            waiting: timings.waiting !== undefined ? timings.waiting : respTime,
+            receiving: timings.receiving !== undefined ? timings.receiving : 0,
+            duration: timings.duration !== undefined ? timings.duration : respTime
         };
     }
 
@@ -159,7 +163,7 @@ function k6HTTPRequest(method, url, body, params) {
             headers: canonical.headers,
             body: canonical.body,
             cookies: result.cookies || {}
-        }
+        }, result.proto
     );
     // Backlog line 150: k6 Response.error ("" on success) / error_code (0 on
     // success, 1xxx on transport failure) — `if (res.error)` now detects
@@ -499,20 +503,19 @@ function escapeMultipartFieldName(name) {
 // Backlog line 102: res.cookies / res.request / proto / remote_ip / html()
 // were absent — res.cookies['sid'] threw TypeError. Cookies are real data
 // from the native bridge (name -> [cookie objects], k6 shape); request is
-// the k6 Response.request {method, url, headers, body, cookies}; proto /
-// remote_ip are best-effort defaults (reqwest doesn't expose the wire
-// version or peer IP through the SDK Response), present so scripts never
-// throw on them.
-function K6Response(status, body, headers, timings, url, cookies, requestInfo) {
+// the k6 Response.request {method, url, headers, body, cookies}; proto comes
+// from the native response's negotiated wire version, while remote_ip remains
+// a best-effort default because reqwest does not expose the peer IP here.
+function K6Response(status, body, headers, timings, url, cookies, requestInfo, proto) {
     this.status = status;
     this.body = body;
     this.headers = headers || {};
-    this.timings = timings || { blocked: 0, connecting: 0, tls_handshaking: 0, sending: 0, waiting: 0, receiving: 0, duration: 0 };
+    this.timings = timings || { blocked: 0, dns: 0, looking_up: 0, connecting: 0, tls_handshaking: 0, sending: 0, waiting: 0, receiving: 0, duration: 0 };
     this.url = url || '';
     this.status_text = String(status) + ' ' + getStatusText(status);
     this.cookies = cookies || {};
     this.request = requestInfo || { method: 'GET', url: url || '', headers: this.headers, body: body, cookies: this.cookies };
-    this.proto = 'HTTP/1.1';
+    this.proto = proto || '';
     this.remote_ip = '';
 }
 
@@ -803,6 +806,8 @@ http.batch = function (requests) {
             }
             var timings = raw.timings || {
                 blocked: 0,
+                dns: 0,
+                looking_up: 0,
                 connecting: 0,
                 tls_handshaking: 0,
                 sending: 0,
@@ -812,13 +817,15 @@ http.batch = function (requests) {
             };
             if (typeof timings === 'object') {
                 timings = {
-                    blocked: timings.blocked || 0,
-                    connecting: timings.connecting || 0,
-                    tls_handshaking: timings.tls_handshaking || 0,
-                    sending: timings.sending || 0,
-                    waiting: timings.waiting || rtime,
-                    receiving: timings.receiving || 0,
-                    duration: timings.duration || rtime
+                    blocked: timings.blocked !== undefined ? timings.blocked : 0,
+                    dns: timings.dns !== undefined ? timings.dns : 0,
+                    looking_up: 0,
+                    connecting: timings.connecting !== undefined ? timings.connecting : 0,
+                    tls_handshaking: timings.tls_handshaking !== undefined ? timings.tls_handshaking : 0,
+                    sending: timings.sending !== undefined ? timings.sending : 0,
+                    waiting: timings.waiting !== undefined ? timings.waiting : rtime,
+                    receiving: timings.receiving !== undefined ? timings.receiving : 0,
+                    duration: timings.duration !== undefined ? timings.duration : rtime
                 };
             }
             var resp = new K6Response(
@@ -832,7 +839,7 @@ http.batch = function (requests) {
                     headers: normalized[ei] ? JSON.parse(normalized[ei].headers_json) : {},
                     body: entry.body !== undefined ? entry.body : '',
                     cookies: raw.cookies || {}
-                }
+                }, raw.proto
             );
             resp.error = raw.error || '';
             resp.error_code = raw.error_code || 0;
