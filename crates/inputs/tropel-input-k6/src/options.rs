@@ -74,6 +74,10 @@ pub struct K6Options {
     /// config. Previously unmodelled, so it was silently dropped.
     #[serde(alias = "insecureSkipTLSVerify")]
     pub insecure_skip_tls_verify: Option<bool>,
+    // TR-201: catch unrecognized options — ~20 k6 root options are currently
+    // silently dropped. This field collects them so we can warn per-key.
+    #[serde(flatten)]
+    pub unknown: HashMap<String, serde_json::Value>,
 }
 
 /// k6 `options.dns` — DNS cache TTL, address selection and family policy.
@@ -171,6 +175,13 @@ impl K6Options {
     /// Named scenarios take precedence over the top-level executor, matching
     /// k6 semantics. Returns `None` when nothing usable is declared.
     pub fn to_declared(&self) -> Option<DriverDeclaredOptions> {
+        // TR-201: warn on every unrecognized option — ~20 k6 root options
+        // were silently dropped before this.
+        if !self.unknown.is_empty() {
+            for key in self.unknown.keys() {
+                tracing::warn!("k6 option '{}' is not recognized by tropel — ignored", key);
+            }
+        }
         let thresholds = self.convert_thresholds();
 
         if let Some(scenarios) = &self.scenarios {
