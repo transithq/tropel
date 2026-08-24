@@ -311,27 +311,37 @@ fn memory_per_vu(c: &mut Criterion) {
 /// aggregator's capacity to absorb and flush samples.
 fn samples_egress(c: &mut Criterion) {
     use std::sync::Arc;
-    use tropel_metrics::collector::{MetricCollector, Sample, SampleType};
-    use tropel_metrics::MetricKey;
+    use tropel_metrics::collector::MetricsCollector;
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
 
     let mut group = c.benchmark_group("throughput");
     group.throughput(Throughput::Elements(10_000));
     group.measurement_time(Duration::from_secs(5));
 
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
     group.bench_function("samples_per_sec_10k", |b| {
-        let collector = MetricCollector::new(100_000);
+        let collector = MetricsCollector::new();
+        let empty_tags: Arc<TagMap> = Arc::new(TagMap::new());
         b.iter(|| {
-            for i in 0..10_000 {
-                let key = MetricKey::new(
-                    format!("http_req_duration_{}", i % 100),
-                    std::collections::HashMap::new(),
-                );
-                collector.record(Sample {
-                    key,
-                    value: (i as f64) * 0.1,
-                    sample_type: SampleType::Trend,
-                });
-            }
+            rt.block_on(async {
+                for i in 0..10_000 {
+                    let name: std::borrow::Cow<'static, str> =
+                        format!("http_req_duration_{}", i % 100).into();
+                    collector
+                        .record(&Sample {
+                            metric: name,
+                            value: (i as f64) * 0.1,
+                            tags: empty_tags.clone(),
+                            timestamp: std::time::SystemTime::now(),
+                            sample_type: SampleType::Trend,
+                        })
+                        .await;
+                }
+            });
             std::hint::black_box(&collector);
         });
     });
@@ -342,27 +352,44 @@ fn samples_egress(c: &mut Criterion) {
 /// TR-002: Aggregator duty cycle — build_results under load.
 /// Measures how long it takes to build results from a populated collector.
 fn aggregator_duty_cycle(c: &mut Criterion) {
-    use tropel_metrics::collector::{MetricCollector, Sample, SampleType};
-    use tropel_metrics::MetricKey;
+    use std::sync::Arc;
+    use tropel_metrics::collector::MetricsCollector;
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
 
     let mut group = c.benchmark_group("throughput");
     group.measurement_time(Duration::from_secs(5));
 
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
     group.bench_function("build_results_1000_series", |b| {
-        let collector = MetricCollector::new(100_000);
+        let collector = MetricsCollector::new();
+        let empty_tags: Arc<TagMap> = Arc::new(TagMap::new());
         // Pre-populate with 1000 series
-        for i in 0..1_000 {
-            let key = MetricKey::new(format!("metric_{}", i), std::collections::HashMap::new());
-            for j in 0..100 {
-                collector.record(Sample {
-                    key: key.clone(),
-                    value: j as f64,
-                    sample_type: SampleType::Trend,
-                });
+        rt.block_on(async {
+            for i in 0..1_000 {
+                let name: std::borrow::Cow<'static, str> = format!("metric_{}", i).into();
+                for j in 0..100 {
+                    collector
+                        .record(&Sample {
+                            metric: name.clone(),
+                            value: j as f64,
+                            tags: empty_tags.clone(),
+                            timestamp: std::time::SystemTime::now(),
+                            sample_type: SampleType::Trend,
+                        })
+                        .await;
+                }
             }
-        }
+        });
         b.iter(|| {
-            let results = collector.build_results();
+            let rt2 = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let results = rt2.block_on(collector.results());
             std::hint::black_box(results);
         });
     });

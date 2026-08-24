@@ -78,7 +78,7 @@ impl StdoutReporter {
 
         // Execution overview — aligned two-column block
         out.push_str("  ── Execution ─────────────────────────────────────────────\n");
-        let mut exec_rows = vec![
+        let exec_rows = vec![
             ("Iterations", result.iterations.to_string()),
             ("Max VUs", result.vus_max.to_string()),
             ("Dropped", result.dropped_iterations.to_string()),

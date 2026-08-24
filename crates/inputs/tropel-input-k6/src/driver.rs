@@ -990,14 +990,6 @@ fn http_tags_for(
     tags
 }
 
-/// TR-014: add protocol tag to tags map. The protocol comes from
-/// the response's version (e.g. "HTTP/1.1", "HTTP/2").
-fn add_protocol_tag(tags: &mut TagMap, protocol: &str) {
-    if !protocol.is_empty() {
-        tags.insert(interned("protocol"), Arc::from(protocol));
-    }
-}
-
 /// Tiny status-0 error envelope used when a response allocation fails
 /// (backlog line 46 P0): mirrors the invalid-method path so the script sees
 /// a FAILED response (checks fail, http_req_failed counts) instead of a
@@ -1321,6 +1313,7 @@ fn try_send_cmd(tx: &tokio::sync::mpsc::Sender<WsCommand>, mut cmd: WsCommand) -
 /// `p(95) < 500` PASS on the handful of pre-outage successes — the failure
 /// durations simply never entered the distribution. The caller measures the
 /// elapsed time-to-failure around the execute call and passes it here.
+#[allow(clippy::too_many_arguments)] // same field set as push_http_samples
 fn push_http_failure(
     sink: &Mutex<Vec<Sample>>,
     req: &Request,

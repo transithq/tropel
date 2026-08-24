@@ -4294,6 +4294,7 @@ dependencies = [
  "tropel-js",
  "tropel-metrics",
  "tropel-native",
+ "tropel-sdk",
  "windows-sys 0.61.2",
 ]
 
