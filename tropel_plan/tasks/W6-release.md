@@ -40,12 +40,12 @@ Source: `TROPEL_MASTER_TODO.md` §W5, §"Release gate for 0.1.0" · `TROPEL_EXEC
 
 A wrong signature is a 403 the user spends a day on. None of this can ship to strangers first.
 
-- [ ] **SigV4 consecutive-slash normalization is incomplete** — `signers.rs:516` `path.replace("//","/")` is a **single pass**, so runs of ≥3 survive. ✅**CALC** two official AWS suite failures; a real 403 on `//prod/users`, the classic base-URL-ends-in-`/` join. **`lib.rs:1503` asserts the buggy behaviour — invert it in the same PR**
-- [ ] **SigV4 streaming bodies sign the empty-payload hash** ✅**EXEC** — a `Body::wrap_stream` carrying `b"payload"` signs as if empty
-- [ ] **The SigV4 signing-key cache made things slower and is collision-unsafe** (`signers.rs:440-470`)
-- [ ] **Digest `SHA-512-256` degrades to MD5** while echoing `algorithm="SHA-512-256"` ✅**EXEC** 32 hex chars returned; `digest_with` has **no SHA-512/256 arm at all**
-- [ ] **The Digest session cache is dead code → the target sees 2× the reported RPS.** The only production construction (`vu_loop.rs:483`) builds a fresh signer per request, so the lookup can never hit; `client.rs:723-764` replaces the 401 **in place**, so it never becomes an `HttpResponse` and **no sample is recorded for it**
-- [ ] **The RPS limiter is acquired once per `execute()`, not per hop** — `client.rs:453` sits above the redirect loop, so `rps:1000` against a 302 chain sends **2000/s**. `rps.rs` itself is correct; the bug is purely at the call site
+- [x] **SigV4 consecutive-slash normalization is incomplete** — `signers.rs:516` `path.replace("//","/")` is a **single pass**, so runs of ≥3 survive. ✅**CALC** two official AWS suite failures; a real 403 on `//prod/users`, the classic base-URL-ends-in-`/` join. **`lib.rs:1503` asserts the buggy behaviour — invert it in the same PR**
+- [x] **SigV4 streaming bodies sign the empty-payload hash** ✅**EXEC** — a `Body::wrap_stream` carrying `b"payload"` signs as if empty
+- [x] **The SigV4 signing-key cache made things slower and is collision-unsafe** (`signers.rs:440-470`)
+- [x] **Digest `SHA-512-256` degrades to MD5** while echoing `algorithm="SHA-512-256"` ✅**EXEC** 32 hex chars returned; `digest_with` has **no SHA-512/256 arm at all**
+- [x] **The Digest session cache is dead code → the target sees 2× the reported RPS.** The only production construction (`vu_loop.rs:483`) builds a fresh signer per request, so the lookup can never hit; `client.rs:723-764` replaces the 401 **in place**, so it never becomes an `HttpResponse` and **no sample is recorded for it**
+- [x] **The RPS limiter is acquired once per `execute()`, not per hop** — `client.rs:453` sits above the redirect loop, so `rps:1000` against a 302 chain sends **2000/s**. `rps.rs` itself is correct; the bug is purely at the call site
 - [ ] **OAuth2 silently drops `client_secret`** with the default Basic auth method (`oauth.rs:438-452`)
 - [ ] **OAuth2 Basic client auth omits RFC 6749 §2.3.1 form-encoding** ✅**EXEC**
 - [ ] Digest: a **realm change with an unchanged nonce is silently ignored**; `signed_headers` re-application **appends** rather than replacing
