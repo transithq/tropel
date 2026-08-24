@@ -1306,6 +1306,7 @@ impl Aggregator {
                 None => None,
             };
 
+            let data_len = self.data.len();
             match self.data.entry(key) {
                 indexmap::map::Entry::Occupied(mut e) => {
                     let existing = e.get_mut();
@@ -1330,6 +1331,11 @@ impl Aggregator {
                     existing.last = s.last;
                 }
                 indexmap::map::Entry::Vacant(v) => {
+                    // P2 line 165: respect the cardinality cap. Without this,
+                    // 50 agents x 100k cap = 5M series on the controller.
+                    if data_len >= self.max_series {
+                        continue;
+                    }
                     v.insert(MetricSet {
                         metric_type: s.metric_type,
                         histogram,
