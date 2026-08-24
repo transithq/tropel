@@ -37,15 +37,15 @@ on:
     # block bites.
     paths:
       - 'crates/**'
-  - 'js/**'
-  - 'examples/**'
-  - '.github/**'
-  - 'Cargo.toml'
-  - 'Cargo.lock'
-  - 'rust-toolchain.toml'
-  - 'deny.toml'
-  - 'package.json'
-  - 'packages/**'
+      - 'js/**'
+      - 'examples/**'
+      - '.github/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'deny.toml'
+      - 'package.json'
+      - 'packages/**'
 
   workflow_dispatch:
 
