@@ -132,11 +132,13 @@ where
 {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).await? == 0 {
+    // P2 line 173: use .take() to limit the read BEFORE read_line grows
+    // the String unbounded. The old code checked AFTER read_line, so a
+    // multi-GB line with no newline allocated all of it first.
+    let mut limited = (&mut reader).take(MAX_HEADER_LINE_LEN as u64 + 1);
+    if limited.read_line(&mut request_line).await? == 0 {
         return Ok(());
     }
-    // Backlog line 256: cap header line length to prevent memory exhaustion
-    // from a single multi-GB line (MAX_BODY_SIZE only guards the body).
     if request_line.len() > MAX_HEADER_LINE_LEN {
         return Err(TropelError::Http(format!(
             "control API: request line too long ({} > {})",
@@ -153,10 +155,11 @@ where
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
+        let mut limited = (&mut reader).take(MAX_HEADER_LINE_LEN as u64 + 1);
+        if limited.read_line(&mut line).await? == 0 {
             break;
         }
-        // Backlog line 256: cap individual header line length.
+        // P2 line 173: cap individual header line length BEFORE read.
         if line.len() > MAX_HEADER_LINE_LEN {
             return Err(TropelError::Http(format!(
                 "control API: header line too long ({} > {})",
