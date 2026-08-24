@@ -993,11 +993,15 @@ fn resolve_refs(doc: &Value) -> Value {
                                 let mut method_out =
                                     serde_json::Map::with_capacity(method_map.len());
                                 for (mk, mv) in method_map {
-                                    let resolved_method = if mk == "responses" {
-                                        mv.clone()
-                                    } else {
-                                        resolve_value(mv, doc, &mut cache, &mut in_progress)
-                                    };
+                                    // P1 line 157: skip resolving responses
+                                    // inside each operation. The old check
+                                    // was at the Path Item level (mk iterates
+                                    // get/post/parameters) where responses
+                                    // never appears. resolve_value will handle
+                                    // the skip when it recurses into the
+                                    // operation's map.
+                                    let resolved_method =
+                                        resolve_value(mv, doc, &mut cache, &mut in_progress);
                                     method_out.insert(mk.clone(), resolved_method);
                                 }
                                 Value::Object(method_out)
@@ -1069,9 +1073,16 @@ fn resolve_value(
                 }
             }
             // Otherwise recurse into members.
+            // P1 line 157: skip resolving responses — they are not consumed
+            // by any code path and inlining potentially huge response schemas
+            // wastes memory and time.
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                out.insert(k.clone(), resolve_value(v, root, cache, in_progress));
+                if k == "responses" {
+                    out.insert(k.clone(), v.clone());
+                } else {
+                    out.insert(k.clone(), resolve_value(v, root, cache, in_progress));
+                }
             }
             Value::Object(out)
         }
