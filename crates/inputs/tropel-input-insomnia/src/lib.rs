@@ -67,8 +67,10 @@ struct InsomniaResource {
     #[serde(default)]
     name: Option<String>,
     // Request-group / request ordering (Insomnia emits a `metaSortKey`).
+    // TR-006: Insomnia assigns sort keys by midpoint averaging, so they
+    // go fractional the first time a user drags anything. Use f64.
     #[serde(default, rename = "metaSortKey")]
-    meta_sort_key: Option<i64>,
+    meta_sort_key: Option<f64>,
     #[serde(default)]
     method: Option<String>,
     #[serde(default)]
@@ -237,7 +239,12 @@ fn build_items(resources: &[InsomniaResource], parent_id: &str) -> Vec<ScenarioI
         .iter()
         .filter(|r| r.parent_id.as_deref() == Some(parent_id))
         .collect();
-    children.sort_by_key(|r| r.meta_sort_key.unwrap_or(0));
+    children.sort_by(|a, b| {
+        a.meta_sort_key
+            .unwrap_or(0.0)
+            .partial_cmp(&b.meta_sort_key.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut out = Vec::new();
     for r in children {
@@ -255,8 +262,16 @@ fn build_items(resources: &[InsomniaResource], parent_id: &str) -> Vec<ScenarioI
                 });
             }
             "request" => {
-                if let Ok(item) = request_to_item(r) {
-                    out.push(item);
+                match request_to_item(r) {
+                    Ok(item) => out.push(item),
+                    Err(e) => {
+                        // TR-006: report conversion errors instead of silently dropping
+                        eprintln!(
+                            "insomnia: skipping request {}: {}",
+                            r.name.as_deref().unwrap_or("?"),
+                            e
+                        );
+                    }
                 }
             }
             _ => {}
