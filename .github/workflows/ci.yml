@@ -153,6 +153,102 @@ jobs:
       - name: Run release machine-readable thresholds
         run: cargo run -p tropel-bench --release --locked --bin perf-regression
 
+  npm-packages:
+    name: npm packages (manifests tracked, clean-clone import)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Deliberately NO Rust toolchain and NO wasm build: TR-008/TR-009 assert
+    # the packages work from a clean clone the way a browser embedder sees
+    # them (knockport's `file:` deps), not after a local build.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # TR-008: every packages/* directory must carry a committed manifest and
+      # be a workspace member. The blanket `*.json` gitignore rule ate three
+      # package.json files; this makes the invariant a hard CI failure.
+      - name: Assert every packages/* has a committed manifest (TR-008)
+        run: |
+          set -euo pipefail
+          for dir in packages/*/; do
+            test -f "$dir/package.json" || { echo "FAIL: $dir has no package.json"; exit 1; }
+            git ls-files --error-unmatch "$dir/package.json" >/dev/null \
+              || { echo "FAIL: $dir/package.json is not committed (gitignore ate it?)"; exit 1; }
+          done
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const root = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const members = (root.workspaces || []).flat();
+            // Expand the workspace globs (e.g. "packages/*") so each package
+            // directory is matched the way npm resolves membership — a literal
+            // compare against "packages/*" would (wrongly) fail every dir.
+            const expand = (pattern) => {
+              const parts = pattern.split("/");
+              let candidates = [""];
+              for (const part of parts) {
+                const next = [];
+                for (const base of candidates) {
+                  if (part === "*") {
+                    const scan = base === "" ? "." : base;
+                    for (const name of fs.readdirSync(scan)) {
+                      const full = path.join(base, name);
+                      if (fs.statSync(full).isDirectory()) next.push(full);
+                    }
+                  } else {
+                    next.push(path.join(base, part));
+                  }
+                }
+                candidates = next;
+              }
+              return candidates;
+            };
+            const matched = new Set();
+            for (const m of members) {
+              for (const dir of expand(m)) matched.add(path.normalize(dir));
+            }
+            for (const dir of fs.readdirSync("packages")) {
+              if (!fs.statSync(`packages/${dir}`).isDirectory()) continue;
+              const pkg = JSON.parse(fs.readFileSync(`packages/${dir}/package.json`, "utf8"));
+              const rel = path.normalize(`packages/${dir}`);
+              if (!matched.has(rel)) {
+                console.error(`FAIL: packages/${dir} is not a root workspace member`);
+                process.exit(1);
+              }
+            }
+            console.log("ok: all packages/* have committed manifests and are workspace members");
+          '
+      # TR-008: a clean clone must run `npm install` at the root with no
+      # missing-manifest error (the workspace resolves every packages/* dir).
+      # Deliberately after the manifest assert, so a failure here names the
+      # dir, not an npm error.
+      - name: Root npm install resolves the workspace (TR-008)
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          echo "ok: root npm install resolved the workspace"
+      # TR-009: @tropel/core-wasm must load from a clean clone with NO Rust
+      # toolchain present. `src/index.js` used a static top-level import of
+      # build-generated pkg/meta.js, which failed at module load with ENOENT.
+      # The smoke must be able to fail — assert the resolver surface exists.
+      - name: Import @tropel/core-wasm with no Rust toolchain (TR-009)
+        run: |
+          set -euo pipefail
+          if command -v cargo >/dev/null 2>&1; then
+            echo "note: cargo present on runner; the assertion is still that the JS module loads"
+          fi
+          node -e '
+            import("./packages/core-wasm/src/index.js").then((m) => {
+              const need = ["initCoreWasm", "resolveDynamicVariables", "getPredefinedVariablesMeta"];
+              for (const k of need) {
+                if (typeof m[k] !== "function") {
+                  throw new Error(`@tropel/core-wasm missing export ${k}`);
+                }
+              }
+              console.log("ok: @tropel/core-wasm loads from clean clone without a Rust build");
+            });
+          '
+
   semver:
     name: semver-checks (tropel-sdk API breaks)
     runs-on: ubuntu-latest
@@ -450,7 +546,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [fmt, clippy, test, msrv, semver, deny, sdk-gates, wasm, smoke]
+    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

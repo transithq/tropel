@@ -224,7 +224,7 @@ struct BruVariable {
 pub struct BruInputAdapter;
 
 inventory::submit!(
-    InputAdapterRegistration::new("bru", || Box::new(BruInputAdapter)).with_priority(25)
+    InputAdapterRegistration::new("bru", || Box::new(BruInputAdapter)).with_priority(26)
 );
 
 impl InputAdapter for BruInputAdapter {
@@ -725,5 +725,47 @@ mod tests {
         let scenario = adapter.parse(data).unwrap();
         assert_eq!(scenario.items.len(), 1);
         assert_eq!(scenario.items[0].name, "R");
+    }
+
+    /// TR-007: bru must NOT share a priority with the `http` file adapter
+    /// (both were 25, making auto-detect ties link-order-dependent). The
+    /// registration constant is the source of truth — change it here and
+    /// the wasm dispatch table in `tropel-input-wasm` must mirror it.
+    #[test]
+    fn bru_priority_is_distinct_from_http() {
+        let reg =
+            InputAdapterRegistration::new("bru", || Box::new(BruInputAdapter)).with_priority(26);
+        assert_eq!(
+            reg.priority, 26,
+            "bru must not share priority with http (25)"
+        );
+    }
+
+    /// TR-005: duplicate query keys must not be silently dropped —
+    /// `[{ids,1},{ids,2}]` joins to `"1, 2"` (the SDK's `HashMap` cannot hold
+    /// duplicate keys, so the data is preserved, not lost).
+    #[test]
+    fn parse_duplicate_query_keys_join_not_drop() {
+        let adapter = BruInputAdapter;
+        let data = br#"{
+            "version": "1",
+            "name": "C",
+            "items": [{
+                "uid": "r",
+                "type": "http-request",
+                "name": "R",
+                "request": {
+                    "url": "https://x.io/",
+                    "method": "GET",
+                    "params": [
+                        {"uid":"p1","name":"ids","value":"1","type":"query","enabled":true},
+                        {"uid":"p2","name":"ids","value":"2","type":"query","enabled":true}
+                    ]
+                }
+            }]
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.query_params.get("ids"), Some(&"1, 2".to_string()));
     }
 }

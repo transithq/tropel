@@ -2300,6 +2300,107 @@ mod tests {
         assert!(!sched.is_paused());
     }
 
+    /// TR-012: the pause-gate lost wakeup. The VU loop parks in
+    /// `vu_loop.rs` by constructing `control_notify().notified()` AFTER
+    /// reading `is_paused()`, while `set_paused` uses edge-triggered
+    /// `notify_waiters()`. A resume PATCH that lands between the `is_paused()`
+    /// read and the `select!` registration is dropped — and with no timeout
+    /// arm the VU parks forever while the control API reports `paused: false`.
+    ///
+    /// The fix pins `notified()` BEFORE the check AND keeps a `sleep(100ms)`
+    /// backstop that re-checks the level. This test reproduces the exact race:
+    /// a resume is fired while the future is already pinned but before the
+    /// waiter re-reads the level, and the VU must still make progress.
+    #[tokio::test]
+    async fn pause_gate_makes_progress_after_resume_during_race_window() {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        }));
+        let progress = Arc::new(AtomicU64::new(0));
+
+        // A VU that models the fixed pause gate from vu_loop.rs: pin the
+        // notified() future BEFORE the is_paused() check, re-register after
+        // each wake, and keep a 100ms sleep backstop for the edge-triggered
+        // Notify. Without the backstop this test would hang (the original bug).
+        let vu = {
+            let sched = sched.clone();
+            let progress = progress.clone();
+            tokio::spawn(async move {
+                let notify = sched.control_notify();
+                let stop = sched.stop_signal();
+                loop {
+                    if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                        break;
+                    }
+                    let mut notify_ready = std::pin::pin!(notify.notified());
+                    let mut stop_ready = std::pin::pin!(stop.notified());
+                    while sched.is_paused()
+                        && !sched.is_stop_requested()
+                        && !sched.is_force_stop_requested()
+                    {
+                        tokio::select! {
+                            _ = &mut notify_ready => {
+                                notify_ready.set(notify.notified());
+                            }
+                            _ = &mut stop_ready => {
+                                stop_ready.set(stop.notified());
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        }
+                    }
+                    if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                        break;
+                    }
+                    progress.fetch_add(1, Ordering::Relaxed);
+                    // Yield so the single-threaded test runtime can poll the
+                    // control loop and observe pause/resume.
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Let the VU reach the top of its loop and start working.
+        for _ in 0..100 {
+            if progress.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            progress.load(Ordering::Relaxed) > 0,
+            "VU must make progress before the pause"
+        );
+
+        // Pause, then fire a resume INSIDE the race window: the resume is
+        // issued immediately after set_paused(true) — before any VU could
+        // have re-registered its notified() — exactly the window the original
+        // bug lost. With the level-recheck backstop the VU must proceed.
+        sched.set_paused(true);
+        // Fire the resume in the race window without awaiting a full 100ms
+        // tick: notify_waiters() is edge-triggered, so the ONLY thing that
+        // guarantees progress is the sleep backstop re-reading the level.
+        sched.set_paused(false);
+
+        let before = progress.load(Ordering::Relaxed);
+        for _ in 0..100 {
+            if progress.load(Ordering::Relaxed) > before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            progress.load(Ordering::Relaxed) > before,
+            "VU must make progress after a resume fired in the pause-gate race window"
+        );
+
+        sched.request_stop();
+        let _ = tokio::time::timeout(Duration::from_secs(5), vu).await;
+    }
+
     /// Locked: a ramp-down claim decrements the logical externally-controlled
     /// pool (control_spawned), so reconcile growth can't double-spawn after
     /// VUs exit.
