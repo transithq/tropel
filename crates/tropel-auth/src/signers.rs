@@ -968,9 +968,11 @@ impl AuthSigner for DigestAuth {
             algorithm: challenge.get("algorithm").cloned(),
             opaque: challenge.get("opaque").cloned(),
         });
-        // Server rotated the nonce (or first challenge for this host) → reset
-        // the per-nonce counter; otherwise keep counting within this nonce.
-        if sess.nonce != *nonce {
+        // P2 line 180: server rotated the nonce OR changed the realm →
+        // reset session. The old code only checked nonce, so a realm
+        // change with unchanged nonce silently used the old realm's HA1,
+        // causing permanent 401.
+        if sess.nonce != *nonce || sess.realm != *realm {
             sess.nonce = nonce.clone();
             sess.nc = 0;
             sess.realm = realm.clone();
@@ -1160,7 +1162,12 @@ fn build_digest_authorization(
         .iter()
         .map(|(k, v)| match k.as_str() {
             "qop" | "nc" | "algorithm" => format!("{k}={v}"),
-            _ => format!("{k}=\"{}\"", v.replace('"', "")),
+            // P2 line 180: escape quotes with backslash instead of
+            // stripping them. Stripping produced wrong values for usernames
+            // containing quotes (ab"c → abc instead of ab\"c), and a
+            // backslash-terminated username (a\) produced a quoted-pair
+            // breakout enabling directive injection from CSV data files.
+            _ => format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
         })
         .collect::<Vec<_>>()
         .join(", ");
