@@ -50,6 +50,10 @@ impl JsonReporter {
             "errors": result.errors,
             "data_received": result.data_received,
             "data_sent": result.data_sent,
+            "dropped_iterations": result.dropped_iterations,
+            "series_dropped": result.series_dropped,
+            "samples_dropped": result.output_samples_dropped,
+            "unverified": result.is_unverified(),
         });
 
         serde_json::to_string_pretty(&output).map_err(|e| {

@@ -19,7 +19,13 @@ impl CsvReporter {
     /// Render the full report as CSV text (no I/O). Exposed for tests and
     /// programmatic consumers; `report()` writes it.
     pub fn render(&self, result: &MetricsResult) -> String {
-        let mut csv_output = String::from("key,count,sum,mean,min,max,p50,p90,p95,p99\n");
+        let mut csv_output = format!(
+            "# unverified={},dropped_iterations={},series_dropped={},samples_dropped={}\nkey,count,sum,mean,min,max,p50,p90,p95,p99\n",
+            result.is_unverified(),
+            result.dropped_iterations,
+            result.series_dropped,
+            result.output_samples_dropped
+        );
 
         for metric in &result.metrics {
             csv_output.push_str(&format!(

@@ -24,6 +24,10 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "W
 # RSS measurement on macOS: mach task_info (MACH_TASK_BASIC_INFO).
 libc = "0.2"
 
+[[bin]]
+name = "perf-regression"
+path = "src/bin/perf-regression.rs"
+
 [[bench]]
 name = "perf"
 harness = false
