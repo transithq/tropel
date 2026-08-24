@@ -251,10 +251,14 @@ impl AuthSigner for AwsSigV4Auth {
             .unwrap_or_else(|| default_service(url.host_str().unwrap_or("")));
 
         // Payload hash — body is always buffered by tropel, but fall back to
-        // the empty-string hash for streaming bodies (never panic).
+        // UNSIGNED-PAYLOAD for streaming bodies (body is None or not
+        // representable as bytes). AWS treats UNSIGNED-PAYLOAD as "don't
+        // verify the body hash" — the correct semantic for unbuffered
+        // streams. The old code used EMPTY_SHA256 (hash of empty string),
+        // which signs the wrong hash and fails verification.
         let payload_hash = match request.body().and_then(|b| b.as_bytes()) {
             Some(bytes) => hex_sha256(bytes),
-            None => EMPTY_SHA256.to_string(),
+            None => "UNSIGNED-PAYLOAD".to_string(),
         };
 
         // Canonical URI. AWS requires DOUBLE URI-encoding of the path for
@@ -1541,7 +1545,7 @@ mod tests {
         assert!(req.headers().contains_key("x-amz-date"));
         assert_eq!(
             req.headers().get("x-amz-content-sha256").unwrap(),
-            EMPTY_SHA256
+            "UNSIGNED-PAYLOAD"
         );
     }
 
