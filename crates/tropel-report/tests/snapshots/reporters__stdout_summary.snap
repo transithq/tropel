@@ -1,6 +1,6 @@
 ---
 source: crates/tropel-report/tests/reporters.rs
-assertion_line: 147
+assertion_line: 148
 expression: rendered
 ---
 
@@ -11,6 +11,8 @@ expression: rendered
     Iterations    1024
     Max VUs       4
     Dropped       2
+    Samples dropped0
+    Series dropped0
 
   ── HTTP requests ─────────────────────────────────────────
     Total         1000 (33.33/s)
