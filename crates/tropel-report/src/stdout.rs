@@ -95,12 +95,12 @@ impl StdoutReporter {
                 "Samples dropped", result.output_samples_dropped
             ));
         }
-        if result.series_dropped > 0 {
-            out.push_str(&format!(
-                "    {:<14}{}\n",
-                "Series dropped", result.series_dropped
-            ));
-        }
+        // W0-line-25: always print series_dropped so users can
+        // distinguish "no drops" from "counter not wired".
+        out.push_str(&format!(
+            "    {:<14}{}\n",
+            "Series dropped", result.series_dropped
+        ));
 
         // HTTP requests — aligned two-column block
         out.push_str("\n  ── HTTP requests ─────────────────────────────────────────\n");
