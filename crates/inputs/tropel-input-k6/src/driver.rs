@@ -10464,6 +10464,34 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
     }
 
     #[test]
+    fn test_reserved_metric_name_guard() {
+        // W1 line 24-26: user code cannot create custom metrics with builtin
+        // names like http_reqs, checks, etc. — the guard throws a clear error.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let shim = include_str!("../../../../js/k6-shim/k6-shim.js");
+            ctx.eval::<(), _>(shim).expect("k6-shim must eval");
+            // Built-in names must throw
+            for name in ["http_reqs", "http_req_duration", "checks", "vus"] {
+                let code = format!(
+                    "try {{ new Counter('{}'); 'FAIL' }} catch(e) {{ e.message }}",
+                    name
+                );
+                let msg: String = ctx.eval(code.as_str()).expect("eval must succeed");
+                assert!(
+                    msg.contains("built-in metric"),
+                    "'{name}' should throw about built-in metric, got: {msg}"
+                );
+            }
+            // Custom names must succeed
+            let r: String = ctx
+                .eval("try { new Counter('my_custom'); 'OK' } catch(e) { e.message }")
+                .expect("eval must succeed");
+            assert_eq!(r, "OK", "custom metric name must be accepted");
+        });
+    }
+  
     fn k6_error_code_http_4xx_5xx() {
         // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
         // while keeping error empty. Only transport errors populate error.

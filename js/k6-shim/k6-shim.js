@@ -1199,11 +1199,29 @@ var __ITER = __ITER || 0;
 // These are also defined in pm-api/pm.js — only define if missing.
 // NOTE: `var` assignments, not `function` declarations — avoids re-declaring
 // when the guard condition is true.
+var __RESERVED_METRICS = [
+    'http_reqs', 'http_req_duration', 'http_req_failed',
+    'http_req_blocked', 'http_req_dns', 'http_req_connecting',
+    'http_req_tls_handshaking', 'http_req_sending', 'http_req_waiting',
+    'http_req_receiving', 'data_received', 'data_sent',
+    'vus', 'vus_max', 'iterations', 'iterations_completed',
+    'checks', 'dropped_iterations', 'errors',
+    'http_req_tls_version', 'http_req_ip', 'http_req_connectivity',
+];
+function __tropel_check_reserved(name) {
+    if (__RESERVED_METRICS.indexOf(name) !== -1) {
+        throw new Error(
+            'Metric "' + name + '" is a built-in metric and cannot be ' +
+            'redefined. Use a different name for your custom metric.'
+        );
+    }
+}
 if (typeof Counter !== 'function') {
     var Counter = function (name) {
         if (!name || typeof name !== 'string') {
             throw new Error('Counter requires a metric name');
         }
+        __tropel_check_reserved(name);
         this._name = name;
         this._type = 'counter';
         this._isTime = false;
@@ -1221,6 +1239,7 @@ if (typeof Gauge !== 'function') {
         if (!name || typeof name !== 'string') {
             throw new Error('Gauge requires a metric name');
         }
+        __tropel_check_reserved(name);
         this._name = name;
         this._type = 'gauge';
         this._isTime = false;
@@ -1238,6 +1257,7 @@ if (typeof Rate !== 'function') {
         if (!name || typeof name !== 'string') {
             throw new Error('Rate requires a metric name');
         }
+        __tropel_check_reserved(name);
         this._name = name;
         this._type = 'rate';
         this._isTime = false;
@@ -1258,6 +1278,7 @@ if (typeof Trend !== 'function') {
         if (!name || typeof name !== 'string') {
             throw new Error('Trend requires a metric name');
         }
+        __tropel_check_reserved(name);
         this._name = name;
         this._type = 'trend';
         this._isTime = isTime === true;
