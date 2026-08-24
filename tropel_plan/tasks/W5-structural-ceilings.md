@@ -106,6 +106,6 @@ Independent of every task above, and the cheapest honesty win in the wave.
 
 - [ ] The summary reports **effective** in-flight concurrency alongside spawned VUs
 - [ ] Exceeding the worker cap is a **visible warning at startup**, naming the number you will actually get
-- [ ] `growth_failed` stops being sticky for the whole run — thread-cap exhaustion is transient (`TR-315`)
+- [x]  `growth_failed` stops being sticky for the whole run — thread-cap exhaustion is transient (`TR-315`)
 - [ ] `make_worker` failure is memoized ✅closed — but the flag is never reset, which is the sticky bug above. Fix both together
 - [ ] Kubernetes `pids.max` and Docker `--pids-limit` are commonly ≤ 4 096, so this fires on ordinary deployments, not exotic ones
