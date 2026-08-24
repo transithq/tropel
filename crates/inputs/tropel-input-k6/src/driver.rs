@@ -923,6 +923,7 @@ fn http_tags(
     scenario: &Arc<str>,
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    protocol: &str,
 ) -> TagMap {
     http_tags_for(
         &req.url,
@@ -931,6 +932,7 @@ fn http_tags(
         scenario,
         extra,
         group,
+        protocol,
     )
 }
 
@@ -951,8 +953,9 @@ fn http_tags_for(
     scenario: &Arc<str>,
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    protocol: &str,
 ) -> TagMap {
-    let mut tags = TagMap::with_capacity(6);
+    let mut tags = TagMap::with_capacity(7);
     let url_arc: Arc<str> = Arc::from(url);
     tags.insert(interned("url"), url_arc.clone());
     tags.insert(interned("method"), intern_method(method));
@@ -962,6 +965,12 @@ fn http_tags_for(
         interned("group"),
         group.map(Arc::from).unwrap_or_else(|| interned("http")),
     );
+    // TR-014: add protocol tag on every sample. Beating k6 which only
+    // tags protocol on success (k6 cannot tell you which protocol failures
+    // happened on).
+    if !protocol.is_empty() {
+        tags.insert(interned("protocol"), Arc::from(protocol));
+    }
     if !scenario.is_empty() {
         // Refcount bump — the Arc was created once at bridge registration.
         tags.insert(interned("scenario"), scenario.clone());
@@ -979,6 +988,14 @@ fn http_tags_for(
         tags.insert(interned("url"), Arc::from(name.to_string()));
     }
     tags
+}
+
+/// TR-014: add protocol tag to tags map. The protocol comes from
+/// the response's version (e.g. "HTTP/1.1", "HTTP/2").
+fn add_protocol_tag(tags: &mut TagMap, protocol: &str) {
+    if !protocol.is_empty() {
+        tags.insert(interned("protocol"), Arc::from(protocol));
+    }
 }
 
 /// Tiny status-0 error envelope used when a response allocation fails
@@ -1036,6 +1053,7 @@ fn push_http_samples(
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    protocol: &str,
 ) {
     push_http_samples_for(
         sink,
@@ -1049,6 +1067,7 @@ fn push_http_samples(
         scenario,
         extra_tags,
         group,
+        protocol,
     );
 }
 
@@ -1077,6 +1096,7 @@ fn push_redirect_hops(
             scenario,
             extra_tags,
             group,
+            &resp.protocol,
         );
     }
 }
@@ -1132,6 +1152,7 @@ fn push_http_samples_for(
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    protocol: &str,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
     let tags = Arc::new(http_tags_for(
@@ -1141,6 +1162,7 @@ fn push_http_samples_for(
         scenario,
         extra_tags,
         group,
+        protocol,
     ));
 
     let is_failed = !(200..400).contains(&status_code);
@@ -1309,7 +1331,7 @@ fn push_http_failure(
     sent: usize,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
-    let tags = Arc::new(http_tags(req, "0", scenario, extra_tags, group));
+    let tags = Arc::new(http_tags(req, "0", scenario, extra_tags, group, ""));
 
     let mut v = sink.lock().unwrap();
     // Time-to-failure in ms (same Trend series the success path feeds), so
@@ -1982,6 +2004,7 @@ fn register_http_bridges<'js>(
                             &scenario_req,
                             Some(&extra_tags),
                             group.as_deref(),
+                            &resp.protocol,
                         );
                         build_k6_response_object(
                             &ctx,
@@ -2177,6 +2200,7 @@ fn register_http_bridges<'js>(
                                     &scenario_batch,
                                     Some(&extra_tags),
                                     group.as_deref(),
+                                    &resp.protocol,
                                 );
                                 // Same native response builder as the single
                                 // bridge — binary bodies become real
@@ -7945,6 +7969,7 @@ mod tests {
             &scenario,
             None,
             None,
+            "HTTP/1.1",
         );
         let samples = sink.lock().unwrap();
         let names: Vec<&str> = samples.iter().map(|s| s.metric.as_ref()).collect();
