@@ -177,12 +177,41 @@ jobs:
           done
           node -e '
             const fs = require("fs");
+            const path = require("path");
             const root = JSON.parse(fs.readFileSync("package.json", "utf8"));
             const members = (root.workspaces || []).flat();
+            // Expand the workspace globs (e.g. "packages/*") so each package
+            // directory is matched the way npm resolves membership — a literal
+            // compare against "packages/*" would (wrongly) fail every dir.
+            const expand = (pattern) => {
+              const parts = pattern.split("/");
+              let candidates = [""];
+              for (const part of parts) {
+                const next = [];
+                for (const base of candidates) {
+                  if (part === "*") {
+                    const scan = base === "" ? "." : base;
+                    for (const name of fs.readdirSync(scan)) {
+                      const full = path.join(base, name);
+                      if (fs.statSync(full).isDirectory()) next.push(full);
+                    }
+                  } else {
+                    next.push(path.join(base, part));
+                  }
+                }
+                candidates = next;
+              }
+              return candidates;
+            };
+            const matched = new Set();
+            for (const m of members) {
+              for (const dir of expand(m)) matched.add(path.normalize(dir));
+            }
             for (const dir of fs.readdirSync("packages")) {
               if (!fs.statSync(`packages/${dir}`).isDirectory()) continue;
               const pkg = JSON.parse(fs.readFileSync(`packages/${dir}/package.json`, "utf8"));
-              if (!members.some((m) => m === `packages/${dir}` || m === `packages/${dir}/*`)) {
+              const rel = path.normalize(`packages/${dir}`);
+              if (!matched.has(rel)) {
                 console.error(`FAIL: packages/${dir} is not a root workspace member`);
                 process.exit(1);
               }
