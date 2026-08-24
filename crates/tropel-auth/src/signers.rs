@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha512_256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -251,10 +251,14 @@ impl AuthSigner for AwsSigV4Auth {
             .unwrap_or_else(|| default_service(url.host_str().unwrap_or("")));
 
         // Payload hash — body is always buffered by tropel, but fall back to
-        // the empty-string hash for streaming bodies (never panic).
+        // UNSIGNED-PAYLOAD for streaming bodies (body is None or not
+        // representable as bytes). AWS treats UNSIGNED-PAYLOAD as "don't
+        // verify the body hash" — the correct semantic for unbuffered
+        // streams. The old code used EMPTY_SHA256 (hash of empty string),
+        // which signs the wrong hash and fails verification.
         let payload_hash = match request.body().and_then(|b| b.as_bytes()) {
             Some(bytes) => hex_sha256(bytes),
-            None => EMPTY_SHA256.to_string(),
+            None => "UNSIGNED-PAYLOAD".to_string(),
         };
 
         // Canonical URI. AWS requires DOUBLE URI-encoding of the path for
@@ -319,7 +323,8 @@ impl AuthSigner for AwsSigV4Auth {
     }
 }
 
-const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+// P1 line 147: EMPTY_SHA256 removed — streaming bodies now use
+// UNSIGNED-PAYLOAD instead of the empty-string hash.
 
 /// Canonical query string for SigV4.
 ///
@@ -513,7 +518,12 @@ fn sigv4_canonical_uri(path: &str, service: &str) -> String {
     // test suite expects //prod/users → /prod/users. Without this, the
     // classic base-URL-ends-in-/ join produces a double-slash that fails
     // signature verification with a 403.
-    let normalized = path.replace("//", "/");
+    // TR-603: single replace("//","/") only handles pairs; use a loop
+    // for runs of 3+ consecutive slashes.
+    let mut normalized = path.to_string();
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
     let encoded: Vec<String> = normalized.split('/').map(enc).collect();
     encoded.join("/")
 }
@@ -1172,9 +1182,10 @@ fn digest_with(input: &str, algorithm: &str) -> String {
 }
 
 fn hex_sha512_256(bytes: &[u8]) -> String {
-    // SHA-512/256 is the leftmost 256 bits of SHA-512 truncated to 32 bytes.
-    let hash = Sha512::digest(bytes);
-    hex::encode(&hash[..32])
+    // SHA-512/256 is a separate hash with a different IV than SHA-512,
+    // NOT the first 256 bits of SHA-512. The old code truncated SHA-512,
+    // producing wrong HA1 values for RFC 7616 3.9.2 compliance.
+    hex::encode(Sha512_256::digest(bytes))
 }
 
 fn hex_md5(bytes: &[u8]) -> String {
@@ -1535,7 +1546,7 @@ mod tests {
         assert!(req.headers().contains_key("x-amz-date"));
         assert_eq!(
             req.headers().get("x-amz-content-sha256").unwrap(),
-            EMPTY_SHA256
+            "UNSIGNED-PAYLOAD"
         );
     }
 
@@ -1566,6 +1577,9 @@ mod tests {
         // Backlog line 240: consecutive slashes are normalized for non-S3
         // services (AWS test suite expects //prod/users → /prod/users).
         assert_eq!(sigv4_canonical_uri("/a//b/", "execute-api"), "/a/b/");
+        // TR-603: 3+ consecutive slashes must also be normalized.
+        assert_eq!(sigv4_canonical_uri("/a///b/", "execute-api"), "/a/b/");
+        assert_eq!(sigv4_canonical_uri("/a////b/", "execute-api"), "/a/b/");
     }
 
     #[test]
