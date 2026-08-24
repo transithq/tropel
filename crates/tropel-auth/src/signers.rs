@@ -513,7 +513,12 @@ fn sigv4_canonical_uri(path: &str, service: &str) -> String {
     // test suite expects //prod/users → /prod/users. Without this, the
     // classic base-URL-ends-in-/ join produces a double-slash that fails
     // signature verification with a 403.
-    let normalized = path.replace("//", "/");
+    // TR-603: single replace("//","/") only handles pairs; use a loop
+    // for runs of 3+ consecutive slashes.
+    let mut normalized = path.to_string();
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
     let encoded: Vec<String> = normalized.split('/').map(enc).collect();
     encoded.join("/")
 }
@@ -1566,6 +1571,9 @@ mod tests {
         // Backlog line 240: consecutive slashes are normalized for non-S3
         // services (AWS test suite expects //prod/users → /prod/users).
         assert_eq!(sigv4_canonical_uri("/a//b/", "execute-api"), "/a/b/");
+        // TR-603: 3+ consecutive slashes must also be normalized.
+        assert_eq!(sigv4_canonical_uri("/a///b/", "execute-api"), "/a/b/");
+        assert_eq!(sigv4_canonical_uri("/a////b/", "execute-api"), "/a/b/");
     }
 
     #[test]
