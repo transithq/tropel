@@ -288,11 +288,13 @@ impl StdoutReporter {
 
         // ── Status footer: green PASS / red FAIL ──
         // ANSI colors only when stdout is a TTY so piped output stays clean.
-        // FAIL is driven by THRESHOLDS ONLY — matching k6 semantics and the
-        // CLI exit code (cli.rs returns Err on threshold failure, not on
-        // ordinary request failures like a single 404 in thousands).
+        // TR-105: FAIL is driven by thresholds AND checks — matching the
+        // CLI exit code (cli.rs returns Err on threshold failure or
+        // script_failures). A run with failed checks but no threshold
+        // must not print PASS while exiting non-zero.
         let thresholds_failed = threshold_results.iter().any(|t| !t.passed);
-        let (status, color) = if thresholds_failed {
+        let checks_failed = result.checks_failed > 0;
+        let (status, color) = if thresholds_failed || checks_failed {
             ("✗ FAIL — one or more thresholds crossed", "\x1b[31m") // red
         } else {
             ("✓ PASS — test completed successfully", "\x1b[32m") // green
@@ -469,6 +471,13 @@ mod tests {
         assert!(out.contains("── Thresholds ──"), "{out}");
         assert!(out.contains("✗"), "failed threshold mark");
         assert!(out.contains("FAIL"), "{out}");
+
+        // TR-105: checks_failed must also show FAIL.
+        let mut checks_fail = result_with();
+        checks_fail.checks_failed = 1;
+        checks_fail.checks_total = 5;
+        let out = StdoutReporter.render(&checks_fail);
+        assert!(out.contains("FAIL"), "checks failure must show FAIL: {out}");
     }
 
     #[test]
