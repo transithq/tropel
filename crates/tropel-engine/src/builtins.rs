@@ -70,15 +70,7 @@ mod tests {
         register_builtins();
         let registry = ExtensionRegistry::new();
         let inputs = registry.list_inputs();
-        for expected in [
-            "postman",
-            "har",
-            "openapi",
-            "k6",
-            "http",
-            "bru",
-            "insomnia",
-        ] {
+        for expected in ["postman", "har", "openapi", "k6", "http", "bru", "insomnia"] {
             assert!(
                 inputs.iter().any(|id| id == expected),
                 "adapter '{expected}' is not reachable from the CLI — it must be added to \

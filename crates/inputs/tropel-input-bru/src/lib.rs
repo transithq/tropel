@@ -733,9 +733,12 @@ mod tests {
     /// the wasm dispatch table in `tropel-input-wasm` must mirror it.
     #[test]
     fn bru_priority_is_distinct_from_http() {
-        let reg = InputAdapterRegistration::new("bru", || Box::new(BruInputAdapter))
-            .with_priority(26);
-        assert_eq!(reg.priority, 26, "bru must not share priority with http (25)");
+        let reg =
+            InputAdapterRegistration::new("bru", || Box::new(BruInputAdapter)).with_priority(26);
+        assert_eq!(
+            reg.priority, 26,
+            "bru must not share priority with http (25)"
+        );
     }
 
     /// TR-005: duplicate query keys must not be silently dropped —

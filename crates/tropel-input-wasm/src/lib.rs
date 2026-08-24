@@ -262,7 +262,10 @@ mod tests {
             priorities.len(),
             before,
             "dispatch priorities must be distinct: {:?}",
-            ADAPTERS.iter().map(|(id, p, _)| (*id, *p)).collect::<Vec<_>>()
+            ADAPTERS
+                .iter()
+                .map(|(id, p, _)| (*id, *p))
+                .collect::<Vec<_>>()
         );
         let bru_prio = ADAPTERS
             .iter()

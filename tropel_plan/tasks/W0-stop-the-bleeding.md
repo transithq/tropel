@@ -55,7 +55,7 @@ What remains is narrow, and it is the part that makes the counter trustworthy ra
 
 - [x] The declared MSRV is true
 - [x] CI builds on exactly the declared MSRV
-- [ ] Confirm the `msrv` job is in the **required** set once branch protection lands (`TR-606`)
+- [x] Confirm the `msrv` job is in the **required** set once branch protection lands (`TR-606`) — confirmed at `1.94` (PR #349): branch protection requires `CI OK`, and `ci-ok` lists `msrv` in its `needs` and fails the aggregate when any dependency fails
 
 ---
 
