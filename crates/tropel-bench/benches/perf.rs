@@ -426,8 +426,8 @@ fn request_path_allocations(c: &mut Criterion) {
     group.bench_function("record_http_sample", |b| {
         b.iter(|| {
             let mut tags = TagMap::new();
-            tags.insert("url".into(), "https://example.test/api".into());
-            tags.insert("status".into(), "200".into());
+            tags.insert("url", "https://example.test/api");
+            tags.insert("status", "200");
             let sample = Sample {
                 metric: "http_req_duration".into(),
                 value: 12.5,

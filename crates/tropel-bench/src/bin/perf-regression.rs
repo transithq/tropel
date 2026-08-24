@@ -48,9 +48,7 @@ fn main() {
         std::hint::black_box(target);
     });
     let allocations = measure(&mut || {
-        let mut tags = Vec::with_capacity(2);
-        tags.push(("url", "https://example.test/api"));
-        tags.push(("status", "200"));
+        let tags = vec![("url", "https://example.test/api"), ("status", "200")];
         std::hint::black_box(tags);
     });
     let threshold = std::env::var("TROPEL_PERF_MAX_NS")
