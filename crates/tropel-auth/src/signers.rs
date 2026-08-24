@@ -30,9 +30,9 @@ use tropel_sdk::TropelError;
 /// midnight, so this eliminates 4 chained HMAC-SHA256 + 5 allocs
 /// per request (backlog line 443).
 static SIGNING_KEY_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>,
+    std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
 > = std::sync::OnceLock::new();
-fn signing_key_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>> {
+fn signing_key_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>> {
     SIGNING_KEY_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -443,20 +443,15 @@ fn bracket_host(host: &str) -> String {
 }
 
 fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    // Backlog line 443: cache the derived key — it only changes at UTC
-    // midnight, but was recomputed (4 chained HMAC-SHA256 + 5 allocs)
-    // on every signed request.
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    secret.hash(&mut hasher);
-    date.hash(&mut hasher);
-    region.hash(&mut hasher);
-    service.hash(&mut hasher);
-    let h = hasher.finish();
+    // P2 line 179: cache the derived key using the full input string as
+    // key instead of a bare DefaultHasher digest. The old code used a
+    // 64-bit hash with no input verification, so collisions returned the
+    // wrong signing key for a different credential. Also removed the
+    // aggressive clear() that collapsed hit rate to ~0 with >= 5 tuples.
+    let cache_key = format!("{secret}|{date}|{region}|{service}");
     {
         let cache = signing_key_cache().lock().unwrap();
-        if let Some(cached) = cache.get(&h) {
+        if let Some(cached) = cache.get(&cache_key) {
             return cached.clone();
         }
     }
@@ -465,12 +460,12 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     let derived = hmac_sha256(&k_service, b"aws4_request");
     let mut cache = signing_key_cache().lock().unwrap();
-    // Evict stale entries when a new date arrives (at most 2 entries
-    // in normal operation — today and yesterday).
-    if cache.len() > 4 {
+    // Evict entries older than 2 days (date changes at UTC midnight).
+    // Keep at most 8 entries to bound memory while allowing multi-region.
+    if cache.len() > 8 {
         cache.clear();
     }
-    cache.insert(h, derived.clone());
+    cache.insert(cache_key, derived.clone());
     derived
 }
 
@@ -973,9 +968,11 @@ impl AuthSigner for DigestAuth {
             algorithm: challenge.get("algorithm").cloned(),
             opaque: challenge.get("opaque").cloned(),
         });
-        // Server rotated the nonce (or first challenge for this host) → reset
-        // the per-nonce counter; otherwise keep counting within this nonce.
-        if sess.nonce != *nonce {
+        // P2 line 180: server rotated the nonce OR changed the realm →
+        // reset session. The old code only checked nonce, so a realm
+        // change with unchanged nonce silently used the old realm's HA1,
+        // causing permanent 401.
+        if sess.nonce != *nonce || sess.realm != *realm {
             sess.nonce = nonce.clone();
             sess.nc = 0;
             sess.realm = realm.clone();
@@ -1165,7 +1162,12 @@ fn build_digest_authorization(
         .iter()
         .map(|(k, v)| match k.as_str() {
             "qop" | "nc" | "algorithm" => format!("{k}={v}"),
-            _ => format!("{k}=\"{}\"", v.replace('"', "")),
+            // P2 line 180: escape quotes with backslash instead of
+            // stripping them. Stripping produced wrong values for usernames
+            // containing quotes (ab"c → abc instead of ab\"c), and a
+            // backslash-terminated username (a\) produced a quoted-pair
+            // breakout enabling directive injection from CSV data files.
+            _ => format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
         })
         .collect::<Vec<_>>()
         .join(", ");

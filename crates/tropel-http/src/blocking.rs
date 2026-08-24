@@ -147,9 +147,20 @@ where
     // spin — otherwise the flag would latch true forever and the "re-arm on
     // fast completion" promise in the doc comment would be unreachable.
     let park_start = Instant::now();
+    // P2 line 169: add a timeout to recv() to prevent parking a VU thread
+    // forever. If the io_rt is saturated the task is never polled, reqwest's
+    // own timeout never starts, and force_stop can't reach a thread blocked
+    // in recv(). VUWorkerPool::drop detaches it after 30s = total deadlock.
     let result = rx
-        .recv()
-        .map_err(|_| TropelError::Http(IO_TASK_DROPPED.into()))?;
+        .recv_timeout(std::time::Duration::from_secs(65))
+        .map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                TropelError::Http("blocking request timed out (65s)".into())
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                TropelError::Http(IO_TASK_DROPPED.into())
+            }
+        })?;
     if park_start.elapsed() < SPIN_WINDOW {
         SKIP_SPIN.with(|s| s.set(false));
     }

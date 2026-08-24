@@ -34,14 +34,13 @@ $RECYCLE.BIN/
 # The e2e smoke fixture is committed despite the *.json rule above.
 !.github/ci/www/ok.json
 !examples/collections/
-# npm package manifests and the OpenAPI sample must be TRACKED despite the
-# *.json rule: CI's wasm-slice job does `cd packages/exec-wasm && npm install`
-# and the sample e2e job runs the OpenAPI fixture — the blanket rule silently
-# excluded them (CI failed with ENOENT: package.json).
-!packages/exec-wasm/package.json
-!packages/exec-wasm/tsconfig.json
+# npm package manifests must be TRACKED despite the *.json rule.
+# TR-401: exec-wasm was renamed to runtime-wasm; dead lines removed.
+!packages/runtime-wasm/package.json
+!packages/runtime-wasm/tsconfig.json
 !packages/shims/package.json
 !packages/core-wasm/package.json
+!packages/input-wasm/package.json
 # W2 #186: the ROOT npm workspace manifest must be tracked — CI's npm install
 # resolves @tropel/shims to the local packages/ sibling only via this file.
 !/package.json

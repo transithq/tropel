@@ -896,7 +896,11 @@ impl HttpClient {
                                 )
                                 .await
                                 .map_err(|e| http_request_error(&e))?;
-                                waiting_duration = retry_start.elapsed();
+                                // P2 line 177: accumulate retry time instead
+                                // of replacing. The old code overwrote
+                                // waiting_duration, making the 401 round-trip
+                                // invisible in the phase breakdown.
+                                waiting_duration += retry_start.elapsed();
                                 tracing::debug!(
                                     "Digest auth: retried after 401 challenge (status now {})",
                                     response.status().as_u16()
