@@ -53,10 +53,10 @@ k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `bl
 ## TR-204 · `error`, `error_code` and `expected_response` tags
 **Effort:** M · **Blocked by:** TR-203
 
-- [ ] **[SILENT]** `error_code` for a non-2xx is **`1000 + status`** (404 → 1404) while the `error` tag stays **empty**. Only transport errors populate `error`. Reimplementations routinely invert this
-- [ ] **[GAP]** Full `error_code` enumeration: 1000 generic, 1010 non-TCP, 1020 invalid URL, 1050 timeout, 1100/1101 DNS, 1110/1111 blacklist/blocked, 1200–1220 TCP, 1301/1310/1311 TLS, 1000+status for ≥400, 1611–1664 HTTP/2, 1701 decompression
+- [x] **[SILENT]** `error_code` for a non-2xx is **`1000 + status`** (404 → 1404) while the `error` tag stays **empty**. Only transport errors populate `error`. Reimplementations routinely invert this
+- [x] **[GAP]** Full `error_code` enumeration: 1000 generic, 1010 non-TCP, 1020 invalid URL, 1050 timeout, 1100/1101 DNS, 1110/1111 blacklist/blocked, 1200–1220 TCP, 1301/1310/1311 TLS, 1000+status for ≥400, 1611–1664 HTTP/2, 1701 decompression
 - [ ] **Do not implement 1300 and 1600** — declared upstream but unreachable
-- [ ] Without `error_code` there is no way to distinguish "connection refused" from "504" in aggregate
+- [x] Without `error_code` there is no way to distinguish "connection refused" from "504" in aggregate
 
 ## TR-205 · The `url` tag is overwritten with `name`
 **Effort:** S · **Blocked by:** none · **Blocks:** TR-206

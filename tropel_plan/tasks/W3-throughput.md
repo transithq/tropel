@@ -57,13 +57,13 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 - [ ] `otlp.rs:212-233` does a linear scan comparing full `Vec<(String,String)>` tag sets — quadratic in series count
 - [ ] It ships **JSON, not protobuf, with no gzip**: 140–750 ms of CPU per 100 ms window, **1.4–7.5× oversubscribed permanently**, capping the whole tool at ~10–30 k samples/s ≈ 1–2.5 k req/s
 - [ ] Hash the tag set; emit protobuf; enable gzip
-- [ ] Delta Sums must carry `startTimeUnixNano` — `aggregationTemporality: 1` without it is not readable by a conformant collector
+- [x] Delta Sums must carry `startTimeUnixNano` — `aggregationTemporality: 1` without it is not readable by a conformant collector
 - [ ] A benchmark asserts the per-window CPU is under budget at 100 k samples/s
 
 ## TR-305 · Per-output waste
 **Effort:** M · **Blocked by:** TR-002
 
-- [ ] `TagPolicy::apply` deep-copies every tag when the policy is a no-op (`output.rs:40-65`) — **11 allocs/sample × 4 outputs = 44/sample**. Return the `Arc` unchanged when the policy is empty
+- [x] `TagPolicy::apply` deep-copies every tag when the policy is a no-op (`output.rs:40-65`) — **11 allocs/sample × 4 outputs = 44/sample**. Return the `Arc` unchanged when the policy is empty
 - [ ] `sanitize_prometheus_name` is the one sanitizer that never got `Cow` — the sibling-miss shape
 - [ ] Prometheus `cumulative` is **never evicted** — ~140 MB at max cardinality; tag limits ship disabled with no CLI flag to enable them
 - [ ] InfluxDB int/float flap — `12.0 → 12i`, `12.5 → 12.5` on the same field; the first sample pins the type and the next one is rejected
@@ -117,7 +117,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 > **✅ CLOSED — verified at `2099cbe`.** `collector.rs:1357` now reads *"NOTE: rebuild_merged() is NOT called here — it is hoisted out of"* the absorb loop, with the single call at `:1493`. The hoist landed.
 
 - [x] `rebuild_merged` is out of the absorb loop
-- [ ] `absorb_snapshot` still silently drops a Trend histogram on a cross-worker type conflict — **not** covered by the hoist, still open
+- [x] `absorb_snapshot` still silently drops a Trend histogram on a cross-worker type conflict — **not** covered by the hoist, still open
 
 ---
 
@@ -152,7 +152,7 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 
 - [ ] The script file is **read 4×** before the ramp, two of them back-to-back
 - [ ] Cache `prepare_module_source` by `(path, mtime)` — closes the N+2 startup oxc parses, the per-VU parse, and a 200 MB memcpy
-- [ ] The shim bytecode cache is dead for the common case — `js_bootstrap.rs:401` takes the per-VU **source-eval** path
+- [x] The shim bytecode cache is dead for the common case — `js_bootstrap.rs:401` takes the per-VU **source-eval** path
 - [ ] `JS_WRITE_OBJ_STRIP_SOURCE` — `context.rs:1014` passes only `JS_WRITE_OBJ_BYTECODE`, so QuickJS retains function source text in every VU
 - [ ] Allocate the 24 MiB broadcast ring **only when an output exists** — `engine.rs:246` allocates `1<<18` slots unconditionally
 - [ ] **Dependencies: 484 crates, 26 % removable** ✅**MEAS** by feature-gating the four optional subsystems
@@ -168,7 +168,7 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 **Effort:** M · **Blocked by:** TR-002
 
 - [ ] `merged_per_url` / `merged_per_group`: entry count capped, **bytes uncapped**
-- [ ] `growth_failed` is sticky for the whole run — thread-cap exhaustion is transient, and the flag never resets
+- [x] `growth_failed` is sticky for the whole run — thread-cap exhaustion is transient, and the flag never resets
 - [ ] `execute_blocking` can park a VU thread **forever** — `blocking.rs:150-152` `rx.recv()` has no timeout
 - [ ] `merge_scenario_tags` erases the entire `Arc<TagMap>` design under one line of user config ✅closed — keep the test
 - [ ] A 24 h soak benchmark, run in CI weekly, asserting flat memory

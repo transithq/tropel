@@ -14,8 +14,8 @@ The worst class. A user ships on a number that was never true.
 **Effort:** M · **Blocked by:** TR-004
 
 - [ ] `build_results` repairs `http_reqs`/`errors` from `totals`, but thresholds evaluate the **capped** series — so past `MAX_SERIES` the printed number and the evaluated number diverge
-- [ ] `errors` and `errors.count` read different populations (`thresholds.rs:847-868`)
-- [ ] `absorb_snapshot` bypasses the cardinality cap entirely — the `Vacant` arm inserts unconditionally (`collector.rs:1332-1343`)
+- [x] `errors` and `errors.count` read different populations (`thresholds.rs:847-868`)
+- [x] `absorb_snapshot` bypasses the cardinality cap entirely — the `Vacant` arm inserts unconditionally (`collector.rs:1332-1343`)
 - [ ] One population, one number. A test asserts the summary value and the threshold input are the same value past the cap
 
 ## TR-102 · A script can forge the `checks` headline

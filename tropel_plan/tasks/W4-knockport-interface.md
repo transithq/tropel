@@ -26,7 +26,7 @@ One of the two documents is wrong. Until that is settled, every downstream task 
 - [ ] The published set is decided and written down: names, tiers, what each contains, and which surface loads which
 - [ ] `TROPEL_EXEC_SPLIT.md` §5 is corrected, or the packages are renamed — not left in disagreement
 - [ ] `knockport/CONTEXT.md`'s "The tropel relationship" section matches
-- [ ] The dead `exec-wasm` ignore lines are deleted (with `TR-008`)
+- [x] The dead `exec-wasm` ignore lines are deleted (with `TR-008`)
 
 ## TR-402 · Wasm error and readiness ergonomics
 **Effort:** M · **Blocked by:** TR-401
@@ -55,7 +55,7 @@ Documented as "never throws". It throws. ✅**MEAS**: 460 k chars in → **200 M
 `MAX_DYNAMIC_LENGTH` caps each `:length` **per occurrence** with no total-output cap, and `panic = "abort"` on the wasm profile means `catch_unwind` is unavailable. **It sits on knockport's synchronous send path, unwrapped** — so a hostile or merely large collection hangs then kills the tab.
 
 ### Acceptance criteria
-- [ ] Total output is capped in `DynamicCatalog::resolve`, returning a `Result` — not a panic, not a trap
+- [x] Total output is capped in `DynamicCatalog::resolve`, returning a `Result` — not a panic, not a trap
 - [ ] The facade try/catches, and the error names the variable and the limit
 - [ ] Wasm memory returns to baseline after a large resolve, or the growth is documented with a number
 - [ ] The "never throws" comment is corrected in the same commit
