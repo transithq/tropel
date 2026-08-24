@@ -1149,6 +1149,26 @@ impl TrpBridge {
             set_global!(
                 "__tropel_pm_metrics_add",
                 Func::from(move |name: String, value: f64, metric_type_str: String| {
+                    // TR-102: reserved-name guard — the sibling guard in
+                    // `__tropel_pm_custom_metric_add` below rejects builtin
+                    // names; `pm.metrics.add('checks', 1)` must be rejected
+                    // the same way, or a script forges the checks headline
+                    // through the Postman-style bridge.
+                    const RESERVED: &[&str] = &[
+                        "http_reqs", "http_req_duration", "http_req_failed",
+                        "http_req_blocked", "http_req_connecting", "http_req_tls_handshaking",
+                        "http_req_receiving", "http_req_sending", "http_req_waiting",
+                        "iterations", "iteration_duration", "dropped_iterations",
+                        "checks", "group_duration", "vus", "vus_max",
+                        "data_received", "data_sent",
+                    ];
+                    if RESERVED.iter().any(|&r| name == r) {
+                        tracing::warn!(
+                            "Custom metric '{}' clashes with built-in metric name — ignoring",
+                            name
+                        );
+                        return;
+                    }
                     let mut st = state_clone.lock().unwrap();
                     // Emit a metric sample with the appropriate type
                     let sample_type = match metric_type_str.as_str() {
@@ -1924,6 +1944,52 @@ mod tests {
                 .unwrap();
             assert!(readonly, "pm/trp must be non-writable");
         });
+    }
+
+    /// TR-102: `pm.metrics.add('checks', …)` must be dropped by the
+    /// reserved-name guard in `__tropel_pm_metrics_add` — the Postman-style
+    /// bridge is the sibling the k6 constructor guard was never mirrored to.
+    #[tokio::test]
+    async fn test_pm_metrics_add_rejects_reserved_names() {
+        use crate::state::new_pm_state;
+
+        let mut ctx = tropel_js::JsContext::new(None, None)
+            .await
+            .expect("context");
+        let state = new_pm_state();
+        TrpBridge::new(state.clone())
+            .install(&mut ctx)
+            .expect("install");
+        ctx.eval(include_str!("../../../../js/scripting-api/pm.js"))
+            .await
+            .expect("pm shim must eval");
+
+        // Reserved builtin name through pm.metrics.add — must be dropped.
+        ctx.eval(
+            "pm.metrics.add('checks', 1.0, 'rate'); pm.metrics.add('http_reqs', 1.0, 'counter');",
+        )
+        .await
+        .expect("eval must succeed");
+        {
+            let st = state.lock().unwrap();
+            assert!(
+                !st.custom_metrics.contains_key("checks"),
+                "reserved 'checks' must not be recorded as a custom metric"
+            );
+            assert!(
+                !st.custom_metrics.contains_key("http_reqs"),
+                "reserved 'http_reqs' must not be recorded as a custom metric"
+            );
+        }
+
+        // A non-reserved name still records normally.
+        ctx.eval("pm.metrics.add('my_custom', 42.0, 'gauge');")
+            .await
+            .expect("eval must succeed");
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.custom_metrics.get("my_custom"), Some(&42.0));
+        }
     }
 
     /// P4b open item: alias configuration is part of the public API.

@@ -21,9 +21,9 @@ The worst class. A user ships on a number that was never true.
 ## TR-102 · A script can forge the `checks` headline
 **Effort:** S · **Blocked by:** none
 
-- [ ] The k6 driver has **no reserved-name guard** (`driver.rs:2276-23xx`), so user code can emit into the builtin `checks` Rate and make a CI gate read whatever it likes
+- [x] The k6 driver has **no reserved-name guard** (`driver.rs:2276-23xx`), so user code can emit into the builtin `checks` Rate and make a CI gate read whatever it likes
 - [x] Reserved builtin metric names reject user emission with a named error
-- [ ] Same guard on the declarative path and the wasm driver — this is the "guard in one place, not its siblings" shape
+- [x] Same guard on the declarative path and the wasm driver — this is the "guard in one place, not its siblings" shape
 
 ## TR-103 · Both proxy guards leak `Object.prototype`
 **Effort:** S · **Blocked by:** none
