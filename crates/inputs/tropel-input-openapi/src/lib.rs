@@ -209,8 +209,11 @@ struct OasExample {
 // `required` is parsed for spec fidelity but not consumed downstream.
 #[allow(dead_code)]
 struct OasSchema {
+    // P1 line 158: accept both "string" and ["string","null"] for the
+    // type field (OpenAPI 3.1 nullable idiom). serde_json::Value handles
+    // both; schema_type() extracts the first non-null string.
     #[serde(default)]
-    r#type: Option<String>,
+    r#type: Option<serde_json::Value>,
     #[serde(default)]
     format: Option<String>,
     #[serde(default)]
@@ -1152,21 +1155,48 @@ fn resolve_pointer(root: &Value, pointer: &str) -> Option<Value> {
 /// OpenAPI 3.1 can be either a string (`"string"`) or an array
 /// (`["string","null"]`). Returns the first non-"null" type, or
 /// "string" as a safe fallback for nullable schemas.
+/// Static string for the nullable-array case since we can't return
+/// a reference into a temporary String.
+static NULL_STR: &str = "null";
+
 fn schema_type(schema: &OasSchema) -> Option<&str> {
-    // The `type` field is typed as Option<String> by serde, so a JSON
-    // array like ["string","null"] deserializes as... well, it doesn't
-    // — it's an error because serde expects a string. We handle this by
-    // also looking at the raw `additionalProperties`-style trick: if the
-    // schema has been partially deserialized, the type field may be None
-    // but the anyOf variant carries the types.
+    // P1 line 158: handle both "string" and ["string","null"] forms.
+    // The r#type field is now serde_json::Value so both deserialize.
     if let Some(ref t) = schema.r#type {
-        return Some(t.as_str());
+        match t {
+            serde_json::Value::String(s) => return Some(s.as_str()),
+            serde_json::Value::Array(arr) => {
+                // Return the first non-null type, or null if all are null.
+                for item in arr {
+                    if let serde_json::Value::String(s) = item {
+                        if s != "null" {
+                            return Some(s.as_str());
+                        }
+                    }
+                }
+                return Some(NULL_STR);
+            }
+            _ => {}
+        }
     }
     // Fallback: if type is absent but anyOf contains a single type, use it.
     if let Some(ref any_of) = schema.any_of {
         if any_of.len() == 1 {
             if let Some(t) = &any_of[0].r#type {
-                return Some(t.as_str());
+                match t {
+                    serde_json::Value::String(s) => return Some(s.as_str()),
+                    serde_json::Value::Array(arr) => {
+                        for item in arr {
+                            if let serde_json::Value::String(s) = item {
+                                if s != "null" {
+                                    return Some(s.as_str());
+                                }
+                            }
+                        }
+                        return Some(NULL_STR);
+                    }
+                    _ => {}
+                }
             }
         }
     }
