@@ -26,6 +26,8 @@ pub fn link_builtins() -> usize {
         Box::new(tropel_input_openapi::OpenApiInputAdapter),
         Box::new(tropel_input_k6::K6ScriptAdapter),
         Box::new(tropel_input_http::HttpFileAdapter),
+        Box::new(tropel_input_bru::BruInputAdapter),
+        Box::new(tropel_input_insomnia::InsomniaInputAdapter),
     ];
     let drivers: Vec<Box<dyn Driver>> = vec![
         Box::new(tropel_input_k6::driver::K6Driver),

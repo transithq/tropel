@@ -306,12 +306,105 @@ fn memory_per_vu(c: &mut Criterion) {
     }
 }
 
+/// TR-002: Throughput benchmark — samples/s egress.
+/// Pushes samples through the metrics collector at rate, measuring the
+/// aggregator's capacity to absorb and flush samples.
+fn samples_egress(c: &mut Criterion) {
+    use std::sync::Arc;
+    use tropel_metrics::collector::MetricsCollector;
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
+
+    let mut group = c.benchmark_group("throughput");
+    group.throughput(Throughput::Elements(10_000));
+    group.measurement_time(Duration::from_secs(5));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    group.bench_function("samples_per_sec_10k", |b| {
+        let collector = MetricsCollector::new();
+        let empty_tags: Arc<TagMap> = Arc::new(TagMap::new());
+        b.iter(|| {
+            rt.block_on(async {
+                for i in 0..10_000 {
+                    let name: std::borrow::Cow<'static, str> =
+                        format!("http_req_duration_{}", i % 100).into();
+                    collector
+                        .record(&Sample {
+                            metric: name,
+                            value: (i as f64) * 0.1,
+                            tags: empty_tags.clone(),
+                            timestamp: std::time::SystemTime::now(),
+                            sample_type: SampleType::Trend,
+                        })
+                        .await;
+                }
+            });
+            std::hint::black_box(&collector);
+        });
+    });
+
+    group.finish();
+}
+
+/// TR-002: Aggregator duty cycle — build_results under load.
+/// Measures how long it takes to build results from a populated collector.
+fn aggregator_duty_cycle(c: &mut Criterion) {
+    use std::sync::Arc;
+    use tropel_metrics::collector::MetricsCollector;
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
+
+    let mut group = c.benchmark_group("throughput");
+    group.measurement_time(Duration::from_secs(5));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    group.bench_function("build_results_1000_series", |b| {
+        let collector = MetricsCollector::new();
+        let empty_tags: Arc<TagMap> = Arc::new(TagMap::new());
+        // Pre-populate with 1000 series
+        rt.block_on(async {
+            for i in 0..1_000 {
+                let name: std::borrow::Cow<'static, str> = format!("metric_{}", i).into();
+                for j in 0..100 {
+                    collector
+                        .record(&Sample {
+                            metric: name.clone(),
+                            value: j as f64,
+                            tags: empty_tags.clone(),
+                            timestamp: std::time::SystemTime::now(),
+                            sample_type: SampleType::Trend,
+                        })
+                        .await;
+                }
+            }
+        });
+        b.iter(|| {
+            let rt2 = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let results = rt2.block_on(collector.results());
+            std::hint::black_box(results);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     perf,
     context_bootstrap,
     script_iteration,
     native_vs_js,
     pool_dispatch,
-    memory_per_vu
+    memory_per_vu,
+    samples_egress,
+    aggregator_duty_cycle
 );
 criterion_main!(perf);
