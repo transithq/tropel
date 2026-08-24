@@ -663,8 +663,16 @@ impl DriverHttpClient for DriverHttpClientImpl {
         // Backlog line 140: honor Request.auth (k6 params.auth). Build the
         // signer from the per-request config so bearer/basic/oauth2/sigv4/
         // digest on ONE request don't need the whole scenario to share it.
-        let signer = req.auth.as_ref().and_then(|a| self.client.get_signer(a));
-        let http_resp = self.client.execute(req, signer.as_deref()).await?;
+        // P1 line 145: use cached signer via VuCookieClient so stateful
+        // signers (Digest) persist their session maps across requests.
+        // The old code called get_signer() which builds a fresh DigestAuth
+        // with an empty session map per request -- the cache could never hit,
+        // causing 2 wire requests per 1 recorded sample.
+        let signer = req
+            .auth
+            .as_ref()
+            .and_then(|a| self.client.get_signer_ref(a));
+        let http_resp = self.client.execute(req, signer).await?;
         // Backlog line 312: use by-value conversion to avoid 16 clones.
         Ok(Response::from(http_resp))
     }
