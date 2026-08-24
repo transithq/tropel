@@ -219,6 +219,8 @@ fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::V
             // Sum per (sorted tag-set). Keep the LAST timestamp seen for a
             // tag-set so the delta point carries the newest time.
             // P-D.2: Use HashMap for O(1) lookup instead of O(n²) linear scan.
+            // Track the earliest timestamp for startTimeUnixNano.
+            let mut earliest_ts: u64 = u64::MAX;
             let mut per_tags: std::collections::HashMap<Vec<(String, String)>, (f64, u64)> =
                 std::collections::HashMap::new();
             for s in samples {
@@ -233,6 +235,9 @@ fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::V
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
+                if ts_nanos < earliest_ts {
+                    earliest_ts = ts_nanos;
+                }
                 match per_tags.get_mut(&tags) {
                     Some((sum, ts)) => {
                         *sum += s.value;
@@ -250,7 +255,11 @@ fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::V
                         .iter()
                         .map(|(k, v)| json!({ "key": k, "value": { "stringValue": v } }))
                         .collect();
+                    // P2 line 175: include startTimeUnixNano for DELTA
+                    // Sums. Without it, the Collector's deltatocumulative/
+                    // Prometheus exporters drop the point silently.
                     json!({
+                        "startTimeUnixNano": if earliest_ts != u64::MAX { earliest_ts.to_string() } else { ts.to_string() },
                         "timeUnixNano": ts.to_string(),
                         "asDouble": sum,
                         "attributes": attrs,
