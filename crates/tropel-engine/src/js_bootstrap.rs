@@ -347,16 +347,25 @@ pub(crate) async fn create_vu_js_context(
                     // the eval is interrupted the moment control returns to JS
                     // (the flag-aware handler unwinds it) — backlog: gracefulStop
                     // force-stop was advisory only.
+                    // P2 line 174: use absolute deadline to avoid sleep
+                    // inflation from OS overshoot. The old code subtracted
+                    // the requested slice, not the actual elapsed time, so
+                    // OS overshoot compounds: ~+1-2% Linux, ~+10-20% macOS,
+                    // ~+56% Windows (15.6ms granularity).
+                    let total = Duration::from_secs_f64(ms / 1000.0);
+                    let deadline_sleep_inner = std::time::Instant::now() + total;
                     let step = Duration::from_millis(10);
-                    let mut remaining = Duration::from_secs_f64(ms / 1000.0);
-                    while remaining > Duration::ZERO {
+                    loop {
                         if force_stop_sleep.load(Ordering::Acquire) {
                             deadline_sleep.store(0, Ordering::Relaxed);
                             return;
                         }
-                        let slice = remaining.min(step);
-                        std::thread::sleep(slice);
-                        remaining -= slice;
+                        let now = std::time::Instant::now();
+                        if now >= deadline_sleep_inner {
+                            break;
+                        }
+                        let remaining = deadline_sleep_inner - now;
+                        std::thread::sleep(remaining.min(step));
                     }
                 }
                 tropel_js::rearm_deadline(&deadline_sleep, max_exec);

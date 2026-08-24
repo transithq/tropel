@@ -172,6 +172,14 @@ impl MetricSet {
     }
 
     fn record(&mut self, value: f64, _sample_type: &SampleType) {
+        // P2 lines 166-167: guard against NaN/Inf at the MetricSet level.
+        // A single NaN/Inf sample poisons the whole flush window across all
+        // outputs: influxdb/statsd render "NaN"/"inf" (invalid line protocol,
+        // backend 400s the entire batch), otlp renders "null" (malformed data
+        // point). One Trend.add(NaN) from a script kills that window everywhere.
+        if !value.is_finite() {
+            return;
+        }
         // W1-B line 157: dispatch on the SET's metric_type, not the sample's
         // type. A set created as Trend (`new Trend('latency')`) fed a
         // Counter-typed sample used to take the Counter arm (count+=1,
