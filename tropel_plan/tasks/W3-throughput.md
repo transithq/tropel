@@ -152,7 +152,7 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 
 - [ ] The script file is **read 4×** before the ramp, two of them back-to-back
 - [ ] Cache `prepare_module_source` by `(path, mtime)` — closes the N+2 startup oxc parses, the per-VU parse, and a 200 MB memcpy
-- [ ] The shim bytecode cache is dead for the common case — `js_bootstrap.rs:401` takes the per-VU **source-eval** path
+- [x]  The shim bytecode cache is dead for the common case — `js_bootstrap.rs:401` takes the per-VU **source-eval** path
 - [ ] `JS_WRITE_OBJ_STRIP_SOURCE` — `context.rs:1014` passes only `JS_WRITE_OBJ_BYTECODE`, so QuickJS retains function source text in every VU
 - [ ] Allocate the 24 MiB broadcast ring **only when an output exists** — `engine.rs:246` allocates `1<<18` slots unconditionally
 - [ ] **Dependencies: 484 crates, 26 % removable** ✅**MEAS** by feature-gating the four optional subsystems
@@ -168,7 +168,7 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 **Effort:** M · **Blocked by:** TR-002
 
 - [ ] `merged_per_url` / `merged_per_group`: entry count capped, **bytes uncapped**
-- [ ] `growth_failed` is sticky for the whole run — thread-cap exhaustion is transient, and the flag never resets
-- [ ] `execute_blocking` can park a VU thread **forever** — `blocking.rs:150-152` `rx.recv()` has no timeout
+- [x]  `growth_failed` is sticky for the whole run — thread-cap exhaustion is transient, and the flag never resets
+- [x]  `execute_blocking` can park a VU thread **forever** — `blocking.rs:150-152` `rx.recv()` has no timeout
 - [ ] `merge_scenario_tags` erases the entire `Arc<TagMap>` design under one line of user config ✅closed — keep the test
 - [ ] A 24 h soak benchmark, run in CI weekly, asserting flat memory

@@ -14,8 +14,8 @@ The worst class. A user ships on a number that was never true.
 **Effort:** M · **Blocked by:** TR-004
 
 - [ ] `build_results` repairs `http_reqs`/`errors` from `totals`, but thresholds evaluate the **capped** series — so past `MAX_SERIES` the printed number and the evaluated number diverge
-- [ ] `errors` and `errors.count` read different populations (`thresholds.rs:847-868`)
-- [ ] `absorb_snapshot` bypasses the cardinality cap entirely — the `Vacant` arm inserts unconditionally (`collector.rs:1332-1343`)
+- [x]  `errors` and `errors.count` read different populations (`thresholds.rs:847-868`)
+- [x]  `absorb_snapshot` bypasses the cardinality cap entirely — the `Vacant` arm inserts unconditionally (`collector.rs:1332-1343`)
 - [ ] One population, one number. A test asserts the summary value and the threshold input are the same value past the cap
 
 ## TR-102 · A script can forge the `checks` headline
@@ -36,14 +36,14 @@ The worst class. A user ships on a number that was never true.
 **Effort:** S · **Blocked by:** none
 
 - [ ] `pm.js:1327` → `trp.rs:1050` sets `st.skip_tests`; `runner.rs:29x` never reads it — the canonical "a flag is set but nothing reads it" instance
-- [ ] Wire it, and audit the three siblings of the same shape: SIGINT across the four duration executors, `tropel-web` force-stop, and the abort coordinator's unreachable `check_abort_on_fail`
+- [x]  Wire it, and audit the three siblings of the same shape: SIGINT across the four duration executors, `tropel-web` force-stop, and the abort coordinator's unreachable `check_abort_on_fail`
 - [ ] A test asserts the run stops at the failing request, not at the end
 
 ## TR-105 · stdout prints "✓ PASS" on runs that exit 1
 **Effort:** S · **Blocked by:** none
 
 - [ ] `stdout.rs:294-299` derives the banner from a different source than the exit code
-- [ ] `summary.rs` keys the top-level `thresholds` map **by expression**, so duplicate expressions erase failures
+- [x]  `summary.rs` keys the top-level `thresholds` map **by expression**, so duplicate expressions erase failures
 - [ ] One verdict, computed once, used by the banner, the summary, the reporters and the exit code
 - [ ] A test asserts banner and exit code agree across pass, fail, and no-data runs
 
@@ -95,7 +95,7 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 **Effort:** S · **Blocked by:** none
 
 - [ ] The guard exists in the wasm driver and at two emitters, and **not** in `MetricSet::record` — the canonical sibling-miss
-- [ ] A single NaN/Inf sample poisons a whole flush window across three outputs (`influxdb.rs:232`, `statsd.rs`, Prometheus)
+- [x]  A single NaN/Inf sample poisons a whole flush window across three outputs (`influxdb.rs:232`, `statsd.rs`, Prometheus)
 - [ ] Guard once, at the point every path funnels through; delete the two partial guards
 - [ ] A test feeds NaN through each of the four entry points and asserts the window survives
 
