@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha512, Sha512_256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -1177,9 +1177,10 @@ fn digest_with(input: &str, algorithm: &str) -> String {
 }
 
 fn hex_sha512_256(bytes: &[u8]) -> String {
-    // SHA-512/256 is the leftmost 256 bits of SHA-512 truncated to 32 bytes.
-    let hash = Sha512::digest(bytes);
-    hex::encode(&hash[..32])
+    // SHA-512/256 is a separate hash with a different IV than SHA-512,
+    // NOT the first 256 bits of SHA-512. The old code truncated SHA-512,
+    // producing wrong HA1 values for RFC 7616 3.9.2 compliance.
+    hex::encode(Sha512_256::digest(bytes))
 }
 
 fn hex_md5(bytes: &[u8]) -> String {
