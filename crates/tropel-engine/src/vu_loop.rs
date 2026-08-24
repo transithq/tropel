@@ -97,12 +97,23 @@ async fn run_vu_loop(
         // `control_notify` fires on every control PATCH (pause/resume/
         // scale), so we await it in a loop — level-triggered by
         // re-checking `is_paused` each wake.
+        //
+        // CRITICAL: pin the notified() future BEFORE the is_paused()
+        // check so a resume that fires between the check and the select
+        // registration is not lost. Re-register after each wake to stay
+        // level-triggered. (Same shape as the arrival-token path at line 138.)
+        let notify = sched.control_notify();
+        let stop = sched.stop_signal();
+        let mut notify_ready = std::pin::pin!(notify.notified());
+        let mut stop_ready = std::pin::pin!(stop.notified());
         while sched.is_paused() && !sched.is_stop_requested() && !sched.is_force_stop_requested() {
-            let notify = sched.control_notify();
-            let stop = sched.stop_signal();
             tokio::select! {
-                _ = notify.notified() => {}
-                _ = stop.notified() => {}
+                _ = &mut notify_ready => {
+                    notify_ready.set(notify.notified());
+                }
+                _ = &mut stop_ready => {
+                    stop_ready.set(stop.notified());
+                }
             }
         }
         if sched.is_stop_requested() || sched.is_force_stop_requested() {
