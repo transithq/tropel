@@ -1138,9 +1138,16 @@ fn push_http_samples_for(
 
     let is_failed = !(200..400).contains(&status_code);
     let mut v = sink.lock().unwrap();
+    // TR-202: http_req_duration = sending + waiting + receiving.
+    // Since reqwest folds sending into waiting, use waiting + receiving.
+    let duration_value = if let Some(t) = timings {
+        (t.waiting + t.receiving).as_secs_f64() * 1000.0
+    } else {
+        duration.as_secs_f64() * 1000.0
+    };
     v.push(Sample {
         metric: "http_req_duration".into(),
-        value: duration.as_secs_f64() * 1000.0,
+        value: duration_value,
         tags: tags.clone(),
         timestamp: now,
         sample_type: SampleType::Trend,
