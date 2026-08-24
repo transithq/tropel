@@ -28,8 +28,10 @@ if (typeof globalThis.__tropelDeepEqual !== 'function') {
         if (a === null || b === null || a === undefined || b === undefined) return a === b;
         if (typeof a !== typeof b) return false;
         // Date: compare by epoch time; two invalid dates compare equal.
+        // TR-013: guard that BOTH are Date before calling getTime() —
+        // the old code threw TypeError when a was non-Date and b was Date.
         if (a instanceof Date || b instanceof Date) {
-            if (!(b instanceof Date)) return false;
+            if (!(a instanceof Date && b instanceof Date)) return false;
             var ta = a.getTime(), tb = b.getTime();
             return (isNaN(ta) && isNaN(tb)) || ta === tb;
         }

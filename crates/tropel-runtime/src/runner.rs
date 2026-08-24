@@ -625,10 +625,19 @@ impl ScenarioRunner {
 
                                     let now = std::time::SystemTime::now();
 
-                                    // http_req_duration (Trend) — this hop's own time
+                                    // http_req_duration (Trend) — k6 defines this as
+                                    // sending + waiting + receiving, deliberately
+                                    // excluding blocked, connecting and tls_handshaking.
+                                    // Since reqwest folds sending into waiting, we use
+                                    // waiting + receiving (TR-202).
+                                    let duration_value = if let Some(ref t) = resp.timings {
+                                        (t.waiting + t.receiving).as_secs_f64() * 1000.0
+                                    } else {
+                                        resp.response_time.as_secs_f64() * 1000.0
+                                    };
                                     result.samples.push(Sample {
                                         metric: "http_req_duration".into(),
-                                        value: resp.response_time.as_secs_f64() * 1000.0,
+                                        value: duration_value,
                                         tags: tags.clone(),
                                         timestamp: now,
                                         sample_type: SampleType::Trend,
@@ -689,13 +698,17 @@ impl ScenarioRunner {
                                     // reuse no connector call happens, so
                                     // blocked/dns/connecting are 0.
                                     if let Some(timings) = &resp.timings {
-                                        // Backlog line 459: omit tls_handshaking and sending
-                                        // — always zero (folded into connecting/waiting by
-                                        // reqwest). Saves 2 MetricKey builds per request.
+                                        // Emit all 8 sub-timing metrics including
+                                        // tls_handshaking and sending (always zero on
+                                        // reqwest, but k6 thresholds reference them).
+                                        // TR-011: removing them broke two stock k6
+                                        // thresholds to permanent FAIL.
                                         let sub_timing_metrics = [
                                             ("http_req_blocked", timings.blocked),
                                             ("http_req_dns", timings.dns),
                                             ("http_req_connecting", timings.connecting),
+                                            ("http_req_tls_handshaking", timings.tls_handshaking),
+                                            ("http_req_sending", timings.sending),
                                             ("http_req_waiting", timings.waiting),
                                             ("http_req_receiving", timings.receiving),
                                         ];

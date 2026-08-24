@@ -112,7 +112,13 @@ pub(crate) fn build_summary_data(
 
     let mut thresholds_map = Map::new();
     for t in evaluate_thresholds(thresholds, results) {
-        thresholds_map.insert(t.expression.clone(), json!(t.passed));
+        // P1 line 164: key by metric+expression to avoid duplicate expressions
+        // erasing failures. The old code keyed by expression alone, so
+        // {http_req_duration: ['p(95)<500'], iteration_duration: ['p(95)<500']}
+        // produced one entry; if the passing one landed last, handleSummary
+        // saw green while a threshold failed.
+        let key = format!("{}.{}", t.name, t.expression);
+        thresholds_map.insert(key, json!(t.passed));
     }
 
     json!({
