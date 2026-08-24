@@ -11,7 +11,7 @@
 #   variables → js → native → auth → sandbox → runtime
 #
 # Notes:
-#   - tropel-sdk must be live at the workspace version (currently 0.2.0) — the
+#   - tropel-sdk must be live at the workspace version (currently 0.3.0) — the
 #     leaf everything else builds on; publish it before running --execute (the
 #     API-presence gate verifies the exact published artifact).
 #   - tropel-http is NOT in the set (F1, review fix): it was published by
