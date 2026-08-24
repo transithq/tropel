@@ -733,7 +733,8 @@ impl VUScheduler {
         let deadline = time::Instant::now() + duration;
         let mut next_tick = time::Instant::now();
         loop {
-            if time::Instant::now() >= deadline {
+            // P1 line 139: check SIGINT stop so Ctrl-C ends the run immediately
+            if time::Instant::now() >= deadline || self.is_stop_requested() {
                 break;
             }
             self.reap_and_respawn(vus, &mut handles, run_vu).await;
@@ -949,10 +950,11 @@ impl VUScheduler {
                 // line 162). sleep_until on a past deadline fires
                 // immediately, so a stage shorter than one tick still lasts
                 // exactly its configured duration.
+                // P1 line 139: check SIGINT stop so Ctrl-C ends the run immediately
                 let deadline = time::Instant::now() + stage_duration;
                 let mut next_tick = time::Instant::now();
                 loop {
-                    if time::Instant::now() >= deadline {
+                    if time::Instant::now() >= deadline || self.is_stop_requested() {
                         break;
                     }
                     self.reap_and_respawn(current_vus, &mut handles, run_vu)
@@ -1172,7 +1174,8 @@ impl VUScheduler {
         let mut last_target: u64 = 0;
         let mut next_reap = time::Instant::now();
 
-        while start.elapsed() < duration {
+        // P1 line 139: check SIGINT stop so Ctrl-C ends the run immediately
+        while start.elapsed() < duration && !self.is_stop_requested() {
             let elapsed_secs = start.elapsed().as_secs_f64();
             let target_tokens = (elapsed_secs * rate) as u64;
 
@@ -1372,7 +1375,8 @@ impl VUScheduler {
         let mut last_target: u64 = 0;
         let mut next_reap = time::Instant::now();
 
-        while start.elapsed() < total_duration {
+        // P1 line 139: check SIGINT stop so Ctrl-C ends the run immediately
+        while start.elapsed() < total_duration && !self.is_stop_requested() {
             let elapsed_secs = start.elapsed().as_secs_f64();
             let exact_tokens = tokens_at(elapsed_secs);
             let target = exact_tokens as u64;
