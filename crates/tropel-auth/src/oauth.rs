@@ -451,13 +451,6 @@ pub fn build_token_request(params: &TokenRequestParams) -> Result<TokenRequest> 
             form.push(("client_id".into(), params.client_id.clone()));
             basic_auth_header = Some(basic(&params.client_id, secret));
         }
-        (Some(secret), _) => {
-            // Unknown auth method with a secret — include in body as fallback.
-            if !params.client_id.is_empty() {
-                form.push(("client_id".into(), params.client_id.clone()));
-            }
-            form.push(("client_secret".into(), secret.to_string()));
-        }
         (None, _) => {
             if !params.client_id.is_empty() {
                 form.push(("client_id".into(), params.client_id.clone()));

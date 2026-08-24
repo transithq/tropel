@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512, Sha512_256};
+use sha2::{Digest, Sha256, Sha512_256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -323,7 +323,8 @@ impl AuthSigner for AwsSigV4Auth {
     }
 }
 
-const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+// P1 line 147: EMPTY_SHA256 removed — streaming bodies now use
+// UNSIGNED-PAYLOAD instead of the empty-string hash.
 
 /// Canonical query string for SigV4.
 ///
