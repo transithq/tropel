@@ -143,9 +143,9 @@ Every item here is a wrong number **caused by** having two implementations. Fixi
 ## TR-133 · Group-path tagging on every path
 **Effort:** S · **Blocked by:** none
 
-- [ ] `::a::b` is correct for http/checks/group_duration; `ws_*` hardcodes the group
-- [ ] Group-tag semantics diverge between drivers — the k6 driver stamps the full `::a::b`, the sandbox stamps the leaf
-- [ ] k6's rules: root is `""`, a leading `::` always, and a name containing `::` is a **hard error**
+- [x] `::a::b` is correct for http/checks/group_duration; `ws_*` hardcodes the group
+- [x] Group-tag semantics diverge between drivers — the k6 driver stamps the full `::a::b`, the sandbox stamps the leaf
+- [x] k6's rules: root is `""`, a leading `::` always, and a name containing `::` is a **hard error**
 
 ## TR-134 · The npm workspace resolves `@tropel/shims` locally
 **Effort:** S · **Blocked by:** TR-008

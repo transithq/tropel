@@ -1094,18 +1094,23 @@ impl TrpBridge {
             );
 
             // ── Group (for nesting groups with group_duration metric) ──
+            // TR-133: push FULL ::a::b paths (k6 convention), matching the
+            // k6 driver's group_start — the old code pushed bare leaf names,
+            // so the stack held ["checkout","payment"] and join gave
+            // "checkout::payment" instead of k6's "::checkout::payment" (root
+            // is "", leading :: always — k6 rule). Every consumer of
+            // group_stack.last() now sees the full path for group tags.
             let state_clone = state.clone();
             set_global!(
                 "__tropel_pm_group_start",
                 Func::from(move |name: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.group_stack.push(name);
-                    // Rebuild the current group path from the stack
-                    st.current_group = if st.group_stack.is_empty() {
-                        None
-                    } else {
-                        Some(st.group_stack.join("::"))
+                    let full = match st.group_stack.last() {
+                        Some(parent) => format!("{}::{}", parent, name),
+                        None => format!("::{}", name),
                     };
+                    st.group_stack.push(full);
+                    st.current_group = st.group_stack.last().cloned();
                 }),
             );
 
@@ -1114,22 +1119,34 @@ impl TrpBridge {
                 "__tropel_pm_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
                     let mut st = state_clone.lock().unwrap();
-                    // Pop the matching group from the stack
-                    if st.group_stack.last().map(|n| n == &name).unwrap_or(false) {
-                        st.group_stack.pop();
+                    // Pop the FULL ::a::b path (start pushed it) and rebuild
+                    // current_group from the new top (TR-133).
+                    let full = st
+                        .group_stack
+                        .pop()
+                        .unwrap_or_else(|| format!("::{}", name));
+                    // Defensive: compare the LEAF (the stack stores full
+                    // ::a::b paths); a mismatched script drops the stale top
+                    // without losing the whole stack (k6 driver parity).
+                    let leaf = full.rsplit("::").next().unwrap_or(&full);
+                    if leaf != name {
+                        tracing::debug!(
+                            "sandbox group_end mismatch: top={} got={}",
+                            full,
+                            name
+                        );
                     }
-                    // Rebuild current group path
-                    st.current_group = if st.group_stack.is_empty() {
-                        None
-                    } else {
-                        Some(st.group_stack.join("::"))
-                    };
+                    st.current_group = st.group_stack.last().cloned();
 
                     // Emit group_duration sample (Trend) in ms — the public
                     // unit end-to-end (backlog §0). The JS side already
                     // measures in ms, so no µs conversion here.
                     let mut tags = tropel_sdk::types::TagMap::new();
-                    tags.insert("group", name.clone());
+                    // TR-133: group = FULL ::a::b path, matching the k6
+                    // driver convention (k6 rules: root is "", leading ::
+                    // always). The old code stamped the leaf name here,
+                    // diverging from the k6 driver's group=::checkout::payment.
+                    tags.insert("group", st.current_group.clone().unwrap_or_default());
                     if let Some(ref path) = st.current_group {
                         tags.insert("group_path", path.clone());
                     }
@@ -1186,14 +1203,15 @@ impl TrpBridge {
                     // W2 line 188: custom metrics recorded inside a group()
                     // must carry the group path like http/checks/group_duration
                     // (they used to be UNTAGGED — invisible to group-filtered
-                    // thresholds). Mirrors the group_duration convention:
-                    // `group` = leaf name, `group_path` = full ::a::b path.
+                    // thresholds). TR-133: `group` = FULL ::a::b path, matching
+                    // the k6 driver — the old code stamped only the leaf name
+                    // here, so a custom metric inside ::checkout::payment
+                    // carried group=payment while http/checks carried the full
+                    // path. `group_path` is kept for backward-compatible
+                    // explicit-path access.
                     let mut tags = tropel_sdk::types::TagMap::new();
                     if let Some(ref path) = st.current_group {
-                        tags.insert(
-                            "group",
-                            path.rsplit("::").next().unwrap_or(path).to_string(),
-                        );
+                        tags.insert("group", path.clone());
                         tags.insert("group_path", path.clone());
                     }
                     st.samples.push(tropel_sdk::types::Sample {
@@ -1271,12 +1289,11 @@ impl TrpBridge {
                         // group() must carry the group path like
                         // http/checks/group_duration (were untagged). User-
                         // supplied tags win; group/group_path only fill in.
+                        // TR-133: group = FULL ::a::b path (k6 convention),
+                        // not the leaf name.
                         if let Some(ref path) = st.current_group {
                             if tags.get("group").is_none() {
-                                tags.insert(
-                                    "group",
-                                    path.rsplit("::").next().unwrap_or(path).to_string(),
-                                );
+                                tags.insert("group", path.clone());
                             }
                             if tags.get("group_path").is_none() {
                                 tags.insert("group_path", path.clone());
@@ -1990,6 +2007,55 @@ mod tests {
             let st = state.lock().unwrap();
             assert_eq!(st.custom_metrics.get("my_custom"), Some(&42.0));
         }
+    }
+
+    /// TR-133: the sandbox stamps `group` = FULL `::a::b` path (k6
+    /// convention), not the leaf name. The old code stamped the leaf here
+    /// while the k6 driver stamped the full path — a custom metric inside
+    /// `::checkout::payment` carried group=payment while http/checks carried
+    /// the full path, so group-filtered thresholds missed it.
+    #[tokio::test]
+    async fn test_custom_metric_inside_nested_group_carries_full_path() {
+        use crate::state::new_pm_state;
+
+        let mut ctx = tropel_js::JsContext::new(None, None)
+            .await
+            .expect("context");
+        let state = new_pm_state();
+        TrpBridge::new(state.clone())
+            .install(&mut ctx)
+            .expect("install");
+        ctx.eval(include_str!("../../../../js/scripting-api/pm.js"))
+            .await
+            .expect("pm shim must eval");
+
+        ctx.eval(
+            "group('checkout', function () { \
+               group('payment', function () { \
+                 pm.metrics.add('latency', 42.0, 'trend'); \
+               }); \
+             });",
+        )
+        .await
+        .expect("eval must succeed");
+
+        let st = state.lock().unwrap();
+        let latency = st
+            .samples
+            .iter()
+            .find(|s| s.metric == "latency")
+            .expect("latency sample must be recorded");
+        assert_eq!(
+            latency.tags.get("group"),
+            Some("::checkout::payment"),
+            "custom metric must carry the FULL group path (TR-133), got {:?}",
+            latency.tags.get("group")
+        );
+        assert_eq!(
+            latency.tags.get("group_path"),
+            Some("::checkout::payment"),
+            "group_path must carry the full path too"
+        );
     }
 
     /// P4b open item: alias configuration is part of the public API.
