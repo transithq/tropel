@@ -8195,27 +8195,23 @@ mod tests {
     /// transport failures), matching k6's status-class rule.
     #[test]
     fn expected_response_tag_tracks_status_class() {
-        let rt = rquickjs::Runtime::new().unwrap();
-        let ctx = rquickjs::Context::full(&rt).unwrap();
-        ctx.with(|ctx| {
-            for (status, expected) in [(200, "true"), (399, "true"), (400, "false"), (500, "false")] {
-                let tags = http_tags_for(
-                    "http://x/",
-                    "GET",
-                    &status.to_string(),
-                    &Arc::from("default"),
-                    None,
-                    None,
-                    "HTTP/1.1",
-                    k6_http_error_code(status),
-                );
-                assert_eq!(
-                    tags.get("expected_response").map(|s| s.as_ref()),
-                    Some(expected),
-                    "status {status} expected_response must be {expected}"
-                );
-            }
-        });
+        for (status, expected) in [(200, "true"), (399, "true"), (400, "false"), (500, "false")] {
+            let tags = http_tags_for(
+                "http://x/",
+                "GET",
+                &status.to_string(),
+                &Arc::from("default"),
+                None,
+                None,
+                "HTTP/1.1",
+                k6_http_error_code(status),
+            );
+            assert_eq!(
+                tags.get("expected_response"),
+                Some(expected),
+                "status {status} expected_response must be {expected}"
+            );
+        }
     }
 
     /// TR-207: setup()/teardown() HTTP calls are tagged `::setup`/`::teardown`
