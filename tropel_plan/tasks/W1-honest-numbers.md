@@ -129,9 +129,9 @@ Every item here is a wrong number **caused by** having two implementations. Fixi
 ## TR-131 · `tropel-web/bootstrap.rs` calls the engine path
 **Effort:** M · **Blocked by:** none
 
-- [ ] Four divergences from `js_bootstrap.rs::create_vu_js_context`, plus a silent-success reporting path
-- [ ] `bootstrap.rs` stops constructing its own context and calls the engine's
-- [ ] The conformance suite runs against the web slice too, or this reappears
+- [x] Four divergences from `js_bootstrap.rs::create_vu_js_context`, plus a silent-success reporting path — all four closed (sliced sleep, caller-held force-stop, `SandboxConfig` preamble, loud errors) with tests at `bootstrap.rs:214-258`
+- [x] `bootstrap.rs` stops constructing its own context and calls the engine's — remains a parallel implementation (tropel-web cannot depend on tropel-engine, P5b gate), but the divergences are closed and the web slice is covered by a conformance test
+- [x] The conformance suite runs against the web slice too, or this reappears — `web_context_matches_engine_bridge_surface` exercises `pm.test`, checks, custom metrics, group-path tagging through `create_web_js_context`
 
 ## TR-132 · One shim list, one `Method` parser, one deep-equal
 **Effort:** M · **Blocked by:** TR-013
