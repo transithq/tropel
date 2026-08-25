@@ -986,6 +986,17 @@ fn http_tags_for(
     // failure; 1000+status for >=400). Sample tags let thresholds/dashboards
     // distinguish "connection refused" from "504" in aggregate.
     tags.insert(interned("error_code"), Arc::from(error_code.to_string()));
+    // TR-204: `expected_response` is a k6 systemTag — true for 2xx/3xx, false
+    // for 4xx/5xx and transport failures (status 0). k6's `expectedResponse`
+    // option can override, but the default is the status-class rule.
+    let expected = status
+        .parse::<u16>()
+        .map(|s| (200..400).contains(&s))
+        .unwrap_or(false);
+    tags.insert(
+        interned("expected_response"),
+        Arc::from(if expected { "true" } else { "false" }),
+    );
     if let Some(extra) = extra {
         for (k, v) in extra {
             tags.insert(k.clone(), v.clone());
@@ -1343,32 +1354,89 @@ fn compress_k6_body(kind: &str, data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// k6-style error codes for `res.error_code`. k6 defines a 1xxx series:
-/// 1000 generic, 1010 non-TCP network error, 1020 malformed HTTP, 1050
-/// timeout, 1100 DNS, 1200 TCP connect, 1300 TLS, 1600 HTTP/2, 1990
-/// unknown. Typed HTTP/2 failures are classified directly; other errors use
-/// the existing message-based mapping for common transport categories.
+/// k6-style error codes for `res.error_code`. k6 defines a 1xxx series
+/// (lib/netext/httpext/error_codes.go): 1000 generic, 1010 non-TCP network
+/// error, 1020 invalid URL, 1050 timeout, 1100/1101 DNS, 1110 blacklisted,
+/// 1200–1220 TCP, 1301/1310/1311 TLS, 1611–1664 HTTP/2, 1701 decompression.
+/// 1300 and 1600 are NOT emitted (declared upstream but unreachable — k6
+/// always produces the specific sub-code, TR-204). Typed HTTP/2 failures map
+/// to 1611 + the h2 error code; other errors use the message-based mapping
+/// below for the transport category.
 fn k6_error_code(error: &tropel_sdk::TropelError) -> i32 {
-    if matches!(error, tropel_sdk::TropelError::Http2(_)) {
-        return 1600;
+    if let tropel_sdk::TropelError::Http2(msg) = error {
+        // k6's 1611-1664 range: 1611 + the h2 error code byte (0=NO_ERROR,
+        // 1=PROTOCOL_ERROR, … 10=INTERNAL_ERROR). Try the typed h2::Error
+        // from the message chain; fall back to 1611 (generic h2 stream error).
+        return h2_error_code(msg).unwrap_or(1611);
     }
     k6_error_code_message(&error.to_string())
 }
 
+/// Extract k6's 1611+HTTP/2 code from an h2 error message. The message is
+/// produced by `http_request_error` (client.rs), which walks the reqwest
+/// error chain and preserves the h2::Error text (e.g. "protocol error: …").
+fn h2_error_code(msg: &str) -> Option<i32> {
+    let m = msg.to_ascii_lowercase();
+    // h2 error code names in the message → k6's 1611 + code byte.
+    let named = [
+        ("no_error", 0),
+        ("protocol_error", 1),
+        ("internal_error", 2),
+        ("flow_control_error", 3),
+        ("settings_timeout", 4),
+        ("stream_closed", 5),
+        ("frame_size_error", 6),
+        ("refused_stream", 7),
+        ("cancel", 8),
+        ("compression_error", 9),
+        ("connect_error", 10),
+        ("enhanced_your_calm", 11),
+        ("inadequate_security", 12),
+    ];
+    for (name, code) in named {
+        // Match both the underscore form ("stream_closed") and the display
+        // form ("stream closed") that the h2 crate's Display produces.
+        let spaced = name.replace('_', " ");
+        if m.contains(name) || m.contains(&spaced) {
+            return Some(1611 + code);
+        }
+    }
+    None
+}
+
+/// Message-based transport-code mapping (k6's coarse series). Returns the
+/// specific code for a recognized category, else 1000 (generic).
 fn k6_error_code_message(msg: &str) -> i32 {
     let m = msg.to_ascii_lowercase();
     if m.contains("dns") || m.contains("nodename") || m.contains("resolve") {
+        // 1100 = DNS no-such-host; 1101 = DNS empty-answer. A "dns error"
+        // without an answer-shape clue is the common 1100.
         1100
     } else if m.contains("timed out") || m.contains("timeout") || m.contains("deadline") {
         1050
-    } else if m.contains("tls") || m.contains("certificate") || m.contains("handshake") {
-        1300
+    } else if m.contains("blacklist") || m.contains("blocked") {
+        1110
+    } else if m.contains("certificate") || m.contains("cert") {
+        1301 // TLS certificate error
+    } else if m.contains("unknown ca") || m.contains("root cert") || m.contains("issuer") {
+        1310 // TLS unknown CA
+    } else if m.contains("tls") || m.contains("handshake") {
+        1311 // TLS handshake / other TLS error
+    } else if m.contains("decompress") || m.contains("inflate") || m.contains("gzip") {
+        1701 // decompression error
+    } else if m.contains("broken pipe")
+        || m.contains("connection reset")
+        || m.contains("reset by peer")
+    {
+        1201 // TCP reset by peer
+    } else if m.contains("refused") {
+        1202 // TCP connect refused
+    } else if m.contains("connect") {
+        1200 // TCP connect error
+    } else if m.contains("url") || m.contains("uri") || m.contains("invalid protocol") {
+        1020 // invalid URL
     } else if m.contains("http2") || m.contains("h2") {
-        1600
-    } else if m.contains("connect") || m.contains("refused") || m.contains("reset") {
-        1200
-    } else if m.contains("url") || m.contains("uri") {
-        1010
+        h2_error_code(msg).unwrap_or(1611)
     } else {
         1000
     }
@@ -8114,6 +8182,40 @@ mod tests {
             "error_code must be 0 for <400, got: {:?}",
             sample.tags.get("error_code")
         );
+        // TR-204: expected_response tag is true for 2xx/3xx.
+        assert_eq!(
+            sample.tags.get("expected_response"),
+            Some("true"),
+            "2xx must carry expected_response=true, got: {:?}",
+            sample.tags.get("expected_response")
+        );
+    }
+
+    /// TR-204: the `expected_response` tag is false for 4xx/5xx (and
+    /// transport failures), matching k6's status-class rule.
+    #[test]
+    fn expected_response_tag_tracks_status_class() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            for (status, expected) in [(200, "true"), (399, "true"), (400, "false"), (500, "false")] {
+                let tags = http_tags_for(
+                    "http://x/",
+                    "GET",
+                    &status.to_string(),
+                    &Arc::from("default"),
+                    None,
+                    None,
+                    "HTTP/1.1",
+                    k6_http_error_code(status),
+                );
+                assert_eq!(
+                    tags.get("expected_response").map(|s| s.as_ref()),
+                    Some(expected),
+                    "status {status} expected_response must be {expected}"
+                );
+            }
+        });
     }
 
     /// TR-207: setup()/teardown() HTTP calls are tagged `::setup`/`::teardown`
@@ -11565,18 +11667,38 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
     fn k6_error_code_http_4xx_5xx() {
         // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
         // while keeping error empty. Only transport errors populate error.
-        // 1000 generic, 1010 non-TCP, 1020 invalid URL, 1050 timeout,
-        // 1100 DNS, 1200 TCP connect, 1300 TLS, 1600 HTTP/2.
+        // k6's series (TR-204): 1000 generic, 1020 invalid URL, 1050
+        // timeout, 1100 DNS, 1110 blacklisted, 1200-1220 TCP, 1301/1310/1311
+        // TLS, 1611-1664 HTTP/2, 1701 decompression. 1300/1600 are never
+        // emitted (unreachable upstream).
 
-        // Transport error codes (unchanged)
+        // Transport error codes.
         assert_eq!(k6_error_code_message("dns resolution failed"), 1100);
         assert_eq!(k6_error_code_message("connection timed out"), 1050);
-        assert_eq!(k6_error_code_message("tls handshake error"), 1300);
-        assert_eq!(k6_error_code_message("connect refused"), 1200);
+        assert_eq!(k6_error_code_message("tls handshake error"), 1311);
+        assert_eq!(k6_error_code_message("certificate verify failed"), 1301);
+        assert_eq!(k6_error_code_message("unknown CA"), 1310);
+        assert_eq!(k6_error_code_message("connection refused"), 1202);
+        assert_eq!(k6_error_code_message("connection reset by peer"), 1201);
+        assert_eq!(k6_error_code_message("blacklisted IP"), 1110);
+        assert_eq!(k6_error_code_message("invalid url"), 1020);
+        assert_eq!(k6_error_code_message("gzip decompression failed"), 1701);
         assert_eq!(k6_error_code_message("unknown error"), 1000);
+        // 1300/1600 must NOT be produced.
+        assert_ne!(k6_error_code_message("tls handshake error"), 1300);
+        assert_ne!(k6_error_code_message("http2 protocol error"), 1600);
+        // HTTP/2 maps to 1611 + the h2 error-code byte.
         assert_eq!(
-            k6_error_code(&tropel_sdk::TropelError::Http2("stream reset".into())),
-            1600
+            k6_error_code(&tropel_sdk::TropelError::Http2("stream closed".into())),
+            1616 // stream_closed = 5
+        );
+        assert_eq!(
+            k6_error_code(&tropel_sdk::TropelError::Http2("protocol error".into())),
+            1612 // protocol_error = 1
+        );
+        assert_eq!(
+            k6_error_code(&tropel_sdk::TropelError::Http2("no error code".into())),
+            1611 // generic h2 → 1611
         );
 
         // HTTP status codes are computed at the call site as 1000 + status
