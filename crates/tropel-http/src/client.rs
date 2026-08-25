@@ -13,7 +13,7 @@ use crate::config::{HttpConfig, TlsConfig};
 use tropel_sdk::Result;
 use tropel_sdk::TropelError;
 
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MULTIPART_BOUNDARY: &str = "------------------------tropel-boundary-7a2f24b9";
 
 /// Credential headers stripped on cross-origin redirect hops and carried
@@ -232,7 +232,8 @@ impl HttpClient {
             config.max_idle_connections
         };
         // Global request timeout: configurable via `HttpConfig.request_timeout`
-        // (k6 `timeout`); falls back to the 10s engine default. A per-request
+        // (k6 `timeout`); falls back to the 60s engine default (k6 parity —
+        // k6's `Params.timeout` defaults to 60s, TR-230). A per-request
         // `timeout` (Request.timeout) can still override it shorter.
         let request_timeout = config
             .request_timeout
