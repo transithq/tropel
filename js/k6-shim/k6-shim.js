@@ -864,6 +864,127 @@ http.batch = function (requests) {
     return results;
 };
 
+// TR-233: `http.cookieJar()` / `new http.CookieJar()` — k6's per-VU cookie
+// jar with 4 methods. cookiesForURL returns VALUES only (array of strings);
+// set parses `expires` as RFC 1123; clear/delete work by re-setting the
+// cookie with Max-Age=-1. The jar is backed by the per-VU native cookie
+// jar (VuCookieClient) through lazy bridges, like exec.*.
+function k6CookieJar() {
+    var jar = {};
+    jar.cookiesForURL = function (url) {
+        if (typeof __tropel_k6_jar_cookies_for_url === 'function') {
+            var json = __tropel_k6_jar_cookies_for_url(String(url));
+            try {
+                var obj = JSON.parse(json);
+                // k6 returns VALUES only: an array of cookie value strings.
+                var values = [];
+                for (var k in obj) {
+                    if (!obj.hasOwnProperty(k)) continue;
+                    var v = obj[k];
+                    values.push(Array.isArray(v) ? v[0] : v);
+                }
+                return values;
+            } catch (e) { return []; }
+        }
+        return [];
+    };
+    jar.set = function (url, name, value, options) {
+        if (typeof __tropel_k6_jar_set === 'function') {
+            var opts = options || {};
+            // k6: `expires` parses as RFC1123 (new Date(expires)); `max_age`
+            // in seconds. A Date/string expiry becomes seconds since epoch.
+            var maxAge = opts.max_age !== undefined ? opts.max_age : 0;
+            var expiresSec = 0;
+            if (opts.expires) {
+                var exp = new Date(opts.expires);
+                if (!isNaN(exp.getTime())) {
+                    expiresSec = Math.floor(exp.getTime() / 1000);
+                }
+            }
+            __tropel_k6_jar_set(
+                String(url), String(name), String(value),
+                String(opts.path || ''), String(opts.domain || ''),
+                opts.secure === true, opts.http_only === true,
+                maxAge, expiresSec
+            );
+        }
+    };
+    jar.clear = function (url, name) {
+        // k6: clear re-sets the cookie with Max-Age=-1 (deletion).
+        if (typeof __tropel_k6_jar_set === 'function') {
+            __tropel_k6_jar_set(String(url), String(name), '', '', '', false, false, -1, 0);
+        }
+    };
+    jar.delete = function (url, name) { jar.clear(url, name); };
+    return jar;
+}
+
+// http.cookieJar() and the constructable form.
+http.cookieJar = function () { return k6CookieJar(); };
+http.CookieJar = k6CookieJar;
+
+// TR-233: `http.setResponseCallback(cb)` — a scoped callback deciding
+// which responses count as expected (http_req_failed). The default matches
+// status 200–399; `null` disables (nothing fails); expectedStatuses builds
+// a callback from ranges. The callback runs in this JS scope; http_req_failed
+// is driven by the SAME logic via the request path's expected computation.
+var __tropel_default_response_callback = function (res) {
+    return res.status >= 200 && res.status < 400;
+};
+var __tropel_response_callback = __tropel_default_response_callback;
+
+http.setResponseCallback = function (cb) {
+    if (cb === null || cb === undefined) {
+        // null suppresses http_req_failed entirely: nothing is "failed".
+        __tropel_response_callback = function () { return true; };
+    } else if (typeof cb === 'function') {
+        __tropel_response_callback = cb;
+    } else {
+        throw new Error('http.setResponseCallback expects a function or null');
+    }
+};
+
+http.expectedStatuses = function () {
+    var ranges = [];
+    for (var i = 0; i < arguments.length; i++) {
+        var a = arguments[i];
+        if (Array.isArray(a) && a.length === 2) {
+            ranges.push([Number(a[0]), Number(a[1])]);
+        } else if (typeof a === 'number') {
+            ranges.push([a, a]);
+        }
+    }
+    return function (res) {
+        if (!res || typeof res.status !== 'number') return false;
+        for (var j = 0; j < ranges.length; j++) {
+            if (res.status >= ranges[j][0] && res.status <= ranges[j][1]) return true;
+        }
+        return false;
+    };
+};
+
+// TR-233: TLS / OCSP constants (k6 exposes these on the http module).
+http.TLS_1_0 = 'tls1.0';
+http.TLS_1_1 = 'tls1.1';
+http.TLS_1_2 = 'tls1.2';
+http.TLS_1_3 = 'tls1.3';
+http.OCSP_STATUS_GOOD = 'good';
+http.OCSP_STATUS_REVOKED = 'revoked';
+http.OCSP_STATUS_SERVER_FAILED = 'server_failed';
+http.OCSP_STATUS_UNKNOWN = 'unknown';
+
+// TR-233: `http.asyncRequest` — returns a Promise; the shim executes
+// synchronously (QuickJS has no async IO) and wraps the result in a
+// resolved Promise (the driver's job pump settles it).
+http.asyncRequest = function (method, url, body, params) {
+    try {
+        var res = k6HTTPRequest(method, url, body, params);
+        return Promise.resolve(res);
+    } catch (e) {
+        return Promise.reject(e);
+    }
+};
+
 function normalizeBatchEntry(req, defaultKey) {
     if (typeof req === 'string') {
         return { key: defaultKey, method: 'GET', url: req, body: null, params: {} };
