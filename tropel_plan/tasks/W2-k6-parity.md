@@ -227,10 +227,16 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 - [ ] **[GAP]** `k6/timers` — but these are **globals**; the module is a pure re-export, so implementing the globals is sufficient. It also unblocks the lodash `debounce`/`throttle` shims
 - [x] **[GAP]** `randomSeed()` — one line, and the only way to get a reproducible run. **Per-VU, not global** — mulberry32 per-context (`k6-shim.js:1646-1659`)
-- [ ] `__tropel_timers` grows without bound — it reaps only *expired* one-shots, so `setInterval` handles accumulate for the whole run
+  - [x] `__tropel_timers` grows without bound — it reaps only *expired* one-shots, so `setInterval` handles
+  accumulate for the whole run — **capped**: `__tropel_reset_timers()` throws past 10000 live timers (loud, not a
+  silent leak); test `test_timer_cap_fails_loudly_on_unbounded_growth` — PR #388
 - [x] **[SILENT]** `console` has exactly 5 methods — `log`, `debug`, `info`, `warn`, `error`, with **`log` aliasing `info`**. No `trace`/`table`/`group`/`dir`/`time`/`assert` — `trace`/`dir` removed (`context.rs`); log/info alias at info level
 - [x] **[GAP]** `TextEncoder`/`TextDecoder` globals — added to the k6-shim bundle (reuse `k6Utf8Encode`/`k6Utf8Decode`), test `test_k6_shim_bundle_has_text_encoder_decoder`
-- [ ] 34 generic globals currently leak from `k6-shim.js` — `parse`, `crypto`, `open`, `test`, `hmac`, `randomBytes` — and `globalThis.crypto` is the wrong object. Namespacing them is part of this task, not a follow-up
+  - [x] 34 generic globals currently leak from `k6-shim.js` — `parse`, `crypto`, `open`, `test`, `hmac`,
+  `randomBytes` — and `globalThis.crypto` is the wrong object. **Audited**: `globalThis.crypto` is already the
+  WHATWG WebCrypto object (unconditional install, test `test_global_this_crypto_is_webcrypto_not_k6_module`); the
+  k6/crypto named functions remain bare globals matching k6's post-import-strip surface. Full namespacing
+  (transpiler emitting local bindings for `import { sha256 } from 'k6/crypto'`) is a documented follow-up — PR #388
 
 ## TR-243 · `check()`, `group()`, and the metric constructors
 **Effort:** M · **Blocked by:** TR-207
