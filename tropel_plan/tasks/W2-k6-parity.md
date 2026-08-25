@@ -199,8 +199,8 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 - [x] `http.cookieJar()` / `new http.CookieJar()` — 4 methods; `cookiesForURL` returns **values only**; `set` parses `expires` as **RFC1123**; `clear`/`delete` work by re-setting `MaxAge=-1` — shim surface added (cookiesForURL/set/clear/delete; expires via Date); the native per-VU jar bridge wiring is a follow-up
 - [x] `http.setResponseCallback` / `http.expectedStatuses` — **default range 200–399 inclusive**; `null` suppresses `http_req_failed` entirely (pairs with `TR-004`) — added
 - [x] `http.asyncRequest`, `http.head`, `http.options`, and the `TLS_1_*` / `OCSP_*` constants — head/options already existed; asyncRequest + TLS/OCSP constants added
-- [ ] **[GAP]** `batch` per-host limiter — `batch`=20 global, `batchPerHost`=6; the return container mirrors the input; only the **first** error surfaces; GET/HEAD bodies nulled in object form
-- [ ] **[GAP]** `del` takes a body; `get`/`head` do not
+- [ ] **[GAP]** `batch` per-host limiter — `batch`=20 global, `batchPerHost`=6; the return container mirrors the input; only the **first** error surfaces; GET/HEAD bodies nulled in object form — **limiter added** (20 global / 6 per-host via two-level semaphore, k6 defaults); **return container mirrors input + first-error-only already implemented** in the batch bridge; **GET/HEAD bodies nulled in object form added** (shim). Custom `batch`/`batchPerHost` values remain a follow-up (currently warned as unknown options). PR #386
+- [ ] **[GAP]** `del` takes a body; `get`/`head` do not — **fixed** in the shim (`http.del(url, body, params)`); `get`/`head` never carry one. PR #386
 
 ---
 
