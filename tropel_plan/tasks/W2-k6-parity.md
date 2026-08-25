@@ -163,14 +163,14 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 - [ ] `headers` — a `Host` key sets `req.Host`; a user `Content-Length` is **deleted with a warning**
 - [ ] `cookies` — including the `{value, replace}` form; `replace:false`, the default, sends **both** the request cookie and the jar cookie
-- [ ] `tags` — setting `tags.name` overrides **both** `name` and `url` (see `TR-205`)
+- [x] `tags` — setting `tags.name` overrides **both** `name` and `url` (see `TR-205`)
 - [ ] `auth` — `"digest"`/`"ntlm"`; **`"basic"` is a documented no-op**, basic auth works purely from URL userinfo
-- [ ] **[SILENT]** `timeout` default is **60 s**, not "no timeout"; a number means ms, a string is a duration
-- [ ] `redirects` default 10; **`0` returns the 3xx** rather than erroring
+- [x] **[SILENT]** `timeout` default is **60 s**, not "no timeout"; a number means ms, a string is a duration — **fixed**: engine default `DEFAULT_REQUEST_TIMEOUT` is 60s (k6 parity)
+- [x] `redirects` default 10; **`0` returns the 3xx** rather than erroring
 - [ ] `compression` — `gzip,deflate,zstd,br`, applied left-to-right
 - [ ] `responseType` — `text` / `binary`→ArrayBuffer / `none`
-- [ ] **[SILENT]** `params.headers` in Postman array form is silently dropped (`k6-shim.js:184` requires a non-Array) ✅**EXEC**
-- [ ] **[SILENT]** `http.post(url, {obj})` sends JSON; k6 sends **form-urlencoded** ✅closed — keep the regression test
+- [x] **[SILENT]** `params.headers` in Postman array form is silently dropped (`k6-shim.js:184` requires a non-Array) ✅**EXEC** — array form accepted (`k6-shim.js:189-194`)
+- [x] **[SILENT]** `http.post(url, {obj})` sends JSON; k6 sends **form-urlencoded** ✅closed — keep the regression test
 
 ## TR-231 · `Response` — the missing members
 **Effort:** L · **Blocked by:** TR-014, TR-204
