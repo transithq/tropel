@@ -951,11 +951,6 @@ fn metric_add_host(
         );
         return;
     }
-    // Refuse non-finite values: a guest NaN/Inf sample would poison Counter/
-    // Trend aggregates and thresholds downstream (avg/p95 become NaN).
-    if !value.is_finite() {
-        return;
-    }
     let sample_type = match type_code {
         1 => SampleType::Counter,
         2 => SampleType::Trend,
@@ -1247,6 +1242,50 @@ mod tests {
     (i32.const 0))
 )
 "#;
+
+    const NON_FINITE_DRIVER_WAT: &str = r#"
+(module
+  (import "env" "metric_add" (func $metric_add (param i32 i32 f64 i32 i32 i32)))
+  (memory (export "memory") 64 256)
+  (data (i32.const 4096) "latency\00")
+  (data (i32.const 8192) "{}\00")
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    ;; metric_add("latency", NaN, "{}", type=2 Trend) — must be dropped by the
+    ;; primary-path TR-120 guard, not counted.
+    (call $metric_add (i32.const 4096) (i32.const 7) (f64.const nan) (i32.const 8192) (i32.const 2) (i32.const 2))
+    ;; metric_add("latency", 42.0, "{}", type=2 Trend) — must survive.
+    (call $metric_add (i32.const 4096) (i32.const 7) (f64.const 42.0) (i32.const 8192) (i32.const 2) (i32.const 2))
+    (i32.const 0))
+)
+"#;
+
+    #[tokio::test]
+    async fn test_non_finite_metric_reaches_buffer() {
+        // TR-120: the wasm metric_add bridge's NaN guard was removed (the
+        // canonical guard is at MetricSet::record / MetricsCollector::record).
+        // The NaN sample must now reach the per-iteration buffer instead of
+        // being silently dropped at the bridge — the collector drops it.
+        let driver = WasmDriver::default();
+        let mut inst = driver
+            .init(NON_FINITE_DRIVER_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        let result = inst.run_iteration(&mut ctx).await;
+        assert!(result.is_ok(), "iteration must succeed, got {:?}", result);
+        let non_finite: Vec<_> = ctx
+            .samples
+            .iter()
+            .filter(|s| !s.value.is_finite())
+            .collect();
+        assert!(
+            !non_finite.is_empty(),
+            "bridge must forward NaN to the per-iteration buffer (guard is at the collector)"
+        );
+        let valid: Vec<_> = ctx.samples.iter().filter(|s| s.value == 42.0).collect();
+        assert!(!valid.is_empty(), "valid sample must survive");
+    }
 
     #[tokio::test]
     async fn test_init_requires_run_iteration_export() {
