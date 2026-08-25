@@ -235,10 +235,10 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 ## TR-243 · `check()`, `group()`, and the metric constructors
 **Effort:** M · **Blocked by:** TR-207
 
-- [ ] **[SILENT]** `check()` returns a **plain bool**, never throws on failure; emits the builtin `checks` Rate tagged `check:<name>`; takes a **third `tags` argument**; **rejects async functions**; a throwing check emits a `false` sample *then* propagates
-- [ ] `group()` also rejects async callbacks and emits `group_duration`
-- [ ] **[SILENT]** `isTime` was dropped from metric constructors. The second arg switches the metric to `ValueType.Time` = **values are milliseconds** — it changes threshold semantics and summary units, not just formatting
-- [ ] `.name` is **read-only**; `.add()` **returns a boolean** and does not throw on a bad value unless `options.throw`; metrics **must** be constructed in init context
+- [x] **[SILENT]** `check()` returns a **plain bool**, never throws on failure; emits the builtin `checks` Rate tagged `check:<name>`; takes a **third `tags` argument**; **rejects async functions**; a throwing check emits a `false` sample *then* propagates — all but the async rejection were already fixed; async rejection added (pm.js + k6-shim)
+- [x] `group()` also rejects async callbacks and emits `group_duration` — async rejection added (pm.js + k6-shim)
+- [x] **[SILENT]** `isTime` was dropped from metric constructors. The second arg switches the metric to `ValueType.Time` = **values are milliseconds** — already fixed (TR-222/earlier)
+- [x] `.name` is **read-only**; `.add()` **returns a boolean** and does not throw on a bad value unless `options.throw`; metrics **must** be constructed in init context — `.name` read-only + `.add()` boolean added (pm.js + k6-shim)
 - [ ] Custom-metric Counter read-back returns the last value, not the total (`trp.rs:1131,1177`)
 
 ## TR-244 · `k6/execution` — the mutable tag objects
