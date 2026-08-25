@@ -56,6 +56,19 @@ __tropel_liveProp(exec.vu, 'iterationInInstance', '__tropel_exec_iteration', 0);
 __tropel_liveProp(exec.instance, 'iterationsCompleted', '__tropel_exec_iterations_completed', 0);
 __tropel_liveProp(exec.instance, 'vusActive', '__tropel_exec_vus_active', 0);
 
+// TR-244: `exec.vu.tags` is a live mutable object — writing to it tags
+// subsequent metrics. Scripts do `exec.vu.tags['mykey'] = 'myvalue'`.
+// The native HTTP bridge reads this object at request time and merges its
+// entries into the sample tags. Plain object, no native bridge needed —
+// the bridge reads it from the JS scope.
+exec.vu.tags = {};
+
+// exec.vu.metrics.tags and exec.vu.metrics.metadata are the same shape
+// (per-metric), knocked out together so the object exists.
+exec.vu.metrics = {};
+exec.vu.metrics.tags = {};
+exec.vu.metrics.metadata = {};
+
 // ── Global test object ──
 // k6 exposes the abort API as `exec.test.abort([message])` (NOT a bare `test`
 // global). Both are provided here for compatibility: the PM path and some
@@ -70,6 +83,18 @@ exec.test = {
             }
             __tropel_test_abort(String(message));
         }
+    },
+    // TR-244: k6's `exec.test.fail(msg)` marks the run failed WITHOUT
+    // stopping it — unlike abort (exit 108), the run continues but the
+    // summary is red. Tropel's contract: a thrown iteration error is
+    // recorded as a script failure (counted, run exits non-zero) and the
+    // VU moves on. So fail() throws the message, which the driver captures
+    // as an iteration error — distinct from abort's immediate stop.
+    fail: function (message) {
+        if (message === undefined || message === null) {
+            message = 'Test failed';
+        }
+        throw new Error(String(message));
     }
 };
 

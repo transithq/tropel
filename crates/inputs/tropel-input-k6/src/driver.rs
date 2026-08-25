@@ -1001,6 +1001,76 @@ fn http_tags_for(
     tags
 }
 
+/// TR-244: read the live `exec.vu.tags` object from the JS scope. It is a
+/// plain mutable object scripts write (`exec.vu.tags['key'] = 'value'`);
+/// the HTTP bridge merges its entries into the sample tags so subsequent
+/// metrics carry them (k6 semantics). Values are restricted to
+/// String/Boolean/Number (k6 contract) — anything else is coerced.
+fn read_exec_vu_tags(ctx: &rquickjs::Ctx) -> rquickjs::Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    let globals = ctx.globals();
+    let exec: rquickjs::Value = match globals.get("exec") {
+        Ok(v) => v,
+        Err(_) => return Ok(out),
+    };
+    if !exec.is_object() {
+        return Ok(out);
+    }
+    let exec = exec.as_object().unwrap();
+    let vu: rquickjs::Value = match exec.get("vu") {
+        Ok(v) => v,
+        Err(_) => return Ok(out),
+    };
+    let vu = match vu.as_object() {
+        Some(o) => o,
+        None => return Ok(out),
+    };
+    let tags: rquickjs::Value = match vu.get("tags") {
+        Ok(v) => v,
+        Err(_) => return Ok(out),
+    };
+    let tags = match tags.as_object() {
+        Some(o) => o.clone(),
+        None => return Ok(out),
+    };
+    // Copy via the iterator (k6's tag values are primitives; a nested object
+    // stringifies). rquickjs's Object IntoIterator yields
+    // Result<(Atom, Value), Error>; stringify the value inline (objects via
+    // JSON.stringify, primitives via String() coercion).
+    for entry in tags {
+        let Ok((key, value)) = entry else { continue };
+        let v: String = match coerce_k6_tag_value(&value, ctx) {
+            Some(s) => s,
+            None => continue,
+        };
+        out.insert(key.to_string().unwrap_or_default(), v);
+    }
+    Ok(out)
+}
+
+/// Coerce a `exec.vu.tags` value to a string: strings pass through, numbers
+/// and booleans coerce, nested objects stringify via JSON. Returns None on
+/// error (a value that can't be represented is skipped).
+fn coerce_k6_tag_value<'js>(
+    value: &rquickjs::Value<'js>,
+    ctx: &rquickjs::Ctx<'js>,
+) -> Option<String> {
+    if value.is_string() {
+        return value.as_string().and_then(|s| s.to_string().ok());
+    }
+    if value.is_object() || value.is_array() {
+        let globals = ctx.globals();
+        let json_fn: rquickjs::Function = globals
+            .get("JSON")
+            .and_then(|json: rquickjs::Object| json.get("stringify"))
+            .ok()?;
+        return json_fn.call::<_, String>((value.clone(),)).ok();
+    }
+    // Primitive: coerce via JS String() for exact semantics.
+    let string_fn: rquickjs::Function = ctx.globals().get("String").ok()?;
+    string_fn.call::<_, String>((value.clone(),)).ok()
+}
+
 /// Tiny status-0 error envelope used when a response allocation fails
 /// (backlog line 46 P0): mirrors the invalid-method path so the script sees
 /// a FAILED response (checks fail, http_req_failed counts) instead of a
@@ -2025,7 +2095,16 @@ fn register_http_bridges<'js>(
                         "",
                     );
                 }
-                let extra_tags = params.tags;
+                let mut extra_tags = params.tags;
+                // TR-244: `exec.vu.tags` is a live mutable object — scripts
+                // tag subsequent metrics by writing it. The bridge reads it
+                // from the JS scope at request time and merges its entries
+                // (k6: vu.tags become part of every metric's tag set).
+                if let Ok(exec_tags) = read_exec_vu_tags(&ctx) {
+                    for (k, v) in exec_tags {
+                        extra_tags.insert(k, v);
+                    }
+                }
                 // Execute on the dedicated I/O runtime via the shared
                 // blocking helper — safe from inside ctx.with on a
                 // current-thread VU runtime. No block_on here: that
@@ -2241,8 +2320,13 @@ fn register_http_bridges<'js>(
                 // for binary, timings, cookies, error_code).
                 let resp_obj = rquickjs::Object::new(ctx.clone())?;
                 let mut seen_keys = std::collections::HashSet::new();
+                // TR-244: exec.vu.tags applies to batch requests too.
+                let exec_vu_tags = read_exec_vu_tags(&ctx).unwrap_or_default();
                 if let Ok(results) = responses {
-                    for (key, req, result, extra_tags, start, response_type) in results {
+                    for (key, req, result, mut extra_tags, start, response_type) in results {
+                        for (k, v) in &exec_vu_tags {
+                            extra_tags.insert(k.clone(), v.clone());
+                        }
                         let key_str = match key {
                             serde_json::Value::String(s) => s,
                             serde_json::Value::Number(n) => n.to_string(),
@@ -7788,6 +7872,45 @@ mod tests {
         );
     }
 
+    /// TR-244: `exec.vu.tags['key'] = 'value'` must tag subsequent http
+    /// samples (k6's live mutable VU tag object). The bridge reads it at
+    /// request time and merges the entries into the sample tags.
+    #[tokio::test]
+    async fn test_exec_vu_tags_reach_http_samples() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                exec.vu.tags['team'] = 'billing';
+                exec.vu.tags['region'] = 'eu';
+                http.get('http://example.com/');
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "http_req_duration")
+            .expect("http_req_duration sample");
+        assert_eq!(
+            sample.tags.get("team"),
+            Some("billing"),
+            "exec.vu.tags['team'] must tag the http sample, got: {:?}",
+            sample.tags.get("team")
+        );
+        assert_eq!(
+            sample.tags.get("region"),
+            Some("eu"),
+            "exec.vu.tags['region'] must tag the http sample"
+        );
+    }
+
     /// TR-212: k6 systemTags — `proto` (not `protocol`) and `error_code` must
     /// appear on every http sample. `error_code` = 1000+status for >=400,
     /// 0 for <400 (k6 semantics), so dashboards can distinguish status
@@ -9040,6 +9163,22 @@ mod tests {
                 // exec.test.abort must exist and reach the bridge.
                 globalThis.__test_type = typeof exec.test.abort;
                 exec.test.abort('stop now');
+                // TR-244: exec.vu.tags is a live mutable object; scripts write
+                // it to tag subsequent metrics. exec.vu.metrics exists with
+                // its own tags + metadata objects.
+                globalThis.__vu_tags_type = typeof exec.vu.tags;
+                exec.vu.tags['mykey'] = 'myvalue';
+                globalThis.__vu_tags_val = exec.vu.tags['mykey'];
+                globalThis.__metrics_type = typeof exec.vu.metrics;
+                globalThis.__metrics_tags_type = typeof exec.vu.metrics.tags;
+                globalThis.__metrics_meta_type = typeof exec.vu.metrics.metadata;
+                // TR-244: exec.test.fail exists and throws (run continues but
+                // the iteration is marked failed) — distinct from abort.
+                globalThis.__fail_type = typeof exec.test.fail;
+                globalThis.__fail_throws = String((function () {
+                    try { exec.test.fail('boom'); return 'no-throw'; }
+                    catch (e) { return e.message; }
+                })());
             "#,
             )
             .expect("script should eval");
@@ -9055,6 +9194,14 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__exec").unwrap(), "shared-iterations");
             assert_eq!(ctx.eval::<String, _>("__test_type").unwrap(), "function", "exec.test.abort must be a function");
             assert_eq!(ctx.eval::<String, _>("__aborted").unwrap(), "stop now", "exec.test.abort must reach the native bridge");
+            // TR-244: exec.vu.tags must be a mutable object.
+            assert_eq!(ctx.eval::<String, _>("__vu_tags_type").unwrap(), "object", "exec.vu.tags must be an object");
+            assert_eq!(ctx.eval::<String, _>("__vu_tags_val").unwrap(), "myvalue", "exec.vu.tags['mykey'] = 'myvalue' must survive");
+            assert_eq!(ctx.eval::<String, _>("__metrics_type").unwrap(), "object", "exec.vu.metrics must exist");
+            assert_eq!(ctx.eval::<String, _>("__metrics_tags_type").unwrap(), "object", "exec.vu.metrics.tags must exist");
+            assert_eq!(ctx.eval::<String, _>("__metrics_meta_type").unwrap(), "object", "exec.vu.metrics.metadata must exist");
+            assert_eq!(ctx.eval::<String, _>("__fail_type").unwrap(), "function", "exec.test.fail must be a function");
+            assert_eq!(ctx.eval::<String, _>("__fail_throws").unwrap(), "boom", "exec.test.fail must throw the message");
         });
     }
 
