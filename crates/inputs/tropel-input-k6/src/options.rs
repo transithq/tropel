@@ -188,6 +188,19 @@ impl K6Options {
             if !scenarios.is_empty() {
                 let mut map = HashMap::new();
                 for (name, sc) in scenarios {
+                    // TR-220: k6 `base_config.go` validates scenario names
+                    // against `^[0-9a-zA-Z_-]+$`. Names with other characters
+                    // (spaces, dots, special chars) are rejected.
+                    if !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        tracing::warn!(
+                            "k6 scenario '{name}' contains invalid characters — \
+                             only [0-9a-zA-Z_-] are allowed, skipping"
+                        );
+                        continue;
+                    }
                     let Some(exec) = sc.to_execution() else {
                         tracing::warn!(
                             "k6 scenario '{name}' (executor '{}') is missing required \
@@ -753,6 +766,37 @@ mod tests {
             }
             other => panic!("expected ConstantArrivalRate, got {other:?}"),
         }
+    }
+
+    /// TR-220: k6 scenario names with invalid characters (dots, spaces) must
+    /// be rejected by the name regex, matching k6's `base_config.go`
+    /// `^[0-9a-zA-Z_-]+$`.
+    #[test]
+    fn test_scenario_name_with_special_chars_is_rejected() {
+        let opts = parse(
+            r#"{
+                "scenarios": {
+                    "valid_name": { "executor": "constant-vus", "vus": 1, "duration": "1s" },
+                    "bad.name": { "executor": "constant-vus", "vus": 1, "duration": "1s" },
+                    "spaced name": { "executor": "constant-vus", "vus": 1, "duration": "1s" }
+                }
+            }"#,
+        );
+        let decl = opts.to_declared().unwrap();
+        let scenarios = decl.scenarios.unwrap();
+        // Only the valid name should survive; invalid names are skipped with a
+        // warning (matching k6, which rejects the whole script — tropel is
+        // deliberately lenient and skips, so a partially-invalid script still
+        // runs its valid scenarios).
+        assert_eq!(
+            scenarios.len(),
+            1,
+            "only valid_name must survive, got {scenarios:?}"
+        );
+        assert!(
+            scenarios.contains_key("valid_name"),
+            "valid_name must be present"
+        );
     }
 
     #[test]

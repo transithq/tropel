@@ -1012,6 +1012,76 @@ fn http_tags_for(
     tags
 }
 
+/// TR-244: read the live `exec.vu.tags` object from the JS scope. It is a
+/// plain mutable object scripts write (`exec.vu.tags['key'] = 'value'`);
+/// the HTTP bridge merges its entries into the sample tags so subsequent
+/// metrics carry them (k6 semantics). Values are restricted to
+/// String/Boolean/Number (k6 contract) — anything else is coerced.
+fn read_exec_vu_tags(ctx: &rquickjs::Ctx) -> rquickjs::Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    let globals = ctx.globals();
+    let exec: rquickjs::Value = match globals.get("exec") {
+        Ok(v) => v,
+        Err(_) => return Ok(out),
+    };
+    if !exec.is_object() {
+        return Ok(out);
+    }
+    let exec = exec.as_object().unwrap();
+    let vu: rquickjs::Value = match exec.get("vu") {
+        Ok(v) => v,
+        Err(_) => return Ok(out),
+    };
+    let vu = match vu.as_object() {
+        Some(o) => o,
+        None => return Ok(out),
+    };
+    let tags: rquickjs::Value = match vu.get("tags") {
+        Ok(v) => v,
+        Err(_) => return Ok(out),
+    };
+    let tags = match tags.as_object() {
+        Some(o) => o.clone(),
+        None => return Ok(out),
+    };
+    // Copy via the iterator (k6's tag values are primitives; a nested object
+    // stringifies). rquickjs's Object IntoIterator yields
+    // Result<(Atom, Value), Error>; stringify the value inline (objects via
+    // JSON.stringify, primitives via String() coercion).
+    for entry in tags {
+        let Ok((key, value)) = entry else { continue };
+        let v: String = match coerce_k6_tag_value(&value, ctx) {
+            Some(s) => s,
+            None => continue,
+        };
+        out.insert(key.to_string().unwrap_or_default(), v);
+    }
+    Ok(out)
+}
+
+/// Coerce a `exec.vu.tags` value to a string: strings pass through, numbers
+/// and booleans coerce, nested objects stringify via JSON. Returns None on
+/// error (a value that can't be represented is skipped).
+fn coerce_k6_tag_value<'js>(
+    value: &rquickjs::Value<'js>,
+    ctx: &rquickjs::Ctx<'js>,
+) -> Option<String> {
+    if value.is_string() {
+        return value.as_string().and_then(|s| s.to_string().ok());
+    }
+    if value.is_object() || value.is_array() {
+        let globals = ctx.globals();
+        let json_fn: rquickjs::Function = globals
+            .get("JSON")
+            .and_then(|json: rquickjs::Object| json.get("stringify"))
+            .ok()?;
+        return json_fn.call::<_, String>((value.clone(),)).ok();
+    }
+    // Primitive: coerce via JS String() for exact semantics.
+    let string_fn: rquickjs::Function = ctx.globals().get("String").ok()?;
+    string_fn.call::<_, String>((value.clone(),)).ok()
+}
+
 /// Tiny status-0 error envelope used when a response allocation fails
 /// (backlog line 46 P0): mirrors the invalid-method path so the script sees
 /// a FAILED response (checks fail, http_req_failed counts) instead of a
@@ -1182,10 +1252,12 @@ fn push_http_samples_for(
 
     let is_failed = !(200..400).contains(&status_code);
     let mut v = sink.lock().unwrap();
-    // TR-202: http_req_duration = sending + waiting + receiving.
-    // Since reqwest folds sending into waiting, use waiting + receiving.
+    // TR-202: http_req_duration = sending + waiting + receiving. The engine
+    // now measures `sending` for real (timed body wrapper) and excludes it
+    // from `waiting`, so the full k6 formula is required — using
+    // waiting + receiving alone would undercount by the request-write time.
     let duration_value = if let Some(t) = timings {
-        (t.waiting + t.receiving).as_secs_f64() * 1000.0
+        (t.sending + t.waiting + t.receiving).as_secs_f64() * 1000.0
     } else {
         duration.as_secs_f64() * 1000.0
     };
@@ -1199,13 +1271,15 @@ fn push_http_samples_for(
     // Backlog line 150: the k6 path now emits the same connection-phase
     // sub-timing samples as the declarative runner — real blocked/dns/
     // connecting/waiting/receiving (from reqwest's resolver + connector
-    // hooks); tls_handshaking/sending stay 0 (folded into connecting /
-    // waiting by reqwest, same as the declarative path). Emitted with the
+    // hooks) plus real `sending` (measured by the timed body wrapper, TR-202).
+    // tls_handshaking stays 0 — reqwest's sealed connector folds the TLS
+    // handshake into `connecting`, so it is genuinely 0 for plain http and
+    // folded for fresh https (see `subtimings::k6_done`). Emitted with the
     // same tags so thresholds like http_req_waiting:p(95) resolve.
     if let Some(t) = timings {
-        // Emit all 8 sub-timing metrics including tls_handshaking and
-        // sending (always zero on reqwest, but k6 thresholds reference
-        // them). TR-011: removing them broke two stock k6 thresholds.
+        // Emit all 8 sub-timing metrics including tls_handshaking (0 for the
+        // reasons above) and the real sending (TR-011: removing the always-zero
+        // samples broke two stock k6 thresholds).
         let sub = [
             ("http_req_blocked", t.blocked),
             ("http_req_dns", t.dns),
@@ -1685,10 +1759,11 @@ impl DriverInstance for K6DriverInstance {
 ///
 /// Backlog line 150: the object now carries REAL `timings` (blocked/dns/
 /// connecting/tls_handshaking/sending/waiting/receiving/duration in ms, from
-/// the reqwest resolver+connector hooks), k6's `error` ("" on success), and
-/// `error_code` (0 on success, 1xxx series on transport failure). For
-/// `responseType: "binary"` the body is a native JS ArrayBuffer instead of a
-/// UTF-8 string (binary payloads are no longer silently destroyed).
+/// the reqwest resolver+connector hooks plus the timed body wrapper for
+/// `sending`), k6's `error` ("" on success), and `error_code` (0 on success,
+/// 1xxx series on transport failure). For `responseType: "binary"` the body
+/// is a native JS ArrayBuffer instead of a UTF-8 string (binary payloads are
+/// no longer silently destroyed).
 ///
 /// W2 line 189: the PRODUCTION degradation path is [`k6_error_envelope`]
 /// (set_memory_limit is QuickJS's HARD limit — the pre-guard fires before
@@ -2093,7 +2168,16 @@ fn register_http_bridges<'js>(
                         "",
                     );
                 }
-                let extra_tags = params.tags;
+                let mut extra_tags = params.tags;
+                // TR-244: `exec.vu.tags` is a live mutable object — scripts
+                // tag subsequent metrics by writing it. The bridge reads it
+                // from the JS scope at request time and merges its entries
+                // (k6: vu.tags become part of every metric's tag set).
+                if let Ok(exec_tags) = read_exec_vu_tags(&ctx) {
+                    for (k, v) in exec_tags {
+                        extra_tags.insert(k, v);
+                    }
+                }
                 // Execute on the dedicated I/O runtime via the shared
                 // blocking helper — safe from inside ctx.with on a
                 // current-thread VU runtime. No block_on here: that
@@ -2309,8 +2393,13 @@ fn register_http_bridges<'js>(
                 // for binary, timings, cookies, error_code).
                 let resp_obj = rquickjs::Object::new(ctx.clone())?;
                 let mut seen_keys = std::collections::HashSet::new();
+                // TR-244: exec.vu.tags applies to batch requests too.
+                let exec_vu_tags = read_exec_vu_tags(&ctx).unwrap_or_default();
                 if let Ok(results) = responses {
-                    for (key, req, result, extra_tags, start, response_type) in results {
+                    for (key, req, result, mut extra_tags, start, response_type) in results {
+                        for (k, v) in &exec_vu_tags {
+                            extra_tags.insert(k.clone(), v.clone());
+                        }
                         let key_str = match key {
                             serde_json::Value::String(s) => s,
                             serde_json::Value::Number(n) => n.to_string(),
@@ -3855,8 +3944,29 @@ fn call_module_handle_summary(
         result
     };
 
+    // TR-246: k6 falls back to the DEFAULT summary when handleSummary
+    // returns any falsy value (undefined, null, false, 0, or ""). The old
+    // code only treated undefined/null as "no custom summary", so
+    // `return "";` produced an EMPTY stdout instead of the default report.
+    // rquickjs::Value has no generic is_truthy — the falsy primitives are
+    // checked explicitly.
     if result.is_undefined() || result.is_null() {
         return Ok(None);
+    }
+    if let Some(b) = result.as_bool() {
+        if !b {
+            return Ok(None);
+        }
+    }
+    if let Some(n) = result.as_number() {
+        if n == 0.0 {
+            return Ok(None);
+        }
+    }
+    if let Some(s) = result.as_string().and_then(|s| s.to_string().ok()) {
+        if s.is_empty() {
+            return Ok(None);
+        }
     }
 
     let stringify: rquickjs::Function = json_obj.get("stringify")?;
@@ -4706,9 +4816,25 @@ mod tests {
             let mp_body: String = ctx
                 .eval("__captured[2].body")
                 .expect("read captured[2] body");
+            // TR-232: the boundary is a random 60-hex-char string (k6 uses
+            // crypto/rand hex); the body must be framed with it.
+            let boundary: String = mp_headers
+                .split("boundary=")
+                .nth(1)
+                .map(|s| s.chars().filter(|c| c.is_ascii_hexdigit()).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                boundary.len(),
+                60,
+                "boundary must be 60 hex chars: {boundary}"
+            );
             assert!(
-                mp_body.contains("----TropelFormBoundary"),
-                "multipart body missing framing: {mp_body}"
+                boundary.chars().all(|c| c.is_ascii_hexdigit()),
+                "boundary must be hex: {boundary}"
+            );
+            assert!(
+                mp_body.contains(&boundary),
+                "multipart body missing boundary framing: {mp_body}"
             );
 
             // 5. A lowercase `content-type` declaration must be replaced (not
@@ -4726,6 +4852,38 @@ mod tests {
                     .to_lowercase()
                     .contains("\"content-type\":\"multipart/form-data\""),
                 "boundary-less content-type variant leaked into header: {mp_lower}"
+            );
+        });
+    }
+
+    /// TR-232: k6 expands ARRAY values in an object body into repeated
+    /// urlencoded keys (`{a: [1, 2]}` → `a=1&a=2`). The old `String(array)`
+    /// produced `a=1,2`.
+    #[test]
+    fn test_urlencoded_array_values_expand_to_repeated_keys() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            // Stub the native HTTP bridge; capture the body handed to it.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body) {
+                    globalThis.__captured.push({ headers: JSON.parse(headersJson), body: body });
+                    return { code: 200, status: 200, body: '{}', headers: {}, responseTime: 5 };
+                };
+                "#,
+            )
+            .expect("stub should eval");
+            let body: String = ctx
+                .eval("http.post('https://e.com/', { a: [1, 2], b: 'x' }); __captured[0].body")
+                .expect("eval must succeed");
+            // The body is the urlencoded serialization.
+            assert_eq!(
+                body, "a=1&a=2&b=x",
+                "array values must expand to repeated keys, got: {body}"
             );
         });
     }
@@ -7835,6 +7993,45 @@ mod tests {
         );
     }
 
+    /// TR-244: `exec.vu.tags['key'] = 'value'` must tag subsequent http
+    /// samples (k6's live mutable VU tag object). The bridge reads it at
+    /// request time and merges the entries into the sample tags.
+    #[tokio::test]
+    async fn test_exec_vu_tags_reach_http_samples() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                exec.vu.tags['team'] = 'billing';
+                exec.vu.tags['region'] = 'eu';
+                http.get('http://example.com/');
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "http_req_duration")
+            .expect("http_req_duration sample");
+        assert_eq!(
+            sample.tags.get("team"),
+            Some("billing"),
+            "exec.vu.tags['team'] must tag the http sample, got: {:?}",
+            sample.tags.get("team")
+        );
+        assert_eq!(
+            sample.tags.get("region"),
+            Some("eu"),
+            "exec.vu.tags['region'] must tag the http sample"
+        );
+    }
+
     /// TR-212: k6 systemTags — `proto` (not `protocol`) and `error_code` must
     /// appear on every http sample. `error_code` = 1000+status for >=400,
     /// 0 for <400 (k6 semantics), so dashboards can distinguish status
@@ -9121,6 +9318,22 @@ mod tests {
                 // exec.test.abort must exist and reach the bridge.
                 globalThis.__test_type = typeof exec.test.abort;
                 exec.test.abort('stop now');
+                // TR-244: exec.vu.tags is a live mutable object; scripts write
+                // it to tag subsequent metrics. exec.vu.metrics exists with
+                // its own tags + metadata objects.
+                globalThis.__vu_tags_type = typeof exec.vu.tags;
+                exec.vu.tags['mykey'] = 'myvalue';
+                globalThis.__vu_tags_val = exec.vu.tags['mykey'];
+                globalThis.__metrics_type = typeof exec.vu.metrics;
+                globalThis.__metrics_tags_type = typeof exec.vu.metrics.tags;
+                globalThis.__metrics_meta_type = typeof exec.vu.metrics.metadata;
+                // TR-244: exec.test.fail exists and throws (run continues but
+                // the iteration is marked failed) — distinct from abort.
+                globalThis.__fail_type = typeof exec.test.fail;
+                globalThis.__fail_throws = String((function () {
+                    try { exec.test.fail('boom'); return 'no-throw'; }
+                    catch (e) { return e.message; }
+                })());
             "#,
             )
             .expect("script should eval");
@@ -9136,6 +9349,14 @@ mod tests {
             assert_eq!(ctx.eval::<String, _>("__exec").unwrap(), "shared-iterations");
             assert_eq!(ctx.eval::<String, _>("__test_type").unwrap(), "function", "exec.test.abort must be a function");
             assert_eq!(ctx.eval::<String, _>("__aborted").unwrap(), "stop now", "exec.test.abort must reach the native bridge");
+            // TR-244: exec.vu.tags must be a mutable object.
+            assert_eq!(ctx.eval::<String, _>("__vu_tags_type").unwrap(), "object", "exec.vu.tags must be an object");
+            assert_eq!(ctx.eval::<String, _>("__vu_tags_val").unwrap(), "myvalue", "exec.vu.tags['mykey'] = 'myvalue' must survive");
+            assert_eq!(ctx.eval::<String, _>("__metrics_type").unwrap(), "object", "exec.vu.metrics must exist");
+            assert_eq!(ctx.eval::<String, _>("__metrics_tags_type").unwrap(), "object", "exec.vu.metrics.tags must exist");
+            assert_eq!(ctx.eval::<String, _>("__metrics_meta_type").unwrap(), "object", "exec.vu.metrics.metadata must exist");
+            assert_eq!(ctx.eval::<String, _>("__fail_type").unwrap(), "function", "exec.test.fail must be a function");
+            assert_eq!(ctx.eval::<String, _>("__fail_throws").unwrap(), "boom", "exec.test.fail must throw the message");
         });
     }
 
@@ -9201,6 +9422,28 @@ mod tests {
         assert_eq!(map.get("stdout").map(|s| s.as_str()), Some("async 3"));
     }
 
+    #[test]
+    fn test_module_eval_handle_summary_falsy_returns_none() {
+        // TR-246: k6 falls back to the DEFAULT summary when handleSummary
+        // returns any falsy value (false, 0, ""), not just undefined/null.
+        // The old code treated "" as an empty-map result, so `return "";`
+        // produced an EMPTY stdout instead of the default report.
+        for source in [
+            r#"export function handleSummary(data) { return ""; } export default function(){}"#,
+            r#"export function handleSummary(data) { return false; } export default function(){}"#,
+            r#"export function handleSummary(data) { return 0; } export default function(){}"#,
+        ] {
+            let rt = rquickjs::Runtime::new().unwrap();
+            let ctx = rquickjs::Context::full(&rt).unwrap();
+            let result: Option<HashMap<String, String>> =
+                ctx.with(|ctx| call_module_handle_summary(&ctx, source, "{}").unwrap());
+            assert!(
+                result.is_none(),
+                "falsy handleSummary return must fall back to the default summary, got {result:?}"
+            );
+        }
+    }
+
     // ── k6 `open()` + `k6/data` SharedArray ──
 
     /// Create a JsContext with the k6 file bridges + shim installed.
@@ -9260,6 +9503,75 @@ mod tests {
             .await
             .expect("sleep must not count against the JS execution deadline");
         assert_eq!(out.trim(), "2");
+    }
+
+    #[tokio::test]
+    async fn test_http_cookie_jar_callbacks_constants() {
+        // TR-233: the http module exposes cookieJar() (4 methods, values-only
+        // cookiesForURL), setResponseCallback/expectedStatuses, asyncRequest,
+        // and the TLS_1_*/OCSP_* constants.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var jar = http.cookieJar();
+                var jar2 = new http.CookieJar();
+                var expected = http.expectedStatuses([200, 204]);
+                JSON.stringify({
+                    jarMethods: [typeof jar.cookiesForURL, typeof jar.set, typeof jar.clear, typeof jar.delete],
+                    jarCtor: typeof jar2.set,
+                    tls13: http.TLS_1_3,
+                    ocsp: http.OCSP_STATUS_REVOKED,
+                    asyncReq: typeof http.asyncRequest,
+                    expMatch: expected({ status: 204 }),
+                    expMiss: expected({ status: 500 }),
+                    setCbType: typeof http.setResponseCallback,
+                })
+                "#,
+            )
+            .await
+            .expect("TR-233 probe must eval");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["jarMethods"][0], "function", "cookiesForURL must exist");
+        assert_eq!(v["jarMethods"][1], "function", "set must exist");
+        assert_eq!(v["jarMethods"][2], "function", "clear must exist");
+        assert_eq!(v["jarMethods"][3], "function", "delete must exist");
+        assert_eq!(
+            v["jarCtor"], "function",
+            "new http.CookieJar() must construct"
+        );
+        assert_eq!(v["tls13"], "tls1.3");
+        assert_eq!(v["ocsp"], "revoked");
+        assert_eq!(v["asyncReq"], "function", "http.asyncRequest must exist");
+        assert_eq!(
+            v["expMatch"], true,
+            "expectedStatuses([200,204]) must match 204"
+        );
+        assert_eq!(v["expMiss"], false, "expectedStatuses must not match 500");
+        assert_eq!(
+            v["setCbType"], "function",
+            "http.setResponseCallback must exist"
+        );
+
+        // setResponseCallback(null) suppresses failure; a callback replaces
+        // the default 200-399 rule.
+        let out2 = ctx
+            .eval(
+                r#"
+                var results = [];
+                http.setResponseCallback(function (res) { return res.status === 418; });
+                var cb = http.expectedStatuses([418, 418]);
+                http.setResponseCallback(cb);
+                results.push(cb({ status: 418 }));
+                results.push(cb({ status: 200 }));
+                http.setResponseCallback(null);
+                results.push('null-ok');
+                JSON.stringify(results)
+                "#,
+            )
+            .await
+            .expect("setResponseCallback probe must eval");
+        assert_eq!(out2, "[true,false,\"null-ok\"]");
     }
 
     #[tokio::test]
@@ -9345,6 +9657,63 @@ mod tests {
         assert_eq!(
             out, "[[\"a\",\"c\"],\"a\",0,false,true,2,[\"a\",\"c\"],true,1]",
             "string/pair/matcher shorthand across the collection family"
+        );
+    }
+
+    /// TR-246: verify groupBy, keyBy, orderBy, sortBy work correctly.
+    /// These were marked done in the register but had no dedicated test —
+    /// the lodash conformance suite (193 cases) exercises them, but the
+    /// per-function test surface was missing.
+    #[tokio::test]
+    async fn test_lodash_group_key_order_sort() {
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var items = [
+                    { name: 'a', group: 1, score: 3 },
+                    { name: 'b', group: 1, score: 1 },
+                    { name: 'c', group: 2, score: 2 },
+                ];
+                JSON.stringify({
+                    // groupBy: should group by property string iteratee.
+                    groupBy: (function () {
+                        var g = _.groupBy(items, 'group');
+                        return { keys: Object.keys(g).map(Number), lens: [g[1].length, g[2].length] };
+                    })(),
+                    // keyBy: should index by property string iteratee.
+                    keyBy: (function () {
+                        var k = _.keyBy(items, 'name');
+                        return { keys: Object.keys(k).sort(), aName: k.a.name };
+                    })(),
+                    // orderBy: single iteratee, asc.
+                    orderByAsc: _.orderBy(items, 'score', 'asc').map(function (x) { return x.name; }),
+                    // orderBy: single iteratee, desc.
+                    orderByDesc: _.orderBy(items, 'score', 'desc').map(function (x) { return x.name; }),
+                    // orderBy: multiple iteratees.
+                    orderByMulti: _.orderBy(items, ['group', 'score'], ['asc', 'desc']).map(function (x) { return x.name; }),
+                    // sortBy: no iteratee → identity (should sort by serialized value).
+                    sortByIdentity: (function () {
+                        var s = _.sortBy([3, 1, 2]);
+                        return s.join(',');
+                    })(),
+                    // sortBy: property string iteratee.
+                    sortByProperty: _.sortBy(items, 'score').map(function (x) { return x.name; }),
+                    // padStart: multi-char pad must REPEAT (register: old code
+                    // returned '07' for '0' pad — lodash repeats to '0007').
+                    padStartRepeat: _.padStart('7', 4, '0'),
+                    padStartMulti: _.padStart('7', 4, 'ab'),
+                    padEndRepeat: _.padEnd('7', 4, '0'),
+                    padEndMulti: _.padEnd('7', 4, 'ab'),
+                })
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            r#"{"groupBy":{"keys":[1,2],"lens":[2,1]},"keyBy":{"keys":["a","b","c"],"aName":"a"},"orderByAsc":["b","c","a"],"orderByDesc":["a","c","b"],"orderByMulti":["a","b","c"],"sortByIdentity":"1,2,3","sortByProperty":["b","c","a"],"padStartRepeat":"0007","padStartMulti":"aba7","padEndRepeat":"7000","padEndMulti":"7aba"}"#,
+            "groupBy / keyBy / orderBy / sortBy / padStart / padEnd must produce correct results"
         );
     }
 
@@ -10357,22 +10726,23 @@ mod tests {
             .eval(
                 r#"
                 JSON.stringify([
-                    crypto.sha256('hello', 'hex'),
-                    crypto.sha1('hello', 'hex'),
-                    crypto.md5('hello', 'hex'),
-                    crypto.md4('abc', 'hex'),
-                    crypto.sha512_224('abc', 'hex'),
-                    crypto.sha512_256('abc', 'hex'),
-                    crypto.ripemd160('hello', 'hex'),
-                    crypto.sha256('hello', 'base64'),
-                    crypto.sha256('hello', 'base64url'),
-                    crypto.sha256('hello', 'base64rawurl'),
-                    Array.from(new Uint8Array(crypto.sha256('hello', 'binary'))).join(','),
+                    sha256('hello', 'hex'),
+                    sha1('hello', 'hex'),
+                    md5('hello', 'hex'),
+                    md4('abc', 'hex'),
+                    sha512_224('abc', 'hex'),
+                    sha512_256('abc', 'hex'),
+                    ripemd160('hello', 'hex'),
+                    sha256('hello', 'base64'),
+                    sha256('hello', 'base64url'),
+                    sha256('hello', 'base64rawurl'),
+                    Array.from(new Uint8Array(sha256('hello', 'binary'))).join(','),
                 ])
                 "#,
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|e| format!("EVAL_ERR: {e}"));
+        assert!(!out.starts_with("EVAL_ERR"), "crypto eval failed: {out}");
         assert_eq!(
             out,
             concat!(
@@ -10403,17 +10773,17 @@ mod tests {
                 var key = [11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11];
                 var keyBuf = new Uint8Array(key).buffer;
                 JSON.stringify([
-                    crypto.hmac('sha256', keyBuf, 'Hi There', 'hex'),
-                    crypto.createHash('sha256').update('he').update('llo').digest('hex'),
-                    crypto.createHMAC('sha256', keyBuf).update('Hi').update(' There').digest('hex'),
+                    hmac('sha256', keyBuf, 'Hi There', 'hex'),
+                    createHash('sha256').update('he').update('llo').digest('hex'),
+                    createHMAC('sha256', keyBuf).update('Hi').update(' There').digest('hex'),
                     // Exercising the digest-0.11 md5 arm of the hmac dispatcher
                     // (RFC 1320 test suite: HMAC-MD5 of "what do ya want for
                     // nothing?" with key "Jefe" = 750c783e6ab0b503eaa86e310a5db738).
                     // Strings are passed straight through (k6ToBytes output is a
                     // plain JS array, which the shim's k6ToBytes rejects).
-                    crypto.hmac('md5', 'Jefe', 'what do ya want for nothing?', 'hex'),
-                    crypto.hexEncode('hello'),
-                    new Uint8Array(crypto.randomBytes(8)).length,
+                    hmac('md5', 'Jefe', 'what do ya want for nothing?', 'hex'),
+                    hexEncode('hello'),
+                    new Uint8Array(randomBytes(8)).length,
                 ])
                 "#,
             )
@@ -10493,6 +10863,65 @@ mod tests {
         assert_eq!(
             out, "[0,2,2]",
             "cleared timeout must not fire; interval re-arms per pump; clearInterval stops it"
+        );
+    }
+
+    /// TR-242: `__tropel_timers` must not grow without bound. The reset now
+    /// throws when the live timer count exceeds the cap (10000) — a script
+    /// that arms setInterval in a loop without clearing is a broken artifact
+    /// and must fail loudly instead of leaking memory for the whole run.
+    #[tokio::test]
+    async fn test_timer_cap_fails_loudly_on_unbounded_growth() {
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                // Arm 10001 one-shots WITHOUT clearing — the reset must throw.
+                for (var i = 0; i < 10001; i++) { setTimeout(function () {}, 60000); }
+                try {
+                    __tropel_reset_timers();
+                    'no-throw';
+                } catch (e) {
+                    String(e);
+                }
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("Timer limit exceeded"),
+            "reset must name the cap, got: {out}"
+        );
+    }
+
+    /// TR-242: `globalThis.crypto` must be the WHATWG WebCrypto object, not
+    /// the k6/crypto module namespace (the register's "wrong object" leak).
+    /// k6/crypto's named functions are bare globals; WebCrypto lives at
+    /// `globalThis.crypto` — scripts use `crypto.getRandomValues` /
+    /// `crypto.subtle.digest`.
+    #[tokio::test]
+    async fn test_global_this_crypto_is_webcrypto_not_k6_module() {
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify({
+                    isWebCrypto: typeof globalThis.crypto.getRandomValues === 'function'
+                        && typeof globalThis.crypto.subtle === 'object'
+                        && typeof globalThis.crypto.subtle.digest === 'function',
+                    hasK6NamedFnOnGlobal: typeof globalThis.crypto.sha256,
+                    // k6/crypto named functions remain bare globals (module
+                    // exports surface, matching k6's import model).
+                    sha256IsBare: typeof sha256,
+                })
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            r#"{"isWebCrypto":true,"hasK6NamedFnOnGlobal":"undefined","sha256IsBare":"function"}"#,
+            "globalThis.crypto must be WebCrypto; k6/crypto fns stay bare globals"
         );
     }
 
@@ -10973,6 +11402,84 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 )
                 .expect("TextDecoder must accept an ArrayBuffer");
             assert_eq!(len, 2);
+        });
+    }
+
+    /// TR-241: `globalThis.crypto` is the WHATWG WebCrypto object (not the
+    /// k6/crypto module namespace). Scripts use `crypto.randomUUID()`,
+    /// `crypto.getRandomValues()`, and `crypto.subtle.digest('SHA-256', data)`.
+    #[test]
+    fn test_k6_shim_bundle_has_webcrypto_global() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            // Stub the native bridges the k6-shim probes at load (the driver
+            // registers real ones; a bare eval needs stand-ins).
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_native_random_bytes = function (n) {
+                    var b = new Uint8Array(n);
+                    for (var i = 0; i < n; i++) b[i] = (i * 37 + n) % 256;
+                    return b;
+                };
+                globalThis.__tropel_native_hmac = function (alg, key, data) {
+                    var out = new Uint8Array(32);
+                    for (var i = 0; i < 32; i++) out[i] = (key.length + data.length + alg.length + i) % 256;
+                    return out;
+                };
+                globalThis.__tropel_native_sha256 = function (d) { return globalThis.__tropel_native_hmac('sha256', new Uint8Array(0), d); };
+                globalThis.__tropel_native_sha1 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_sha384 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_sha512 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_base64_encode = function (b) { return ''; };
+                globalThis.__tropel_native_base64url_encode = function (b) { return ''; };
+                globalThis.__tropel_native_base64_decode = function (s) { return new Uint8Array(0); };
+            "#,
+            )
+            .expect("native bridge stubs must eval");
+            let bundle = format!(
+                "{}\n{}\n",
+                include_str!("../../../../js/k6-shim/k6-shim.js"),
+                include_str!("../../../../js/k6-shim/open-data-shim.js")
+            );
+            ctx.eval::<(), _>(bundle.as_str())
+                .expect("shims in production order must eval");
+
+            let uuid: String = ctx
+                .eval("crypto.randomUUID()")
+                .unwrap_or_else(|e| format!("ERR: {e}"));
+            assert_ne!(uuid, "", "crypto.randomUUID must exist, got err: {uuid}");
+            assert_eq!(uuid.len(), 36, "UUID must be RFC 4122 v4 shape, got {uuid}");
+            let chars: Vec<char> = uuid.chars().collect();
+            assert_eq!(chars[14], '4', "UUID must be version 4");
+
+            let rand_ok: bool = ctx
+                .eval(
+                    "var a = new Uint8Array(4); \
+                     var r = crypto.getRandomValues(a); \
+                     r === a && a.length === 4",
+                )
+                .expect("crypto.getRandomValues must exist");
+            assert!(rand_ok, "getRandomValues must fill the typed array");
+
+            // subtle.digest is async — eval to a Promise and finish it.
+            let digest_res: std::result::Result<String, rquickjs::Error> = ctx
+                .eval::<rquickjs::Promise, _>(
+                    "(async function () { \
+                       try { \
+                         var buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('hi')); \
+                         return String(buf instanceof ArrayBuffer && buf.byteLength === 32); \
+                       } catch (e) { \
+                         return 'ERR: ' + e.message; \
+                       } \
+                     })()",
+                )
+                .and_then(|p| p.finish::<String>().map_err(|_| rquickjs::Error::Exception));
+            let digest_str = digest_res.unwrap_or_else(|e| format!("PROMISE_ERR: {e}"));
+            assert_eq!(
+                digest_str, "true",
+                "crypto.subtle.digest must return an ArrayBuffer, got: {digest_str}"
+            );
         });
     }
 

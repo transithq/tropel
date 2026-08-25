@@ -131,6 +131,8 @@ pub struct HttpClient {
     /// Log every HTTP request/response (method, URL, status, timing) at
     /// debug level — the `--http-debug` flag / `HttpConfig.http_debug`.
     http_debug: bool,
+    /// `--http-debug=full` — also log request/response bodies.
+    http_debug_full: bool,
     /// k6 `blacklistIPs` CIDRs, parsed once at client build. Hostnames are
     /// filtered by the DNS resolver, but an IP-literal URL (e.g.
     /// `http://127.0.0.1:8080`) never triggers a lookup — reqwest hands the
@@ -208,6 +210,7 @@ impl HttpClient {
             discard_bodies: config.discard_response_bodies,
             rps,
             http_debug: config.http_debug,
+            http_debug_full: config.http_debug_full,
             blacklist: parse_blacklist(&config.blacklist_ips),
         })
     }
@@ -595,13 +598,32 @@ impl HttpClient {
         if self.http_debug {
             // info! so the flag is self-sufficient: the default log filter is
             // WARN, and a debug-level line would only appear with RUST_LOG.
-            tracing::info!(
-                "HTTP >>> {:?} {} (body {} bytes, {} headers)",
-                request.method,
-                request.url,
-                request_body_size,
-                request.headers.len()
-            );
+            if self.http_debug_full {
+                let body_preview = body_bytes
+                    .as_deref()
+                    .map(|b| String::from_utf8_lossy(&b[..b.len().min(1024)]).into_owned())
+                    .unwrap_or_else(|| "(no body)".to_string());
+                let headers: Vec<String> = request
+                    .headers
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v))
+                    .collect();
+                tracing::info!(
+                    "HTTP >>> {:?} {} headers={:?} body={:?}",
+                    request.method,
+                    request.url,
+                    headers,
+                    body_preview
+                );
+            } else {
+                tracing::info!(
+                    "HTTP >>> {:?} {} (body {} bytes, {} headers)",
+                    request.method,
+                    request.url,
+                    request_body_size,
+                    request.headers.len()
+                );
+            }
         }
 
         // Build the reqwest request
@@ -669,6 +691,10 @@ impl HttpClient {
             check_literal_blacklist(&self.blacklist, &current_url)?;
             // Line 454: parse once per hop, reuse for cookie jar + redirect.
             let hop_url = reqwest::Url::parse(&current_url).ok();
+            // The per-hop timing slot is created BEFORE the request body so the
+            // timed body wrapper can record the request-write phase into it.
+            // request_start is stamped later, just before execute() (see below).
+            let slot = crate::subtimings::new_slot();
 
             // Build the reqwest request for THIS hop (URL/method/body may
             // have been rewritten by a redirect). Match by reference: the
@@ -706,7 +732,24 @@ impl HttpClient {
                 }
             };
             if let Some(bytes) = &current_body {
-                req_builder = req_builder.body(reqwest::Body::from(bytes.clone()));
+                // TR-202: wrap the body in a timed body so `sending` is a REAL
+                // measurement (the wire-write time of the request body), not a
+                // hardcoded 0. The wrapper preserves Content-Length (exact size
+                // hint), so the wire format is unchanged. The `sending` phase
+                // is recorded into this hop's slot; k6's tracer.go subtleties
+                // are applied in the timings assembly (see `k6_done`).
+                //
+                // Gated on `signer.is_none()`: the Digest challenge-response
+                // retry re-sends the request via `built_request.try_clone()`,
+                // which returns None for a streaming (wrapped) body — wrapping
+                // a signed request would silently disable the 401 retry.
+                if signer.is_none() {
+                    let timed =
+                        crate::subtimings::TimedBody::new(bytes.clone().into(), slot.clone());
+                    req_builder = req_builder.body(reqwest::Body::wrap(timed));
+                } else {
+                    req_builder = req_builder.body(reqwest::Body::from(bytes.clone()));
+                }
             }
 
             // Add headers
@@ -857,7 +900,7 @@ impl HttpClient {
             // fully built and signed so build+sign overhead is excluded from
             // blocked/waiting, and total = Σphases actually holds.
             let hop_start = std::time::Instant::now();
-            let slot = crate::subtimings::begin_request(hop_start);
+            crate::subtimings::stamp_request_start(&slot, hop_start);
 
             // The response head (status line + headers) is received when this
             // resolves. The measured "waiting" time includes everything up to
@@ -1019,21 +1062,15 @@ impl HttpClient {
                     }
                     let hop_total = hop_start.elapsed();
                     let hop_phases = crate::subtimings::take_slot(&slot);
-                    let mut hop_timings =
-                        Timings::from_measured(waiting_duration, Duration::ZERO, hop_total);
-                    if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
-                        hop_phases.request_start,
-                        hop_phases.connect_start,
-                        hop_phases.connect_elapsed,
-                    ) {
-                        hop_timings.blocked =
-                            connect_start.saturating_duration_since(request_start);
-                        hop_timings.dns = hop_phases.dns_elapsed.unwrap_or_default();
-                        hop_timings.connecting = connect_elapsed.saturating_sub(hop_timings.dns);
-                    }
-                    let hop_connect =
-                        hop_timings.blocked + hop_timings.dns + hop_timings.connecting;
-                    hop_timings.waiting = hop_timings.waiting.saturating_sub(hop_connect);
+                    // TR-202: same k6 tracer.go assembly as the final response —
+                    // the hop's `sending` is real (timed body wrapper), and the
+                    // waiting guard + reused-connection basis are identical.
+                    let hop_timings = crate::subtimings::k6_done(
+                        &hop_phases,
+                        waiting_duration,
+                        Duration::ZERO,
+                        hop_total,
+                    );
 
                     // `size` counts the drained hop body bytes so data_received
                     // per hop matches the wire (k6 counts per-request
@@ -1179,41 +1216,46 @@ impl HttpClient {
             // "127.0.0.1") reqwest's HttpConnector skips DNS resolution entirely,
             // so only the connect phases exist.
             let phases = crate::subtimings::take_slot(&slot);
-            let mut timings =
-                Timings::from_measured(waiting_duration, receiving_duration, total_duration);
-            if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
-                phases.request_start,
-                phases.connect_start,
-                phases.connect_elapsed,
-            ) {
-                timings.blocked = connect_start.saturating_duration_since(request_start);
-                timings.dns = phases.dns_elapsed.unwrap_or_default();
-                // connect_elapsed spans DNS + TCP (+ TLS for https); subtract the
-                // separately-measured DNS to leave the transport phases.
-                timings.connecting = connect_elapsed.saturating_sub(timings.dns);
-            }
-
-            // k6 phase semantics: `http_req_waiting` (TTFB) is measured from the
-            // moment the request is fully sent, EXCLUDING the connection phases.
-            // Our `waiting_duration` is stamped just before `client.execute()`,
-            // so for a fresh connection it *includes* blocked + DNS + connecting.
-            // Subtract them so the breakdown sums to `total`:
-            //   total = blocked + dns + connecting + waiting + receiving
-            // (tls_handshaking/sending stay zero — reqwest seals those inside the
-            // connector/request future; see the module docs.) For pooled reuse the
-            // connect phases are zero, so `waiting` is unchanged.
-            let connect_phases = timings.blocked + timings.dns + timings.connecting;
-            timings.waiting = timings.waiting.saturating_sub(connect_phases);
+            // TR-202: full k6 `tracer.go` `Done()` port — real `sending`
+            // (measured by the timed body wrapper), the TLS-vs-plain sending
+            // basis, the reused-connection stamp overwrite, and the
+            // `gotFirstResponseByte > wroteRequest` waiting guard. `waiting`
+            // excludes the request-write time, so `http_req_duration =
+            // sending + waiting + receiving` no longer undercounts.
+            let timings = crate::subtimings::k6_done(
+                &phases,
+                waiting_duration,
+                receiving_duration,
+                total_duration,
+            );
 
             if self.http_debug {
-                tracing::info!(
-                    "HTTP <<< {:?} {} -> {} ({} bytes in {:.2?})",
-                    request.method,
-                    current_url,
-                    status_code,
-                    size,
-                    total_duration
-                );
+                if self.http_debug_full {
+                    let body_preview =
+                        String::from_utf8_lossy(&body_vec[..body_vec.len().min(1024)]).into_owned();
+                    let headers: Vec<String> = headers
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect();
+                    tracing::info!(
+                        "HTTP <<< {:?} {} -> {} headers={:?} body={:?} in {:.2?}",
+                        request.method,
+                        current_url,
+                        status_code,
+                        headers,
+                        body_preview,
+                        total_duration
+                    );
+                } else {
+                    tracing::info!(
+                        "HTTP <<< {:?} {} -> {} ({} bytes in {:.2?})",
+                        request.method,
+                        current_url,
+                        status_code,
+                        size,
+                        total_duration
+                    );
+                }
             }
 
             let response = HttpResponse {
@@ -2793,5 +2835,69 @@ mod tests {
         }
 
         server.abort();
+    }
+
+    /// TR-202 twin guard: the Digest challenge-response retry must still work
+    /// when a request carries a body. The timed body wrapper is a streaming
+    /// body (`reqwest::Body::wrap`), and `Request::try_clone` returns `None`
+    /// for streaming bodies — so a signed request must keep the plain
+    /// cloneable body, or the 401 retry silently stops happening (the engine
+    /// would report the unauthenticated 401 as the request's result). This
+    /// test runs a full challenge-response round trip WITH a body and asserts
+    /// the retry fires (status 200, not 401).
+    #[tokio::test(flavor = "current_thread")]
+    async fn digest_retry_with_body_still_retries_when_timed_body_gated_off() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Server: first request gets `401 WWW-Authenticate: Digest ...`, second
+        // (retried) request gets 200. The 401 body carries the challenge realm;
+        // the retry must carry the request body too.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..n]);
+                let has_auth = raw.to_ascii_lowercase().contains("authorization:");
+                let has_body = raw.contains("digest-body");
+                let body = format!("attempt:auth={has_auth},body={has_body}");
+                let resp = if has_auth {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"t\", nonce=\"n\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let signer = tropel_auth::signers::DigestAuth::new("user", "pass");
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+        let req = Request {
+            url: format!("http://{}/x", addr),
+            method: Method::POST,
+            body: Some(Body::Raw("digest-body".to_string())),
+            ..Default::default()
+        };
+
+        let resp = client.execute(&req, Some(&signer)).await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            resp.status_code, 200,
+            "Digest retry must fire and succeed (timed-body gating must not \
+             disable the 401 challenge-response retry)"
+        );
+        let echo = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(
+            echo.contains("body=true"),
+            "retried request must carry the request body, server saw: {echo}"
+        );
     }
 }

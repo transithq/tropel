@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tropel_core::config::ExecutionConfig;
-use tropel_sdk::Result;
+use tropel_sdk::{Result, TropelError};
 
 /// Hard bound on the trailing VU-handle join. After `grace` expires the
 /// scheduler force-stops; if a VU still ignores that (e.g. a runaway JS
@@ -1953,23 +1953,55 @@ fn rate_per_second(rate: f64, time_unit: &str) -> Result<f64> {
 /// Public so the engine CLI can fail fast on `-d 30x` before the engine
 /// even constructs a scheduler (same backlog line 53 guarantee).
 pub fn validate_execution_config(config: &ExecutionConfig) -> Result<()> {
+    // k6 `executor/constant_vus.go:40` — the minimum duration for a
+    // `duration`/`maxDuration` field is 1s. 0-duration STAGES remain legal
+    // (instant VU jumps); only the executor-level run length is floored.
+    // `executor/ramping_vus.go:22` — `maxConcurrentVUs = 100_000_000` is the
+    // sanity cap on startVUs and every stage target.
+    const MAX_CONCURRENT_VUS: u32 = 100_000_000;
+    const MIN_RUN_DURATION: &str = "1s";
+
+    let floor_run_duration = |d: &str| -> Result<()> {
+        let parsed = parse_duration(d)?;
+        let floor = parse_duration(MIN_RUN_DURATION)?;
+        if parsed < floor {
+            return Err(TropelError::Config(format!(
+                "the duration must be at least {MIN_RUN_DURATION}, but is {d}"
+            )));
+        }
+        Ok(())
+    };
+
     match config {
         ExecutionConfig::ConstantVus { duration, .. } => {
-            parse_duration(duration)?;
+            floor_run_duration(duration)?;
         }
         ExecutionConfig::ConstantArrivalRate {
             duration,
             time_unit,
             ..
         } => {
-            parse_duration(duration)?;
+            floor_run_duration(duration)?;
             // W0 P0#1: a malformed timeUnit must fail the run loudly, not
             // silently default the rate to per-second.
             time_unit_seconds(time_unit)?;
         }
-        ExecutionConfig::RampingVus { stages, .. } => {
-            for stage in stages {
+        ExecutionConfig::RampingVus {
+            stages, start_vus, ..
+        } => {
+            if *start_vus > MAX_CONCURRENT_VUS {
+                return Err(TropelError::Config(format!(
+                    "the startVUs exceed the max limit of {MAX_CONCURRENT_VUS}"
+                )));
+            }
+            for (i, stage) in stages.iter().enumerate() {
                 parse_duration(&stage.duration)?;
+                if stage.target > MAX_CONCURRENT_VUS {
+                    return Err(TropelError::Config(format!(
+                        "target for stage {} exceeds the max limit of {MAX_CONCURRENT_VUS}",
+                        i + 1
+                    )));
+                }
             }
         }
         ExecutionConfig::RampingArrivalRate {
@@ -1983,12 +2015,12 @@ pub fn validate_execution_config(config: &ExecutionConfig) -> Result<()> {
         ExecutionConfig::SharedIterations { max_duration, .. }
         | ExecutionConfig::PerVUIterations { max_duration, .. } => {
             if let Some(d) = max_duration {
-                parse_duration(d)?;
+                floor_run_duration(d)?;
             }
         }
         ExecutionConfig::ExternallyControlled { duration, .. } => {
             if let Some(d) = duration {
-                parse_duration(d)?;
+                floor_run_duration(d)?;
             }
         }
     }
@@ -2020,6 +2052,71 @@ mod tests {
         );
         // And the executor must not have started any VU work.
         assert_eq!(sched.active_vus().await, 0);
+    }
+
+    /// TR-220: a `duration` below the 1s floor must be rejected at startup —
+    /// k6's `constant_vus.go` enforces `minDuration = 1s`.
+    #[test]
+    fn validate_rejects_duration_below_1s_floor() {
+        let cfg = ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "500ms".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        };
+        let err = validate_execution_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("at least 1s"),
+            "must mention the 1s floor, got: {}",
+            err
+        );
+    }
+
+    /// TR-220: a 1s duration is legal; 0-duration STAGES are legal (instant
+    /// VU jumps) — the floor applies only to executor-level run lengths.
+    #[test]
+    fn validate_accepts_1s_and_zero_duration_stages() {
+        assert!(validate_execution_config(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        })
+        .is_ok());
+        assert!(validate_execution_config(&ExecutionConfig::RampingVus {
+            start_vus: 1,
+            stages: vec![tropel_core::config::Stage {
+                duration: "0s".to_string(),
+                target: 10,
+            }],
+            graceful_ramp_down: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        })
+        .is_ok());
+    }
+
+    /// TR-220: `startVUs` / stage targets above `maxConcurrentVUs`
+    /// (100_000_000) must be rejected — k6's sanity cap against OOM.
+    #[test]
+    fn validate_rejects_start_vus_over_max_concurrent() {
+        let over = 100_000_001u32;
+        let cfg = ExecutionConfig::RampingVus {
+            start_vus: over,
+            stages: vec![tropel_core::config::Stage {
+                duration: "1s".to_string(),
+                target: 1,
+            }],
+            graceful_ramp_down: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        };
+        let err = validate_execution_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("max limit of 100000000"),
+            "must mention the cap, got: {}",
+            err
+        );
     }
 
     /// VU ids are handed to `run_vu` for data-row rotation / worker pinning /

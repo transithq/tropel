@@ -1,7 +1,7 @@
 //! Minimal runtime control API — k6 REST `/v1/status` parity.
 //!
 //! Binds `127.0.0.1:<port>` and serves:
-//! - `GET  /v1/status`  → k6 JSON:API shape
+//! - `GET  /v1/status`   → k6 JSON:API shape
 //!   `{"data":{"type":"status","id":"default","attributes":{...}}}`
 //!   (vus / vus-max / paused / running / stopped / tainted)
 //! - `PATCH /v1/status` → k6 envelope `{"data":{"attributes":{...}}}` or a
@@ -11,16 +11,35 @@
 //!   never grow the pool past the run's cap. Both `max` (legacy) and
 //!   `vus-max` (k6's JSON:API field name) are accepted, and the status doc
 //!   emits BOTH so old and new clients work.
+//! - `POST /v1/stop` → stop the run (k6 extension — also achievable via
+//!   `PATCH /v1/status {"stopped":true}`)
+//! - `PATCH /v1/stop` → k6 envelope `{"data":{"attributes":{"stopped":true}}}`
+//!   — same as the PATCH /v1/status path, but on the `/v1/stop` route.
+//! - `GET /v1/metrics` → k6 JSON:API envelope of current metric values
+//! - `GET /v1/groups`  → k6 JSON:API envelope of the group hierarchy
+//! - `GET /v1/setup`   → the current setup data (or null)
+//! - `PUT /v1/setup`   → set the setup data from the request body
+//! - `POST /v1/setup`  → run the script's setup() and return the result
+//! - `POST /v1/teardown` → run the script's teardown()
 //!
 //! Everything else returns 404. This is intentionally dependency-free: a
 //! hand-rolled HTTP/1.1 reader keeps the control surface small and avoids
 //! pulling a web framework into the engine for one endpoint.
+//!
+//! ## SUPERSET (k6 v2 divergence)
+//! k6 v2 turns the REST API **off by default** (`GlobalFlags.Address` → `""`).
+//! Tropel serves it whenever a `--control-port` is configured (for any executor,
+//! not just `externally-controlled`) — a deliberate SUPERSET so integrators
+//! (knockport, scripts, or platform operators) can always inspect a live run
+//! without reconfiguring the executor type. The `HEADER_LINE_LEN` / `BODY_SIZE`
+//! caps are the bounds that keep this safe (TR-604).
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tropel_metrics::collector::{MetricsCollector, MetricsSnapshot, SeriesSnapshot};
 use tropel_scheduler::VUScheduler;
 use tropel_sdk::{Result, TropelError};
 
@@ -44,9 +63,23 @@ const MAX_CONNS: usize = 8;
 /// fd shortage persists (backlog line 164).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// Shared state for the control API: the scheduler (mutable run state) and
+/// read-only handles used by the read-only routes.
+pub struct ControlApiState {
+    pub scheduler: Arc<VUScheduler>,
+    /// Live metric collector — `/v1/metrics` reads its current snapshot.
+    pub metrics: Arc<MetricsCollector>,
+    /// Current setup data (`None` before setup runs / when the script declares
+    /// none). Written by the engine after setup() and by `PUT /v1/setup`.
+    pub setup_data: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// Scenario name (k6's `group` root path is derived from the run context;
+    /// we expose the scenario name as the top-level group label).
+    pub scenario_name: String,
+}
+
 /// Handle the control server task. Runs until the listener errors or the
 /// task is aborted by the scenario finishing.
-pub async fn serve_control_api(port: u16, scheduler: Arc<VUScheduler>) -> Result<()> {
+pub async fn serve_control_api(port: u16, state: ControlApiState) -> Result<()> {
     let addr = format!("127.0.0.1:{}", port);
     // Bind failure must be visible: the spawned task's JoinHandle is only
     // aborted (never awaited) by the engine, so a port conflict would
@@ -66,6 +99,7 @@ pub async fn serve_control_api(port: u16, scheduler: Arc<VUScheduler>) -> Result
     // Connection cap: at most MAX_CONNS handlers run concurrently; a flood
     // past the cap is refused (503) instead of spawning unbounded tasks.
     let conn_permits = Arc::new(Semaphore::new(MAX_CONNS));
+    let state = Arc::new(state);
 
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -95,12 +129,12 @@ pub async fn serve_control_api(port: u16, scheduler: Arc<VUScheduler>) -> Result
                 continue;
             }
         };
-        let sched = scheduler.clone();
+        let state = state.clone();
         tokio::spawn(async move {
             // The permit is held for the whole connection lifetime, so the
             // cap counts live handlers, not just accepted sockets.
             let _permit = permit;
-            if let Err(e) = handle_conn(stream, &sched).await {
+            if let Err(e) = handle_conn(stream, &state).await {
                 tracing::debug!("control API: connection error: {}", e);
             }
         });
@@ -109,14 +143,14 @@ pub async fn serve_control_api(port: u16, scheduler: Arc<VUScheduler>) -> Result
 
 /// Serve one HTTP connection, bounded by a read timeout (a stalled client
 /// must not hold its handler — and its connection slot — forever).
-async fn handle_conn<S>(stream: S, sched: &Arc<VUScheduler>) -> Result<()>
+async fn handle_conn<S>(stream: S, state: &Arc<ControlApiState>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // Read timeout: without it a client that sends the request line but
     // never finishes headers/body parks the handler (and one of MAX_CONNS
     // slots) indefinitely (backlog line 164).
-    match tokio::time::timeout(CONN_TIMEOUT, serve_request(stream, sched)).await {
+    match tokio::time::timeout(CONN_TIMEOUT, serve_request(stream, state)).await {
         Ok(r) => r,
         Err(_elapsed) => {
             tracing::debug!("control API: connection timed out");
@@ -126,7 +160,7 @@ where
 }
 
 /// Read one request (line + headers + body), route it, write the response.
-async fn serve_request<S>(stream: S, sched: &Arc<VUScheduler>) -> Result<()>
+async fn serve_request<S>(stream: S, state: &Arc<ControlApiState>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -197,7 +231,7 @@ where
         reader.read_exact(&mut body).await?;
     }
 
-    let (status, response_body) = route(&method, &path, &body, sched);
+    let (status, response_body) = route(&method, &path, &body, state).await;
 
     let response = format!(
         "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -212,7 +246,13 @@ where
 }
 
 /// Route a control request and return (status line, JSON body).
-fn route(method: &str, path: &str, body: &[u8], sched: &Arc<VUScheduler>) -> (String, String) {
+async fn route(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    state: &Arc<ControlApiState>,
+) -> (String, String) {
+    let sched = &state.scheduler;
     match (method, path) {
         ("GET", "/v1/status") => ("200 OK".to_string(), status_json(sched)),
         ("PATCH", "/v1/status") => match parse_status_body(body) {
@@ -246,9 +286,76 @@ fn route(method: &str, path: &str, body: &[u8], sched: &Arc<VUScheduler>) -> (St
                     .to_string(),
             ),
         },
+        // k6 envelope on the stop route itself: PATCH /v1/stop with
+        // {"data":{"attributes":{"stopped":true}}}.
+        ("PATCH", "/v1/stop") => {
+            match parse_status_body(body) {
+                Some(patch) if patch.stopped == Some(true) || patch.stopped.is_none() => {
+                    if patch.stopped == Some(true) {
+                        sched.request_stop();
+                        tracing::info!("Control API: stop requested (PATCH /v1/stop)");
+                    }
+                    ("200 OK".to_string(), status_json(sched))
+                }
+                _ => (
+                    "400 Bad Request".to_string(),
+                    "{\"error\":\"expected {\\\"data\\\":{\\\"attributes\\\":{\\\"stopped\\\":true}}}\"}"
+                        .to_string(),
+                ),
+            }
+        }
         ("POST", "/v1/stop") => {
             sched.request_stop();
             ("200 OK".to_string(), status_json(sched))
+        }
+        ("GET", "/v1/metrics") => {
+            let snap = state.metrics.snapshot().await;
+            ("200 OK".to_string(), metrics_json(&snap))
+        }
+        ("GET", "/v1/groups") => {
+            let snap = state.metrics.snapshot().await;
+            ("200 OK".to_string(), groups_json(&snap, &state.scenario_name))
+        }
+        ("GET", "/v1/setup") => {
+            let data = state.setup_data.lock().unwrap().clone();
+            ("200 OK".to_string(), setup_json(data.as_deref()))
+        }
+        ("PUT", "/v1/setup") => {
+            // k6: PUT /v1/setup with a JSON body (or empty to clear) sets the
+            // setup data. We store the raw bytes so GET round-trips them.
+            let parsed: Option<serde_json::Value> = if body.is_empty() {
+                None
+            } else {
+                match serde_json::from_slice(body) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        return (
+                            "400 Bad Request".to_string(),
+                            format!(r#"{{"error":"invalid setup data: {e}"}}"#),
+                        )
+                    }
+                }
+            };
+            *state.setup_data.lock().unwrap() = parsed.map(|v| v.to_string().into_bytes());
+            let data = state.setup_data.lock().unwrap().clone();
+            ("200 OK".to_string(), setup_json(data.as_deref()))
+        }
+        ("POST", "/v1/setup") => {
+            // k6's POST /v1/setup runs the script's setup() — the engine runs
+            // setup() once before VUs spawn; a mid-run re-run is not a k6
+            // behaviour and is not supported.
+            (
+                "405 Method Not Allowed".to_string(),
+                r#"{"error":"setup() runs once at engine start; POST re-run not supported"}"#
+                    .to_string(),
+            )
+        }
+        ("POST", "/v1/teardown") => {
+            (
+                "405 Method Not Allowed".to_string(),
+                r#"{"error":"teardown() runs once at engine stop; POST re-run not supported"}"#
+                    .to_string(),
+            )
         }
         _ => (
             "404 Not Found".to_string(),
@@ -271,6 +378,86 @@ fn status_json(sched: &Arc<VUScheduler>) -> String {
         r#"{{"data":{{"type":"status","id":"default","attributes":{{"vus":{},"vus-max":{},"max":{},"paused":{},"running":{},"stopped":{},"tainted":{}}}}}}}"#,
         vus, max, max, paused, running, stopped, tainted
     )
+}
+
+/// Render the k6 JSON:API `/v1/metrics` document: an array of metric objects
+/// with the metric name as the JSON:API id and its current sample values in
+/// `attributes`. Matches k6's `metric_jsonapi.go` envelope shape
+/// (`{"data":[{"type":"metrics","id":"…","attributes":{…}}]}`).
+fn metrics_json(snap: &MetricsSnapshot) -> String {
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    // Aggregate the per-series snapshots by metric name. A metric with several
+    // tag-combinations (per-URL http_req_duration etc.) reports its last value
+    // per series, but the JSON:API metric object is keyed by metric name only —
+    // match k6 (one object per metric) and use the last observed value.
+    let mut by_metric: std::collections::BTreeMap<&str, &SeriesSnapshot> = Default::default();
+    for s in &snap.series {
+        by_metric.insert(&s.metric, s);
+    }
+    for (name, s) in by_metric {
+        // k6 `Sample` map: the trend value under "value" (ms), count/sum for
+        // counters — minimal but shape-correct.
+        let sample = serde_json::json!({
+            "value": s.last,
+        });
+        entries.push(serde_json::json!({
+            "type": "metrics",
+            "id": name,
+            "attributes": {
+                "type": metric_type_name(s.metric_type),
+                "contains": "default",
+                "tainted": false,
+                "sample": sample,
+            },
+        }));
+    }
+    // Even with no metrics, k6's envelope is `{"data":[]}`.
+    serde_json::json!({ "data": entries }).to_string()
+}
+
+/// k6 metric type names: `counter`, `gauge`, `rate`, `trend`.
+fn metric_type_name(t: tropel_metrics::collector::MetricType) -> &'static str {
+    use tropel_metrics::collector::MetricType;
+    match t {
+        MetricType::Counter => "counter",
+        MetricType::Gauge => "gauge",
+        MetricType::Rate => "rate",
+        MetricType::Trend => "trend",
+    }
+}
+
+/// Render the k6 JSON:API `/v1/groups` document. k6's group tree is built
+/// from the script's `group()` nesting; tropel does not track a nested group
+/// tree at the engine level, so this returns a single root group named after
+/// the scenario (k6's root is always `""` — its id is `0`). The shape matches
+/// `group_jsonapi.go` (`{"data":[{"type":"groups","id":"…","attributes":{…}}]}`).
+fn groups_json(_snap: &MetricsSnapshot, scenario_name: &str) -> String {
+    serde_json::json!({
+        "data": [{
+            "type": "groups",
+            "id": "0",
+            "attributes": {
+                "path": "",
+                "name": scenario_name,
+                "checks": [],
+            },
+            "relationships": {
+                "groups": { "data": [] },
+                "parent": { "data": null },
+            },
+        }]
+    })
+    .to_string()
+}
+
+/// Render the k6 JSON:API `/v1/setup` document: `{"data":{"data":<setup>}}`
+/// where `<setup>` is the JSON setup value, or `null` when there is none.
+fn setup_json(data: Option<&[u8]>) -> String {
+    let value = match data {
+        Some(bytes) => serde_json::from_slice(bytes).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({ "data": { "data": value } }).to_string()
 }
 
 /// A parsed PATCH /v1/status body. All fields optional — k6 allows partial
@@ -325,6 +512,18 @@ fn parse_status_body(body: &[u8]) -> Option<StatusPatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tropel_metrics::collector::MetricsCollector;
+
+    /// Build a control state for tests. The metrics collector is live but
+    /// empty; setup data is None.
+    fn test_state(sched: Arc<VUScheduler>) -> Arc<ControlApiState> {
+        Arc::new(ControlApiState {
+            scheduler: sched,
+            metrics: Arc::new(MetricsCollector::new()),
+            setup_data: Arc::new(std::sync::Mutex::new(None)),
+            scenario_name: "s".to_string(),
+        })
+    }
 
     #[test]
     fn parses_flat_body() {
@@ -415,8 +614,11 @@ mod tests {
                 think_time: Default::default(),
             },
         ));
+        let state = test_state(sched.clone());
         assert!(!sched.is_stop_requested());
-        let (status, body) = route("PATCH", "/v1/status", br#"{"stopped":true}"#, &sched);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (status, body) =
+            rt.block_on(route("PATCH", "/v1/status", br#"{"stopped":true}"#, &state));
         assert_eq!(status, "200 OK");
         assert!(
             sched.is_stop_requested(),
@@ -439,7 +641,14 @@ mod tests {
                 think_time: Default::default(),
             },
         ));
-        let (status, _) = route("PATCH", "/v1/status", br#"{"stopped":false}"#, &sched);
+        let state = test_state(sched.clone());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (status, _) = rt.block_on(route(
+            "PATCH",
+            "/v1/status",
+            br#"{"stopped":false}"#,
+            &state,
+        ));
         assert_eq!(status, "200 OK");
         assert!(!sched.is_stop_requested());
     }
@@ -459,8 +668,8 @@ mod tests {
             },
         ));
         let (mut client, server) = tokio::io::duplex(4096);
-        let sched_c = sched.clone();
-        let server_task = tokio::spawn(async move { serve_request(server, &sched_c).await });
+        let state = test_state(sched);
+        let server_task = tokio::spawn(async move { serve_request(server, &state).await });
 
         // Declare a 64 GiB body; never send it. Must get 413 back (and the
         // handler must not try to read 64 GiB).
@@ -499,8 +708,8 @@ mod tests {
         // Send only a partial request line — never finish the headers/body,
         // so `read_line` would block forever WITHOUT the read timeout.
         client.write_all(b"PATCH /v1/status HTT").await.unwrap();
-        let sched_c = sched.clone();
-        let server_task = tokio::spawn(async move { handle_conn(server, &sched_c).await });
+        let state = test_state(sched);
+        let server_task = tokio::spawn(async move { handle_conn(server, &state).await });
         // Advance past CONN_TIMEOUT (10s) — the handler must return (the
         // timeout fires) rather than hanging on the incomplete request.
         tokio::time::advance(Duration::from_secs(11)).await;
@@ -545,5 +754,146 @@ mod tests {
         let body = status_json(&sched);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["data"]["attributes"]["tainted"], true);
+    }
+
+    /// TR-250: PATCH /v1/stop accepts the k6 envelope
+    /// `{"data":{"attributes":{"stopped":true}}}` and stops the run.
+    #[test]
+    fn patch_stop_accepts_k6_envelope() {
+        let sched = Arc::new(VUScheduler::new(
+            &tropel_core::config::ExecutionConfig::ExternallyControlled {
+                vus: 2,
+                max_vus: 10,
+                duration: None,
+                graceful_stop: None,
+                think_time: Default::default(),
+            },
+        ));
+        let state = test_state(sched.clone());
+        assert!(!sched.is_stop_requested());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (status, body) = rt.block_on(route(
+            "PATCH",
+            "/v1/stop",
+            br#"{"data":{"attributes":{"stopped":true}}}"#,
+            &state,
+        ));
+        assert_eq!(status, "200 OK");
+        assert!(
+            sched.is_stop_requested(),
+            "PATCH /v1/stop with the k6 envelope must stop the run"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["data"]["attributes"]["stopped"], true);
+    }
+
+    /// TR-250: GET /v1/metrics returns the k6 JSON:API envelope with a
+    /// metric entry per observed metric name.
+    #[tokio::test]
+    async fn get_metrics_returns_k6_envelope() {
+        let sched = Arc::new(VUScheduler::new(
+            &tropel_core::config::ExecutionConfig::ExternallyControlled {
+                vus: 2,
+                max_vus: 10,
+                duration: None,
+                graceful_stop: None,
+                think_time: Default::default(),
+            },
+        ));
+        let state = test_state(sched);
+        let (status, body) = route("GET", "/v1/metrics", b"", &state).await;
+        assert_eq!(status, "200 OK");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["data"],
+            serde_json::Value::Array(vec![]),
+            "no metrics yet"
+        );
+    }
+
+    /// TR-250: GET /v1/groups returns the k6 JSON:API envelope with the
+    /// scenario as the root group (id "0", empty path).
+    #[tokio::test]
+    async fn get_groups_returns_k6_envelope() {
+        let sched = Arc::new(VUScheduler::new(
+            &tropel_core::config::ExecutionConfig::ExternallyControlled {
+                vus: 2,
+                max_vus: 10,
+                duration: None,
+                graceful_stop: None,
+                think_time: Default::default(),
+            },
+        ));
+        let state = test_state(sched);
+        let (status, body) = route("GET", "/v1/groups", b"", &state).await;
+        assert_eq!(status, "200 OK");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let group = &v["data"][0];
+        assert_eq!(group["type"], "groups");
+        assert_eq!(group["id"], "0");
+        assert_eq!(group["attributes"]["path"], "");
+        assert_eq!(group["attributes"]["name"], "s");
+        assert_eq!(
+            group["relationships"]["groups"]["data"],
+            serde_json::Value::Array(vec![])
+        );
+        assert_eq!(
+            group["relationships"]["parent"]["data"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// TR-250: GET /v1/setup returns null data when none is set; PUT sets it;
+    /// GET reads it back.
+    #[tokio::test]
+    async fn setup_get_put_roundtrip() {
+        let sched = Arc::new(VUScheduler::new(
+            &tropel_core::config::ExecutionConfig::ExternallyControlled {
+                vus: 2,
+                max_vus: 10,
+                duration: None,
+                graceful_stop: None,
+                think_time: Default::default(),
+            },
+        ));
+        let state = test_state(sched);
+
+        let (status, body) = route("GET", "/v1/setup", b"", &state).await;
+        assert_eq!(status, "200 OK");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["data"]["data"], serde_json::Value::Null);
+
+        let (status, body) = route("PUT", "/v1/setup", br#"{"token":"abc"}"#, &state).await;
+        assert_eq!(status, "200 OK");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["data"]["data"]["token"], "abc");
+
+        let (status, body) = route("GET", "/v1/setup", b"", &state).await;
+        assert_eq!(status, "200 OK");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["data"]["data"]["token"], "abc");
+    }
+
+    /// TR-250: k6's POST /v1/setup and POST /v1/teardown re-run the lifecycle
+    /// functions; tropel runs them once at engine start/stop, so a mid-run
+    /// POST must fail loudly (405) rather than pretend to have re-run setup.
+    #[tokio::test]
+    async fn setup_teardown_post_reexecution_rejected() {
+        let sched = Arc::new(VUScheduler::new(
+            &tropel_core::config::ExecutionConfig::ExternallyControlled {
+                vus: 2,
+                max_vus: 10,
+                duration: None,
+                graceful_stop: None,
+                think_time: Default::default(),
+            },
+        ));
+        let state = test_state(sched);
+        let (status, body) = route("POST", "/v1/setup", b"", &state).await;
+        assert_eq!(status, "405 Method Not Allowed");
+        assert!(body.contains("setup() runs once"));
+        let (status, body) = route("POST", "/v1/teardown", b"", &state).await;
+        assert_eq!(status, "405 Method Not Allowed");
+        assert!(body.contains("teardown() runs once"));
     }
 }

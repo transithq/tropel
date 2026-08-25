@@ -135,10 +135,13 @@ pub enum Commands {
         #[arg(short = 'v', long = "verbose")]
         verbose: bool,
 
-        /// Log every HTTP request/response at debug level (method, URL,
-        /// status, timing). Equivalent to `HttpConfig.http_debug`.
-        #[arg(long = "http-debug")]
-        http_debug: bool,
+        /// Log every HTTP request/response at debug level. Without `=full`,
+        /// prints the method, URL, status, timing, and body / header counts.
+        /// With `--http-debug=full`, also prints the request/response headers
+        /// and the first 1 KiB of the body. Equivalent to k6's `--http-debug`
+        /// and `--http-debug=full`.
+        #[arg(long = "http-debug", num_args = 0..=1, default_missing_value = "headers")]
+        http_debug: Option<String>,
 
         /// Never follow redirects: each 3xx response is returned to the
         /// script as-is and every redirect hop is counted as a request
@@ -263,6 +266,13 @@ pub enum Commands {
 
     /// Print the version and build information
     Version,
+
+    /// Generate a new k6-style script template.
+    New {
+        /// Output file path (default: `script.js`).
+        #[arg(default_value = "script.js")]
+        output: PathBuf,
+    },
 }
 
 impl Cli {
@@ -347,6 +357,7 @@ pub async fn run_cli() -> Result<()> {
             .await
         }
         Commands::Version => print_version(),
+        Commands::New { output } => crate::cli_commands::new_command(&output),
     }
 }
 
@@ -408,7 +419,11 @@ async fn run_command(cli: Cli) -> Result<()> {
     let control_port = *control_port;
     let thresholds = threshold.clone();
     let insecure = *insecure;
-    let http_debug = *http_debug;
+    let http_debug_mode = http_debug.as_deref();
+    let http_debug = http_debug.is_some();
+    let http_debug_full = http_debug_mode
+        .map(|v| v.eq_ignore_ascii_case("full"))
+        .unwrap_or(false);
     let no_redirects = *no_redirects;
     let no_thresholds = *no_thresholds;
     // `mode` is now optional so we can tell whether the user explicitly chose
@@ -554,6 +569,7 @@ async fn run_command(cli: Cli) -> Result<()> {
     // the overlay to make sure they always win (regardless of what the
     // overlay set).
     config.http.http_debug = http_debug;
+    config.http.http_debug_full = http_debug_full;
     config.http.no_redirects = no_redirects;
 
     // ── Apply the overlay (CLI flags win; overlay fills gaps) ──

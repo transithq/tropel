@@ -23,3 +23,5 @@ simd-json.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 serde_urlencoded.workspace = true
+http-body = "1.0"
+bytes.workspace = true

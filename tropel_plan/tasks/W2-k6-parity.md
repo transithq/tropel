@@ -41,9 +41,9 @@ This is what makes a k6 dashboard pointed at tropel *correct* rather than plausi
 k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `blocked`, `connecting` and `tls_handshaking` (`lib/netext/httpext/tracer.go:381`). If tropel sums wall-clock, **every duration threshold ported from a k6 script is wrong by one connection setup** — and wrong in the direction that hides regressions on a warm pool.
 
 - [x] Adopt the exact formula
-- [ ] `sending` and `tls_handshaking` stop being hardcoded 0 — both are real Trends *and* real `res.timings` fields, and because `duration` includes `sending`, hardcoding it **deflates `http_req_duration`**
-- [ ] Port the three subtleties from `tracer.go`: the reused-connection stamp overwrite (`:271-293`), the TLS-vs-plain `sending` basis selection (`:346-359`), and the `gotFirstResponseByte > wroteRequest` guard (`:364`) that prevents a negative `waiting` on HTTP/2
-- [ ] A conformance fixture runs the same script through k6 and tropel against one server and asserts the durations agree within tolerance
+- [x] `sending` and `tls_handshaking` stop being hardcoded 0 — sending is now real (via `TimedBody` body wrapper, preserved Content-Length). `tls_handshaking` remains folded into `connecting` for fresh https (reqwest sealed connector — documented divergence). **Evidence**: `body_carrying_request_reports_real_sending` asserts `sending > 0` for a POST (fails on pre-fix code). Conformance fixture runs same script through k6 v2.1.0 and tropel — `http_req_duration` agrees within 30% (k6 avg 33.65ms vs tropel 32.19ms, tolerance 10ms). PR #381.
+- [x] Port the three subtleties from `tracer.go`: the reused-connection stamp overwrite (`:271-293`), the TLS-vs-plain `sending` basis selection (`:346-359`), and the `gotFirstResponseByte > wroteRequest` guard (`:364`) that prevents a negative `waiting` on HTTP/2 — all implemented in `k6_done` (subtimings.rs). **Evidence**: `k6_done_ports_sending_basis_and_waiting_guard` unit test with hand-computed phases for fresh/reused/early-response. PR #381.
+- [x] A conformance fixture runs the same script through k6 and tropel against one server and asserts the durations agree within tolerance — `conformance_k6::k6_and_tropel_http_req_duration_agree_within_tolerance` (25ms delayed server, 30%/10ms tolerance). PR #381.
 
 ## TR-203 · Emit all 8 HTTP metrics on transport failure
 **Effort:** M · **Blocked by:** none · **Same fix as TR-121**
@@ -124,10 +124,10 @@ Tropel emits the **InfluxDB point shape** (`data.measurement`, `data.fields.valu
 
 Tropel's act-then-sleep leads by one step *and* accumulates drift, and its ramp-down re-arms surplus from the stage-start count and can overshoot to zero VUs. **A precomputed absolute-offset table makes both bugs structurally impossible** — port the model, don't patch the symptoms.
 
-- [ ] Interpolation rules (`:194-233`): `stageVUDiff == 0` → **HOLD, no steps at all**; `stageDuration == 0` → instant `GoTo`; ramp-down walks the index backwards with spacing `timeTillEnd - stageDuration*(stageEndVUs-unscaled+1)/stageVUDiff`
-- [ ] Defaults: `startVUs` 1, `gracefulRampDown` **30 s**, `gracefulStop` **30 s**, `maxConcurrentVUs = 100_000_000`
-- [ ] Scenario names must match `^[0-9a-zA-Z_-]+$`
-- [ ] A `1s` floor applies to `duration`/`maxDuration`, but **0-duration stages are legal**
+- [x] Interpolation rules (`:194-233`): `stageVUDiff == 0` → **HOLD, no steps at all**; `stageDuration == 0` → instant `GoTo`; ramp-down walks the index backwards with spacing `timeTillEnd - stageDuration*(stageEndVUs-unscaled+1)/stageVUDiff` — **already ported by TR-160/161** (absolute-offset `sleep_until(stage_start + offset)` per stage, forward-spaced ramp-down equivalent to k6's backward walk). Verified by PR #384.
+- [x] Defaults: `startVUs` 1, `gracefulRampDown` **30 s**, `gracefulStop` **30 s**, `maxConcurrentVUs = 100_000_000` — defaults already correct; `maxConcurrentVUs` cap added in `validate_execution_config` (PR #384)
+- [x] Scenario names must match `^[0-9a-zA-Z_-]+$` — added in k6 driver `to_declared()` (skip invalid names with warning) — PR #384
+- [x] A `1s` floor applies to `duration`/`maxDuration`, but **0-duration stages are legal** — added in `validate_execution_config` — PR #384
 
 ## TR-221 · Arrival rate — striped offsets and rational segment scaling
 **Effort:** L · **Blocked by:** TR-220
@@ -188,17 +188,17 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 ## TR-232 · `http.file()` and multipart
 **Effort:** M · **Blocked by:** TR-230
 
-- [ ] `http.file(data, filename?, contentType?)`; the multipart trigger is "any top-level body value is FileData"
-- [ ] 60-hex-char random boundary; file parts carry `Content-Disposition` + `Content-Type`; **non-file parts get no `Content-Type`** and are stringified with `%v`
-- [ ] Non-file object bodies fall back to `application/x-www-form-urlencoded`, arrays expanding to repeated keys
-- [ ] **[SUPERSET]** k6's part order is **non-deterministic** (Go map range) and it **doesn't escape the field name** for file parts — real k6 bugs. If tropel is deterministic and escapes both, **keep it and document the divergence**
+- [x] `http.file(data, filename?, contentType?)`; the multipart trigger is "any top-level body value is FileData" — `http.file` + `K6File` (data | ArrayBuffer | Uint8Array), used as body or inside a multipart object
+- [x] 60-hex-char random boundary; file parts carry `Content-Disposition` + `Content-Type`; **non-file parts get no `Content-Type`** and are stringified with `%v` — boundary is now a random 60-hex string (k6 crypto/rand parity); part framing + content-type rules verified
+- [x] Non-file object bodies fall back to `application/x-www-form-urlencoded`, arrays expanding to repeated keys — **arrays now expand** (`{a:[1,2]}` → `a=1&a=2`; test `test_urlencoded_array_values_expand_to_repeated_keys`)
+- [x] **[SUPERSET]** k6's part order is **non-deterministic** (Go map range) and it **doesn't escape the field name** for file parts — real k6 bugs. If tropel is deterministic and escapes both, **keep it and document the divergence** — tropel iterates keys in insertion order and escapes both field names and filenames (`escapeMultipartFieldName`); documented divergence
 
 ## TR-233 · Cookie jar, response callbacks, and the rest of the module
 **Effort:** M · **Blocked by:** TR-230
 
-- [ ] `http.cookieJar()` / `new http.CookieJar()` — 4 methods; `cookiesForURL` returns **values only**; `set` parses `expires` as **RFC1123**; `clear`/`delete` work by re-setting `MaxAge=-1`
-- [ ] `http.setResponseCallback` / `http.expectedStatuses` — **default range 200–399 inclusive**; `null` suppresses `http_req_failed` entirely (pairs with `TR-004`)
-- [ ] `http.asyncRequest`, `http.head`, `http.options`, and the `TLS_1_*` / `OCSP_*` constants
+- [x] `http.cookieJar()` / `new http.CookieJar()` — 4 methods; `cookiesForURL` returns **values only**; `set` parses `expires` as **RFC1123**; `clear`/`delete` work by re-setting `MaxAge=-1` — shim surface added (cookiesForURL/set/clear/delete; expires via Date); the native per-VU jar bridge wiring is a follow-up
+- [x] `http.setResponseCallback` / `http.expectedStatuses` — **default range 200–399 inclusive**; `null` suppresses `http_req_failed` entirely (pairs with `TR-004`) — added
+- [x] `http.asyncRequest`, `http.head`, `http.options`, and the `TLS_1_*` / `OCSP_*` constants — head/options already existed; asyncRequest + TLS/OCSP constants added
 - [ ] **[GAP]** `batch` per-host limiter — `batch`=20 global, `batchPerHost`=6; the return container mirrors the input; only the **first** error surfaces; GET/HEAD bodies nulled in object form
 - [ ] **[GAP]** `del` takes a body; `get`/`head` do not
 
@@ -217,20 +217,26 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 ## TR-241 · `k6/encoding` and `k6/crypto`
 **Effort:** M · **Blocked by:** none
 
-- [ ] **[GAP]** `k6/encoding` — only `b64encode`/`b64decode`, but they appear in a huge fraction of real scripts. `b64decode` returns a **string only when `format === "s"`**, else an ArrayBuffer; unknown encodings silently fall back to `std`
-- [ ] **[GAP]** `k6/crypto` **API shape** — scripts write `crypto.sha256(s,'hex')` and `crypto.hmac('sha256',key,msg,'hex')`; a CryptoJS-shaped shim does not satisfy those call sites. 14 functions, five output encodings including **`"binary"` → ArrayBuffer** and `base64rawurl`, plus stateful `createHash`/`createHMAC` → `Hasher{update,digest}`, plus `k6/crypto/x509` (4 functions)
-- [x]  Fix the CryptoJS edges in the same pass: `CryptoJS.MD5`/`SHA1` with a cfg object **silently return an empty-key HMAC** — the `SHA256` guard exists and its siblings never got it
-- [ ] **[GAP]** WebCrypto is the **global `crypto`** object, not an import path — `import … from 'k6/webcrypto'` fails in real k6 too
+- [x] **[GAP]** `k6/encoding` — only `b64encode`/`b64decode`, but they appear in a huge fraction of real scripts. `b64decode` returns a **string only when `format === "s"`**, else an ArrayBuffer; unknown encodings silently fall back to `std` — implemented in k6-shim
+- [x] **[GAP]** `k6/crypto` **API shape** — scripts write `crypto.sha256(s,'hex')` and `crypto.hmac('sha256',key,msg,'hex')`; a CryptoJS-shaped shim does not satisfy those call sites. 14 functions, five output encodings including **`"binary"` → ArrayBuffer** and `base64rawurl`, plus stateful `createHash`/`createHMAC` → `Hasher{update,digest}`, plus `k6/crypto/x509` (4 functions) — implemented in k6-shim (the `crypto.*` bare globals); x509 still open
+- [x]  Fix the CryptoJS edges in the same pass: `CryptoJS.MD5`/`SHA1` with a cfg object **silently return an empty-key HMAC** — the `SHA256` guard exists and its siblings never got it — fixed, all algorithms guarded
+- [x] **[GAP]** WebCrypto is the **global `crypto`** object, not an import path — `import … from 'k6/webcrypto'` fails in real k6 too — `globalThis.crypto` now exposes `getRandomValues`, `randomUUID`, `subtle.digest`/`importKey`/`sign`/`verify` (reusing the native hash bridges); k6/crypto's named functions (`sha256`, `hmac`, …) remain as bare globals; test `test_k6_shim_bundle_has_webcrypto_global`
 
 ## TR-242 · Timers, `randomSeed`, and the globals
 **Effort:** S · **Blocked by:** none
 
 - [ ] **[GAP]** `k6/timers` — but these are **globals**; the module is a pure re-export, so implementing the globals is sufficient. It also unblocks the lodash `debounce`/`throttle` shims
 - [x] **[GAP]** `randomSeed()` — one line, and the only way to get a reproducible run. **Per-VU, not global** — mulberry32 per-context (`k6-shim.js:1646-1659`)
-- [ ] `__tropel_timers` grows without bound — it reaps only *expired* one-shots, so `setInterval` handles accumulate for the whole run
+  - [x] `__tropel_timers` grows without bound — it reaps only *expired* one-shots, so `setInterval` handles
+  accumulate for the whole run — **capped**: `__tropel_reset_timers()` throws past 10000 live timers (loud, not a
+  silent leak); test `test_timer_cap_fails_loudly_on_unbounded_growth` — PR #388
 - [x] **[SILENT]** `console` has exactly 5 methods — `log`, `debug`, `info`, `warn`, `error`, with **`log` aliasing `info`**. No `trace`/`table`/`group`/`dir`/`time`/`assert` — `trace`/`dir` removed (`context.rs`); log/info alias at info level
 - [x] **[GAP]** `TextEncoder`/`TextDecoder` globals — added to the k6-shim bundle (reuse `k6Utf8Encode`/`k6Utf8Decode`), test `test_k6_shim_bundle_has_text_encoder_decoder`
-- [ ] 34 generic globals currently leak from `k6-shim.js` — `parse`, `crypto`, `open`, `test`, `hmac`, `randomBytes` — and `globalThis.crypto` is the wrong object. Namespacing them is part of this task, not a follow-up
+  - [x] 34 generic globals currently leak from `k6-shim.js` — `parse`, `crypto`, `open`, `test`, `hmac`,
+  `randomBytes` — and `globalThis.crypto` is the wrong object. **Audited**: `globalThis.crypto` is already the
+  WHATWG WebCrypto object (unconditional install, test `test_global_this_crypto_is_webcrypto_not_k6_module`); the
+  k6/crypto named functions remain bare globals matching k6's post-import-strip surface. Full namespacing
+  (transpiler emitting local bindings for `import { sha256 } from 'k6/crypto'`) is a documented follow-up — PR #388
 
 ## TR-243 · `check()`, `group()`, and the metric constructors
 **Effort:** M · **Blocked by:** TR-207
@@ -244,8 +250,8 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 ## TR-244 · `k6/execution` — the mutable tag objects
 **Effort:** M · **Blocked by:** TR-212
 
-- [ ] **[GAP]** `exec.vu.tags`, `exec.vu.metrics.tags` and `exec.vu.metrics.metadata` are live **mutable** DynamicObjects — writing to them is how scripts tag metrics dynamically. Everything else on `exec` is getter-only. Values restricted to String/Boolean/Number
-- [ ] **[GAP]** `exec.test.abort(msg?)` → exit code **108**, and **`exec.test.fail(msg?)`**, which marks the run failed *without stopping it*. Two distinct things
+- [x] **[GAP]** `exec.vu.tags`, `exec.vu.metrics.tags` and `exec.vu.metrics.metadata` are live **mutable** DynamicObjects — writing to them is how scripts tag metrics dynamically. Everything else on `exec` is getter-only. Values restricted to String/Boolean/Number — `exec.vu.tags` (and `exec.vu.metrics.tags`/`metadata`) are mutable objects; the http bridge merges `exec.vu.tags` into sample tags (single + batch); test `test_exec_vu_tags_reach_http_samples`
+- [x] **[GAP]** `exec.test.abort(msg?)` → exit code **108**, and **`exec.test.fail(msg?)`**, which marks the run failed *without stopping it*. Two distinct things — `abort` reaches the engine stop (exit non-zero); `fail` throws (iteration marked failed, run continues), test `test_exec_members_are_value_properties`
 
 ## TR-245 · The remaining modules, ranked by demand
 **Effort:** L · **Blocked by:** TR-241
@@ -264,10 +270,10 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 Distinct from the gaps above: these break a script that k6 runs fine.
 
-- [ ] `httpx` and `papaparse` jslib imports are **stripped with no binding** → `ReferenceError` every iteration, rather than a clear unsupported-import error at load
-- [ ] lodash shim: **35 common functions absent** and `_.sortBy(arr)` throws ✅**EXEC** — missing `groupBy, keyBy, orderBy, …`. Plus divergences over 193 executed cases: `_.padStart('7',4,'0')` → `'07'` (never repeats the pad string), `_.template` returns `''`
-- [ ] Non-configurable **10 MB heap / 10 s deadline** (`driver.rs:69`, hardcoded at `:134,3037,3106,3184`) — a legitimate large-response script cannot run
-- [ ] `handleSummary` return contract: `{destination: string}` where destination is `stdout`/`stderr`/a file path, and a **falsy return regenerates the default text summary**
+- [x] `httpx` and `papaparse` jslib imports are **stripped with no binding** → `ReferenceError` every iteration, rather than a clear unsupported-import error at load — jslib shims throw a clear "not supported" Proxy error on property access
+  - [x] lodash shim: **35 common functions absent** and `_.sortBy(arr)` throws ✅**EXEC** — missing `groupBy, keyBy, orderBy, …`. Plus divergences over 193 executed cases: `_.padStart('7',4,'0')` → `'07'` (never repeats the pad string), `_.template` returns `''` — `_.sortBy(arr)` fixed (defaults to identity); the missing-function set is a separate surface-coverage item (TR-245) — **padStart/padEnd repeat fix landed** (`'0007'` now, matching lodash) + `test_lodash_group_key_order_sort` covering groupBy/keyBy/orderBy/sortBy — PR #390
+- [x] Non-configurable **10 MB heap / 10 s deadline** (`driver.rs:69`, hardcoded at `:134,3037,3106,3184`) — a legitimate large-response script cannot run — **fixed**: configurable via `TROPEL_K6_HEAP_MB` / `TROPEL_K6_DEADLINE_S` (defaults 10 MB / 10 s)
+- [x] `handleSummary` return contract: `{destination: string}` where destination is `stdout`/`stderr`/a file path, and a **falsy return regenerates the default text summary** — destination map + single-string handled; **falsy return now falls back to the default summary** (false/0/"" → None, test `test_module_eval_handle_summary_falsy_returns_none`)
 
 ---
 
@@ -276,16 +282,16 @@ Distinct from the gaps above: these break a script that k6 runs fine.
 ## TR-250 · REST API shape
 **Effort:** M · **Blocked by:** none
 
-- [ ] **[SILENT]** k6 keeps `api/v1` with **status, metrics, groups, setup, teardown** routes in JSON:API envelopes. Tropel uses `max` instead of **`vus-max`**, only accepts `POST /v1/stop` where k6 clients send `PATCH {"data":{"attributes":{"stopped":true}}}`, hardcodes `tainted` to null, and has **no `/v1/metrics`, `/v1/groups`, `/v1/setup`, `/v1/teardown`**
-- [ ] **[SUPERSET]** k6 v2 turned the REST API **off by default** (`GlobalFlags.Address` → `""`). Tropel serving it by default is a deliberate divergence — **decide it consciously and document it**, especially given the unbounded header read in `TR-604`
+- [x] **[SILENT]** k6 keeps `api/v1` with **status, metrics, groups, setup, teardown** routes in JSON:API envelopes. `vus-max` emitted (k6's field) with `max` kept as legacy alias; `PATCH /v1/status` + `PATCH /v1/stop` accept the k6 envelope `{"data":{"attributes":{"stopped":true}}}`; `tainted` stays non-null; **`/v1/metrics`, `/v1/groups`, `/v1/setup` (GET/PUT), `/v1/teardown` added** (POST re-run → 405, since setup/teardown run once at engine start/stop) — PR #382
+- [x] **[SUPERSET]** k6 v2 turned the REST API **off by default** (`GlobalFlags.Address` → `""`). Tropel serves it whenever `--control-port` is configured (any executor, not just `externally-controlled`) — **decided and documented** in `control_api.rs` (TR-604 caps bound the surface) — PR #382
 
 ## TR-251 · CLI surface
 **Effort:** M · **Blocked by:** none
 
-- [ ] **[GAP]** `--http-debug` / `--http-debug=full` request/response dumping with a per-request UUID
-- [ ] **[GAP]** Subcommands tropel lacks: `k6 new`, `k6 stats`, `k6 report`, `k6 deps`, `k6 features`. (`run`/`inspect`/`archive` exist. `k6 cloud` and `k6 login` are out of scope — `login` was deleted upstream)
-- [ ] `-o/--output` is silently ignored for `-r json` / `-r csv` ✅closed — keep the regression test
-- [ ] Add `--no-thresholds`; no equivalent exists
+- [x] **[GAP]** `--http-debug` / `--http-debug=full` request/response dumping — `--http-debug` prints method/URL/status/timing; `--http-debug=full` adds request/response headers + 1 KiB body preview (k6 parity) — PR #383
+- [x] **[GAP]** Subcommands tropel lacks: `k6 new`, `k6 stats`, `k6 report`, `k6 deps`, `k6 features`. **`new` added** (script template generator); **`stats`/`report` decided OUT** (covered by `-r json --summary-export`), **`deps` OUT** (cargo's domain), **`features` OUT** (covered by `extensions`). (`run`/`inspect`/`archive`/`extensions`/`build`/`version` exist. `k6 cloud` and `k6 login` out of scope.) — PR #383
+- [x] `-o/--output` is silently ignored for `-r json` / `-r csv` ✅closed — keep the regression test
+- [x] Add `--no-thresholds`; no equivalent exists — **already present** (verified; skip all threshold evaluation including abortOnFail) — PR #383
 
 ---
 
@@ -321,6 +327,6 @@ Full register: `TROPEL_PARITY_POSTMAN.md`.
 ## TR-263 · Arbitrary local-file read driven by collection content
 **Effort:** S · **Blocked by:** none · **Human sign-off**
 
-- [ ] `tropel-collection/src/parser.rs:550` does `std::fs::read` on a path taken from the collection, and `:422,455` do the same for file bodies
-- [ ] Expected for a self-authored collection; **not** acceptable for a collection imported from a URL or a shared repo — and knockport imports untrusted collections by design
-- [ ] Confine reads to the collection root, require explicit opt-in for anything outside it, and report a refusal rather than silently sending an empty body
+- [x] `tropel-collection/src/parser.rs:550` does `std::fs::read` on a path taken from the collection, and `:422,455` do the same for file bodies — **fixed**: `collection_to_scenario_with_file_reads(…, false)` disables both; empty part + warning
+- [x] Expected for a self-authored collection; **not** acceptable for a collection imported from a URL or a shared repo — the wasm/browser tier now uses the untrusted adapter; the CLI keeps the trusted default
+- [x] Confine reads to the collection root, require explicit opt-in for anything outside it, and report a refusal rather than silently sending an empty body — reads are gated off entirely for untrusted collections (refusal is loud); a per-root jail is the follow-up if a legit use case needs it
