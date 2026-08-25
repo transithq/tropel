@@ -675,7 +675,11 @@ where
     // TR-244: read the abort message so the CLI can exit with k6's 108
     // (ScriptAborted) instead of a generic non-zero.
     let abort_message = abort_message_handle.lock().unwrap().clone();
-    (init_failures, script_failures.load(Ordering::SeqCst), abort_message)
+    (
+        init_failures,
+        script_failures.load(Ordering::SeqCst),
+        abort_message,
+    )
 }
 
 // ── Driver HTTP client adapter ──

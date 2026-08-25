@@ -61,7 +61,12 @@ impl ExecutionSegment {
                  {from_num}/{from_den}..{to_num}/{to_den}"
             )));
         }
-        Ok(Self { from_num, from_den, to_num, to_den })
+        Ok(Self {
+            from_num,
+            from_den,
+            to_num,
+            to_den,
+        })
     }
 
     /// Convenience: create from f64 (used by tests that compute bounds
@@ -89,7 +94,11 @@ impl ExecutionSegment {
     }
 
     fn gcd(a: i64, b: i64) -> i64 {
-        if b == 0 { a.abs() } else { Self::gcd(b, a % b) }
+        if b == 0 {
+            a.abs()
+        } else {
+            Self::gcd(b, a % b)
+        }
     }
 
     /// Parse a single fraction like `"1/3"`, `"0.5"`, or `"0"` into an exact
@@ -530,8 +539,9 @@ mod tests {
             for n in [1usize, 2, 3, 7] {
                 let mut total = 0u64;
                 for i in 0..n {
-                    let seg = ExecutionSegment::new_f64(i as f64 / n as f64, (i + 1) as f64 / n as f64)
-                        .unwrap();
+                    let seg =
+                        ExecutionSegment::new_f64(i as f64 / n as f64, (i + 1) as f64 / n as f64)
+                            .unwrap();
                     total += seg.scale_vus(vus) as u64;
                 }
                 assert_eq!(total, vus as u64, "VUs {vus} across {n} segments");

@@ -2250,8 +2250,11 @@ fn register_http_bridges<'js>(
                 let http_for_io = http_client.clone();
                 let batch_limit = batch_limit.clone();
                 // Per-host limiters (lazily created on first request to a host).
-                let per_host_limits: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>> =
-                    Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                let per_host_limits: Arc<
+                    std::sync::Mutex<
+                        std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>,
+                    >,
+                > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
                 let futures = batch_requests.into_iter().map(move |entry| {
                     let key = entry
                         .get("key")
@@ -11069,15 +11072,24 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(
-            v["get"].as_str().unwrap_or_default().contains("k6/secrets is not supported"),
+            v["get"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("k6/secrets is not supported"),
             "secrets.get must throw the clear unsupported error, got {out}"
         );
         assert!(
-            v["source"].as_str().unwrap_or_default().contains("k6/secrets is not supported"),
+            v["source"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("k6/secrets is not supported"),
             "secrets.source must throw the clear unsupported error, got {out}"
         );
         assert!(
-            v["other"].as_str().unwrap_or_default().contains("has no property"),
+            v["other"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("has no property"),
             "unknown secrets props must throw a naming error, got {out}"
         );
     }
