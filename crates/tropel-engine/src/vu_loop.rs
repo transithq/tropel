@@ -332,6 +332,7 @@ async fn run_vus<F>(
     data_rows: std::sync::Arc<Vec<HashMap<String, serde_json::Value>>>,
     test_start: Instant,
     control_port: Option<u16>,
+    setup_data: Option<String>,
     run_vu: F,
 ) -> (u32, u64)
 where
@@ -416,18 +417,23 @@ where
         signal_handle2.request_force_stop();
     });
 
-    // Runtime control API (k6 /v1/status parity): when the executor is
-    // externally-controlled and a control port is configured, serve the
-    // endpoint so VUs can be scaled mid-run. The task aborts when the
-    // scenario finishes (we hold the handle below).
-    let control_server = if matches!(exec_cfg, ExecutionConfig::ExternallyControlled { .. }) {
-        control_port.map(|port| {
-            let sched_handle = executor.control_handle();
-            tokio::spawn(crate::control_api::serve_control_api(port, sched_handle))
-        })
-    } else {
-        None
-    };
+    // Runtime control API (k6 /v1/status parity): when a control port is
+    // configured, serve the endpoint so VUs can be scaled mid-run. The task
+    // aborts when the scenario finishes (we hold the handle below).
+    // TR-250: the API is served for ANY executor (not just externally-
+    // controlled) — a deliberate SUPERSET over k6 v2, which turns the REST
+    // API off by default; documented in control_api.rs.
+    let control_server = control_port.map(|port| {
+        let state = crate::control_api::ControlApiState {
+            scheduler: executor.control_handle(),
+            metrics: metrics.clone(),
+            setup_data: std::sync::Arc::new(std::sync::Mutex::new(
+                setup_data.as_ref().map(|s| s.as_bytes().to_vec()),
+            )),
+            scenario_name: sc_name.clone(),
+        };
+        tokio::spawn(crate::control_api::serve_control_api(port, state))
+    });
 
     let total_iterations = match &exec_cfg {
         ExecutionConfig::SharedIterations { iterations, .. } => *iterations,
@@ -828,6 +834,7 @@ pub(crate) async fn run_scenario_vus(
         data_rows,
         test_start,
         control_port,
+        None, // run_scenario_vus has no driver → no setup data
         move |sched, vu_id, shared| {
             let shared = shared.clone();
             let lane_idx = vu_id as usize % lanes.len();
@@ -1051,6 +1058,7 @@ pub(crate) async fn run_driver_vus(
         data_rows,
         test_start,
         control_port,
+        setup_data_c.clone(),
         move |sched, vu_id, shared| {
             let shared = shared.clone();
             let driver_id = driver_id_c.clone();

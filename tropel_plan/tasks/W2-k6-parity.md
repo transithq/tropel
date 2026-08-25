@@ -276,8 +276,8 @@ Distinct from the gaps above: these break a script that k6 runs fine.
 ## TR-250 · REST API shape
 **Effort:** M · **Blocked by:** none
 
-- [ ] **[SILENT]** k6 keeps `api/v1` with **status, metrics, groups, setup, teardown** routes in JSON:API envelopes. Tropel uses `max` instead of **`vus-max`**, only accepts `POST /v1/stop` where k6 clients send `PATCH {"data":{"attributes":{"stopped":true}}}`, hardcodes `tainted` to null, and has **no `/v1/metrics`, `/v1/groups`, `/v1/setup`, `/v1/teardown`**
-- [ ] **[SUPERSET]** k6 v2 turned the REST API **off by default** (`GlobalFlags.Address` → `""`). Tropel serving it by default is a deliberate divergence — **decide it consciously and document it**, especially given the unbounded header read in `TR-604`
+- [x] **[SILENT]** k6 keeps `api/v1` with **status, metrics, groups, setup, teardown** routes in JSON:API envelopes. `vus-max` emitted (k6's field) with `max` kept as legacy alias; `PATCH /v1/status` + `PATCH /v1/stop` accept the k6 envelope `{"data":{"attributes":{"stopped":true}}}`; `tainted` stays non-null; **`/v1/metrics`, `/v1/groups`, `/v1/setup` (GET/PUT), `/v1/teardown` added** (POST re-run → 405, since setup/teardown run once at engine start/stop) — PR #382
+- [x] **[SUPERSET]** k6 v2 turned the REST API **off by default** (`GlobalFlags.Address` → `""`). Tropel serves it whenever `--control-port` is configured (any executor, not just `externally-controlled`) — **decided and documented** in `control_api.rs` (TR-604 caps bound the surface) — PR #382
 
 ## TR-251 · CLI surface
 **Effort:** M · **Blocked by:** none
