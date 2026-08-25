@@ -7415,6 +7415,58 @@ mod tests {
         );
     }
 
+    /// TR-243: k6 rejects async check() predicates and group() callbacks, and
+    /// metric constructors expose a read-only `.name` plus an `.add()` that
+    /// returns a boolean (false for a non-finite value).
+    #[test]
+    fn test_check_group_async_rejected_and_metric_contract() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+                .expect("pm shim should eval");
+            // Stub the custom-metric bridge + group bridges.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_group_start = function (name) {};
+                globalThis.__tropel_pm_group_end = function (name, dur) {};
+                globalThis.__tropel_pm_test = function (name, passed, tags) {};
+                globalThis.__tropel_pm_custom_metric_add = function (name, value, tags, type, isTime) {};
+                var results = {};
+                try {
+                    check({a: 1}, {ok: async function () { return true; }});
+                    results.asyncCheck = 'no-throw';
+                } catch (e) {
+                    results.asyncCheck = 'threw';
+                }
+                try {
+                    group('g', async function () { return 1; });
+                    results.asyncGroup = 'no-throw';
+                } catch (e) {
+                    results.asyncGroup = 'threw';
+                }
+                var c = new Counter('latency_check');
+                results.name = c.name;
+                c.name = 'overridden';
+                results.nameAfterSet = c.name;
+                results.addOk = c.add(1);
+                results.addBad = c.add(parseFloat('not-a-number'));
+                globalThis.__tr243 = JSON.stringify(results);
+            "#,
+            )
+            .expect("TR-243 probe should eval");
+
+            let raw: String = ctx.eval("__tr243").unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["asyncCheck"], "threw", "async check predicate must be rejected");
+            assert_eq!(v["asyncGroup"], "threw", "async group callback must be rejected");
+            assert_eq!(v["name"], "latency_check");
+            assert_eq!(v["nameAfterSet"], "latency_check", ".name must be read-only");
+            assert_eq!(v["addOk"], true, ".add(1) must return true");
+            assert_eq!(v["addBad"], false, ".add(NaN) must return false");
+        });
+    }
+
     /// W1-B line 159: a non-finite custom-metric value from JS must be
     /// DROPPED at the bridge, not recorded. The wasm driver guards at the
     /// emitter; the k6 bridge used to take `value: f64` straight from JS, so
@@ -7440,11 +7492,10 @@ mod tests {
             .await
             .expect("iteration must complete");
 
-        // The NaN samples DO reach the per-iteration buffer (the bridge guard
-        // is gone — the canonical TR-120 guard is at MetricSet::record and
-        // MetricsCollector::record/record_batch). Assert the buffer carried
-        // both the NaN and the valid sample, then that the COLLECTOR drops
-        // the NaN and the aggregation window survives.
+        // TR-243: the k6 shim's `.add()` now rejects non-finite values (returns
+        // false, drops) BEFORE the bridge — k6 parity. Only the valid sample
+        // reaches the per-iteration buffer. The collector guard (TR-120) still
+        // protects the direct-entry path.
         let latency: Vec<&Sample> = ctx
             .samples
             .iter()
@@ -7452,26 +7503,26 @@ mod tests {
             .collect();
         assert_eq!(
             latency.len(),
-            2,
-            "bridge must forward both samples to the per-iteration buffer"
+            1,
+            "only the valid Trend.add reaches the buffer (shim drops NaN)"
         );
-        assert!(
-            latency.iter().any(|s| !s.value.is_finite()),
-            "NaN Trend.add reaches the buffer (guard is at the collector)"
-        );
-        assert!(latency.iter().any(|s| s.value == 42.0));
+        assert_eq!(latency[0].value, 42.0, "valid Trend.add must survive");
 
         let events: Vec<&Sample> = ctx
             .samples
             .iter()
             .filter(|s| s.metric == "events")
             .collect();
-        assert_eq!(events.len(), 2, "both Counter.add samples reach the buffer");
-        assert!(events.iter().any(|s| !s.value.is_finite()));
+        assert_eq!(
+            events.len(),
+            1,
+            "only the valid Counter.add reaches the buffer"
+        );
+        assert_eq!(events[0].value, 1.0);
 
-        // TR-120: feed the buffer through the real collector and assert the
-        // window survives — the NaN samples are dropped at the primary path,
-        // only the valid ones aggregate.
+        // TR-120: the collector's record/record_batch still guards the
+        // direct-entry path (a NaN fed past the shim must not poison the
+        // window) — the canonical guard at MetricSet::record.
         let collector = tropel_metrics::collector::MetricsCollector::new();
         collector.record_batch(&ctx.samples).await;
         let results = collector.results().await;
@@ -7486,7 +7537,7 @@ mod tests {
         let l = latency_s.expect("latency series must exist");
         assert!(
             l.mean.is_finite(),
-            "NaN Trend must not poison the aggregate (mean={})",
+            "aggregate must stay finite (mean={})",
             l.mean
         );
         assert_eq!(l.count, 1, "only the valid Trend.add should be counted");

@@ -11,6 +11,12 @@ function __tropel_build_binding(namespace) {
     var pm = {};
     var __ns = namespace || 'pm';
 
+// TR-243: detect async functions for check()/group() rejection (k6 parity).
+// An async function's `Symbol.toStringTag` is 'AsyncFunction'.
+function isAsyncFunction(fn) {
+    return Object.prototype.toString.call(fn) === '[object AsyncFunction]';
+}
+
 // ── pm.environment ──
 // Backlog line 89: set/get must be INVERSES. The old setter String()-coerced
 // (pm.response.json() → "[object Object]" stored) and the getter returned raw
@@ -1390,7 +1396,13 @@ pm.metrics = {
 // Wraps a block of code in a named group. Emits group_duration
 // metric (Trend) showing how long the group took to execute.
 // Supports nesting (groups within groups).
+// TR-243: k6 rejects ASYNC group callbacks — an async fn returns a
+// Promise immediately, so the group would measure ~0ms and its internal
+// awaits would run after the group already closed.
 function group(name, fn) {
+    if (typeof fn === 'function' && isAsyncFunction(fn)) {
+        throw new TypeError('group() does not support async callbacks (k6 rejects them)');
+    }
     if (typeof __tropel_pm_group_start === 'function') {
         __tropel_pm_group_start(name);
         var startTime = Date.now();
@@ -1436,6 +1448,14 @@ function check(val, conds, tags) {
         var passed = false;
 
         if (typeof condition === 'function') {
+            // TR-243: k6 rejects ASYNC predicates — an async condition
+            // returns a Promise, `!!Promise` is truthy, so it would record
+            // PASS without ever evaluating. k6 throws instead.
+            if (isAsyncFunction(condition)) {
+                throw new TypeError(
+                    'check() condition "' + name + '" is an async function; k6 rejects async conditions'
+                );
+            }
             // Predicate function — call with the value. On throw, record
             // the failed check, then let the error propagate (k6 parity).
             try {
@@ -1493,13 +1513,30 @@ function Counter(name) {
     this._type = 'counter';
     this._isTime = false;
 }
+// TR-243: k6's `.name` is read-only (the metric name is fixed at
+// construction). Define an own getter so assignment is a silent no-op in
+// sloppy mode and the property always reflects the real name.
+Object.defineProperty(Counter.prototype, 'name', {
+    configurable: false,
+    enumerable: true,
+    get: function () { return this._name; },
+    set: function () { /* k6: name is read-only */ },
+});
 
 Counter.prototype.add = function (value, tags) {
+    var v = Number(value);
+    // TR-243: k6's `.add()` returns a boolean — true when the value is a
+    // finite number (accepted), false when it is NaN/Infinity (silently
+    // dropped unless options.throw, which tropel does not implement — the
+    // primary-path collector guard drops non-finite anyway).
+    if (!isFinite(v)) {
+        return false;
+    }
     if (typeof __tropel_pm_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
+        __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
     }
-    return this;
+    return true;
 };
 
 function Gauge(name) {
@@ -1510,13 +1547,23 @@ function Gauge(name) {
     this._type = 'gauge';
     this._isTime = false;
 }
+Object.defineProperty(Gauge.prototype, 'name', {
+    configurable: false,
+    enumerable: true,
+    get: function () { return this._name; },
+    set: function () { /* k6: name is read-only */ },
+});
 
 Gauge.prototype.add = function (value, tags) {
+    var v = Number(value);
+    if (!isFinite(v)) {
+        return false;
+    }
     if (typeof __tropel_pm_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
+        __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
     }
-    return this;
+    return true;
 };
 
 function Rate(name) {
@@ -1527,13 +1574,23 @@ function Rate(name) {
     this._type = 'rate';
     this._isTime = false;
 }
+Object.defineProperty(Rate.prototype, 'name', {
+    configurable: false,
+    enumerable: true,
+    get: function () { return this._name; },
+    set: function () { /* k6: name is read-only */ },
+});
 
 Rate.prototype.add = function (value, tags) {
+    var v = Number(value);
+    if (!isFinite(v)) {
+        return false;
+    }
     if (typeof __tropel_pm_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
+        __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
     }
-    return this;
+    return true;
 };
 
 function Trend(name, isTime) {
@@ -1544,13 +1601,23 @@ function Trend(name, isTime) {
     this._type = 'trend';
     this._isTime = isTime === true;
 }
+Object.defineProperty(Trend.prototype, 'name', {
+    configurable: false,
+    enumerable: true,
+    get: function () { return this._name; },
+    set: function () { /* k6: name is read-only */ },
+});
 
 Trend.prototype.add = function (value, tags) {
+    var v = Number(value);
+    if (!isFinite(v)) {
+        return false;
+    }
     if (typeof __tropel_pm_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
+        __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
     }
-    return this;
+    return true;
 };
 
     // Expose the k6-style globals the shim also provides (unchanged behavior).
