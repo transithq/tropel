@@ -102,9 +102,9 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-121 · Transport failures emit no `http_req_duration`
 **Effort:** M · **Blocked by:** none · **Also k6 parity — see TR-203**
 
-- [ ] `driver.rs:1057-1082` emits only `http_reqs` + `http_req_failed`; the declarative runner also omits `data_sent` (`runner.rs:715-7xx`)
-- [ ] k6 emits **all 8** HTTP metrics on transport failure, with genuine zeros — dropping them makes `http_reqs` and `http_req_duration` counts disagree and **silently biases every percentile**
-- [ ] Fix once, in the shared path, so both drivers inherit it
+- [x] `driver.rs:1057-1082` emits only `http_reqs` + `http_req_failed`; the declarative runner also omits `data_sent` (`runner.rs:715-7xx`)
+- [x] k6 emits **all 8** HTTP metrics on transport failure, with genuine zeros — dropping them makes `http_reqs` and `http_req_duration` counts disagree and **silently biases every percentile**
+- [x] Fix once, in the shared path, so both drivers inherit it
 
 ## TR-122 · `merged_percentile` never merges in production
 **Effort:** M · **Blocked by:** TR-002

@@ -1376,6 +1376,31 @@ fn push_http_failure(
         timestamp: now,
         sample_type: SampleType::Rate,
     });
+    // TR-121: k6 emits ALL 8 HTTP metrics on transport failure, with the
+    // sub-timings as genuine zeros (the request never reached those phases).
+    // The old code emitted only http_reqs + http_req_failed, so
+    // `http_req_waiting:p(95) < 500` PASSED on a run where every request
+    // failed (the failure path never fed the distribution — same lie as
+    // TR-202 on the success path). Same names as the success path so
+    // thresholds resolve.
+    let sub_zero = [
+        ("http_req_blocked", 0.0),
+        ("http_req_dns", 0.0),
+        ("http_req_connecting", 0.0),
+        ("http_req_tls_handshaking", 0.0),
+        ("http_req_sending", 0.0),
+        ("http_req_waiting", 0.0),
+        ("http_req_receiving", 0.0),
+    ];
+    for (name, dur) in &sub_zero {
+        v.push(Sample {
+            metric: (*name).into(),
+            value: *dur,
+            tags: tags.clone(),
+            timestamp: now,
+            sample_type: SampleType::Trend,
+        });
+    }
     // Request-body bytes (same wire-size computation as the success path).
     v.push(Sample {
         metric: "data_sent".into(),
@@ -8199,7 +8224,34 @@ mod tests {
             sent.value, 7.0,
             "data_sent must carry the request-body bytes"
         );
-        assert_eq!(samples.len(), 4, "duration + reqs + failed + data_sent");
+        // TR-121: the failure path emits ALL 8 HTTP metrics — the 4 base
+        // samples plus the 7 sub-timing series (blocked/dns/connecting/
+        // tls_handshaking/sending/waiting/receiving) as genuine zeros, so a
+        // duration/waiting threshold cannot PASS on a fully-down target.
+        for sub in [
+            "http_req_blocked",
+            "http_req_dns",
+            "http_req_connecting",
+            "http_req_tls_handshaking",
+            "http_req_sending",
+            "http_req_waiting",
+            "http_req_receiving",
+        ] {
+            let sample = samples
+                .iter()
+                .find(|s| s.metric == sub)
+                .unwrap_or_else(|| panic!("failure must emit {sub}"));
+            assert_eq!(
+                sample.value, 0.0,
+                "{sub} must be a genuine zero on transport failure"
+            );
+            assert_eq!(
+                sample.sample_type,
+                SampleType::Trend,
+                "{sub} must be the same Trend series as the success path"
+            );
+        }
+        assert_eq!(samples.len(), 11, "4 base + 7 sub-timing samples");
     }
 
     #[test]
