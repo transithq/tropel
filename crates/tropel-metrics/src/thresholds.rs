@@ -12,6 +12,12 @@ pub struct ThresholdResult {
     pub name: String,
     pub expression: String,
     pub passed: bool,
+    /// TR-111: a no-data verdict is distinct from FAIL. `true` when the
+    /// threshold (or every clause of a compound) had NO samples at all —
+    /// k6 marks such thresholds as failed for the exit code, but the summary
+    /// renders "no data" so a user can tell a genuinely-failed threshold
+    /// apart from one that was never exercised.
+    pub no_data: bool,
     pub actual: f64,
     pub threshold: f64,
     pub abort_on_fail: bool,
@@ -26,13 +32,14 @@ pub fn evaluate_thresholds(
     let mut results = Vec::new();
 
     for (name, config) in thresholds {
-        let result = evaluate_single_threshold(&config.expression, metrics);
+        let result = evaluate_single_threshold_opt(&config.expression, metrics);
         results.push(ThresholdResult {
             name: name.clone(),
             expression: config.expression.clone(),
-            passed: result.0,
-            actual: result.1,
-            threshold: result.2,
+            passed: result.map(|(passed, _, _)| passed).unwrap_or(false),
+            no_data: result.is_none(),
+            actual: result.map(|(_, actual, _)| actual).unwrap_or(0.0),
+            threshold: result.map(|(_, _, threshold)| threshold).unwrap_or(0.0),
             abort_on_fail: config.abort_on_fail,
             delay_abort_eval: config
                 .delay_abort_eval
@@ -513,7 +520,10 @@ fn evaluate_single_threshold_opt(
 }
 
 /// Fail-closed wrapper used by the final summary: no data → FAILED (k6 marks
-/// no-data thresholds as failed).
+/// no-data thresholds as failed). Production path is `evaluate_thresholds`
+/// (which uses the opt variant and records a distinct `no_data` verdict);
+/// this wrapper remains for tests that assert on the tuple directly.
+#[cfg(test)]
 fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool, f64, f64) {
     evaluate_single_threshold_opt(expression, metrics).unwrap_or((false, 0.0, 0.0))
 }
@@ -1183,6 +1193,8 @@ mod tests {
             per_group: vec![],
             summary_trend_stats: vec![],
             effective_thresholds: HashMap::new(),
+            vu_init_failures: 0,
+            script_failures: 0,
         };
 
         // Unscoped: merged population p95 ≈ 10 ms → threshold passes.
@@ -1483,6 +1495,49 @@ mod tests {
             &metrics,
         );
         assert!(!result.0, "AND with a no-data clause must fail closed");
+    }
+
+    #[test]
+    fn threshold_result_marks_no_data_distinct_from_fail() {
+        // TR-111: "no data" is a THIRD verdict, distinct from FAIL. A
+        // threshold on a metric with zero samples must be flagged `no_data`,
+        // not reported as a measured failure with a fabricated 0.0.
+        let metrics = make_metrics();
+        // http_req_duration has data and passes; a phantom metric has none.
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "good".to_string(),
+            ThresholdConfig {
+                expression: "http_req_duration < 1000".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        thresholds.insert(
+            "no-data".to_string(),
+            ThresholdConfig {
+                expression: "phantom_metric < 1".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        let results = evaluate_thresholds(&thresholds, &metrics);
+        assert_eq!(results.len(), 2);
+
+        let good = results.iter().find(|r| r.name == "good").unwrap();
+        assert!(good.passed);
+        assert!(!good.no_data, "data-bearing threshold must not be no_data");
+
+        let nodata = results.iter().find(|r| r.name == "no-data").unwrap();
+        assert!(
+            !nodata.passed,
+            "no-data threshold fails closed (k6 marks it failed)"
+        );
+        assert!(
+            nodata.no_data,
+            "no-data threshold must carry the no_data verdict"
+        );
+        assert_eq!(nodata.actual, 0.0);
     }
 
     // ── Backlog line 60: Rate/Gauge percentile stats fail closed ──
