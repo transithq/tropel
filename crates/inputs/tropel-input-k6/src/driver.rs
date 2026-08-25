@@ -9399,6 +9399,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_cookie_jar_callbacks_constants() {
+        // TR-233: the http module exposes cookieJar() (4 methods, values-only
+        // cookiesForURL), setResponseCallback/expectedStatuses, asyncRequest,
+        // and the TLS_1_*/OCSP_* constants.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var jar = http.cookieJar();
+                var jar2 = new http.CookieJar();
+                var expected = http.expectedStatuses([200, 204]);
+                JSON.stringify({
+                    jarMethods: [typeof jar.cookiesForURL, typeof jar.set, typeof jar.clear, typeof jar.delete],
+                    jarCtor: typeof jar2.set,
+                    tls13: http.TLS_1_3,
+                    ocsp: http.OCSP_STATUS_REVOKED,
+                    asyncReq: typeof http.asyncRequest,
+                    expMatch: expected({ status: 204 }),
+                    expMiss: expected({ status: 500 }),
+                    setCbType: typeof http.setResponseCallback,
+                })
+                "#,
+            )
+            .await
+            .expect("TR-233 probe must eval");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["jarMethods"][0], "function", "cookiesForURL must exist");
+        assert_eq!(v["jarMethods"][1], "function", "set must exist");
+        assert_eq!(v["jarMethods"][2], "function", "clear must exist");
+        assert_eq!(v["jarMethods"][3], "function", "delete must exist");
+        assert_eq!(
+            v["jarCtor"], "function",
+            "new http.CookieJar() must construct"
+        );
+        assert_eq!(v["tls13"], "tls1.3");
+        assert_eq!(v["ocsp"], "revoked");
+        assert_eq!(v["asyncReq"], "function", "http.asyncRequest must exist");
+        assert_eq!(
+            v["expMatch"], true,
+            "expectedStatuses([200,204]) must match 204"
+        );
+        assert_eq!(v["expMiss"], false, "expectedStatuses must not match 500");
+        assert_eq!(
+            v["setCbType"], "function",
+            "http.setResponseCallback must exist"
+        );
+
+        // setResponseCallback(null) suppresses failure; a callback replaces
+        // the default 200-399 rule.
+        let out2 = ctx
+            .eval(
+                r#"
+                var results = [];
+                http.setResponseCallback(function (res) { return res.status === 418; });
+                var cb = http.expectedStatuses([418, 418]);
+                http.setResponseCallback(cb);
+                results.push(cb({ status: 418 }));
+                results.push(cb({ status: 200 }));
+                http.setResponseCallback(null);
+                results.push('null-ok');
+                JSON.stringify(results)
+                "#,
+            )
+            .await
+            .expect("setResponseCallback probe must eval");
+        assert_eq!(out2, "[true,false,\"null-ok\"]");
+    }
+
+    #[tokio::test]
     async fn test_lodash_get_bracket_and_primitive_paths() {
         // Backlog line 155: `_.get(o,'a[0].b')` returned undefined and
         // `_.get({name:'bob'},'name.length')` THREW ('length' in 'bob').
