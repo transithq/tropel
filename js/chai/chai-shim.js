@@ -713,6 +713,11 @@ var chai = chai || {};
     // Postman members, not core chai).
     Assertion.prototype.status = function (code) {
         var actual = (typeof pm !== 'undefined' && pm.response) ? pm.response.code : undefined;
+        // TR-114: accept BOTH a numeric code AND a reason-phrase string —
+        // `expect(res).to.have.status('OK')` is the canonical Postman form.
+        if (typeof code === 'string' && typeof pm !== 'undefined' && pm.response) {
+            actual = pm.response.status;
+        }
         var negate = !!(this.__flags && this.__flags.negate);
         var passed = (actual === code) !== negate;
         if (!passed) {
