@@ -1357,6 +1357,41 @@ function k6Utf8Decode(bytes) {
     return out;
 }
 
+// TR-242: TextEncoder/TextDecoder globals (k6 exposes the WHATWG
+// encoders; a script calling `new TextEncoder()` threw ReferenceError).
+// Reuse the k6Utf8Encode/Decode helpers (one implementation per behaviour).
+if (typeof TextEncoder === 'undefined') {
+    var TextEncoder = function () {};
+    TextEncoder.prototype.encode = function (str) {
+        if (str === undefined) str = '';
+        var bytes = k6Utf8Encode(String(str));
+        return new Uint8Array(bytes);
+    };
+    TextEncoder.prototype.encodeInto = function (str, dest) {
+        var bytes = k6Utf8Encode(String(str));
+        var n = Math.min(bytes.length, dest.length);
+        for (var i = 0; i < n; i++) dest[i] = bytes[i];
+        return { read: n, written: n };
+    };
+}
+if (typeof TextDecoder === 'undefined') {
+    var TextDecoder = function (label) {
+        this._label = label || 'utf-8';
+    };
+    TextDecoder.prototype.decode = function (input) {
+        if (input === undefined) return '';
+        var bytes;
+        if (input instanceof ArrayBuffer) {
+            bytes = new Uint8Array(input);
+        } else if (typeof Uint8Array !== 'undefined' && input instanceof Uint8Array) {
+            bytes = input;
+        } else {
+            throw new TypeError('TextDecoder.decode: expected a BufferSource');
+        }
+        return k6Utf8Decode(Array.prototype.slice.call(bytes));
+    };
+}
+
 // k6's common.ToBytes: string → UTF-8 bytes, ArrayBuffer → bytes.
 function k6ToBytes(input) {
     if (typeof input === 'string') {
