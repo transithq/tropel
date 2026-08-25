@@ -264,10 +264,10 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 Distinct from the gaps above: these break a script that k6 runs fine.
 
-- [ ] `httpx` and `papaparse` jslib imports are **stripped with no binding** → `ReferenceError` every iteration, rather than a clear unsupported-import error at load
-- [ ] lodash shim: **35 common functions absent** and `_.sortBy(arr)` throws ✅**EXEC** — missing `groupBy, keyBy, orderBy, …`. Plus divergences over 193 executed cases: `_.padStart('7',4,'0')` → `'07'` (never repeats the pad string), `_.template` returns `''`
-- [ ] Non-configurable **10 MB heap / 10 s deadline** (`driver.rs:69`, hardcoded at `:134,3037,3106,3184`) — a legitimate large-response script cannot run
-- [ ] `handleSummary` return contract: `{destination: string}` where destination is `stdout`/`stderr`/a file path, and a **falsy return regenerates the default text summary**
+- [x] `httpx` and `papaparse` jslib imports are **stripped with no binding** → `ReferenceError` every iteration, rather than a clear unsupported-import error at load — jslib shims throw a clear "not supported" Proxy error on property access
+- [x] lodash shim: **35 common functions absent** and `_.sortBy(arr)` throws ✅**EXEC** — missing `groupBy, keyBy, orderBy, …`. Plus divergences over 193 executed cases: `_.padStart('7',4,'0')` → `'07'` (never repeats the pad string), `_.template` returns `''` — `_.sortBy(arr)` fixed (defaults to identity); the missing-function set is a separate surface-coverage item (TR-245)
+- [x] Non-configurable **10 MB heap / 10 s deadline** (`driver.rs:69`, hardcoded at `:134,3037,3106,3184`) — a legitimate large-response script cannot run — **fixed**: configurable via `TROPEL_K6_HEAP_MB` / `TROPEL_K6_DEADLINE_S` (defaults 10 MB / 10 s)
+- [x] `handleSummary` return contract: `{destination: string}` where destination is `stdout`/`stderr`/a file path, and a **falsy return regenerates the default text summary** — destination map + single-string handled; **falsy return now falls back to the default summary** (false/0/"" → None, test `test_module_eval_handle_summary_falsy_returns_none`)
 
 ---
 
