@@ -642,6 +642,14 @@ async fn run_command(cli: Cli) -> Result<()> {
         )));
     }
 
+    // TR-244: `exec.test.abort()` maps to k6's exit code 108 (ScriptAborted)
+    // — a specific non-zero distinct from generic failures. The message has
+    // already been logged by the VU loop; exit immediately with the right code.
+    if let Some(msg) = &result.abort_message {
+        tracing::error!("Test aborted: {}", msg);
+        std::process::exit(108);
+    }
+
     // Evaluate thresholds and drive exit code. Uses the engine's EFFECTIVE
     // threshold set (job thresholds merged with script-declared ones, e.g.
     // k6 `export const options` thresholds) so k6 SLOs are reported too.

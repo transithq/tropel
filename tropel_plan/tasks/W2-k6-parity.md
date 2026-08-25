@@ -54,8 +54,8 @@ k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `bl
 **Effort:** M · **Blocked by:** TR-203
 
 - [x] **[SILENT]** `error_code` for a non-2xx is **`1000 + status`** (404 → 1404) while the `error` tag stays **empty**. Only transport errors populate `error`. Reimplementations routinely invert this
-- [x] **[GAP]** Full `error_code` enumeration: 1000 generic, 1010 non-TCP, 1020 invalid URL, 1050 timeout, 1100/1101 DNS, 1110/1111 blacklist/blocked, 1200–1220 TCP, 1301/1310/1311 TLS, 1000+status for ≥400, 1611–1664 HTTP/2, 1701 decompression
-- [ ] **Do not implement 1300 and 1600** — declared upstream but unreachable
+- [x] **[GAP]** Full `error_code` enumeration: 1000 generic, 1010 non-TCP, 1020 invalid URL, 1050 timeout, 1100/1101 DNS, 1110/1111 blacklist/blocked, 1200–1220 TCP, 1301/1310/1311 TLS, 1000+status for ≥400, 1611–1664 HTTP/2, 1701 decompression — **implemented** with message-based mapping; 1300/1600 are NOT emitted (TR-204)
+- [x] **Do not implement 1300 and 1600** — declared upstream but unreachable — **1300/1600 removed**; TLS → 1301/1310/1311, HTTP/2 → 1611+code
 - [x] Without `error_code` there is no way to distinguish "connection refused" from "504" in aggregate
 
 ## TR-205 · The `url` tag is overwritten with `name`
@@ -134,10 +134,10 @@ Tropel's act-then-sleep leads by one step *and* accumulates drift, and its ramp-
 
 `constant_arrival_rate.go:316-330` walks a **global** iteration index `gi`, recomputing the deadline as `period × gi` from `time.Since(startTime)` every tick — **zero drift**. Segmentation is expressed purely by *skipping the global ticks this segment doesn't own*, so N instances interleave into the exact original global rate.
 
-- [ ] **[GAP]** Implement `GetStripedOffsets`. Tropel runs an *independent* arrival-rate executor per node, so arrivals **bunch instead of interleaving**
-- [ ] **[SILENT]** Segment scaling must use exact rationals — k6 uses `big.Rat`; tropel's `f64` gives 100 agents / 100 VUs → **two agents get 0 VUs and two get 2**
-- [ ] Ramping arrival rate integrates the rate curve in closed form (`ramping_arrival_rate.go:234-283`), solving a quadratic for linear ramps and carrying the fractional remainder across stage boundaries via `doneSoFar`
-- [ ] **[GAP, deliberate]** `rps` is **not** segment-scaled in k6 either — tropel's 4-agents-each-enforcing-the-full-cap **matches**. Document it as a shared footgun; do not "fix" it into a divergence
+- [ ] **[GAP]** Implement `GetStripedOffsets`. Tropel runs an *independent* arrival-rate executor per node, so arrivals **bunch instead of interleaving** — **deferred** (the rational scaling fix lands first)
+- [x] **[SILENT]** Segment scaling must use exact rationals — k6 uses `big.Rat`; tropel's `f64` gave 100 agents / 100 VUs → **two agents get 0 VUs and two get 2** — **fixed**: exact `(num, den)` bounds with `floor(n·num/den)` via `i128` integer division; 100 agents × 100 VUs → each gets exactly 1 (PR #385)
+- [x] Ramping arrival rate integrates the rate curve in closed form (`ramping_arrival_rate.go:234-283`), solving a quadratic for linear ramps and carrying the fractional remainder across stage boundaries via `doneSoFar` — **already done**: prefix-sum trapezoids with `tokens_at` (closed-form, O(log n)), fractional remainder carried implicitly via `last_target` (the integer floor of the cumulative integral). Verified by inspection; no code change needed.
+- [x] **[GAP, deliberate]** `rps` is **not** segment-scaled in k6 either — tropel's 4-agents-each-enforcing-the-full-cap **matches**. Documented in the module doc — PR #385
 
 ## TR-222 · Thresholds — grammar, semantics, and the units model
 **Effort:** M · **Blocked by:** TR-112
@@ -199,8 +199,8 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 - [x] `http.cookieJar()` / `new http.CookieJar()` — 4 methods; `cookiesForURL` returns **values only**; `set` parses `expires` as **RFC1123**; `clear`/`delete` work by re-setting `MaxAge=-1` — shim surface added (cookiesForURL/set/clear/delete; expires via Date); the native per-VU jar bridge wiring is a follow-up
 - [x] `http.setResponseCallback` / `http.expectedStatuses` — **default range 200–399 inclusive**; `null` suppresses `http_req_failed` entirely (pairs with `TR-004`) — added
 - [x] `http.asyncRequest`, `http.head`, `http.options`, and the `TLS_1_*` / `OCSP_*` constants — head/options already existed; asyncRequest + TLS/OCSP constants added
-- [ ] **[GAP]** `batch` per-host limiter — `batch`=20 global, `batchPerHost`=6; the return container mirrors the input; only the **first** error surfaces; GET/HEAD bodies nulled in object form
-- [ ] **[GAP]** `del` takes a body; `get`/`head` do not
+- [ ] **[GAP]** `batch` per-host limiter — `batch`=20 global, `batchPerHost`=6; the return container mirrors the input; only the **first** error surfaces; GET/HEAD bodies nulled in object form — **limiter added** (20 global / 6 per-host via two-level semaphore, k6 defaults); **return container mirrors input + first-error-only already implemented** in the batch bridge; **GET/HEAD bodies nulled in object form added** (shim). Custom `batch`/`batchPerHost` values remain a follow-up (currently warned as unknown options). PR #386
+- [ ] **[GAP]** `del` takes a body; `get`/`head` do not — **fixed** in the shim (`http.del(url, body, params)`); `get`/`head` never carry one. PR #386
 
 ---
 
@@ -251,19 +251,21 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 **Effort:** M · **Blocked by:** TR-212
 
 - [x] **[GAP]** `exec.vu.tags`, `exec.vu.metrics.tags` and `exec.vu.metrics.metadata` are live **mutable** DynamicObjects — writing to them is how scripts tag metrics dynamically. Everything else on `exec` is getter-only. Values restricted to String/Boolean/Number — `exec.vu.tags` (and `exec.vu.metrics.tags`/`metadata`) are mutable objects; the http bridge merges `exec.vu.tags` into sample tags (single + batch); test `test_exec_vu_tags_reach_http_samples`
-- [x] **[GAP]** `exec.test.abort(msg?)` → exit code **108**, and **`exec.test.fail(msg?)`**, which marks the run failed *without stopping it*. Two distinct things — `abort` reaches the engine stop (exit non-zero); `fail` throws (iteration marked failed, run continues), test `test_exec_members_are_value_properties`
+- [x] **[GAP]** `exec.test.abort(msg?)` → exit code **108**, and **`exec.test.fail(msg?)`**, which marks the run
+  failed *without stopping it*. Two distinct things — `abort` reaches the engine stop (exit 108); `fail` throws
+  (iteration marked failed, run continues), test `test_exec_members_are_value_properties` — **exit-code 108 mapping added** (PR #387)
 
 ## TR-245 · The remaining modules, ranked by demand
 **Effort:** L · **Blocked by:** TR-241
 
-- [ ] **[GAP]** `k6/websockets` (WHATWG `WebSocket` + `Blob`) alongside legacy `k6/ws`. **Both emit the same six `ws_*` metrics**, so metric parity doesn't tell you which API a script uses. Legacy **blocks the VU** in a callback; modern is event-loop driven. `onping`/`onpong` are k6 extensions; there is **no `removeEventListener`**
-- [ ] **[GAP]** `k6/net/grpc` from scripts — note the import path is `k6/net/grpc`, and `k6/experimental/grpc` throws a "graduated" error. `Client` (`load`/`loadProtoset` are **init-only**), `Stream` (the `status` event is registrable but **never emitted**), 17 `Status*` constants, 4 `HealthCheck*` constants including the shipped typo `HealthCheckServiceUnkown`. `invoke` default timeout **2 min**; streams have **no default timeout**
-- [ ] **[GAP]** `k6/html` — `parseHTML` + 39 Selection methods. More load-bearing than it sounds: `serializeArray`/`serialize` is a real k6 login idiom
-- [ ] **[GAP]** `SharedArray` semantics — builder runs **once per process** under a mutex, elements stored JSON-stringified outside the JS heap, mutation throws `TypeError`, init-only, builder must be sync and return an Array. **[SUPERSET]** tropel's avoids k6's per-access `JSON.parse` + recursive freeze — keep that, match the semantics. Close the view gaps: `filter`, `reduce`, `sort`, `concat` are all `undefined` ✅**EXEC**
-- [ ] **[GAP]** `k6/experimental/{csv,fs,streams}` — **k6's own are incomplete** (no `Symbol.asyncIterator` on the CSV parser; no `pipeTo`/`pipeThrough`/`TransformStream`/`tee()` on streams), so parity here is a lower bar than the spec implies
-- [ ] **[GAP]** `k6/secrets` (2 methods)
-- [ ] **Decide `k6/browser` explicitly** — in or out, but not by omission. Survey only: 9 `browser_*` metrics
-- [ ] **[SILENT]** `open()` — mode `"b"` → ArrayBuffer else string; init-only; **files not opened during the `__VU==0` pass cannot be opened later**; directories error
+- [ ] **[GAP]** `k6/websockets` (WHATWG `WebSocket` + `Blob`) alongside legacy `k6/ws`. **Both emit the same six `ws_*` metrics**, so metric parity doesn't tell you which API a script uses. Legacy **blocks the VU** in a callback; modern is event-loop driven. `onping`/`onpong` are k6 extensions; there is **no `removeEventListener`** — **deferred** (full module, own PR)
+- [ ] **[GAP]** `k6/net/grpc` from scripts — note the import path is `k6/net/grpc`, and `k6/experimental/grpc` throws a "graduated" error. `Client` (`load`/`loadProtoset` are **init-only**), `Stream` (the `status` event is registrable but **never emitted**), 17 `Status*` constants, 4 `HealthCheck*` constants including the shipped typo `HealthCheckServiceUnkown`. `invoke` default timeout **2 min**; streams have **no default timeout** — **deferred** (full module, own PR)
+- [ ] **[GAP]** `k6/html` — `parseHTML` + 39 Selection methods. More load-bearing than it sounds: `serializeArray`/`serialize` is a real k6 login idiom — **deferred** (full module, own PR; the existing `K6HtmlSelection` stub returns empty selections)
+- [x] **[GAP]** `SharedArray` semantics — builder runs **once per process** under a mutex, elements stored JSON-stringified outside the JS heap, mutation throws `TypeError`, init-only, builder must be sync and return an Array. **[SUPERSET]** tropel's avoids k6's per-access `JSON.parse` + recursive freeze — keep that, match the semantics. Close the view gaps: `filter`, `reduce`, `sort`, `concat` are all `undefined` ✅**EXEC** — **verified done** (all four implemented + exercised) — PR #389
+- [ ] **[GAP]** `k6/experimental/{csv,fs,streams}` — **k6's own are incomplete** (no `Symbol.asyncIterator` on the CSV parser; no `pipeTo`/`pipeThrough`/`TransformStream`/`tee()` on streams), so parity here is a lower bar than the spec implies — **deferred** (full module, own PR)
+- [x] **[GAP]** `k6/secrets` (2 methods) — **stub added**: `secrets.get`/`secrets.source` exist but throw a clear unsupported error (no secretsource manager), matching the jslib pattern — PR #389
+- [x] **Decide `k6/browser` explicitly** — in or out, but not by omission. Survey only: 9 `browser_*` metrics — **decided OUT** (no demand for browser automation in tropel's profile; documented) — PR #389
+- [x] **[SILENT]** `open()` — mode `"b"` → ArrayBuffer else string; init-only; **files not opened during the `__VU==0` pass cannot be opened later**; directories error — **verified done** (open-data-shim) — PR #389
 
 ## TR-246 · Working scripts that behave wrongly
 **Effort:** M · **Blocked by:** none

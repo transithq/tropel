@@ -241,6 +241,14 @@ async fn run_vu_loop(
 
             if let Some(msg) = outcome.abort_message {
                 tracing::warn!("test.abort(): {} — stopping", msg);
+                // TR-244: store the message so the CLI can exit with
+                // k6's 108 (ScriptAborted) instead of a generic non-zero.
+                {
+                    let mut slot = shared.abort_message.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(msg);
+                    }
+                }
                 sched.request_stop();
             }
 
@@ -295,6 +303,10 @@ struct VuRunShared {
     /// [`VuIterationOutcome::script_failures`] so a run where scripts keep
     /// throwing exits non-zero instead of reporting success (backlog line 98).
     script_failures: Arc<AtomicU64>,
+    /// Set when `exec.test.abort()` is called. First VU to abort wins; later
+    /// calls are idempotent. Read after the run so the CLI can exit with
+    /// k6's 108 (script aborted) instead of a generic non-zero (TR-244).
+    abort_message: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Shared VU-run scaffolding used by both the scenario and driver paths:
@@ -334,7 +346,7 @@ async fn run_vus<F>(
     control_port: Option<u16>,
     setup_data: Option<String>,
     run_vu: F,
-) -> (u32, u64)
+) -> (u32, u64, Option<String>)
 where
     F: Fn(Arc<VUScheduler>, u32, &VuRunShared) -> tokio::task::JoinHandle<()>
         + Send
@@ -469,6 +481,8 @@ where
 
     let vu_init_failures = Arc::new(AtomicU32::new(0));
     let script_failures = Arc::new(AtomicU64::new(0));
+    let abort_message: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let last_active_vus = Arc::new(AtomicU32::new(0));
 
     // Single scheduler-wide vus/vus_max sampler (backlog line 165): the
@@ -504,7 +518,11 @@ where
         executor_name,
         vu_init_failures: vu_init_failures.clone(),
         script_failures: script_failures.clone(),
+        abort_message: abort_message.clone(),
     };
+    // Clone the abort-message handle before `shared` is moved into the
+    // executor.run closure below — it is read after the run (TR-244).
+    let abort_message_handle = shared.abort_message.clone();
 
     // Backlog line 423: warn when per-VU JS init cost makes the ramp
     // physically impossible. At ~1ms per VU init, a 0→10000 ramp in 1s
@@ -654,7 +672,14 @@ where
     if let Some(handle) = control_server {
         handle.abort();
     }
-    (init_failures, script_failures.load(Ordering::SeqCst))
+    // TR-244: read the abort message so the CLI can exit with k6's 108
+    // (ScriptAborted) instead of a generic non-zero.
+    let abort_message = abort_message_handle.lock().unwrap().clone();
+    (
+        init_failures,
+        script_failures.load(Ordering::SeqCst),
+        abort_message,
+    )
 }
 
 // ── Driver HTTP client adapter ──
@@ -748,7 +773,7 @@ pub(crate) async fn run_scenario_vus(
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
     input_path: &str,
-) -> (u32, u64) {
+) -> (u32, u64, Option<String>) {
     // Expected statuses are read by every VU's ScenarioRunner — snapshot them once
     // and share (the closure no longer captures the whole HttpConfig, which
     // is consumed into the shared client build below).
@@ -779,7 +804,7 @@ pub(crate) async fn run_scenario_vus(
                     lane_count,
                     e
                 );
-                return (1, 0);
+                return (1, 0, None);
             }
         }
     }
@@ -955,13 +980,13 @@ pub(crate) async fn run_driver_vus(
     // shared map into every VU's VuContext so drivers dispatch non-HTTP
     // schemes through the same lookup the declarative runner uses.
     protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
-) -> (u32, u64) {
+) -> (u32, u64, Option<String>) {
     let driver_id = driver.id().to_string();
     let input_bytes = match std::fs::read(input_path) {
         Ok(b) => Arc::new(b),
         Err(e) => {
             tracing::error!("Scenario '{}': failed to read input: {}", sc_name, e);
-            return (0, 0);
+            return (0, 0, None);
         }
     };
     let input_p = std::path::Path::new(input_path).to_path_buf();
@@ -989,7 +1014,7 @@ pub(crate) async fn run_driver_vus(
                     lane_count,
                     e
                 );
-                return (1, 0);
+                return (1, 0, None);
             }
         }
     }
@@ -1176,12 +1201,13 @@ pub(crate) async fn run_driver_vus(
         metrics_after_run.record_batch(&teardown_samples).await;
     }
 
-    // `run_vus` returns (vu_init_failures, script_failures) — VUs that
-    // failed to START and driver iterations that errored. Propagate them so
-    // the engine can fail the run loudly (silent truncation / throwing
-    // scripts must not report green).
-    let (init_failures, script_failures) = run_vus_result;
-    (init_failures, script_failures)
+    // `run_vus` returns (vu_init_failures, script_failures, abort_message) —
+    // VUs that failed to START, driver iterations that errored, and the
+    // `exec.test.abort()` message if any. Propagate them so the engine can
+    // fail the run loudly (silent truncation / throwing scripts must not
+    // report green) and the CLI can exit 108 on abort.
+    let (init_failures, script_failures, abort_message) = run_vus_result;
+    (init_failures, script_failures, abort_message)
 }
 // Helpers
 // ══════════════════════════════════════════════════════════════════

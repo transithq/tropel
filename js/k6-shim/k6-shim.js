@@ -682,8 +682,8 @@ var http = {};
 http.get = function (url, params) { return k6HTTPRequest('GET', url, null, params); };
 http.post = function (url, body, params) { return k6HTTPRequest('POST', url, body, params); };
 http.put = function (url, body, params) { return k6HTTPRequest('PUT', url, body, params); };
-http.del = function (url, params) { return k6HTTPRequest('DELETE', url, null, params); };
-http.delete = function (url, params) { return k6HTTPRequest('DELETE', url, null, params); };
+http.del = function (url, body, params) { return k6HTTPRequest('DELETE', url, body, params); };
+http.delete = function (url, body, params) { return k6HTTPRequest('DELETE', url, body, params); };
 http.patch = function (url, body, params) { return k6HTTPRequest('PATCH', url, body, params); };
 
 // Backlog line 150: k6's http.file(data, filename, contentType) → K6File.
@@ -1016,24 +1016,32 @@ function normalizeBatchEntry(req, defaultKey) {
             params: req.length > 3 ? req[3] : {}
         };
     }
-    if (typeof req === 'object') {
-        // Preserve the object-form entry's responseType (k6: params.responseType)
-        var entryParams = req.params || {};
-        return {
-            key: req.name != null ? req.name : defaultKey,
-            method: req.method || 'GET',
-            url: req.url || '',
-            // Backlog §3: `req.body || null` dropped 0/''/false — only
-            // undefined/null mean "no body".
-            body: req.body !== undefined ? req.body : null,
-            params: {
-                headers: req.headers || entryParams.headers || {},
-                tags: req.tags || entryParams.tags || {},
-                // Backlog §3: object-form entries forced `timeout:'30s'`,
-                // overriding the global HttpConfig.request_timeout. Mirror
-                // the single path — leave it unset so timeoutMs stays 0 and
-                // the driver applies the client-level global.
-                timeout: req.timeout || entryParams.timeout,
+      if (typeof req === 'object') {
+          // Preserve the object-form entry's responseType (k6: params.responseType)
+          var entryParams = req.params || {};
+          // TR-233: k6 nulls the body for GET/HEAD in object form
+          // (parseBatchRequest in request.go: `if method == GET || method ==
+          // HEAD { body = nil }`). GET/HEAD never carry a body on the wire.
+          var entryMethod = (req.method || 'GET').toUpperCase();
+          var entryBody = req.body !== undefined ? req.body : null;
+          if (entryMethod === 'GET' || entryMethod === 'HEAD') {
+              entryBody = null;
+          }
+          return {
+              key: req.name != null ? req.name : defaultKey,
+              method: entryMethod,
+              url: req.url || '',
+              // Backlog §3: `req.body || null` dropped 0/''/false — only
+              // undefined/null mean "no body".
+              body: entryBody,
+              params: {
+                  headers: req.headers || entryParams.headers || {},
+                  tags: req.tags || entryParams.tags || {},
+                  // Backlog §3: object-form entries forced `timeout:'30s'`,
+                  // overriding the global HttpConfig.request_timeout. Mirror
+                  // the single path — leave it unset so timeoutMs stays 0 and
+                  // the driver applies the client-level global.
+                  timeout: req.timeout || entryParams.timeout,
                 responseType: entryParams.responseType || req.responseType || 'text',
                 // Backlog §3: object-form entries dropped auth/redirects/
                 // compression/cookies that the single path honors.
@@ -2211,6 +2219,28 @@ if (typeof parse === 'undefined') { var parse = x509.parse; }
 if (typeof getSubject === 'undefined') { var getSubject = x509.getSubject; }
 if (typeof getIssuer === 'undefined') { var getIssuer = x509.getIssuer; }
 if (typeof getAltNames === 'undefined') { var getAltNames = x509.getAltNames; }
+
+// ── k6/secrets (TR-245) ──
+// k6 v2.1: `import secrets from 'k6/secrets'` → `secrets.get(key)` returns a
+// Promise<string>. Tropel is synchronous and has no secretsource manager, so
+// this stub throws a clear error on access, matching the httpx/papaparse
+// jslib pattern.
+if (typeof secrets === 'undefined') {
+    var secrets = new Proxy({}, {
+        get: function (_, prop) {
+            if (prop === '__esModule') return false;
+            if (prop === 'get' || prop === 'source') {
+                return function () {
+                    throw new Error(
+                        'k6/secrets is not supported by Tropel yet (no secretsource manager). '
+                        + 'Use environment variables or a config file instead.'
+                    );
+                };
+            }
+            throw new Error('k6/secrets has no property "' + prop + '"');
+        }
+    });
+}
 
 // ══════════════════════════════════════════════════════════════════
 // Helpers
