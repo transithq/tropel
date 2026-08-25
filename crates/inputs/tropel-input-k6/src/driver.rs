@@ -10827,6 +10827,40 @@ mod tests {
             .expect("cross-iteration timer must fire");
     }
 
+    /// TR-245: `k6/secrets` stub module — `secrets.get(key)` / `secrets.source(name)`
+    /// exist but throw a clear error on access (Tropel has no secretsource
+    /// manager), matching the httpx/papaparse jslib pattern instead of a bare
+    /// ReferenceError.
+    #[tokio::test]
+    async fn test_k6_secrets_stub_throws_clear_error() {
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var threwGet = false, threwSource = false, threwOther = false;
+                try { secrets.get('cool'); } catch (e) { threwGet = String(e); }
+                try { secrets.source('file'); } catch (e) { threwSource = String(e); }
+                try { secrets.nope; } catch (e) { threwOther = String(e); }
+                JSON.stringify({ get: threwGet, source: threwSource, other: threwOther })
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["get"].as_str().unwrap_or_default().contains("k6/secrets is not supported"),
+            "secrets.get must throw the clear unsupported error, got {out}"
+        );
+        assert!(
+            v["source"].as_str().unwrap_or_default().contains("k6/secrets is not supported"),
+            "secrets.source must throw the clear unsupported error, got {out}"
+        );
+        assert!(
+            v["other"].as_str().unwrap_or_default().contains("has no property"),
+            "unknown secrets props must throw a naming error, got {out}"
+        );
+    }
+
     #[tokio::test]
     async fn test_timer_callback_samples_and_abort_survive_final_iteration() {
         // Backlog line 100: run_iteration drained the sample sink BEFORE
