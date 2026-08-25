@@ -2235,6 +2235,9 @@ fn register_http_bridges<'js>(
     let group_stack_batch = group_stack.clone();
     let deadline_batch = deadline.clone();
     let max_exec_batch = max_exec;
+    // TR-233: batch concurrency limiter — k6 defaults: 20 global, 6 per-host.
+    // TODO: wire `batch`/`batchPerHost` from k6 options; these are placeholders.
+    let batch_limit = Arc::new(tokio::sync::Semaphore::new(20));
     let _ = globals.set(
         "__tropel_k6_http_batch",
         Func::from(
@@ -2245,6 +2248,10 @@ fn register_http_bridges<'js>(
                     serde_json::from_str(&requests_json).unwrap_or_default();
 
                 let http_for_io = http_client.clone();
+                let batch_limit = batch_limit.clone();
+                // Per-host limiters (lazily created on first request to a host).
+                let per_host_limits: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>> =
+                    Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
                 let futures = batch_requests.into_iter().map(move |entry| {
                     let key = entry
                         .get("key")
@@ -2274,22 +2281,16 @@ fn register_http_bridges<'js>(
                         .and_then(|v| v.as_str())
                         .unwrap_or("text")
                         .to_string();
-                    // W2 line 169: ONE canonical extras shape shared with the
-                    // single-request bridge (timeoutMs/tags/auth/redirects/
-                    // compression/bodyB64) — the old tags_json/auth_json/
-                    // body_b64/timeout_ms variants disagreed on four of seven
-                    // wire fields (and the batch dropped the whole tag map on
-                    // any non-string value).
+                    // TR-233: k6 nulls the body for GET/HEAD in object form
+                    // (parseBatchRequest in request.go). The body is relevant
+                    // only for the send path; the bridge entry carries it for
+                    // sample construction, but the actual HTTP request body
+                    // is nulled by build_k6_request for GET/HEAD.
                     let extras: serde_json::Value = entry
                         .get("extras")
                         .and_then(|v| v.as_str())
                         .and_then(|s| serde_json::from_str(s).ok())
                         .unwrap_or(serde_json::Value::Null);
-                    // Same loud-failure guard as the single bridge: an invalid
-                    // method token must not silently become GET. Carried as an
-                    // immediate Err result inside the async block (never
-                    // executed) — the caller maps it to a status-0 response +
-                    // failure samples.
                     let (req, params, method_error) = build_k6_request(
                         method,
                         url,
@@ -2298,8 +2299,24 @@ fn register_http_bridges<'js>(
                         response_type.clone(),
                         &extras,
                     );
+                    // Extract the host for per-host limiting.
+                    let host = url::Url::parse(&req.url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_string()))
+                        .unwrap_or_default();
                     let http_client = http_for_io.clone();
+                    let batch_limit = batch_limit.clone();
+                    let per_host_limits = per_host_limits.clone();
                     async move {
+                        // Acquire a global permit first, then a per-host permit.
+                        let _global = batch_limit.acquire().await.expect("batch semaphore");
+                        let host_limit = {
+                            let mut map = per_host_limits.lock().unwrap();
+                            map.entry(host.clone())
+                                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(6)))
+                                .clone()
+                        };
+                        let _host = host_limit.acquire().await.ok();
                         let start = std::time::Instant::now();
                         let resp = match &method_error {
                             Some(msg) => Err(TropelError::Other(msg.clone())),
@@ -5223,6 +5240,94 @@ mod tests {
                 ctx.eval::<bool, _>("__threwMissing").expect("read threwMissing"),
                 "missing native key must throw, not fabricate status-0"
             );
+        });
+    }
+
+    /// TR-233: `http.del` takes a body; `http.get`/`http.head` do not. The
+    /// single-request shim must forward the del body (k6: `del(url, body,
+    /// params)` via getMethodClosure) while get/head never carry one. Also
+    /// the batch OBJECT-form entry nulls the body for GET/HEAD (k6
+    /// parseBatchRequest) — the array-form entry keeps the caller's body.
+    #[test]
+    fn test_del_body_and_batch_get_head_body_nulling() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body, responseType, extrasJson) {
+                    globalThis.__captured.push({ method: method, url: url, body: body, responseType: responseType });
+                    return { status: 200, code: 200, status_text: 'OK', body: '', headers: [], timings: {}, error: '', error_code: 0 };
+                };
+                // del with a body: the body must reach the bridge.
+                http.del('https://example.com/thing', 'payload-delete', { tags: { name: 'd1' } });
+                // get / head: no body argument.
+                http.get('https://example.com/g');
+                http.head('https://example.com/h');
+
+                globalThis.__tropel_k6_http_batch = function (requestsJson) {
+                    var reqs = JSON.parse(requestsJson);
+                    globalThis.__captured.push({ method: 'BATCH', entries: reqs });
+                    var out = {};
+                    for (var ri = 0; ri < reqs.length; ri++) {
+                        out[reqs[ri].key] = { status: 200, code: 200, body: 'ok', headers: {}, timings: {} };
+                    }
+                    return JSON.stringify(out);
+                };
+                // Batch object form: GET/HEAD bodies nulled, POST body kept.
+                http.batch([
+                    { key: 'get', url: 'https://example.com/a', method: 'GET', body: 'should-null' },
+                    { key: 'head', url: 'https://example.com/b', method: 'HEAD', body: 'should-null' },
+                    { key: 'post', url: 'https://example.com/c', method: 'POST', body: 'keep-me' },
+                ]);
+                // Batch array form: caller's body preserved for all methods.
+                http.batch([
+                    ['GET', 'https://example.com/d', 'arr-get-body'],
+                    ['DELETE', 'https://example.com/e', 'arr-del-body'],
+                ]);
+            "#,
+            )
+            .expect("script should eval");
+
+            // Single-request path: del carries the body; get/head have none.
+            let captured_json: String = ctx
+                .eval("JSON.stringify(__captured)")
+                .expect("read captured");
+            let reqs: Vec<serde_json::Value> =
+                serde_json::from_str(&captured_json).expect("captured is JSON");
+            assert_eq!(reqs[0]["method"], "DELETE");
+            assert_eq!(reqs[0]["body"], "payload-delete", "del body must reach the bridge");
+            assert_eq!(reqs[1]["method"], "GET");
+            // serializeK6Body maps null → '' on the wire; the bridge treats
+            // '' as "no body" (build_k6_request: `body.is_empty()` → None).
+            assert_eq!(reqs[1]["body"], "", "get must not carry a body");
+            assert_eq!(reqs[2]["method"], "HEAD");
+            assert_eq!(reqs[2]["body"], "", "head must not carry a body");
+
+            // Batch object form (captured[3] is the BATCH marker).
+            let batch_obj: serde_json::Value = reqs
+                .iter()
+                .find(|r| r["method"] == "BATCH" && r["entries"].as_array().is_some_and(|a| a.len() == 3))
+                .expect("object-form batch captured")
+                .clone();
+            let entries = batch_obj["entries"].as_array().unwrap();
+            // serializeK6Body maps null → '' on the wire; '' means "no body".
+            assert_eq!(entries[0]["body"], "", "GET object-form body must be nulled");
+            assert_eq!(entries[1]["body"], "", "HEAD object-form body must be nulled");
+            assert_eq!(entries[2]["body"], "keep-me", "POST object-form body must be kept");
+
+            // Batch array form (4 entries).
+            let batch_arr: serde_json::Value = reqs
+                .iter()
+                .find(|r| r["method"] == "BATCH" && r["entries"].as_array().is_some_and(|a| a.len() == 2))
+                .expect("array-form batch captured")
+                .clone();
+            let entries = batch_arr["entries"].as_array().unwrap();
+            assert_eq!(entries[0]["body"], "arr-get-body", "array-form GET body must be preserved (k6 array form)");
+            assert_eq!(entries[1]["body"], "arr-del-body", "array-form DELETE body must be preserved");
         });
     }
 
