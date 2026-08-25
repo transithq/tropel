@@ -499,7 +499,7 @@ impl Engine {
                             input_path,
                             e
                         );
-                        return (0, 0);
+                        return (0, 0, None);
                     }
                 };
 
@@ -510,7 +510,7 @@ impl Engine {
                 // to its registered protocol (the runner's scheme lookup).
                 let protocols: Arc<HashMap<String, Arc<dyn Protocol>>> =
                     Arc::new(registry_sc.instantiate_protocols());
-                let (init_failures, script_failures) = match resolved {
+                let (init_failures, script_failures, abort_message) = match resolved {
                     ResolvedInput::Scenario(scenario) => {
                         run_scenario_vus(
                             sc_name,
@@ -566,7 +566,7 @@ impl Engine {
                 };
 
                 tracing::info!("Scenario '{}': completed", sc_name_log);
-                (init_failures, script_failures)
+                (init_failures, script_failures, abort_message)
             });
 
             scenario_handles.push(handle);
@@ -581,11 +581,16 @@ impl Engine {
         // where every script throws must exit non-zero.
         let mut total_vu_init_failures = 0u32;
         let mut total_script_failures = 0u64;
+        let mut total_abort_message: Option<String> = None;
         for handle in scenario_handles {
             match handle.await {
-                Ok((init_failures, script_failures)) => {
+                Ok((init_failures, script_failures, abort_message)) => {
                     total_vu_init_failures += init_failures;
                     total_script_failures += script_failures;
+                    // First VU to abort wins; later scenarios are idempotent.
+                    if abort_message.is_some() {
+                        total_abort_message = total_abort_message.or(abort_message);
+                    }
                 }
                 // P0 (backlog): a PANICKED scenario task (e.g. worker-pool
                 // thread/runtime creation failing under fd exhaustion) used
@@ -677,6 +682,9 @@ impl Engine {
             // that errored during the run. Non-zero means scripts kept
             // failing; the CLI exits non-zero (backlog line 98).
             script_failures: total_script_failures,
+            // TR-244: `exec.test.abort(msg?)` message, if any — the CLI maps
+            // it to k6's exit code 108.
+            abort_message: total_abort_message,
         })
     }
 
@@ -806,4 +814,8 @@ pub struct EngineResult {
     /// line 98: script failures used to be swallowed — warn only, no failed
     /// check, exit 0).
     pub script_failures: u64,
+    /// Message from `exec.test.abort(msg?)`, if any. Set when a VU called
+    /// abort during the run. The CLI uses this to exit with k6's exit code
+    /// 108 (ScriptAborted) instead of a generic non-zero (TR-244).
+    pub abort_message: Option<String>,
 }

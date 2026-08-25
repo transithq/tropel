@@ -131,3 +131,45 @@ async fn passing_threshold_exits_zero() {
     );
     let _ = std::fs::remove_file(&script);
 }
+
+/// Write a script that calls `exec.test.abort()` on the first iteration.
+fn write_abort_script(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tropel-abort-{}-{}.js", std::process::id(), tag));
+    let script = r#"import exec from 'k6/execution';
+export const options = { vus: 1, iterations: 3 };
+export default function () {
+  exec.test.abort('stop now');
+}
+"#;
+    std::fs::write(&path, script).unwrap();
+    path
+}
+
+/// TR-244: `exec.test.abort(msg)` must map to exit code 108 (k6
+/// `ScriptAborted`), NOT a generic non-zero. CI pipelines that branch on
+/// "aborted" vs "failed" depend on the distinction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_abort_exits_108() {
+    let script = write_abort_script("abort108");
+    let out = Command::new(env!("CARGO_BIN_EXE_tropel"))
+        .arg("run")
+        .arg(&script)
+        .arg("--format")
+        .arg("k6")
+        .arg("-u")
+        .arg("1")
+        .arg("-d")
+        .arg("5s")
+        .output()
+        .expect("failed to spawn the tropel binary");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(108),
+        "test.abort() must exit with code 108, exited {:?}\nstderr: {}",
+        out.status.code(),
+        stderr
+    );
+    let _ = std::fs::remove_file(&script);
+}
