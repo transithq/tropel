@@ -69,9 +69,9 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-112 · Tag-scoped `avg` is worst-of; unscoped `avg` is pooled
 **Effort:** M · **Blocked by:** none
 
-- [ ] `thresholds.rs:516` vs `:665`. 1000 requests @10 ms on `/a` plus 10 @2000 ms on `/b` gives two different "averages" depending on whether the threshold names a tag
-- [ ] One aggregation path, dispatching on `self.metric_type` — this single change also closes `avg > max`, the `absorb_snapshot` type conflict, and the reserved-name collisions
-- [ ] Add the missing `value`/`last` arm in `aggregate_series` — it closes the Trend vacuous pass, tag-scoped arbitrary-series selection, and `vus:['value>10']` at the same time
+- [x] `thresholds.rs:516` vs `:665`. 1000 requests @10 ms on `/a` plus 10 @2000 ms on `/b` gives two different "averages" depending on whether the threshold names a tag — **fixed**: the tag-scoped `avg` POOLS the mean across matches, test `test_tag_scoped_avg_pools_across_series_not_worst_of` asserts 29.7 ms
+- [x] One aggregation path, dispatching on `self.metric_type` — this single change also closes `avg > max`, the `absorb_snapshot` type conflict, and the reserved-name collisions — **fixed**: `get_tag_scoped_metric_value` and `aggregate_series` collapsed into one shared `aggregate_matches(metrics, name, tag_filters, stat)`; both old functions are thin wrappers
+- [x] Add the missing `value`/`last` arm in `aggregate_series` — it closes the Trend vacuous pass, tag-scoped arbitrary-series selection, and `vus:['value>10']` at the same time — `aggregate_matches` has the arm, test `custom_series_value_stat_resolves`
 
 ## TR-113 · `handleSummary` has no unscoped `http_req_duration`
 **Effort:** S · **Blocked by:** TR-112
