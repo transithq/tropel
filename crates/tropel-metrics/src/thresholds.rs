@@ -592,151 +592,24 @@ fn percentile_guard_fails(matched: &[&MetricSummary], stat: Option<&str>) -> boo
 /// If no entry matches, returns `None` (no data for this tag set → the
 /// evaluator fails the threshold closed, matching k6's "no data" behavior
 /// instead of inventing a passing 0.0).
+///
+/// TR-112: collapsed into a thin wrapper over `aggregate_matches` — the old
+/// function had its own tag-filter loop and IDENTICAL arms to `aggregate_series`.
 fn get_tag_scoped_metric_value(
     metrics: &MetricsResult,
     metric_name: &str,
     tag_filters: &[(&str, &str)],
     stat: Option<&str>,
 ) -> Option<f64> {
-    let mut matched = Vec::new();
+    aggregate_matches(metrics, metric_name, tag_filters, stat)
+}
 
-    for m in &metrics.metrics {
-        // Exact base-name match: `login` must not aggregate `login_errors`.
-        if metric_base_name(&m.key) != metric_name {
-            continue;
-        }
-        // Match structurally against the parsed tag pairs — NOT the rendered
-        // key. The collector emits ONE comma-joined brace group
-        // (`{status=200,method=GET}`), so a substring like `{status=200}` can
-        // never match; the k6-copied `http_req_duration{status:200}` threshold
-        // therefore reported actual = 0.00 on a healthy run. `tags` is the
-        // authoritative (key, value) source (backlog §1 P0).
-        let all_tags_match = tag_filters
-            .iter()
-            .all(|(key, val)| m.tags.iter().any(|(k, v)| k == key && v == val));
-        if !all_tags_match {
-            continue;
-        }
-        matched.push(m);
-    }
-
-    if matched.is_empty() {
-        return None;
-    }
-
-    // Backlog §1: percentile/min/max stats on a Counter are meaningless — the
-    // accumulated value would masquerade as every percentile, so `errors.p95`
-    // (or any custom counter like `data_received.p95`) must FAIL CLOSED, not
-    // resolve to the counter's 1.0 bucket and pass a `> 0.5` gate.
-    // Backlog §1 + line 60: percentile/min/max stats are only meaningful on
-    // series that actually track a distribution or real extremes. The old
-    // guard checked `all(Counter)` only, so a **Rate** summary (p50..p99
-    // hardcoded 0) let `http_req_failed: ['p(95)<0.01']` PASS on a
-    // 100%-failure run, and a **Gauge** (p50..p99 hardcoded 0) passed
-    // `queue_depth.p95 < 10` trivially. Fail closed unless EVERY matched
-    // series supports the stat (Trend for percentiles; Trend/Gauge for
-    // min/max — Gauge tracks real extremes from its samples).
-    if percentile_guard_fails(&matched, stat) {
-        return None;
-    }
-
-    // Aggregate all matching entries
-    Some(match stat {
-        Some("avg") => {
-            // W1-B line 151: POOLED mean across all matches (k6 semantics),
-            // not the worst (highest) per-series mean — 1000 @10 ms on /a +
-            // 10 @2000 ms on /b must yield 29.7 ms, not max(10, 2000). The
-            // old worst-of fold made `{status=200}.avg < 100` FAIL with 2000
-            // while the unscoped `avg` PASSED with 29.7. Mirrors the
-            // unscoped aggregate_series arm (incl. the Counter special-case:
-            // count == accumulated value, so avg on a counter is the
-            // per-second rate, matching k6).
-            if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
-                counter_rate(metrics, &matched)
-            } else {
-                let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
-                let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
-                if total_count > 0.0 {
-                    total_sum / total_count
-                } else {
-                    0.0
-                }
-            }
-        }
-        Some("min") => {
-            // Return the MINIMUM min across all matches
-            matched.iter().map(|m| m.min).fold(f64::MAX, f64::min)
-        }
-        Some("max") => {
-            // Return the MAXIMUM max across all matches
-            matched
-                .iter()
-                .map(|m| m.max)
-                .fold(f64::NEG_INFINITY, f64::max)
-        }
-        Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
-        Some("p90") => merged_percentile(&matched, 90.0),
-        Some("p95") => merged_percentile(&matched, 95.0),
-        Some("p99") => merged_percentile(&matched, 99.0),
-        // Any other pNN / p(NN) percentile — exact from the retained
-        // histogram of each matching series; merged-population when all
-        // retained, worst (highest) fallback otherwise.
-        Some(s) if parse_percentile(s).is_some() => {
-            let pct = parse_percentile(s).expect("guarded");
-            merged_percentile(&matched, pct)
-        }
-        Some("count") => matched.iter().map(|m| m.count as f64).sum(),
-        Some("rate") => {
-            if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
-                counter_rate(metrics, &matched)
-            } else {
-                let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
-                let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
-                if total_count > 0.0 {
-                    total_sum / total_count
-                } else {
-                    0.0
-                }
-            }
-        }
-        Some("sum") => matched.iter().map(|m| m.sum).sum(),
-        // k6's `value`/`last` stat = the most recent sample. W1-A: the OLD
-        // code read an ARBITRARY `matched.last()` (iteration-order-dependent
-        // pick), and `last` was hardcoded 0.0 for Counter/Rate/Trend so the
-        // tag-scoped value always PASSED a `<` gate trivially. Now that
-        // Trend/Gauge track a real `last`, aggregate worst-of (max) across
-        // matches — consistent with the avg/min/max arms — so a failure on
-        // ANY matching series is visible.
-        // k6's `value`/`last` stat = the most recent sample. W1-A: the OLD
-        // code read an ARBITRARY `matched.last()` (iteration-order-dependent
-        // pick), and `last` was hardcoded 0.0 for Counter/Rate/Trend so the
-        // tag-scoped value always PASSED a `<` gate trivially. Trend/Gauge
-        // now track a real `last` (worst-of max across matches, consistent
-        // with the avg/min/max arms). Counter/Rate hardcode `last` 0.0, so
-        // they FAIL CLOSED (same guard as the percentile path):
-        // `http_req_failed.value < 0.01` must never pass against an invented
-        // 0.0 on a 100%-failure run.
-        Some("value") | Some("last") => {
-            if !matched
-                .iter()
-                .all(|m| matches!(m.metric_type, MetricType::Trend | MetricType::Gauge))
-            {
-                return None;
-            }
-            matched
-                .iter()
-                .map(|m| m.last)
-                .fold(f64::NEG_INFINITY, f64::max)
-        }
-        // Bare metric (no stat) → WORST mean across matches (documented
-        // default). Backlog §1: an UNKNOWN/typo'd stat must FAIL CLOSED,
-        // not silently gate on the mean like the old `_ =>` arm.
-        None => matched
-            .iter()
-            .map(|m| m.mean)
-            .fold(f64::NEG_INFINITY, f64::max),
-        Some(_) => return None,
-    })
+/// Aggregate a statistic across ALL series whose base name equals `name`
+/// (unscoped / bare-metric threshold). TR-112: thin wrapper over the shared
+/// `aggregate_matches` with no tag filters — the old function duplicated
+/// every aggregation arm of `get_tag_scoped_metric_value`.
+fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
+    aggregate_matches(metrics, name, &[], stat)
 }
 
 /// Per-second rate for all-Counter matched series: the accumulated total
@@ -753,12 +626,6 @@ fn counter_rate(metrics: &MetricsResult, matched: &[&MetricSummary]) -> f64 {
     }
 }
 
-/// Aggregate a statistic across ALL series in `metrics.metrics` whose BASE
-/// name equals `name` (k6 merges tagged sub-series for the unscoped metric).
-/// Exact match — never prefix: a threshold on `login` must not aggregate
-/// `login_errors` / `login_duration`.
-/// Returns `None` when no series match, so callers can fall back to a
-/// top-level field or 0.0.
 /// Compute a percentile over the MERGED population of every matching series
 /// (k6 semantics: an unscoped or tag-scoped threshold like `http_req_waiting.p95`
 /// is the p95 of ALL samples across the matching series, not the worst
@@ -787,15 +654,41 @@ fn merged_percentile(matched: &[&MetricSummary], pct: f64) -> f64 {
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
-fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
+/// Aggregate a statistic across ALL series in `metrics.metrics` whose BASE
+/// name equals `name` and whose tags match `tag_filters` (all must match).
+/// When `tag_filters` is empty, the function aggregates ALL matching series
+/// (unscoped / bare metric, e.g. `http_req_duration < 100`). When non-empty,
+/// it filters to series whose tags contain every key=value pair (tag-scoped
+/// threshold, e.g. `http_req_duration{status=200}.avg < 100`).
+///
+/// Returns `None` when no series match, so callers can distinguish "no data"
+/// (fails closed, like k6) from a real measured 0.0.
+///
+/// TR-112: `get_tag_scoped_metric_value` and `aggregate_series` were TWO
+/// parallel functions with IDENTICAL aggregation arms but different tag-filter
+/// code. The shared core below is the single aggregation path, dispatching on
+/// `self.metric_type` and `stat` — the two old functions are thin wrappers.
+fn aggregate_matches(
+    metrics: &MetricsResult,
+    name: &str,
+    tag_filters: &[(&str, &str)],
+    stat: Option<&str>,
+) -> Option<f64> {
     let matched: Vec<&MetricSummary> = metrics
         .metrics
         .iter()
         .filter(|m| metric_base_name(&m.key) == name)
+        .filter(|m| {
+            tag_filters
+                .iter()
+                .all(|(key, val)| m.tags.iter().any(|(k, v)| k == key && v == val))
+        })
         .collect();
+
     if matched.is_empty() {
         return None;
     }
+
     // Backlog §1 + line 60: percentile/min/max stats are only meaningful on
     // series that actually track a distribution or real extremes. The old
     // guard checked `all(Counter)` only, so a **Rate** summary (p50..p99
@@ -807,44 +700,8 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
     if percentile_guard_fails(&matched, stat) {
         return None;
     }
+
     Some(match stat {
-        // Percentiles: merged-population (k6 semantics) when the exact
-        // per-series histograms are retained; worst (highest) fallback.
-        Some("min") => matched.iter().map(|m| m.min).fold(f64::MAX, f64::min),
-        Some("max") => matched
-            .iter()
-            .map(|m| m.max)
-            .fold(f64::NEG_INFINITY, f64::max),
-        Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
-        Some("p90") => merged_percentile(&matched, 90.0),
-        Some("p95") => merged_percentile(&matched, 95.0),
-        Some("p99") => merged_percentile(&matched, 99.0),
-        Some(s) if parse_percentile(s).is_some() => {
-            let pct = parse_percentile(s).expect("guarded");
-            merged_percentile(&matched, pct)
-        }
-        // Rate = total sum / total count across ALL series (k6 merges tagged
-        // sub-series for the unscoped metric).
-        Some("rate") => {
-            if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
-                // Counter `count` IS the accumulated value (k6 semantics), so
-                // sum/count would degenerate to 1.0. The per-second rate is
-                // the accumulated total across series / run duration — the
-                // backlog's `data_received: ['rate>1000000']` case, which the
-                // old per-series-mean fallback made permanently red.
-                counter_rate(metrics, &matched)
-            } else {
-                let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
-                let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
-                if total_count > 0.0 {
-                    total_sum / total_count
-                } else {
-                    0.0
-                }
-            }
-        }
-        Some("count") => matched.iter().map(|m| m.count as f64).sum(),
-        Some("sum") => matched.iter().map(|m| m.sum).sum(),
         Some("avg") => {
             if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
                 // Counter: count == accumulated value, so sum/count is always
@@ -860,21 +717,34 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                 }
             }
         }
-        // k6's `value`/`last` stat = the most recent sample. W1-A: the OLD
-        // code had NO value arm here — `Some(_) => return None` made every
-        // `.value` threshold on a custom series FAIL CLOSED forever (the
-        // `vus: ['value>10']` sub-item: the translator emitted `vus.value >
-        // 10` and the evaluator never resolved it). With Trend/Gauge now
-        // tracking a real `last`, worst-of (max) across matches.
-        // k6's `value`/`last` stat = the most recent sample. W1-A: the OLD
-        // code had NO value arm here — `Some(_) => return None` made every
-        // `.value` threshold on a custom series FAIL CLOSED forever (the
-        // `vus: ['value>10']` sub-item: the translator emitted `vus.value >
-        // 10` and the evaluator never resolved it). Trend/Gauge now track a
-        // real `last` (worst-of max across matches). Counter/Rate hardcode
-        // `last` 0.0, so they FAIL CLOSED (same guard as the tag-scoped
-        // path) — resolving them would re-open the always-pass hole on
-        // `http_req_failed.value`.
+        Some("min") => matched.iter().map(|m| m.min).fold(f64::MAX, f64::min),
+        Some("max") => matched
+            .iter()
+            .map(|m| m.max)
+            .fold(f64::NEG_INFINITY, f64::max),
+        Some("p50") | Some("median") | Some("med") => merged_percentile(&matched, 50.0),
+        Some("p90") => merged_percentile(&matched, 90.0),
+        Some("p95") => merged_percentile(&matched, 95.0),
+        Some("p99") => merged_percentile(&matched, 99.0),
+        Some(s) if parse_percentile(s).is_some() => {
+            let pct = parse_percentile(s).expect("guarded");
+            merged_percentile(&matched, pct)
+        }
+        Some("count") => matched.iter().map(|m| m.count as f64).sum(),
+        Some("rate") => {
+            if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
+                counter_rate(metrics, &matched)
+            } else {
+                let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
+                let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
+                if total_count > 0.0 {
+                    total_sum / total_count
+                } else {
+                    0.0
+                }
+            }
+        }
+        Some("sum") => matched.iter().map(|m| m.sum).sum(),
         Some("value") | Some("last") => {
             if !matched
                 .iter()

@@ -562,4 +562,95 @@ mod tests {
         assert!(out.contains("/a"), "{out}");
         assert!(out.contains("/b"), "{out}");
     }
+
+    /// TR-105: the banner's PASS/FAIL verdict and the CLI exit code MUST
+    /// agree across pass, fail, and no-data runs. The CLI exits non-zero when
+    /// `thresholds_failed || run_failed()` (cli.rs); the banner uses the same
+    /// predicate (stdout.rs footer). This test renders the banner for each
+    /// failure class and asserts the printed verdict matches the exit-code
+    /// predicate — a green banner must mean exit 0, a red banner exit != 0.
+    #[test]
+    fn banner_and_exit_code_agree_across_pass_fail_and_no_data() {
+        // Mirror of the CLI exit predicate (cli.rs:667-679).
+        let exit_nonzero =
+            |result: &MetricsResult, thresholds: &HashMap<String, ThresholdConfig>| {
+                let tr = evaluate_thresholds(thresholds, result);
+                tr.iter().any(|t| !t.passed) || result.run_failed()
+            };
+        let assert_agree =
+            |result: &MetricsResult, thresholds: &HashMap<String, ThresholdConfig>| {
+                let out = StdoutReporter.render(result);
+                let banner_fail = out.contains("FAIL");
+                let exit_fail = exit_nonzero(result, thresholds);
+                assert_eq!(
+                    banner_fail, exit_fail,
+                    "banner FAIL ({}) must equal exit-code failure ({}) for run: {out}",
+                    banner_fail, exit_fail
+                );
+            };
+
+        // PASS: green thresholds, no checks/script/VU failures.
+        let mut pass = result_with();
+        pass.effective_thresholds = HashMap::from([(
+            "good".to_string(),
+            ThresholdConfig {
+                expression: "http_req_duration < 1000".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        )]);
+        assert_agree(&pass, &pass.effective_thresholds);
+        assert!(!pass.run_failed());
+
+        // FAIL via a crossed threshold (exit-code predicate = thresholds).
+        let mut thr_fail = result_with();
+        thr_fail.effective_thresholds = HashMap::from([(
+            "bad".to_string(),
+            ThresholdConfig {
+                expression: "http_req_duration > 1".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        )]);
+        assert_agree(&thr_fail, &thr_fail.effective_thresholds);
+
+        // FAIL via checks (no threshold at all): banner FAIL, exit-code
+        // predicate run_failed() → non-zero. This was the original lie.
+        let mut checks_fail = result_with();
+        checks_fail.effective_thresholds = HashMap::new();
+        checks_fail.checks_failed = 3;
+        checks_fail.checks_total = 5;
+        assert_agree(&checks_fail, &checks_fail.effective_thresholds);
+
+        // FAIL via VU-init failures (banner used to print PASS here).
+        let mut init_fail = result_with();
+        init_fail.effective_thresholds = HashMap::new();
+        init_fail.vu_init_failures = 1;
+        assert_agree(&init_fail, &init_fail.effective_thresholds);
+
+        // FAIL via script failures.
+        let mut script_fail = result_with();
+        script_fail.effective_thresholds = HashMap::new();
+        script_fail.script_failures = 1;
+        assert_agree(&script_fail, &script_fail.effective_thresholds);
+
+        // No-data: a threshold with zero observations fails closed (k6
+        // marks no-data thresholds as failed) but renders distinctly — the
+        // banner is FAIL and the exit code is non-zero, so they still agree.
+        let mut nodata = result_with();
+        nodata.effective_thresholds = HashMap::from([(
+            "phantom".to_string(),
+            ThresholdConfig {
+                expression: "phantom_metric < 1".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        )]);
+        assert_agree(&nodata, &nodata.effective_thresholds);
+        let out = StdoutReporter.render(&nodata);
+        assert!(
+            out.contains("NO DATA"),
+            "no-data threshold renders distinctly: {out}"
+        );
+    }
 }

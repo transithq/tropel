@@ -42,10 +42,10 @@ The worst class. A user ships on a number that was never true.
 ## TR-105 · stdout prints "✓ PASS" on runs that exit 1
 **Effort:** S · **Blocked by:** none
 
-- [ ] `stdout.rs:294-299` derives the banner from a different source than the exit code
+- [x] `stdout.rs:294-299` derives the banner from a different source than the exit code — **fixed**: banner uses `MetricsResult::run_failed()` (checks/script/VU-init), the same predicate the CLI exit code uses
 - [x]  `summary.rs` keys the top-level `thresholds` map **by expression**, so duplicate expressions erase failures
-- [ ] One verdict, computed once, used by the banner, the summary, the reporters and the exit code
-- [ ] A test asserts banner and exit code agree across pass, fail, and no-data runs
+- [x] One verdict, computed once, used by the banner, the summary, the reporters and the exit code — `run_failed()` added to `MetricsResult`, consumed by both `stdout.rs` and `cli.rs`
+- [x] A test asserts banner and exit code agree across pass, fail, and no-data runs — `stdout::banner_and_exit_code_agree_across_pass_fail_and_no_data` renders the banner for pass/threshold-fail/checks-fail/VU-init-fail/script-fail/no-data and asserts the printed verdict equals the CLI exit predicate (`thresholds_failed || run_failed()`, cli.rs:667-679)
 
 ---
 
@@ -69,16 +69,16 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-112 · Tag-scoped `avg` is worst-of; unscoped `avg` is pooled
 **Effort:** M · **Blocked by:** none
 
-- [ ] `thresholds.rs:516` vs `:665`. 1000 requests @10 ms on `/a` plus 10 @2000 ms on `/b` gives two different "averages" depending on whether the threshold names a tag
-- [ ] One aggregation path, dispatching on `self.metric_type` — this single change also closes `avg > max`, the `absorb_snapshot` type conflict, and the reserved-name collisions
-- [ ] Add the missing `value`/`last` arm in `aggregate_series` — it closes the Trend vacuous pass, tag-scoped arbitrary-series selection, and `vus:['value>10']` at the same time
+- [x] `thresholds.rs:516` vs `:665`. 1000 requests @10 ms on `/a` plus 10 @2000 ms on `/b` gives two different "averages" depending on whether the threshold names a tag — **fixed**: the tag-scoped `avg` POOLS the mean across matches, test `test_tag_scoped_avg_pools_across_series_not_worst_of` asserts 29.7 ms
+- [x] One aggregation path, dispatching on `self.metric_type` — this single change also closes `avg > max`, the `absorb_snapshot` type conflict, and the reserved-name collisions — **fixed**: `get_tag_scoped_metric_value` and `aggregate_series` collapsed into one shared `aggregate_matches(metrics, name, tag_filters, stat)`; both old functions are thin wrappers
+- [x] Add the missing `value`/`last` arm in `aggregate_series` — it closes the Trend vacuous pass, tag-scoped arbitrary-series selection, and `vus:['value>10']` at the same time — `aggregate_matches` has the arm, test `custom_series_value_stat_resolves`
 
 ## TR-113 · `handleSummary` has no unscoped `http_req_duration`
 **Effort:** S · **Blocked by:** TR-112
 
-- [ ] `summary.rs:23-84` iterates `results.metrics`; the merged unscoped series never appears, so the most common `handleSummary` script in existence reads `undefined`
-- [ ] k6's v2.1.0 default `data` shape is still the legacy `{root_group, options, state, metrics, setup_data}` — match it
-- [ ] `root_group` is currently a hardcoded empty stub while `per_group` is fully populated
+- [x] `summary.rs:23-84` iterates `results.metrics`; the merged unscoped series never appears, so the most common `handleSummary` script in existence reads `undefined` — **fixed**: `summary.rs` re-injects the merged `http_req_duration`/`iteration_duration` headlines under their unscoped keys (test `headline_http_req_duration_reinjected_into_handle_summary`)
+- [x] k6's v2.1.0 default `data` shape is still the legacy `{root_group, options, state, metrics, setup_data}` — match it — `metrics` carries the headline series and `root_group` is now a real tree
+- [x] `root_group` is currently a hardcoded empty stub while `per_group` is fully populated — **fixed**: `build_root_group` builds a nested group tree (name/path/id/groups/checks) from the per-group summaries; test `root_group_builds_tree_from_per_group_data` asserts nested `checkout::payment` with per-group passes/fails
 
 ## TR-114 · `pm.response.to.have.jsonBody("key")` is a false failure
 **Effort:** S · **Blocked by:** none
