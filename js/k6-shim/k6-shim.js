@@ -1549,6 +1549,8 @@ crypto.hexEncode = k6HexEncode;
 // NOTE: each fallback declares the binding with `var` inside the block. A
 // bare `name = value` assignment to a never-declared global is a ReferenceError
 // under QuickJS's strict eval; the hoisted `var` makes it a legal assignment.
+// The bare globals MUST be bound BEFORE the WebCrypto global below replaces
+// `crypto` (which is the k6/crypto module namespace here, not WebCrypto).
 if (typeof md4 === 'undefined') { var md4 = crypto.md4; }
 if (typeof md5 === 'undefined') { var md5 = crypto.md5; }
 if (typeof sha1 === 'undefined') { var sha1 = crypto.sha1; }
@@ -1563,6 +1565,82 @@ if (typeof createHash === 'undefined') { var createHash = crypto.createHash; }
 if (typeof createHMAC === 'undefined') { var createHMAC = crypto.createHMAC; }
 if (typeof randomBytes === 'undefined') { var randomBytes = crypto.randomBytes; }
 if (typeof hexEncode === 'undefined') { var hexEncode = crypto.hexEncode; }
+
+// ── WebCrypto global `crypto` (TR-241) ──
+// In real k6, `globalThis.crypto` is the WHATWG WebCrypto object, not an
+// import path (`import ... from 'k6/webcrypto'` fails in k6 too). Scripts
+// use `crypto.getRandomValues`, `crypto.randomUUID`, and
+// `crypto.subtle.digest('SHA-256', data)`. k6/crypto's NAMED functions
+// (sha256, hmac, ...) are bare globals bound above; the module namespace
+// object `crypto` is NOT the global — the WebCrypto object is, so install
+// it unconditionally (overwriting the module-scope `var crypto` leak).
+{
+    // getRandomValues: fill a Uint8Array with cryptographically random bytes.
+    var webcrypto = {};
+    webcrypto.getRandomValues = function (array) {
+        if (!array || typeof array.length !== 'number') {
+            throw new TypeError('getRandomValues: expected a typed array');
+        }
+        var n = array.length;
+        var bytes = __tropel_native_random_bytes(n);
+        for (var i = 0; i < n; i++) {
+            array[i] = bytes[i];
+        }
+        return array;
+    };
+    // randomUUID: RFC 4122 v4 from random bytes.
+    webcrypto.randomUUID = function () {
+        var b = __tropel_native_random_bytes(16);
+        b[6] = (b[6] & 0x0f) | 0x40; // version 4
+        b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+        var h = k6BytesToHex(b);
+        return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' +
+            h.slice(16, 20) + '-' + h.slice(20);
+    };
+    // subtle.digest: async SHA-1/256/384/512 → ArrayBuffer.
+    var subtle = {};
+    subtle.digest = function (algorithm, data) {
+        var name = (typeof algorithm === 'string') ? algorithm : algorithm.name;
+        var alg = name.toLowerCase().replace(/-/g, '').replace('_', '');
+        var fn;
+        if (alg === 'sha1') fn = k6OneShotHash('sha1');
+        else if (alg === 'sha256') fn = k6OneShotHash('sha256');
+        else if (alg === 'sha384') fn = k6OneShotHash('sha384');
+        else if (alg === 'sha512') fn = k6OneShotHash('sha512');
+        else return Promise.reject(new DOMException('Unsupported algorithm: ' + name, 'NotSupportedError'));
+        // k6OneShotHash calls k6ToBytes internally — pass the raw input
+        // (string / ArrayBuffer / Uint8Array), not a pre-converted array.
+        return Promise.resolve(fn(data, 'binary'));
+    };
+    // subtle.importKey + sign/verify for HMAC (SHA-256) — the common WebCrypto
+    // idiom a load-test script uses to sign a request.
+    subtle.importKey = function (format, keyData, algorithm, extractable, usages) {
+        var name = (typeof algorithm === 'string') ? algorithm : algorithm.name;
+        if (name && name.toLowerCase() === 'hmac') {
+            return Promise.resolve({ _secret: k6ToBytes(keyData), _alg: algorithm.hash ? algorithm.hash.name : 'SHA-256' });
+        }
+        return Promise.reject(new DOMException('Unsupported importKey: ' + name, 'NotSupportedError'));
+    };
+    subtle.sign = function (algorithm, key, data) {
+        var alg = (key && key._alg) ? key._alg : 'SHA-256';
+        var out = __tropel_native_hmac(alg.replace(/-/g, ''), key._secret, k6ToBytes(data));
+        if (!out) return Promise.reject(new DOMException('sign failed', 'OperationError'));
+        return Promise.resolve(new Uint8Array(out).buffer);
+    };
+    subtle.verify = function (algorithm, key, signature, data) {
+        var alg = (key && key._alg) ? key._alg : 'SHA-256';
+        var out = __tropel_native_hmac(alg.replace(/-/g, ''), key._secret, k6ToBytes(data));
+        if (!out) return Promise.resolve(false);
+        var sig = (signature instanceof ArrayBuffer) ? new Uint8Array(signature) : k6ToBytes(signature);
+        if (out.length !== sig.length) return Promise.resolve(false);
+        for (var i = 0; i < out.length; i++) {
+            if (out[i] !== sig[i]) return Promise.resolve(false);
+        }
+        return Promise.resolve(true);
+    };
+    webcrypto.subtle = subtle;
+    globalThis.crypto = webcrypto;
+}
 
 // ── k6/encoding (backlog line 125) ──
 // b64encode(input, encoding) / b64decode(input, encoding, format).
