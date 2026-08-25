@@ -1193,6 +1193,8 @@ mod tests {
             per_group: vec![],
             summary_trend_stats: vec![],
             effective_thresholds: HashMap::new(),
+            vu_init_failures: 0,
+            script_failures: 0,
         };
 
         // Unscoped: merged population p95 ≈ 10 ms → threshold passes.
