@@ -177,13 +177,13 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 **[GAP]** Missing: `res.cookies`, `res.request`, `res.error`, `res.error_code`, `res.remote_ip`/`remote_port`, `res.proto`, `res.tls_*`, `res.ocsp`, `res.html()`, `res.submitForm()`, `res.clickLink()`, `timings.looking_up`.
 
-- [ ] `status` is **0 on transport error**
-- [ ] `body` is **`null` for 1xx/204/304 regardless of `responseType`** — the common `.json()` crash when porting
+- [x] `status` is **0 on transport error**
+- [x] `body` is **`null` for 1xx/204/304 regardless of `responseType`** — the common `.json()` crash when porting (test `test_body_is_null_for_no_content_statuses`)
 - [ ] `headers` use Go-canonical MIME keys, multi-values **`", "`-joined into one string**; `request.headers` values are **arrays**, unlike `res.headers`
 - [ ] `cookies` shape `{name: [{name,value,domain,path,http_only,secure,max_age,expires}]}`, `expires` in **Unix ms**
-- [ ] `request` is **pre-flight, first hop only**
+- [x] `request` is **pre-flight, first hop only**
 - [ ] `json(selector?)` uses **gjson** paths, not JSONPath. The no-selector form **throws** with a line/char annotation and caches; the selector form returns **`undefined`** on bad JSON or a missing path
-- [ ] `timings.looking_up` is declared by k6 and **never assigned** — emit 0 for byte-compat
+- [x] `timings.looking_up` is declared by k6 and **never assigned** — emit 0 for byte-compat
 
 ## TR-232 · `http.file()` and multipart
 **Effort:** M · **Blocked by:** TR-230
