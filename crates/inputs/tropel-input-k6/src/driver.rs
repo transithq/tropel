@@ -9558,6 +9558,63 @@ mod tests {
         );
     }
 
+    /// TR-246: verify groupBy, keyBy, orderBy, sortBy work correctly.
+    /// These were marked done in the register but had no dedicated test —
+    /// the lodash conformance suite (193 cases) exercises them, but the
+    /// per-function test surface was missing.
+    #[tokio::test]
+    async fn test_lodash_group_key_order_sort() {
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var items = [
+                    { name: 'a', group: 1, score: 3 },
+                    { name: 'b', group: 1, score: 1 },
+                    { name: 'c', group: 2, score: 2 },
+                ];
+                JSON.stringify({
+                    // groupBy: should group by property string iteratee.
+                    groupBy: (function () {
+                        var g = _.groupBy(items, 'group');
+                        return { keys: Object.keys(g).map(Number), lens: [g[1].length, g[2].length] };
+                    })(),
+                    // keyBy: should index by property string iteratee.
+                    keyBy: (function () {
+                        var k = _.keyBy(items, 'name');
+                        return { keys: Object.keys(k).sort(), aName: k.a.name };
+                    })(),
+                    // orderBy: single iteratee, asc.
+                    orderByAsc: _.orderBy(items, 'score', 'asc').map(function (x) { return x.name; }),
+                    // orderBy: single iteratee, desc.
+                    orderByDesc: _.orderBy(items, 'score', 'desc').map(function (x) { return x.name; }),
+                    // orderBy: multiple iteratees.
+                    orderByMulti: _.orderBy(items, ['group', 'score'], ['asc', 'desc']).map(function (x) { return x.name; }),
+                    // sortBy: no iteratee → identity (should sort by serialized value).
+                    sortByIdentity: (function () {
+                        var s = _.sortBy([3, 1, 2]);
+                        return s.join(',');
+                    })(),
+                    // sortBy: property string iteratee.
+                    sortByProperty: _.sortBy(items, 'score').map(function (x) { return x.name; }),
+                    // padStart: multi-char pad must REPEAT (register: old code
+                    // returned '07' for '0' pad — lodash repeats to '0007').
+                    padStartRepeat: _.padStart('7', 4, '0'),
+                    padStartMulti: _.padStart('7', 4, 'ab'),
+                    padEndRepeat: _.padEnd('7', 4, '0'),
+                    padEndMulti: _.padEnd('7', 4, 'ab'),
+                })
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            r#"{"groupBy":{"keys":[1,2],"lens":[2,1]},"keyBy":{"keys":["a","b","c"],"aName":"a"},"orderByAsc":["b","c","a"],"orderByDesc":["a","c","b"],"orderByMulti":["a","b","c"],"sortByIdentity":"1,2,3","sortByProperty":["b","c","a"],"padStartRepeat":"0007","padStartMulti":"aba7","padEndRepeat":"7000","padEndMulti":"7aba"}"#,
+            "groupBy / keyBy / orderBy / sortBy / padStart / padEnd must produce correct results"
+        );
+    }
+
     #[tokio::test]
     async fn test_lodash_set_blocks_proto_pollution() {
         // Backlog line 155: `_.set({}, '__proto__.polluted', 1)` polluted
