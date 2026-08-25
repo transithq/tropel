@@ -251,7 +251,9 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 **Effort:** M · **Blocked by:** TR-212
 
 - [x] **[GAP]** `exec.vu.tags`, `exec.vu.metrics.tags` and `exec.vu.metrics.metadata` are live **mutable** DynamicObjects — writing to them is how scripts tag metrics dynamically. Everything else on `exec` is getter-only. Values restricted to String/Boolean/Number — `exec.vu.tags` (and `exec.vu.metrics.tags`/`metadata`) are mutable objects; the http bridge merges `exec.vu.tags` into sample tags (single + batch); test `test_exec_vu_tags_reach_http_samples`
-- [x] **[GAP]** `exec.test.abort(msg?)` → exit code **108**, and **`exec.test.fail(msg?)`**, which marks the run failed *without stopping it*. Two distinct things — `abort` reaches the engine stop (exit non-zero); `fail` throws (iteration marked failed, run continues), test `test_exec_members_are_value_properties`
+- [x] **[GAP]** `exec.test.abort(msg?)` → exit code **108**, and **`exec.test.fail(msg?)`**, which marks the run
+  failed *without stopping it*. Two distinct things — `abort` reaches the engine stop (exit 108); `fail` throws
+  (iteration marked failed, run continues), test `test_exec_members_are_value_properties` — **exit-code 108 mapping added** (PR #387)
 
 ## TR-245 · The remaining modules, ranked by demand
 **Effort:** L · **Blocked by:** TR-241
