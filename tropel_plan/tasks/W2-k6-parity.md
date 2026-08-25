@@ -163,27 +163,27 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 - [ ] `headers` — a `Host` key sets `req.Host`; a user `Content-Length` is **deleted with a warning**
 - [ ] `cookies` — including the `{value, replace}` form; `replace:false`, the default, sends **both** the request cookie and the jar cookie
-- [ ] `tags` — setting `tags.name` overrides **both** `name` and `url` (see `TR-205`)
+- [x] `tags` — setting `tags.name` overrides **both** `name` and `url` (see `TR-205`)
 - [ ] `auth` — `"digest"`/`"ntlm"`; **`"basic"` is a documented no-op**, basic auth works purely from URL userinfo
-- [ ] **[SILENT]** `timeout` default is **60 s**, not "no timeout"; a number means ms, a string is a duration
-- [ ] `redirects` default 10; **`0` returns the 3xx** rather than erroring
+- [x] **[SILENT]** `timeout` default is **60 s**, not "no timeout"; a number means ms, a string is a duration — **fixed**: engine default `DEFAULT_REQUEST_TIMEOUT` is 60s (k6 parity)
+- [x] `redirects` default 10; **`0` returns the 3xx** rather than erroring
 - [ ] `compression` — `gzip,deflate,zstd,br`, applied left-to-right
 - [ ] `responseType` — `text` / `binary`→ArrayBuffer / `none`
-- [ ] **[SILENT]** `params.headers` in Postman array form is silently dropped (`k6-shim.js:184` requires a non-Array) ✅**EXEC**
-- [ ] **[SILENT]** `http.post(url, {obj})` sends JSON; k6 sends **form-urlencoded** ✅closed — keep the regression test
+- [x] **[SILENT]** `params.headers` in Postman array form is silently dropped (`k6-shim.js:184` requires a non-Array) ✅**EXEC** — array form accepted (`k6-shim.js:189-194`)
+- [x] **[SILENT]** `http.post(url, {obj})` sends JSON; k6 sends **form-urlencoded** ✅closed — keep the regression test
 
 ## TR-231 · `Response` — the missing members
 **Effort:** L · **Blocked by:** TR-014, TR-204
 
 **[GAP]** Missing: `res.cookies`, `res.request`, `res.error`, `res.error_code`, `res.remote_ip`/`remote_port`, `res.proto`, `res.tls_*`, `res.ocsp`, `res.html()`, `res.submitForm()`, `res.clickLink()`, `timings.looking_up`.
 
-- [ ] `status` is **0 on transport error**
-- [ ] `body` is **`null` for 1xx/204/304 regardless of `responseType`** — the common `.json()` crash when porting
+- [x] `status` is **0 on transport error**
+- [x] `body` is **`null` for 1xx/204/304 regardless of `responseType`** — the common `.json()` crash when porting (test `test_body_is_null_for_no_content_statuses`)
 - [ ] `headers` use Go-canonical MIME keys, multi-values **`", "`-joined into one string**; `request.headers` values are **arrays**, unlike `res.headers`
 - [ ] `cookies` shape `{name: [{name,value,domain,path,http_only,secure,max_age,expires}]}`, `expires` in **Unix ms**
-- [ ] `request` is **pre-flight, first hop only**
+- [x] `request` is **pre-flight, first hop only**
 - [ ] `json(selector?)` uses **gjson** paths, not JSONPath. The no-selector form **throws** with a line/char annotation and caches; the selector form returns **`undefined`** on bad JSON or a missing path
-- [ ] `timings.looking_up` is declared by k6 and **never assigned** — emit 0 for byte-compat
+- [x] `timings.looking_up` is declared by k6 and **never assigned** — emit 0 for byte-compat
 
 ## TR-232 · `http.file()` and multipart
 **Effort:** M · **Blocked by:** TR-230

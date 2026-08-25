@@ -1745,6 +1745,14 @@ fn build_k6_response_object<'js>(
             None => Err(rquickjs::Error::Exception),
         };
     }
+    // TR-231: k6 sets `body` to null for 1xx/204/304 regardless of
+    // `responseType` (a status code with no body by HTTP semantics). The
+    // common `.json()` crash when porting: `res.json()` on a 204/304 must
+    // fail loudly, not return undefined-from-empty-string.
+    if (100..200).contains(&code) || code == 204 || code == 304 {
+        let _ = obj.set("body", rquickjs::Value::new_null(ctx.clone()));
+        return Ok(obj);
+    }
     if response_type.eq_ignore_ascii_case("binary") {
         // In-between sizes (under the cap) try the ArrayBuffer and fall back
         // to the envelope on failure.
@@ -10687,6 +10695,63 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 body.as_object().is_some_and(|o| o.is_array_buffer()),
                 "binary degradation must keep an ArrayBuffer body, got: {body:?}"
             );
+        });
+    }
+
+    /// TR-231: k6 sets `res.body` to null for 1xx/204/304 regardless of
+    /// `responseType` (HTTP statuses with no body). The old code always set a
+    /// String/ArrayBuffer body, so `res.json()` on a 204/304 returned
+    /// undefined-from-empty-string instead of failing loudly — the common
+    /// `.json()` crash when porting a k6 script.
+    #[test]
+    fn test_body_is_null_for_no_content_statuses() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            for (code, status_text) in [
+                (100, "Continue"),
+                (204, "No Content"),
+                (304, "Not Modified"),
+            ] {
+                let resp = build_k6_response_object(
+                    &ctx,
+                    code,
+                    status_text.to_string(),
+                    b"should-be-null".to_vec(),
+                    &HashMap::new(),
+                    1.0,
+                    None,
+                    "",
+                    0,
+                    "text",
+                    &[],
+                    "HTTP/1.1",
+                )
+                .expect("response object must build");
+                let body: rquickjs::Value = resp.get("body").unwrap();
+                assert!(
+                    body.is_null(),
+                    "status {code} must have null body, got: {body:?}"
+                );
+            }
+            // A 200 still carries the body.
+            let resp = build_k6_response_object(
+                &ctx,
+                200,
+                "OK".to_string(),
+                b"hello".to_vec(),
+                &HashMap::new(),
+                1.0,
+                None,
+                "",
+                0,
+                "text",
+                &[],
+                "HTTP/1.1",
+            )
+            .expect("response object must build");
+            let body: String = resp.get("body").unwrap();
+            assert_eq!(body, "hello", "200 must keep its body");
         });
     }
 
