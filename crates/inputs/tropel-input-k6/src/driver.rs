@@ -1376,6 +1376,31 @@ fn push_http_failure(
         timestamp: now,
         sample_type: SampleType::Rate,
     });
+    // TR-121: k6 emits ALL 8 HTTP metrics on transport failure, with the
+    // sub-timings as genuine zeros (the request never reached those phases).
+    // The old code emitted only http_reqs + http_req_failed, so
+    // `http_req_waiting:p(95) < 500` PASSED on a run where every request
+    // failed (the failure path never fed the distribution — same lie as
+    // TR-202 on the success path). Same names as the success path so
+    // thresholds resolve.
+    let sub_zero = [
+        ("http_req_blocked", 0.0),
+        ("http_req_dns", 0.0),
+        ("http_req_connecting", 0.0),
+        ("http_req_tls_handshaking", 0.0),
+        ("http_req_sending", 0.0),
+        ("http_req_waiting", 0.0),
+        ("http_req_receiving", 0.0),
+    ];
+    for (name, dur) in &sub_zero {
+        v.push(Sample {
+            metric: (*name).into(),
+            value: *dur,
+            tags: tags.clone(),
+            timestamp: now,
+            sample_type: SampleType::Trend,
+        });
+    }
     // Request-body bytes (same wire-size computation as the success path).
     v.push(Sample {
         metric: "data_sent".into(),
@@ -5278,6 +5303,21 @@ mod tests {
                     try { pm.expect(pm.response).to.have.status(200); return true; }
                     catch (e) { return 'threw: ' + e.message; }
                 })());
+                // TR-114: the reason-phrase form `to.have.status('OK')` is
+                // Postman's canonical snippet — must pass against the status
+                // text, and a wrong phrase must throw.
+                globalThis.__status_phrase_ok = String((function () {
+                    try { pm.expect(pm.response).to.have.status('OK'); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__status_phrase_bad = String((function () {
+                    try { pm.expect(pm.response).to.have.status('Created'); return 'no-throw'; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__status_chain_phrase_ok = String((function () {
+                    try { pm.response.to.have.status('OK'); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
             "#,
             )
             .expect("script should eval");
@@ -5330,6 +5370,22 @@ mod tests {
                 ctx.eval::<String, _>("__status_ok").unwrap(),
                 "true",
                 "pm.expect(pm.response).to.have.status(200) must pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_phrase_ok").unwrap(),
+                "true",
+                "pm.expect(pm.response).to.have.status('OK') must pass (TR-114)"
+            );
+            assert!(
+                ctx.eval::<String, _>("__status_phrase_bad")
+                    .unwrap()
+                    .contains("threw:"),
+                "to.have.status('Created') must throw on a 200 OK (TR-114)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_chain_phrase_ok").unwrap(),
+                "true",
+                "pm.response.to.have.status('OK') must pass (TR-114)"
             );
         });
     }
@@ -6036,6 +6092,10 @@ mod tests {
                 // Postman extensions survive delegation.
                 trial('status_ok', function () { pm.expect(pm.response).to.have.status(200); });
                 trial('status_bad', function () { pm.expect(pm.response).to.have.status(404); });
+                // TR-114: the reason-phrase form through the delegated chai
+                // assertion surface.
+                trial('status_phrase_ok', function () { pm.expect(pm.response).to.have.status('OK'); });
+                trial('status_phrase_bad', function () { pm.expect(pm.response).to.have.status('Created'); });
                 trial('header_ok', function () {
                     pm.expect(pm.response).to.have.header('Content-Type', 'application/json');
                 });
@@ -6087,6 +6147,8 @@ mod tests {
             assert_eq!(r("throw_bad"), "threw", "throw must fail closed when nothing throws");
             assert_eq!(r("status_ok"), "true", "pm.expect(pm.response).to.have.status must survive delegation");
             assert_eq!(r("status_bad"), "threw", "status must fail closed");
+            assert_eq!(r("status_phrase_ok"), "true", "status('OK') must pass (TR-114)");
+            assert_eq!(r("status_phrase_bad"), "threw", "status('Created') must fail closed (TR-114)");
             assert_eq!(r("header_ok"), "true", "header must survive delegation");
             assert_eq!(r("header_bad"), "threw", "header must fail closed");
             assert_eq!(r("typo"), "threw", "the guard must still trip on real typos through the delegated chain");
@@ -8162,7 +8224,34 @@ mod tests {
             sent.value, 7.0,
             "data_sent must carry the request-body bytes"
         );
-        assert_eq!(samples.len(), 4, "duration + reqs + failed + data_sent");
+        // TR-121: the failure path emits ALL 8 HTTP metrics — the 4 base
+        // samples plus the 7 sub-timing series (blocked/dns/connecting/
+        // tls_handshaking/sending/waiting/receiving) as genuine zeros, so a
+        // duration/waiting threshold cannot PASS on a fully-down target.
+        for sub in [
+            "http_req_blocked",
+            "http_req_dns",
+            "http_req_connecting",
+            "http_req_tls_handshaking",
+            "http_req_sending",
+            "http_req_waiting",
+            "http_req_receiving",
+        ] {
+            let sample = samples
+                .iter()
+                .find(|s| s.metric == sub)
+                .unwrap_or_else(|| panic!("failure must emit {sub}"));
+            assert_eq!(
+                sample.value, 0.0,
+                "{sub} must be a genuine zero on transport failure"
+            );
+            assert_eq!(
+                sample.sample_type,
+                SampleType::Trend,
+                "{sub} must be the same Trend series as the success path"
+            );
+        }
+        assert_eq!(samples.len(), 11, "4 base + 7 sub-timing samples");
     }
 
     #[test]

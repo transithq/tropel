@@ -763,10 +763,43 @@ impl ScenarioRunner {
                                 result.samples.push(tropel_sdk::types::Sample {
                                     metric: "http_req_failed".into(),
                                     value: 1.0,
-                                    tags: err_tags,
+                                    tags: err_tags.clone(),
                                     timestamp: now,
                                     sample_type: SampleType::Rate,
                                 });
+                                // TR-121: k6 emits ALL 8 HTTP metrics on
+                                // transport failure, sub-timings as genuine
+                                // zeros (the request never reached those
+                                // phases). The old code emitted only
+                                // http_reqs + errors + http_req_failed, so a
+                                // duration/waiting threshold PASSED on a run
+                                // where every request failed. Mirrors the k6
+                                // driver's push_http_failure (same names,
+                                // same zero values — one contract).
+                                result.samples.push(tropel_sdk::types::Sample {
+                                    metric: "http_req_duration".into(),
+                                    value: duration.as_secs_f64() * 1000.0,
+                                    tags: err_tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Trend,
+                                });
+                                for name in [
+                                    "http_req_blocked",
+                                    "http_req_dns",
+                                    "http_req_connecting",
+                                    "http_req_tls_handshaking",
+                                    "http_req_sending",
+                                    "http_req_waiting",
+                                    "http_req_receiving",
+                                ] {
+                                    result.samples.push(tropel_sdk::types::Sample {
+                                        metric: name.into(),
+                                        value: 0.0,
+                                        tags: err_tags.clone(),
+                                        timestamp: now,
+                                        sample_type: SampleType::Trend,
+                                    });
+                                }
                             }
                         }
                     }
@@ -2262,13 +2295,55 @@ mod tests {
         let mut runner =
             ScenarioRunner::new(scenario, execution_items, names, client, 0, "stale".into());
 
+        // First iteration: item 1 succeeds (200), item 2 hits the transport
+        // error — the stale-pm.response shape W1-A exercises.
         let _ = runner.run_iteration(0, None, &HashMap::new()).await;
-
-        let state = runner.pm_state().lock().unwrap();
+        {
+            let state = runner.pm_state().lock().unwrap();
+            assert!(
+                state.response.is_none(),
+                "pm.response must be None after a failed request — got {:?} (stale from item 1)",
+                state.response.as_ref().map(|r| r.status_code)
+            );
+        }
+        // Second iteration: EVERY call fails (the mock fails after the first),
+        // so every request must emit the full failure metric set.
+        let iteration = runner.run_iteration(0, None, &HashMap::new()).await;
+        // Two failures: each emits duration + http_reqs + errors +
+        // http_req_failed + data_sent + 7 sub-timings.
+        let samples = &iteration.samples;
+        let durations: Vec<_> = samples
+            .iter()
+            .filter(|s| s.metric == "http_req_duration")
+            .collect();
+        assert_eq!(durations.len(), 2, "two failure durations");
         assert!(
-            state.response.is_none(),
-            "pm.response must be None after a failed request — got {:?} (stale from item 1)",
-            state.response.as_ref().map(|r| r.status_code)
+            durations.iter().all(|s| s.value > 0.0),
+            "failure duration must carry the time-to-failure"
         );
+        let failed: Vec<_> = samples
+            .iter()
+            .filter(|s| s.metric == "http_req_failed")
+            .collect();
+        assert!(
+            !failed.is_empty() && failed.iter().all(|s| s.value == 1.0),
+            "transport failures must all be flagged http_req_failed=1.0, got {:?}",
+            failed.iter().map(|s| s.value).collect::<Vec<_>>()
+        );
+        // The failure path must emit ALL 7 sub-timing names as zeros.
+        for sub in [
+            "http_req_blocked",
+            "http_req_dns",
+            "http_req_connecting",
+            "http_req_tls_handshaking",
+            "http_req_sending",
+            "http_req_waiting",
+            "http_req_receiving",
+        ] {
+            assert!(
+                samples.iter().any(|s| s.metric == sub),
+                "failure path must emit {sub}"
+            );
+        }
     }
 }
