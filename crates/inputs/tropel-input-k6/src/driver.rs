@@ -917,6 +917,7 @@ fn intern_status(s: &str) -> Arc<str> {
 /// [`interned`]. The scenario tag is stamped here when present, so the
 /// drain's scenario pass is a no-op for http samples — it never
 /// `Arc::make_mut`-clones the map shared by the 5 per-request samples.
+#[allow(clippy::too_many_arguments)] // mirrors http_tags_for's field set
 fn http_tags(
     req: &Request,
     status: &str,
@@ -924,6 +925,7 @@ fn http_tags(
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
     protocol: &str,
+    error_code: i32,
 ) -> TagMap {
     http_tags_for(
         &req.url,
@@ -933,6 +935,7 @@ fn http_tags(
         extra,
         group,
         protocol,
+        error_code,
     )
 }
 
@@ -947,6 +950,7 @@ fn http_tags(
 /// recorded inside `group("x")` with `group=::x`, not the hardcoded
 /// `group=http`). None → default `group=""` (k6's root group; the leading
 /// `::` appears only inside a nested group).
+#[allow(clippy::too_many_arguments)] // the tag set mirrors k6's systemTags
 fn http_tags_for(
     url: &str,
     method: &str,
@@ -955,6 +959,7 @@ fn http_tags_for(
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
     protocol: &str,
+    error_code: i32,
 ) -> TagMap {
     let mut tags = TagMap::with_capacity(7);
     let url_arc: Arc<str> = Arc::from(url);
@@ -966,16 +971,21 @@ fn http_tags_for(
         interned("group"),
         group.map(Arc::from).unwrap_or_else(|| Arc::from("")),
     );
-    // TR-014: add protocol tag on every sample. Beating k6 which only
-    // tags protocol on success (k6 cannot tell you which protocol failures
-    // happened on).
+    // TR-212: `proto` is k6's systemTag (the old name was `protocol`, which
+    // k6-ecosystem consumers keyed on never matched). k6 only tags proto on
+    // success; tropel tags every sample (better — it can tell you which
+    // protocol failures happened on).
     if !protocol.is_empty() {
-        tags.insert(interned("protocol"), Arc::from(protocol));
+        tags.insert(interned("proto"), Arc::from(protocol));
     }
     if !scenario.is_empty() {
         // Refcount bump — the Arc was created once at bridge registration.
         tags.insert(interned("scenario"), scenario.clone());
     }
+    // TR-212: `error_code` is a k6 systemTag (0 on success; transport codes on
+    // failure; 1000+status for >=400). Sample tags let thresholds/dashboards
+    // distinguish "connection refused" from "504" in aggregate.
+    tags.insert(interned("error_code"), Arc::from(error_code.to_string()));
     if let Some(extra) = extra {
         for (k, v) in extra {
             tags.insert(k.clone(), v.clone());
@@ -1156,6 +1166,7 @@ fn push_http_samples_for(
         extra_tags,
         group,
         protocol,
+        k6_http_error_code(status_code),
     ));
 
     let is_failed = !(200..400).contains(&status_code);
@@ -1345,7 +1356,15 @@ fn push_http_failure(
     protocol: &str,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
-    let mut tags = http_tags(req, "0", scenario, extra_tags, group, protocol);
+    let mut tags = http_tags(
+        req,
+        "0",
+        scenario,
+        extra_tags,
+        group,
+        protocol,
+        k6_error_code_message(error_msg),
+    );
     // TR-204: error tag is populated on transport failures (k6 semantics).
     // The error tag is empty on success; error_code is 0 on success.
     if !error_msg.is_empty() {
@@ -7694,6 +7713,50 @@ mod tests {
             vec!["".to_string()],
             "root group must be empty string (k6 root), got: {:?}",
             groups
+        );
+    }
+
+    /// TR-212: k6 systemTags — `proto` (not `protocol`) and `error_code` must
+    /// appear on every http sample. `error_code` = 1000+status for >=400,
+    /// 0 for <400 (k6 semantics), so dashboards can distinguish status
+    /// failures from transport errors.
+    #[tokio::test]
+    async fn test_http_samples_carry_proto_and_error_code_tags() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                http.get('http://example.com/');
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "http_req_duration")
+            .expect("http_req_duration sample");
+        assert_eq!(
+            sample.tags.get("proto"),
+            Some("HTTP/1.1"),
+            "k6 systemTag must be `proto`, not `protocol`, got: {:?}",
+            sample.tags.get("proto")
+        );
+        assert!(
+            sample.tags.get("protocol").is_none(),
+            "the old `protocol` tag name must be gone"
+        );
+        // Stub returns 200 → error_code 0.
+        assert_eq!(
+            sample.tags.get("error_code"),
+            Some("0"),
+            "error_code must be 0 for <400, got: {:?}",
+            sample.tags.get("error_code")
         );
     }
 
