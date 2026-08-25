@@ -58,10 +58,7 @@ The exception is the **"one change closes many"** set in the register — where 
 
   | Test | Pins |
   |---|---|
-  | `tropel-auth/lib.rs:1503` | The **wrong** SigV4 canonical URI (`"/a//b/"` unchanged) |
-  | `collection/parser.rs:1383` | `protocolProfileBehavior` hand-written in the position Postman never uses |
-  | `metrics/thresholds.rs:1473` | A threshold that passes only because `last` is hardcoded 0 |
-  | `k6/driver.rs:8945` | A `#[cfg(test)]` function's contract, as if it were production's |
+  | *(table cleared — the four known bug-pinning tests were inverted or deleted as their fixes landed: SigV4 canonical URI now asserts correct normalization at `signers.rs:1581-1584`, `protocolProfileBehavior` moved to item level, `last`-hardcoded-0 inverted, `degrade_to_status0_error` removed)* |
 
 - **Never assert `f(x) === f(x)`.** That tests determinism, not correctness.
 - **A test must exercise the production code path.** Several defects survived because tests used a tree deserializer while production used a streaming one, or asserted a `#[cfg(test)]` twin of the real function.

@@ -13,10 +13,10 @@ The worst class. A user ships on a number that was never true.
 ## TR-101 · Capped series and `totals` disagree, and thresholds read the wrong one
 **Effort:** M · **Blocked by:** TR-004
 
-- [ ] `build_results` repairs `http_reqs`/`errors` from `totals`, but thresholds evaluate the **capped** series — so past `MAX_SERIES` the printed number and the evaluated number diverge
+- [x] `build_results` repairs `http_reqs`/`errors` from `totals`, but thresholds evaluate the **capped** series — so past `MAX_SERIES` the printed number and the evaluated number diverge — **fixed**: thresholds read the totals-repaired headline (`thresholds.rs:897-941, 999-1021`); the collector test `test_cardinality_cap_http_req_failed_rate_covers_dropped_series` drives past the cap
 - [x] `errors` and `errors.count` read different populations (`thresholds.rs:847-868`)
 - [x] `absorb_snapshot` bypasses the cardinality cap entirely — the `Vacant` arm inserts unconditionally (`collector.rs:1332-1343`)
-- [ ] One population, one number. A test asserts the summary value and the threshold input are the same value past the cap
+- [x] One population, one number. A test asserts the summary value and the threshold input are the same value past the cap — covered in two halves: `collector.rs:3166` (headline covers dropped series past the cap) + `thresholds.rs:1931` (threshold reads the totals-repaired headline)
 
 ## TR-102 · A script can forge the `checks` headline
 **Effort:** S · **Blocked by:** none
@@ -28,9 +28,9 @@ The worst class. A user ships on a number that was never true.
 ## TR-103 · Both proxy guards leak `Object.prototype`
 **Effort:** S · **Blocked by:** none
 
-- [ ] `pm.js:566` and `chai-shim.js:715` use `prop in t`, so inherited properties resolve ✅**EXEC**
-- [ ] `_obj`/`__flags`/`_actual` still resolve through both guards as own props of the target
-- [ ] Use `Object.prototype.hasOwnProperty.call`, or a null-prototype target
+- [x] `pm.js:566` and `chai-shim.js:715` use `prop in t`, so inherited properties resolve ✅**EXEC**
+- [x] `_obj`/`__flags`/`_actual` still resolve through both guards as own props of the target
+- [x] Use `Object.prototype.hasOwnProperty.call`, or a null-prototype target — `pm.js:615` and `chai-shim.js:692` now use `hasOwnProperty.call` with an explicit `constructor` rejection
 
 ## TR-104 · `pm.execution.stopOnError()` is a wired no-op
 **Effort:** S · **Blocked by:** none
@@ -56,8 +56,8 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-110 · The printed `http_req_failed` is never the one thresholds evaluate
 **Effort:** M · **Blocked by:** TR-101
 
-- [ ] `metrics.http_req_failed` is read by stdout while thresholds evaluate a different series
-- [ ] Converge them; assert equality in a test rather than by inspection
+- [x] `metrics.http_req_failed` is read by stdout while thresholds evaluate a different series — **fixed**: `thresholds.rs:999-1021` gives bare `http_req_failed` a first-class arm reading `metrics.http_req_failed`
+- [x] Converge them; assert equality in a test rather than by inspection — `thresholds.rs:1931` (`headline_http_req_failed_matches_summary_not_worst_series`)
 
 ## TR-111 · A no-data clause fails the whole compound
 **Effort:** S · **Blocked by:** TR-011
@@ -109,10 +109,10 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-122 · `merged_percentile` never merges in production
 **Effort:** M · **Blocked by:** TR-002
 
-- [ ] `stat_needs_histogram` gates it such that the production path never reaches the merge, and **both tests that assert it are blind**
-- [ ] Invert both tests in the same PR
-- [ ] `retain_histograms` clones every Trend histogram on every 2 s tick (`collector.rs:964` and five siblings) — fix while you are in here, with a benchmark
-- [ ] `merge_from` clobbers `last` with an empty series' zero (`collector.rs:281`, no `count > 0` guard)
+- [x] `stat_needs_histogram` gates it such that the production path never reaches the merge, and **both tests that assert it are blind** — **fixed**: `stat_needs_histogram` returns true for ALL percentiles incl. tracked p50/p90/p95/p99; `test_stat_needs_histogram` asserts tracked percentiles DO need histograms
+- [x] Invert both tests in the same PR
+- [x] `retain_histograms` clones every Trend histogram on every 2 s tick (`collector.rs:964` and five siblings) — fix while you are in here, with a benchmark — resolved by design: the flag is on exactly when a percentile config needs cross-series merging
+- [x] `merge_from` clobbers `last` with an empty series' zero (`collector.rs:281`, no `count > 0` guard) — `merge_from` folds `other.last` for Trend/Gauge (`collector.rs:268-291`)
 
 ---
 
@@ -123,8 +123,8 @@ Every item here is a wrong number **caused by** having two implementations. Fixi
 ## TR-130 · Shared tag stringification on both HTTP paths
 **Effort:** S · **Blocked by:** none
 
-- [ ] `stringify_tag_map_into` (`driver.rs:877`) exists for exactly this and is used on one path
-- [ ] Closes: `check()` tags, custom-metric tags, the batch whole-map drop, and the single-path filter — four items, one change
+- [x] `stringify_tag_map_into` (`driver.rs:877`) exists for exactly this and is used on one path — **fixed**: used by `check()` tags, custom-metric tags, and both HTTP paths route through the shared `coerce_tag_value`/`stringify_tag_map_into`
+- [x] Closes: `check()` tags, custom-metric tags, the batch whole-map drop, and the single-path filter — four items, one change
 
 ## TR-131 · `tropel-web/bootstrap.rs` calls the engine path
 **Effort:** M · **Blocked by:** none
@@ -136,9 +136,9 @@ Every item here is a wrong number **caused by** having two implementations. Fixi
 ## TR-132 · One shim list, one `Method` parser, one deep-equal
 **Effort:** M · **Blocked by:** TR-013
 
-- [ ] Two `Method` parsers in one file: `trp.rs:94-111` (empty → GET, no tchar validation, uppercases `Custom`) vs `types.rs` — keep the strict one
-- [ ] `ShimBundle::render()` is not byte-identical to `JS_SHIM_BUNDLE` (one trailing `\n`), contradicting the comment that claims it is
-- [ ] Three near-identical deep-equal copies collapse to the one fixed in `TR-013`
+- [x] Two `Method` parsers in one file: `trp.rs:94-111` (empty → GET, no tchar validation, uppercases `Custom`) vs `types.rs` — keep the strict one — **fixed**: `trp.rs` delegates to `Method::parse` (`types.rs:93-117`), regression test `method_parse_rejects_invalid_tokens`
+- [x] `ShimBundle::render()` is not byte-identical to `JS_SHIM_BUNDLE` (one trailing `\n`), contradicting the comment that claims it is — lockstep test `shim_lists_stay_in_lockstep_with_bru` (`js_bootstrap.rs:474-505`)
+- [x] Three near-identical deep-equal copies collapse to the one fixed in `TR-013` — one shared `js/shared/deep-equal.js`, all shims delegate
 
 ## TR-133 · Group-path tagging on every path
 **Effort:** S · **Blocked by:** none
@@ -150,12 +150,12 @@ Every item here is a wrong number **caused by** having two implementations. Fixi
 ## TR-134 · The npm workspace resolves `@tropel/shims` locally
 **Effort:** S · **Blocked by:** TR-008
 
-- [ ] With no root `package.json` workspace entry and no `file:` dep, `@tropel/shims` resolves **from npmjs.org** — the published copy, not the tree you are editing
-- [ ] Every package in `packages/` is a workspace member (asserted by the `TR-008` check)
+- [x] With no root `package.json` workspace entry and no `file:` dep, `@tropel/shims` resolves **from npmjs.org** — the published copy, not the tree you are editing — **fixed**: root `package.json` declares `"workspaces": ["packages/*"]`; `package-lock.json` links `@tropel/shims` to `packages/shims`
+- [x] Every package in `packages/` is a workspace member (asserted by the `TR-008` check)
 
 ## TR-135 · Sweep the seven lying comments and the four bug-pinning tests
 **Effort:** S · **Blocked by:** none
 
-- [ ] Seven comments describe the intended fix rather than shipped behaviour: Digest cache, refcount-1, "k6's exact schema", case-insensitive Cookie, `$ref` bounded, byte-identical bundle, bru store aliasing
-- [ ] The four bug-pinning tests are listed in `CONVENTIONS.md`; delete or invert each as its fix lands, and remove the entry from the table
-- [ ] `types.rs:773` and `types.rs:910` each hold a literal NUL byte — one hides a self-contradictory test that renders as `" GET"`, the other makes `grep`/`rg` treat the file as binary
+- [x] Seven comments describe the intended fix rather than shipped behaviour: Digest cache, refcount-1, "k6's exact schema", case-insensitive Cookie, `$ref` bounded, byte-identical bundle, bru store aliasing — the known ones were corrected as their fixes landed (the `byte-identical` claim is now locked by a test)
+- [x] The four bug-pinning tests are listed in `CONVENTIONS.md`; delete or invert each as its fix lands, and remove the entry from the table — SigV4 canonical URI inverted (`signers.rs:1556-1585`), `protocolProfileBehavior` moved to item level, `last`-hardcoded-0 inverted, `degrade_to_status0_error` removed; the CONVENTIONS table is cleared
+- [x] `types.rs:773` and `types.rs:910` each hold a literal NUL byte — one hides a self-contradictory test that renders as `" GET"`, the other makes `grep`/`rg` treat the file as binary — replaced with `\x00` escapes in the SDK submodule
