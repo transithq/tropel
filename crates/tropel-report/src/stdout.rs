@@ -270,7 +270,16 @@ impl StdoutReporter {
             out.push_str("\n  ── Thresholds ──────────────────────────────────────────\n");
             for tr in &threshold_results {
                 let op = tr.expression.split_whitespace().nth(1).unwrap_or("<?>");
-                if tr.passed {
+                if tr.no_data {
+                    // TR-111: a no-data verdict is distinct from FAIL — k6
+                    // marks no-data thresholds as failed for the exit code,
+                    // but a threshold that was never exercised is not a
+                    // measured failure.
+                    out.push_str(&format!(
+                        "    ? {}: (no data) {} {:.2} (NO DATA)\n",
+                        tr.name, op, tr.threshold
+                    ));
+                } else if tr.passed {
                     out.push_str(&format!(
                         "    ✓ {}: {:.2} {} {:.2} (PASS)\n",
                         tr.name, tr.actual, op, tr.threshold
@@ -476,6 +485,30 @@ mod tests {
         checks_fail.checks_total = 5;
         let out = StdoutReporter.render(&checks_fail);
         assert!(out.contains("FAIL"), "checks failure must show FAIL: {out}");
+
+        // TR-111: a NO-DATA threshold renders distinctly from FAIL.
+        let mut nodata = result_with();
+        nodata.effective_thresholds = HashMap::from([(
+            "phantom".to_string(),
+            ThresholdConfig {
+                expression: "phantom_metric < 1".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        )]);
+        let out = StdoutReporter.render(&nodata);
+        assert!(
+            out.contains("NO DATA"),
+            "no-data threshold must render distinctly: {out}"
+        );
+        assert!(
+            out.contains("? phantom: (no data)"),
+            "no-data line must use the distinct ? mark: {out}"
+        );
+        assert!(
+            !out.contains("phantom_metric"),
+            "no-data must not render a measured FAIL mark on the threshold line: {out}"
+        );
     }
 
     #[test]
