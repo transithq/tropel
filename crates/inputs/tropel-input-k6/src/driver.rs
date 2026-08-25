@@ -10346,22 +10346,23 @@ mod tests {
             .eval(
                 r#"
                 JSON.stringify([
-                    crypto.sha256('hello', 'hex'),
-                    crypto.sha1('hello', 'hex'),
-                    crypto.md5('hello', 'hex'),
-                    crypto.md4('abc', 'hex'),
-                    crypto.sha512_224('abc', 'hex'),
-                    crypto.sha512_256('abc', 'hex'),
-                    crypto.ripemd160('hello', 'hex'),
-                    crypto.sha256('hello', 'base64'),
-                    crypto.sha256('hello', 'base64url'),
-                    crypto.sha256('hello', 'base64rawurl'),
-                    Array.from(new Uint8Array(crypto.sha256('hello', 'binary'))).join(','),
+                    sha256('hello', 'hex'),
+                    sha1('hello', 'hex'),
+                    md5('hello', 'hex'),
+                    md4('abc', 'hex'),
+                    sha512_224('abc', 'hex'),
+                    sha512_256('abc', 'hex'),
+                    ripemd160('hello', 'hex'),
+                    sha256('hello', 'base64'),
+                    sha256('hello', 'base64url'),
+                    sha256('hello', 'base64rawurl'),
+                    Array.from(new Uint8Array(sha256('hello', 'binary'))).join(','),
                 ])
                 "#,
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|e| format!("EVAL_ERR: {e}"));
+        assert!(!out.starts_with("EVAL_ERR"), "crypto eval failed: {out}");
         assert_eq!(
             out,
             concat!(
@@ -10392,17 +10393,17 @@ mod tests {
                 var key = [11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11];
                 var keyBuf = new Uint8Array(key).buffer;
                 JSON.stringify([
-                    crypto.hmac('sha256', keyBuf, 'Hi There', 'hex'),
-                    crypto.createHash('sha256').update('he').update('llo').digest('hex'),
-                    crypto.createHMAC('sha256', keyBuf).update('Hi').update(' There').digest('hex'),
+                    hmac('sha256', keyBuf, 'Hi There', 'hex'),
+                    createHash('sha256').update('he').update('llo').digest('hex'),
+                    createHMAC('sha256', keyBuf).update('Hi').update(' There').digest('hex'),
                     // Exercising the digest-0.11 md5 arm of the hmac dispatcher
                     // (RFC 1320 test suite: HMAC-MD5 of "what do ya want for
                     // nothing?" with key "Jefe" = 750c783e6ab0b503eaa86e310a5db738).
                     // Strings are passed straight through (k6ToBytes output is a
                     // plain JS array, which the shim's k6ToBytes rejects).
-                    crypto.hmac('md5', 'Jefe', 'what do ya want for nothing?', 'hex'),
-                    crypto.hexEncode('hello'),
-                    new Uint8Array(crypto.randomBytes(8)).length,
+                    hmac('md5', 'Jefe', 'what do ya want for nothing?', 'hex'),
+                    hexEncode('hello'),
+                    new Uint8Array(randomBytes(8)).length,
                 ])
                 "#,
             )
@@ -10962,6 +10963,84 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
                 )
                 .expect("TextDecoder must accept an ArrayBuffer");
             assert_eq!(len, 2);
+        });
+    }
+
+    /// TR-241: `globalThis.crypto` is the WHATWG WebCrypto object (not the
+    /// k6/crypto module namespace). Scripts use `crypto.randomUUID()`,
+    /// `crypto.getRandomValues()`, and `crypto.subtle.digest('SHA-256', data)`.
+    #[test]
+    fn test_k6_shim_bundle_has_webcrypto_global() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            // Stub the native bridges the k6-shim probes at load (the driver
+            // registers real ones; a bare eval needs stand-ins).
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_native_random_bytes = function (n) {
+                    var b = new Uint8Array(n);
+                    for (var i = 0; i < n; i++) b[i] = (i * 37 + n) % 256;
+                    return b;
+                };
+                globalThis.__tropel_native_hmac = function (alg, key, data) {
+                    var out = new Uint8Array(32);
+                    for (var i = 0; i < 32; i++) out[i] = (key.length + data.length + alg.length + i) % 256;
+                    return out;
+                };
+                globalThis.__tropel_native_sha256 = function (d) { return globalThis.__tropel_native_hmac('sha256', new Uint8Array(0), d); };
+                globalThis.__tropel_native_sha1 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_sha384 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_sha512 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_base64_encode = function (b) { return ''; };
+                globalThis.__tropel_native_base64url_encode = function (b) { return ''; };
+                globalThis.__tropel_native_base64_decode = function (s) { return new Uint8Array(0); };
+            "#,
+            )
+            .expect("native bridge stubs must eval");
+            let bundle = format!(
+                "{}\n{}\n",
+                include_str!("../../../../js/k6-shim/k6-shim.js"),
+                include_str!("../../../../js/k6-shim/open-data-shim.js")
+            );
+            ctx.eval::<(), _>(bundle.as_str())
+                .expect("shims in production order must eval");
+
+            let uuid: String = ctx
+                .eval("crypto.randomUUID()")
+                .unwrap_or_else(|e| format!("ERR: {e}"));
+            assert_ne!(uuid, "", "crypto.randomUUID must exist, got err: {uuid}");
+            assert_eq!(uuid.len(), 36, "UUID must be RFC 4122 v4 shape, got {uuid}");
+            let chars: Vec<char> = uuid.chars().collect();
+            assert_eq!(chars[14], '4', "UUID must be version 4");
+
+            let rand_ok: bool = ctx
+                .eval(
+                    "var a = new Uint8Array(4); \
+                     var r = crypto.getRandomValues(a); \
+                     r === a && a.length === 4",
+                )
+                .expect("crypto.getRandomValues must exist");
+            assert!(rand_ok, "getRandomValues must fill the typed array");
+
+            // subtle.digest is async — eval to a Promise and finish it.
+            let digest_res: std::result::Result<String, rquickjs::Error> = ctx
+                .eval::<rquickjs::Promise, _>(
+                    "(async function () { \
+                       try { \
+                         var buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('hi')); \
+                         return String(buf instanceof ArrayBuffer && buf.byteLength === 32); \
+                       } catch (e) { \
+                         return 'ERR: ' + e.message; \
+                       } \
+                     })()",
+                )
+                .and_then(|p| p.finish::<String>().map_err(|_| rquickjs::Error::Exception));
+            let digest_str = digest_res.unwrap_or_else(|e| format!("PROMISE_ERR: {e}"));
+            assert_eq!(
+                digest_str, "true",
+                "crypto.subtle.digest must return an ArrayBuffer, got: {digest_str}"
+            );
         });
     }
 

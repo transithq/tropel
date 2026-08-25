@@ -94,8 +94,11 @@ type AdapterEntry = (&'static str, u8, fn() -> Box<dyn InputAdapter>);
 // adapter (postman=40) is probed first. The old order was arbitrary
 // and har(30)/bru(25) were checked before postman(40) for no reason.
 const ADAPTERS: &[AdapterEntry] = &[
+    // TR-263: the wasm/browser tier parses SUBMITTED (untrusted)
+    // collections — use the untrusted Postman adapter so mode:"file"
+    // bodies / form-data file parts cannot read arbitrary paths.
     ("postman", 40, || {
-        Box::new(tropel_input_postman::PostmanInputAdapter)
+        Box::new(tropel_input_postman::PostmanUntrustedInputAdapter)
     }),
     ("insomnia", 35, || {
         Box::new(tropel_input_insomnia::InsomniaInputAdapter)

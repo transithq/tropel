@@ -55,9 +55,28 @@ fn validate_methods(items: &[CollectionItem]) -> Result<()> {
 }
 
 /// Convert a Collection into a protocol-agnostic Scenario.
+///
+/// TR-263: local-file reads driven by collection content (`mode:"file"` body,
+/// form-data file parts) are an exfiltration primitive once a collection is
+/// SUBMITTED (tropel-web/tropel-distributed make that plausible). Self-authored
+/// CLI collections are trusted; submitted collections are not. This default
+/// path allows file reads (CLI semantics); embedders that parse untrusted
+/// collections call [`collection_to_scenario_with_file_reads`] with `false`.
 pub fn collection_to_scenario(
     collection: Collection,
     env_vars: HashMap<String, String>,
+) -> Scenario {
+    collection_to_scenario_with_file_reads(collection, env_vars, true)
+}
+
+/// [`collection_to_scenario`] with an explicit local-file-read trust boundary.
+/// Pass `false` when the collection is not self-authored (web, distributed,
+/// shared), so `mode:"file"` bodies and form-data file parts degrade to empty
+/// parts with a warning instead of reading an arbitrary path off the disk.
+pub fn collection_to_scenario_with_file_reads(
+    collection: Collection,
+    env_vars: HashMap<String, String>,
+    allow_local_file_reads: bool,
 ) -> Scenario {
     let mut scenario = Scenario {
         info: ScenarioInfo {
@@ -94,6 +113,7 @@ pub fn collection_to_scenario(
         &collection.item,
         &collection.event,
         collection.auth.as_ref(),
+        allow_local_file_reads,
     );
 
     scenario
@@ -103,13 +123,19 @@ fn convert_items(
     items: &[CollectionItem],
     parent_events: &[Event],
     inherited_auth: Option<&CollectionAuth>,
+    allow_local_file_reads: bool,
 ) -> Vec<ScenarioItem> {
     let mut result = Vec::new();
 
     for item in items {
         match item {
             CollectionItem::Request(req) => {
-                let scenario_item = convert_request_item(req, parent_events, inherited_auth);
+                let scenario_item = convert_request_item(
+                    req,
+                    parent_events,
+                    inherited_auth,
+                    allow_local_file_reads,
+                );
                 result.push(scenario_item);
             }
             CollectionItem::Folder(folder) => {
@@ -130,7 +156,8 @@ fn convert_items(
                 // outer→inner.
                 let mut events = parent_events.to_vec();
                 events.extend(folder.event.iter().cloned());
-                let children = convert_items(&folder.item, &events, folder_auth);
+                let children =
+                    convert_items(&folder.item, &events, folder_auth, allow_local_file_reads);
                 // Backlog line 146: an EMPTY folder (no requests anywhere in
                 // its subtree) must not be emitted as a ScenarioItem.
                 // `flatten_execution_items` treats any leaf carrying scripts
@@ -171,6 +198,7 @@ fn convert_request_item(
     req: &RequestItem,
     parent_events: &[Event],
     inherited_auth: Option<&CollectionAuth>,
+    allow_local_file_reads: bool,
 ) -> ScenarioItem {
     // v2.1 schema location for request-level auth is `item.request.auth`
     // (RequestDetail.auth) — `item.auth` is a position the schema doesn't
@@ -182,6 +210,7 @@ fn convert_request_item(
         request_auth,
         inherited_auth,
         req.protocol_profile_behavior.as_ref(),
+        allow_local_file_reads,
     );
 
     // P0 (backlog): request events were EITHER/OR with parent events — a
@@ -207,6 +236,7 @@ fn convert_request(
     request_auth: Option<&CollectionAuth>,
     inherited_auth: Option<&CollectionAuth>,
     protocol_profile_behavior: Option<&ProtocolProfileBehavior>,
+    allow_local_file_reads: bool,
 ) -> Request {
     // validate_methods() (called from parse_collection) rejects genuinely
     // invalid tokens at parse time. Direct callers of collection_to_scenario
@@ -232,7 +262,7 @@ fn convert_request(
 
     let query_params = build_query_params(detail, &mut url);
 
-    let mut body = convert_body(detail.body.as_ref());
+    let mut body = convert_body(detail.body.as_ref(), allow_local_file_reads);
 
     // Backlog line 140: Postman prunes the request body for GET/HEAD unless
     // `protocolProfileBehavior.disableBodyPruning` is set. The HTTP client is
@@ -494,7 +524,7 @@ fn mime_from_filename(filename: &str) -> String {
     }
 }
 
-fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
+fn convert_body(body: Option<&RequestBody>, allow_local_file_reads: bool) -> Option<Body> {
     match body {
         Some(b) => match b.mode.as_str() {
             "raw" => b.raw.clone().map(Body::Raw),
@@ -529,7 +559,16 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                                         .map(|f| f.to_string_lossy().into_owned())
                                 });
                                 let mime = filename.as_deref().map(mime_from_filename);
-                                match p.src.as_ref().and_then(|s| std::fs::read(s).ok()) {
+                                // TR-263: a submitted (untrusted) collection
+                                // must not read an arbitrary path off the
+                                // disk. When file reads are disallowed, emit an
+                                // EMPTY part with a warning instead.
+                                let bytes = if allow_local_file_reads {
+                                    p.src.as_ref().and_then(|s| std::fs::read(s).ok())
+                                } else {
+                                    None
+                                };
+                                match bytes {
                                     Some(bytes) => FormDataPart {
                                         name: p.key.clone(),
                                         value: None,
@@ -537,16 +576,18 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                                         mime,
                                         data: Some(bytes),
                                     },
-                                    // Line 198 (c): a missing file used to
-                                    // silently become an EMPTY part — the
-                                    // normal case on a worker. Warn so it is
-                                    // visible; the part is still emitted
-                                    // (empty) so the request shape survives.
+                                    // Line 198 (c): a missing file (or a
+                                    // disallowed read) used to silently become
+                                    // an EMPTY part — the normal case on a
+                                    // worker. Warn so it is visible; the part
+                                    // is still emitted (empty) so the request
+                                    // shape survives.
                                     None => {
                                         tracing::warn!(
-                                            "form-data file part '{}' source {:?} missing or unreadable — sending empty part",
+                                            "form-data file part '{}' source {:?} missing, unreadable{} — sending empty part",
                                             p.key,
-                                            p.src
+                                            p.src,
+                                            if allow_local_file_reads { "" } else { ", or file reads are disabled for untrusted collections (TR-263)" }
                                         );
                                         FormDataPart {
                                             name: p.key.clone(),
@@ -592,8 +633,19 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                         }
                     }
                     if let Some(src) = &f.src {
-                        if let Ok(bytes) = std::fs::read(src) {
-                            return Some(Body::Binary(bytes));
+                        // TR-263: submitted collections must not read an
+                        // arbitrary path. When disallowed, the file body
+                        // degrades to no body (like a missing file).
+                        if allow_local_file_reads {
+                            if let Ok(bytes) = std::fs::read(src) {
+                                return Some(Body::Binary(bytes));
+                            }
+                        } else {
+                            tracing::warn!(
+                                "request body mode=\"file\" source {:?} ignored — file reads are disabled for untrusted collections (TR-263)",
+                                src
+                            );
+                            return None;
                         }
                     }
                 }
@@ -1091,6 +1143,56 @@ mod tests {
                 // original filename (NOT a lossy string and no filename).
                 assert_eq!(file.filename.as_deref(), Some("tropel-test-form.txt"));
                 assert_eq!(file.data.as_deref(), Some(b"part-contents".as_slice()));
+            }
+            other => panic!("expected FormData body, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_formdata_file_part_blocked_when_file_reads_disabled() {
+        // TR-263: a SUBMITTED (untrusted) collection must not read an
+        // arbitrary path off the disk. With file reads disabled, the
+        // form-data file part degrades to an EMPTY part (no data, no read),
+        // and the request still builds.
+        let path = std::env::temp_dir().join("tropel-test-secret.txt");
+        std::fs::write(&path, b"should-never-be-read").expect("write temp file");
+        let src = path.display().to_string().replace('\\', "\\\\");
+        let json = format!(
+            r#"{{
+                "info": {{
+                    "name": "FD-UNTRUSTED",
+                    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                }},
+                "item": [{{
+                    "name": "Form",
+                    "request": {{
+                        "method": "POST",
+                        "url": "https://api.test/form",
+                        "body": {{
+                            "mode": "formdata",
+                            "formdata": [
+                                {{"key": "file", "type": "file", "src": "{src}"}}
+                            ]
+                        }}
+                    }}
+                }}]
+            }}"#
+        );
+        let collection = parse_collection_str(&json).unwrap();
+        let scenario = collection_to_scenario_with_file_reads(collection, HashMap::new(), false);
+        let req = scenario.items[0].request.as_ref().expect("request");
+        match &req.body {
+            Some(Body::FormData(parts)) => {
+                let file = parts.iter().find(|p| p.name == "file").expect("file part");
+                assert!(
+                    file.data.is_none(),
+                    "untrusted parse must NOT read the file — got data: {:?}",
+                    file.data
+                );
+                // The filename is still present (shape survives); the content
+                // is empty.
+                assert_eq!(file.filename.as_deref(), Some("tropel-test-secret.txt"));
             }
             other => panic!("expected FormData body, got {other:?}"),
         }

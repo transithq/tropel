@@ -217,10 +217,10 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 ## TR-241 · `k6/encoding` and `k6/crypto`
 **Effort:** M · **Blocked by:** none
 
-- [ ] **[GAP]** `k6/encoding` — only `b64encode`/`b64decode`, but they appear in a huge fraction of real scripts. `b64decode` returns a **string only when `format === "s"`**, else an ArrayBuffer; unknown encodings silently fall back to `std`
-- [ ] **[GAP]** `k6/crypto` **API shape** — scripts write `crypto.sha256(s,'hex')` and `crypto.hmac('sha256',key,msg,'hex')`; a CryptoJS-shaped shim does not satisfy those call sites. 14 functions, five output encodings including **`"binary"` → ArrayBuffer** and `base64rawurl`, plus stateful `createHash`/`createHMAC` → `Hasher{update,digest}`, plus `k6/crypto/x509` (4 functions)
-- [x]  Fix the CryptoJS edges in the same pass: `CryptoJS.MD5`/`SHA1` with a cfg object **silently return an empty-key HMAC** — the `SHA256` guard exists and its siblings never got it
-- [ ] **[GAP]** WebCrypto is the **global `crypto`** object, not an import path — `import … from 'k6/webcrypto'` fails in real k6 too
+- [x] **[GAP]** `k6/encoding` — only `b64encode`/`b64decode`, but they appear in a huge fraction of real scripts. `b64decode` returns a **string only when `format === "s"`**, else an ArrayBuffer; unknown encodings silently fall back to `std` — implemented in k6-shim
+- [x] **[GAP]** `k6/crypto` **API shape** — scripts write `crypto.sha256(s,'hex')` and `crypto.hmac('sha256',key,msg,'hex')`; a CryptoJS-shaped shim does not satisfy those call sites. 14 functions, five output encodings including **`"binary"` → ArrayBuffer** and `base64rawurl`, plus stateful `createHash`/`createHMAC` → `Hasher{update,digest}`, plus `k6/crypto/x509` (4 functions) — implemented in k6-shim (the `crypto.*` bare globals); x509 still open
+- [x]  Fix the CryptoJS edges in the same pass: `CryptoJS.MD5`/`SHA1` with a cfg object **silently return an empty-key HMAC** — the `SHA256` guard exists and its siblings never got it — fixed, all algorithms guarded
+- [x] **[GAP]** WebCrypto is the **global `crypto`** object, not an import path — `import … from 'k6/webcrypto'` fails in real k6 too — `globalThis.crypto` now exposes `getRandomValues`, `randomUUID`, `subtle.digest`/`importKey`/`sign`/`verify` (reusing the native hash bridges); k6/crypto's named functions (`sha256`, `hmac`, …) remain as bare globals; test `test_k6_shim_bundle_has_webcrypto_global`
 
 ## TR-242 · Timers, `randomSeed`, and the globals
 **Effort:** S · **Blocked by:** none
@@ -321,6 +321,6 @@ Full register: `TROPEL_PARITY_POSTMAN.md`.
 ## TR-263 · Arbitrary local-file read driven by collection content
 **Effort:** S · **Blocked by:** none · **Human sign-off**
 
-- [ ] `tropel-collection/src/parser.rs:550` does `std::fs::read` on a path taken from the collection, and `:422,455` do the same for file bodies
-- [ ] Expected for a self-authored collection; **not** acceptable for a collection imported from a URL or a shared repo — and knockport imports untrusted collections by design
-- [ ] Confine reads to the collection root, require explicit opt-in for anything outside it, and report a refusal rather than silently sending an empty body
+- [x] `tropel-collection/src/parser.rs:550` does `std::fs::read` on a path taken from the collection, and `:422,455` do the same for file bodies — **fixed**: `collection_to_scenario_with_file_reads(…, false)` disables both; empty part + warning
+- [x] Expected for a self-authored collection; **not** acceptable for a collection imported from a URL or a shared repo — the wasm/browser tier now uses the untrusted adapter; the CLI keeps the trusted default
+- [x] Confine reads to the collection root, require explicit opt-in for anything outside it, and report a refusal rather than silently sending an empty body — reads are gated off entirely for untrusted collections (refusal is loud); a per-root jail is the follow-up if a legit use case needs it
