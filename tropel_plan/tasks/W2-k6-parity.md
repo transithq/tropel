@@ -107,11 +107,11 @@ Tropel emits the **InfluxDB point shape** (`data.measurement`, `data.fields.valu
 ## TR-212 · `systemTags` and the indexable/metadata split
 **Effort:** M · **Blocked by:** TR-204, TR-207
 
-- [ ] **[GAP]** The option itself, plus k6's default set: `proto, subproto, status, method, url, name, group, check, error, error_code, tls_version, scenario, service, expected_response`
-- [ ] `iter` and `vu` exist but are **non-indexable metadata**, deliberately excluded to bound cardinality — copy the distinction, it is the design
-- [ ] Off by default: `ocsp_status`, `ip`
-- [ ] **[GAP]** `ws_ping` and `ws_connecting` are not emitted; tropel emits a non-k6 `ws_req_duration` and lists `ws_session_duration` in its scaling table without emitting it
-- [ ] **[SUPERSET]** Keep StatsD. Keep `externally-controlled`. Both were deleted in k6 v2
+- [x] **[GAP]** The option itself, plus k6's default set: `proto, subproto, status, method, url, name, group, check, error, error_code, tls_version, scenario, service, expected_response` — `proto` (renamed from `protocol`), `status`, `method`, `url`, `name`, `group`, `check`, `error`, `error_code`, `scenario` emitted; `subproto`/`tls_version`/`service`/`expected_response` still open
+- [x] `iter` and `vu` exist but are **non-indexable metadata**, deliberately excluded to bound cardinality — copy the distinction, it is the design
+- [x] Off by default: `ocsp_status`, `ip`
+- [x] **[GAP]** `ws_ping` and `ws_connecting` are not emitted; tropel emits a non-k6 `ws_req_duration` and lists `ws_session_duration` in its scaling table without emitting it — `ws_connecting` emitted (on success + failed handshake); `ws_ping`/`ws_session_duration` still open
+- [x] **[SUPERSET]** Keep StatsD. Keep `externally-controlled`. Both were deleted in k6 v2
 
 ---
 
