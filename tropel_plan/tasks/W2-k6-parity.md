@@ -124,10 +124,10 @@ Tropel emits the **InfluxDB point shape** (`data.measurement`, `data.fields.valu
 
 Tropel's act-then-sleep leads by one step *and* accumulates drift, and its ramp-down re-arms surplus from the stage-start count and can overshoot to zero VUs. **A precomputed absolute-offset table makes both bugs structurally impossible** — port the model, don't patch the symptoms.
 
-- [ ] Interpolation rules (`:194-233`): `stageVUDiff == 0` → **HOLD, no steps at all**; `stageDuration == 0` → instant `GoTo`; ramp-down walks the index backwards with spacing `timeTillEnd - stageDuration*(stageEndVUs-unscaled+1)/stageVUDiff`
-- [ ] Defaults: `startVUs` 1, `gracefulRampDown` **30 s**, `gracefulStop` **30 s**, `maxConcurrentVUs = 100_000_000`
-- [ ] Scenario names must match `^[0-9a-zA-Z_-]+$`
-- [ ] A `1s` floor applies to `duration`/`maxDuration`, but **0-duration stages are legal**
+- [x] Interpolation rules (`:194-233`): `stageVUDiff == 0` → **HOLD, no steps at all**; `stageDuration == 0` → instant `GoTo`; ramp-down walks the index backwards with spacing `timeTillEnd - stageDuration*(stageEndVUs-unscaled+1)/stageVUDiff` — **already ported by TR-160/161** (absolute-offset `sleep_until(stage_start + offset)` per stage, forward-spaced ramp-down equivalent to k6's backward walk). Verified by PR #384.
+- [x] Defaults: `startVUs` 1, `gracefulRampDown` **30 s**, `gracefulStop` **30 s**, `maxConcurrentVUs = 100_000_000` — defaults already correct; `maxConcurrentVUs` cap added in `validate_execution_config` (PR #384)
+- [x] Scenario names must match `^[0-9a-zA-Z_-]+$` — added in k6 driver `to_declared()` (skip invalid names with warning) — PR #384
+- [x] A `1s` floor applies to `duration`/`maxDuration`, but **0-duration stages are legal** — added in `validate_execution_config` — PR #384
 
 ## TR-221 · Arrival rate — striped offsets and rational segment scaling
 **Effort:** L · **Blocked by:** TR-220
