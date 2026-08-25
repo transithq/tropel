@@ -62,9 +62,9 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-111 · A no-data clause fails the whole compound
 **Effort:** S · **Blocked by:** TR-011
 
-- [ ] `thresholds.rs:312` propagates `None` out of the entire expression, so one metric with no observations fails an unrelated compound threshold
-- [ ] "No data" is a third verdict, rendered distinctly from FAIL, and configurable in how it affects the exit code
-- [ ] This is the same root cause as `TR-011`; fixing either alone leaves the other reachable
+- [x] `thresholds.rs:312` propagates `None` out of the entire expression, so one metric with no observations fails an unrelated compound threshold
+- [x] "No data" is a third verdict, rendered distinctly from FAIL, and configurable in how it affects the exit code
+- [x] This is the same root cause as `TR-011`; fixing either alone leaves the other reachable
 
 ## TR-112 · Tag-scoped `avg` is worst-of; unscoped `avg` is pooled
 **Effort:** M · **Blocked by:** none
@@ -83,9 +83,9 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-114 · `pm.response.to.have.jsonBody("key")` is a false failure
 **Effort:** S · **Blocked by:** none
 
-- [ ] `pm.js:464` deep-equals the argument against the whole body instead of treating a string argument as a path assertion
-- [ ] `to.have.status()` rejects the reason-phrase form in both `pm.js:437-445` and `chai-shim.js:714`
-- [ ] Both fixes land with the six stock-snippet regression tests
+- [x] `pm.js:464` deep-equals the argument against the whole body instead of treating a string argument as a path assertion
+- [x] `to.have.status()` rejects the reason-phrase form in both `pm.js:437-445` and `chai-shim.js:714`
+- [x] Both fixes land with the six stock-snippet regression tests
 
 ---
 
