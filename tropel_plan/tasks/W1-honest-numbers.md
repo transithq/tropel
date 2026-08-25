@@ -35,17 +35,17 @@ The worst class. A user ships on a number that was never true.
 ## TR-104 · `pm.execution.stopOnError()` is a wired no-op
 **Effort:** S · **Blocked by:** none
 
-- [ ] `pm.js:1327` → `trp.rs:1050` sets `st.skip_tests`; `runner.rs:29x` never reads it — the canonical "a flag is set but nothing reads it" instance
+- [x] `pm.js:1327` → `trp.rs:1050` sets `st.skip_tests`; `runner.rs:29x` never reads it — the canonical "a flag is set but nothing reads it" instance — **resolved by removal**: the invented `stopOnError` is absent (calling it throws, like real Postman); `skipRequest` is wired end-to-end (`trp.rs:1089-1094`, `runner.rs:360-370`)
 - [x]  Wire it, and audit the three siblings of the same shape: SIGINT across the four duration executors, `tropel-web` force-stop, and the abort coordinator's unreachable `check_abort_on_fail`
-- [ ] A test asserts the run stops at the failing request, not at the end
+- [x] A test asserts the run stops at the failing request, not at the end — `end_to_end::failing_abort_on_fail_threshold_stops_run_at_the_failing_request`: a genuinely-failed `abort_on_fail` threshold stops the run at the first ~2 s coordinator check instead of running its full 30 s
 
 ## TR-105 · stdout prints "✓ PASS" on runs that exit 1
 **Effort:** S · **Blocked by:** none
 
-- [ ] `stdout.rs:294-299` derives the banner from a different source than the exit code
+- [x] `stdout.rs:294-299` derives the banner from a different source than the exit code — **fixed**: banner uses `MetricsResult::run_failed()` (checks/script/VU-init), the same predicate the CLI exit code uses
 - [x]  `summary.rs` keys the top-level `thresholds` map **by expression**, so duplicate expressions erase failures
-- [ ] One verdict, computed once, used by the banner, the summary, the reporters and the exit code
-- [ ] A test asserts banner and exit code agree across pass, fail, and no-data runs
+- [x] One verdict, computed once, used by the banner, the summary, the reporters and the exit code — `run_failed()` added to `MetricsResult`, consumed by both `stdout.rs` and `cli.rs`
+- [x] A test asserts banner and exit code agree across pass, fail, and no-data runs — `stdout::banner_and_exit_code_agree_across_pass_fail_and_no_data` renders the banner for pass/threshold-fail/checks-fail/VU-init-fail/script-fail/no-data and asserts the printed verdict equals the CLI exit predicate (`thresholds_failed || run_failed()`, cli.rs:667-679)
 
 ---
 
@@ -69,9 +69,9 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-112 · Tag-scoped `avg` is worst-of; unscoped `avg` is pooled
 **Effort:** M · **Blocked by:** none
 
-- [ ] `thresholds.rs:516` vs `:665`. 1000 requests @10 ms on `/a` plus 10 @2000 ms on `/b` gives two different "averages" depending on whether the threshold names a tag
-- [ ] One aggregation path, dispatching on `self.metric_type` — this single change also closes `avg > max`, the `absorb_snapshot` type conflict, and the reserved-name collisions
-- [ ] Add the missing `value`/`last` arm in `aggregate_series` — it closes the Trend vacuous pass, tag-scoped arbitrary-series selection, and `vus:['value>10']` at the same time
+- [x] `thresholds.rs:516` vs `:665`. 1000 requests @10 ms on `/a` plus 10 @2000 ms on `/b` gives two different "averages" depending on whether the threshold names a tag — **fixed**: the tag-scoped `avg` POOLS the mean across matches, test `test_tag_scoped_avg_pools_across_series_not_worst_of` asserts 29.7 ms
+- [x] One aggregation path, dispatching on `self.metric_type` — this single change also closes `avg > max`, the `absorb_snapshot` type conflict, and the reserved-name collisions — **fixed**: `get_tag_scoped_metric_value` and `aggregate_series` collapsed into one shared `aggregate_matches(metrics, name, tag_filters, stat)`; both old functions are thin wrappers
+- [x] Add the missing `value`/`last` arm in `aggregate_series` — it closes the Trend vacuous pass, tag-scoped arbitrary-series selection, and `vus:['value>10']` at the same time — `aggregate_matches` has the arm, test `custom_series_value_stat_resolves`
 
 ## TR-113 · `handleSummary` has no unscoped `http_req_duration`
 **Effort:** S · **Blocked by:** TR-112

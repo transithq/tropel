@@ -737,3 +737,78 @@ async fn midrun_rate_threshold_with_abort_on_fail_does_not_kill_healthy_run() ->
     let _ = std::fs::remove_file(&coll);
     Ok(())
 }
+
+/// TR-104: the mirror image of the two healthy-run tests above. A threshold
+/// that genuinely FAILS with `abort_on_fail: true` must stop the run at the
+/// failing request — the first ~2 s abort-coordinator check — NOT run to the
+/// end and report green. The old code wired `pm.execution.stopOnError()` to a
+/// flag nobody read; the abort coordinator here is the real stop mechanism,
+/// and it must fire when a threshold is actually breached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_abort_on_fail_threshold_stops_run_at_the_failing_request() -> Result<()> {
+    let srv = start_echo_server_with_latency_tail().await;
+    let coll = write_collection(&format!("http://{srv}"), "abort-fail");
+
+    // An impossible threshold: p(95) of the latency-tail server is ~500ms,
+    // so `p(95) < 1` fails on every check. With abort_on_fail the run must
+    // terminate at the first ~2s coordinator tick.
+    let mut thresholds = HashMap::new();
+    thresholds.insert(
+        "http_req_duration".to_string(),
+        ThresholdConfig {
+            expression: "http_req_duration.p(95) < 1".to_string(),
+            abort_on_fail: true,
+            delay_abort_eval: None,
+        },
+    );
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 2,
+            // Long enough that an abort at the first check is unambiguous
+            // vs. the full run.
+            duration: "30s".to_string(),
+            graceful_stop: Some("2s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds,
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let start = std::time::Instant::now();
+    let result = engine.run(&config).await?;
+    let elapsed = start.elapsed();
+    let m = &result.metrics;
+
+    // The run must STOP, not run its full 30s. The abort fires at the first
+    // ~2s check + in-flight drain (bounded by the 2s graceful stop). Any
+    // completed run is >= 30s wall-clock, so a < 15s bound discriminates
+    // sharply between "aborted at the failing request" and "ran to the end".
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "abort_on_fail run must stop at the failing request; ran {elapsed:?} instead"
+    );
+
+    // The threshold genuinely failed — non-vacuous guard.
+    let threshold_results = evaluate_thresholds(&result.effective_thresholds, m);
+    let t = threshold_results
+        .iter()
+        .find(|t| t.name == "http_req_duration")
+        .expect("threshold evaluated");
+    assert!(
+        !t.passed,
+        "threshold '{}' must have failed (actual={})",
+        t.expression, t.actual
+    );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
