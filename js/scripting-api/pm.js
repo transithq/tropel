@@ -436,8 +436,16 @@ pm.response.to = guardChain({
     have: guardChain({
         status: function (code) {
             // Backlog line 143: pm.response.code is a VALUE now.
+            // TR-114: accept BOTH a numeric code AND a reason-phrase string.
+            // Postman's `to.have.status('OK')` is the canonical form; the
+            // numeric form is also valid.
             var actual = pm.response.code;
-            if (actual !== code) {
+            var expected = code;
+            if (typeof code === 'string') {
+                actual = pm.response.status;
+                expected = code;
+            }
+            if (actual !== expected) {
                 throw new Error(
                     'expected response to have status ' + code + ' but got ' + actual
                 );
@@ -777,7 +785,12 @@ AssertChain.prototype.status = function (code) {
     // Must THROW on mismatch (Postman/chai semantics) — a boolean return
     // makes `pm.test` treat the callback's `undefined` statement result as
     // passed. Backlog line 143: pm.response.code is a VALUE now.
+    // TR-114: accept BOTH a numeric code AND a reason-phrase string
+    // (`to.have.status('OK')` is Postman's canonical form).
     var actual = pm.response.code;
+    if (typeof code === 'string') {
+        actual = pm.response.status;
+    }
     var holds = actual === code;
     if (this._negated ? holds : !holds) {
         throw new Error('expected response ' + (this._negated ? 'not ' : '') + 'to have status ' + code + ' but got ' + actual);

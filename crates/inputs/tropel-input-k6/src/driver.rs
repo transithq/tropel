@@ -5278,6 +5278,21 @@ mod tests {
                     try { pm.expect(pm.response).to.have.status(200); return true; }
                     catch (e) { return 'threw: ' + e.message; }
                 })());
+                // TR-114: the reason-phrase form `to.have.status('OK')` is
+                // Postman's canonical snippet — must pass against the status
+                // text, and a wrong phrase must throw.
+                globalThis.__status_phrase_ok = String((function () {
+                    try { pm.expect(pm.response).to.have.status('OK'); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__status_phrase_bad = String((function () {
+                    try { pm.expect(pm.response).to.have.status('Created'); return 'no-throw'; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__status_chain_phrase_ok = String((function () {
+                    try { pm.response.to.have.status('OK'); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
             "#,
             )
             .expect("script should eval");
@@ -5330,6 +5345,22 @@ mod tests {
                 ctx.eval::<String, _>("__status_ok").unwrap(),
                 "true",
                 "pm.expect(pm.response).to.have.status(200) must pass"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_phrase_ok").unwrap(),
+                "true",
+                "pm.expect(pm.response).to.have.status('OK') must pass (TR-114)"
+            );
+            assert!(
+                ctx.eval::<String, _>("__status_phrase_bad")
+                    .unwrap()
+                    .contains("threw:"),
+                "to.have.status('Created') must throw on a 200 OK (TR-114)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_chain_phrase_ok").unwrap(),
+                "true",
+                "pm.response.to.have.status('OK') must pass (TR-114)"
             );
         });
     }
@@ -6036,6 +6067,10 @@ mod tests {
                 // Postman extensions survive delegation.
                 trial('status_ok', function () { pm.expect(pm.response).to.have.status(200); });
                 trial('status_bad', function () { pm.expect(pm.response).to.have.status(404); });
+                // TR-114: the reason-phrase form through the delegated chai
+                // assertion surface.
+                trial('status_phrase_ok', function () { pm.expect(pm.response).to.have.status('OK'); });
+                trial('status_phrase_bad', function () { pm.expect(pm.response).to.have.status('Created'); });
                 trial('header_ok', function () {
                     pm.expect(pm.response).to.have.header('Content-Type', 'application/json');
                 });
@@ -6087,6 +6122,8 @@ mod tests {
             assert_eq!(r("throw_bad"), "threw", "throw must fail closed when nothing throws");
             assert_eq!(r("status_ok"), "true", "pm.expect(pm.response).to.have.status must survive delegation");
             assert_eq!(r("status_bad"), "threw", "status must fail closed");
+            assert_eq!(r("status_phrase_ok"), "true", "status('OK') must pass (TR-114)");
+            assert_eq!(r("status_phrase_bad"), "threw", "status('Created') must fail closed (TR-114)");
             assert_eq!(r("header_ok"), "true", "header must survive delegation");
             assert_eq!(r("header_bad"), "threw", "header must fail closed");
             assert_eq!(r("typo"), "threw", "the guard must still trip on real typos through the delegated chain");

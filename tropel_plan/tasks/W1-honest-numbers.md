@@ -83,9 +83,9 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-114 · `pm.response.to.have.jsonBody("key")` is a false failure
 **Effort:** S · **Blocked by:** none
 
-- [ ] `pm.js:464` deep-equals the argument against the whole body instead of treating a string argument as a path assertion
-- [ ] `to.have.status()` rejects the reason-phrase form in both `pm.js:437-445` and `chai-shim.js:714`
-- [ ] Both fixes land with the six stock-snippet regression tests
+- [x] `pm.js:464` deep-equals the argument against the whole body instead of treating a string argument as a path assertion
+- [x] `to.have.status()` rejects the reason-phrase form in both `pm.js:437-445` and `chai-shim.js:714`
+- [x] Both fixes land with the six stock-snippet regression tests
 
 ---
 
