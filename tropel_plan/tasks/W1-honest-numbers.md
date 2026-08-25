@@ -35,9 +35,9 @@ The worst class. A user ships on a number that was never true.
 ## TR-104 · `pm.execution.stopOnError()` is a wired no-op
 **Effort:** S · **Blocked by:** none
 
-- [ ] `pm.js:1327` → `trp.rs:1050` sets `st.skip_tests`; `runner.rs:29x` never reads it — the canonical "a flag is set but nothing reads it" instance
+- [x] `pm.js:1327` → `trp.rs:1050` sets `st.skip_tests`; `runner.rs:29x` never reads it — the canonical "a flag is set but nothing reads it" instance — **resolved by removal**: the invented `stopOnError` is absent (calling it throws, like real Postman); `skipRequest` is wired end-to-end (`trp.rs:1089-1094`, `runner.rs:360-370`)
 - [x]  Wire it, and audit the three siblings of the same shape: SIGINT across the four duration executors, `tropel-web` force-stop, and the abort coordinator's unreachable `check_abort_on_fail`
-- [ ] A test asserts the run stops at the failing request, not at the end
+- [x] A test asserts the run stops at the failing request, not at the end — `end_to_end::failing_abort_on_fail_threshold_stops_run_at_the_failing_request`: a genuinely-failed `abort_on_fail` threshold stops the run at the first ~2 s coordinator check instead of running its full 30 s
 
 ## TR-105 · stdout prints "✓ PASS" on runs that exit 1
 **Effort:** S · **Blocked by:** none
