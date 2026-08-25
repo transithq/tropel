@@ -1202,6 +1202,8 @@ impl Aggregator {
             checks_total,
             checks_passed,
             checks_failed,
+            vu_init_failures: 0,
+            script_failures: 0,
             http_reqs,
             http_req_duration,
             iteration_duration,
@@ -1619,6 +1621,15 @@ pub struct MetricsResult {
     pub checks_total: u64,
     pub checks_passed: u64,
     pub checks_failed: u64,
+    /// Number of VUs that failed to START (driver init / HTTP client
+    /// creation). Non-zero means the requested load was NOT delivered.
+    /// Stamped by the engine after the run; reporters use it in the PASS/FAIL
+    /// verdict so the banner and the CLI exit code cannot disagree (TR-105).
+    pub vu_init_failures: u32,
+    /// Number of script executions (prerequest/test scripts, driver
+    /// iterations) that errored during the run. Stamped by the engine after
+    /// the run, same as `vu_init_failures`.
+    pub script_failures: u64,
     pub http_reqs: u64,
     pub http_req_duration: Option<MetricSummary>,
     pub iteration_duration: Option<MetricSummary>,
@@ -1660,6 +1671,16 @@ impl MetricsResult {
     pub fn is_unverified(&self) -> bool {
         self.dropped_iterations > 0 || self.series_dropped > 0 || self.output_samples_dropped > 0
     }
+
+    /// The one verdict the banner, the reporters, the summary and the CLI
+    /// exit code all share (TR-105): a run is FAIL when any check failed, any
+    /// script errored, or any VU failed to start. Threshold verdicts are
+    /// evaluated separately against `effective_thresholds` (the reporter
+    /// already does that); this covers the non-threshold failure classes so
+    /// the banner cannot print PASS while the process exits non-zero.
+    pub fn run_failed(&self) -> bool {
+        self.checks_failed > 0 || self.script_failures > 0 || self.vu_init_failures > 0
+    }
 }
 
 impl Default for MetricsResult {
@@ -1671,6 +1692,8 @@ impl Default for MetricsResult {
             checks_total: 0,
             checks_passed: 0,
             checks_failed: 0,
+            vu_init_failures: 0,
+            script_failures: 0,
             http_reqs: 0,
             http_req_duration: None,
             iteration_duration: None,

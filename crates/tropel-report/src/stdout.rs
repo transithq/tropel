@@ -286,13 +286,15 @@ impl StdoutReporter {
 
         // ── Status footer: green PASS / red FAIL ──
         // ANSI colors only when stdout is a TTY so piped output stays clean.
-        // TR-105: FAIL is driven by thresholds AND checks — matching the
-        // CLI exit code (cli.rs returns Err on threshold failure or
-        // script_failures). A run with failed checks but no threshold
-        // must not print PASS while exiting non-zero.
+        // TR-105: FAIL is driven by thresholds AND checks AND run-level
+        // failures (VU init / script errors) — the SAME verdict the CLI exit
+        // code uses. A run that will exit non-zero must not print PASS, and a
+        // run that prints FAIL must exit non-zero.
         let thresholds_failed = threshold_results.iter().any(|t| !t.passed);
-        let checks_failed = result.checks_failed > 0;
-        let (status, color) = if thresholds_failed || checks_failed {
+        // run_failed() covers checks_failed, script_failures, vu_init_failures
+        // — the same verdict the CLI exit code uses (TR-105).
+        let run_failed = result.run_failed();
+        let (status, color) = if thresholds_failed || run_failed {
             ("✗ FAIL — one or more thresholds crossed", "\x1b[31m") // red
         } else {
             ("✓ PASS — test completed successfully", "\x1b[32m") // green
@@ -476,6 +478,28 @@ mod tests {
         checks_fail.checks_total = 5;
         let out = StdoutReporter.render(&checks_fail);
         assert!(out.contains("FAIL"), "checks failure must show FAIL: {out}");
+
+        // TR-105: vu_init_failures must also show FAIL (the old banner printed
+        // PASS while the CLI exited 1 on undelivered load).
+        let mut init_fail = result_with();
+        init_fail.vu_init_failures = 3;
+        let out = StdoutReporter.render(&init_fail);
+        assert!(
+            out.contains("FAIL"),
+            "VU init failure must show FAIL: {out}"
+        );
+
+        // TR-105: script_failures must also show FAIL.
+        let mut script_fail = result_with();
+        script_fail.script_failures = 2;
+        let out = StdoutReporter.render(&script_fail);
+        assert!(out.contains("FAIL"), "script failure must show FAIL: {out}");
+
+        // No-data run (zero checks, zero failures) must stay PASS.
+        let empty = MetricsResult::default();
+        assert!(empty.checks_total == 0 && empty.checks_failed == 0);
+        let out = StdoutReporter.render(&empty);
+        assert!(out.contains("PASS"), "empty run must show PASS: {out}");
     }
 
     #[test]
