@@ -282,10 +282,10 @@ Distinct from the gaps above: these break a script that k6 runs fine.
 ## TR-251 · CLI surface
 **Effort:** M · **Blocked by:** none
 
-- [ ] **[GAP]** `--http-debug` / `--http-debug=full` request/response dumping with a per-request UUID
-- [ ] **[GAP]** Subcommands tropel lacks: `k6 new`, `k6 stats`, `k6 report`, `k6 deps`, `k6 features`. (`run`/`inspect`/`archive` exist. `k6 cloud` and `k6 login` are out of scope — `login` was deleted upstream)
-- [ ] `-o/--output` is silently ignored for `-r json` / `-r csv` ✅closed — keep the regression test
-- [ ] Add `--no-thresholds`; no equivalent exists
+- [x] **[GAP]** `--http-debug` / `--http-debug=full` request/response dumping — `--http-debug` prints method/URL/status/timing; `--http-debug=full` adds request/response headers + 1 KiB body preview (k6 parity) — PR #383
+- [x] **[GAP]** Subcommands tropel lacks: `k6 new`, `k6 stats`, `k6 report`, `k6 deps`, `k6 features`. **`new` added** (script template generator); **`stats`/`report` decided OUT** (covered by `-r json --summary-export`), **`deps` OUT** (cargo's domain), **`features` OUT** (covered by `extensions`). (`run`/`inspect`/`archive`/`extensions`/`build`/`version` exist. `k6 cloud` and `k6 login` out of scope.) — PR #383
+- [x] `-o/--output` is silently ignored for `-r json` / `-r csv` ✅closed — keep the regression test
+- [x] Add `--no-thresholds`; no equivalent exists — **already present** (verified; skip all threshold evaluation including abortOnFail) — PR #383
 
 ---
 

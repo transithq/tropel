@@ -378,6 +378,37 @@ pub(crate) fn print_version() -> Result<()> {
     Ok(())
 }
 
+/// `tropel new [script.js]` — write a minimal, runnable k6-style script
+/// template (TR-251). k6's `k6 new` writes the same default script; an empty
+/// target script is the most common onboarding step.
+pub(crate) fn new_command(output: &Path) -> Result<()> {
+    if output.exists() {
+        return Err(TropelError::Config(format!(
+            "'{}' already exists — refusing to overwrite",
+            output.display()
+        )));
+    }
+    let template = r#"import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  vus: 1,
+  duration: '30s',
+};
+
+export default function () {
+  const res = http.get('https://test.k6.io/');
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+  });
+  sleep(1);
+}
+"#;
+    std::fs::write(output, template).map_err(TropelError::Io)?;
+    println!("Created '{}'", output.display());
+    Ok(())
+}
+
 /// Load iteration data from a CSV or JSON file.
 pub(crate) fn load_data_file(path: &PathBuf) -> Result<Vec<HashMap<String, serde_json::Value>>> {
     let content = std::fs::read_to_string(path).map_err(TropelError::Io)?;
@@ -422,4 +453,33 @@ pub(crate) fn load_data_file(path: &PathBuf) -> Result<Vec<HashMap<String, serde
     }
 
     Ok(vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_writes_a_runnable_template_and_refuses_overwrite() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tropel-new-{}.js", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        new_command(&path).unwrap();
+        let script = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            script.contains("export default function"),
+            "template must be a runnable script, got: {}",
+            script
+        );
+        assert!(script.contains("http.get"));
+        // Refuses to overwrite an existing file (k6 new also errors).
+        let err = new_command(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "must refuse to overwrite, got: {}",
+            err
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

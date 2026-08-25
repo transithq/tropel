@@ -131,6 +131,8 @@ pub struct HttpClient {
     /// Log every HTTP request/response (method, URL, status, timing) at
     /// debug level — the `--http-debug` flag / `HttpConfig.http_debug`.
     http_debug: bool,
+    /// `--http-debug=full` — also log request/response bodies.
+    http_debug_full: bool,
     /// k6 `blacklistIPs` CIDRs, parsed once at client build. Hostnames are
     /// filtered by the DNS resolver, but an IP-literal URL (e.g.
     /// `http://127.0.0.1:8080`) never triggers a lookup — reqwest hands the
@@ -208,6 +210,7 @@ impl HttpClient {
             discard_bodies: config.discard_response_bodies,
             rps,
             http_debug: config.http_debug,
+            http_debug_full: config.http_debug_full,
             blacklist: parse_blacklist(&config.blacklist_ips),
         })
     }
@@ -595,13 +598,32 @@ impl HttpClient {
         if self.http_debug {
             // info! so the flag is self-sufficient: the default log filter is
             // WARN, and a debug-level line would only appear with RUST_LOG.
-            tracing::info!(
-                "HTTP >>> {:?} {} (body {} bytes, {} headers)",
-                request.method,
-                request.url,
-                request_body_size,
-                request.headers.len()
-            );
+            if self.http_debug_full {
+                let body_preview = body_bytes
+                    .as_deref()
+                    .map(|b| String::from_utf8_lossy(&b[..b.len().min(1024)]).into_owned())
+                    .unwrap_or_else(|| "(no body)".to_string());
+                let headers: Vec<String> = request
+                    .headers
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v))
+                    .collect();
+                tracing::info!(
+                    "HTTP >>> {:?} {} headers={:?} body={:?}",
+                    request.method,
+                    request.url,
+                    headers,
+                    body_preview
+                );
+            } else {
+                tracing::info!(
+                    "HTTP >>> {:?} {} (body {} bytes, {} headers)",
+                    request.method,
+                    request.url,
+                    request_body_size,
+                    request.headers.len()
+                );
+            }
         }
 
         // Build the reqwest request
@@ -1208,14 +1230,32 @@ impl HttpClient {
             );
 
             if self.http_debug {
-                tracing::info!(
-                    "HTTP <<< {:?} {} -> {} ({} bytes in {:.2?})",
-                    request.method,
-                    current_url,
-                    status_code,
-                    size,
-                    total_duration
-                );
+                if self.http_debug_full {
+                    let body_preview =
+                        String::from_utf8_lossy(&body_vec[..body_vec.len().min(1024)]).into_owned();
+                    let headers: Vec<String> = headers
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect();
+                    tracing::info!(
+                        "HTTP <<< {:?} {} -> {} headers={:?} body={:?} in {:.2?}",
+                        request.method,
+                        current_url,
+                        status_code,
+                        headers,
+                        body_preview,
+                        total_duration
+                    );
+                } else {
+                    tracing::info!(
+                        "HTTP <<< {:?} {} -> {} ({} bytes in {:.2?})",
+                        request.method,
+                        current_url,
+                        status_code,
+                        size,
+                        total_duration
+                    );
+                }
             }
 
             let response = HttpResponse {
