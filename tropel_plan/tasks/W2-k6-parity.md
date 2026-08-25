@@ -188,10 +188,10 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 ## TR-232 · `http.file()` and multipart
 **Effort:** M · **Blocked by:** TR-230
 
-- [ ] `http.file(data, filename?, contentType?)`; the multipart trigger is "any top-level body value is FileData"
-- [ ] 60-hex-char random boundary; file parts carry `Content-Disposition` + `Content-Type`; **non-file parts get no `Content-Type`** and are stringified with `%v`
-- [ ] Non-file object bodies fall back to `application/x-www-form-urlencoded`, arrays expanding to repeated keys
-- [ ] **[SUPERSET]** k6's part order is **non-deterministic** (Go map range) and it **doesn't escape the field name** for file parts — real k6 bugs. If tropel is deterministic and escapes both, **keep it and document the divergence**
+- [x] `http.file(data, filename?, contentType?)`; the multipart trigger is "any top-level body value is FileData" — `http.file` + `K6File` (data | ArrayBuffer | Uint8Array), used as body or inside a multipart object
+- [x] 60-hex-char random boundary; file parts carry `Content-Disposition` + `Content-Type`; **non-file parts get no `Content-Type`** and are stringified with `%v` — boundary is now a random 60-hex string (k6 crypto/rand parity); part framing + content-type rules verified
+- [x] Non-file object bodies fall back to `application/x-www-form-urlencoded`, arrays expanding to repeated keys — **arrays now expand** (`{a:[1,2]}` → `a=1&a=2`; test `test_urlencoded_array_values_expand_to_repeated_keys`)
+- [x] **[SUPERSET]** k6's part order is **non-deterministic** (Go map range) and it **doesn't escape the field name** for file parts — real k6 bugs. If tropel is deterministic and escapes both, **keep it and document the divergence** — tropel iterates keys in insertion order and escapes both field names and filenames (`escapeMultipartFieldName`); documented divergence
 
 ## TR-233 · Cookie jar, response callbacks, and the rest of the module
 **Effort:** M · **Blocked by:** TR-230
