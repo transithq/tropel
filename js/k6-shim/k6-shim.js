@@ -440,7 +440,14 @@ function serializeK6Body(body, headers) {
 }
 
 function buildMultipartFormData(object) {
-    var boundary = '----TropelFormBoundary' + Math.random().toString(36).slice(2);
+    // TR-232: k6 generates a random 60-hex-char boundary (crypto/rand).
+    // Deterministic per request; reusing Math.random (not crypto) keeps the
+    // shim dependency-free and is collision-safe at this length.
+    var boundary = '';
+    var hexChars = '0123456789abcdef';
+    for (var bi = 0; bi < 60; bi++) {
+        boundary += hexChars[Math.floor(Math.random() * 16)];
+    }
     var body = '';
     var binary = false;
 
@@ -487,7 +494,18 @@ function serializeUrlEncoded(object) {
         if (value === undefined || value === null) {
             value = '';
         }
-        parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(value)));
+        // TR-232: k6 expands ARRAY values into repeated keys
+        // (`{a: [1, 2]}` → `a=1&a=2`). The old `String(array)` produced
+        // `a=1,2`, which a form parser reads as a single value.
+        if (Array.isArray(value)) {
+            for (var i = 0; i < value.length; i++) {
+                var v = value[i];
+                if (v === undefined || v === null) v = '';
+                parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(v)));
+            }
+        } else {
+            parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(value)));
+        }
     }
     return parts.join('&');
 }

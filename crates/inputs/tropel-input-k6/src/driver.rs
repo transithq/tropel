@@ -4659,9 +4659,25 @@ mod tests {
             let mp_body: String = ctx
                 .eval("__captured[2].body")
                 .expect("read captured[2] body");
+            // TR-232: the boundary is a random 60-hex-char string (k6 uses
+            // crypto/rand hex); the body must be framed with it.
+            let boundary: String = mp_headers
+                .split("boundary=")
+                .nth(1)
+                .map(|s| s.chars().filter(|c| c.is_ascii_hexdigit()).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                boundary.len(),
+                60,
+                "boundary must be 60 hex chars: {boundary}"
+            );
             assert!(
-                mp_body.contains("----TropelFormBoundary"),
-                "multipart body missing framing: {mp_body}"
+                boundary.chars().all(|c| c.is_ascii_hexdigit()),
+                "boundary must be hex: {boundary}"
+            );
+            assert!(
+                mp_body.contains(&boundary),
+                "multipart body missing boundary framing: {mp_body}"
             );
 
             // 5. A lowercase `content-type` declaration must be replaced (not
@@ -4679,6 +4695,38 @@ mod tests {
                     .to_lowercase()
                     .contains("\"content-type\":\"multipart/form-data\""),
                 "boundary-less content-type variant leaked into header: {mp_lower}"
+            );
+        });
+    }
+
+    /// TR-232: k6 expands ARRAY values in an object body into repeated
+    /// urlencoded keys (`{a: [1, 2]}` → `a=1&a=2`). The old `String(array)`
+    /// produced `a=1,2`.
+    #[test]
+    fn test_urlencoded_array_values_expand_to_repeated_keys() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            // Stub the native HTTP bridge; capture the body handed to it.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body) {
+                    globalThis.__captured.push({ headers: JSON.parse(headersJson), body: body });
+                    return { code: 200, status: 200, body: '{}', headers: {}, responseTime: 5 };
+                };
+                "#,
+            )
+            .expect("stub should eval");
+            let body: String = ctx
+                .eval("http.post('https://e.com/', { a: [1, 2], b: 'x' }); __captured[0].body")
+                .expect("eval must succeed");
+            // The body is the urlencoded serialization.
+            assert_eq!(
+                body, "a=1&a=2&b=x",
+                "array values must expand to repeated keys, got: {body}"
             );
         });
     }
