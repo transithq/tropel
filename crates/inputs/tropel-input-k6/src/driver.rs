@@ -945,7 +945,8 @@ fn http_tags(
 ///
 /// `group` is the active group() path (backlog line 154: k6 stamps metrics
 /// recorded inside `group("x")` with `group=::x`, not the hardcoded
-/// `group=http`). None → default `group=http` (back-compat).
+/// `group=http`). None → default `group=""` (k6's root group; the leading
+/// `::` appears only inside a nested group).
 fn http_tags_for(
     url: &str,
     method: &str,
@@ -963,7 +964,7 @@ fn http_tags_for(
     tags.insert(interned("name"), url_arc);
     tags.insert(
         interned("group"),
-        group.map(Arc::from).unwrap_or_else(|| interned("http")),
+        group.map(Arc::from).unwrap_or_else(|| Arc::from("")),
     );
     // TR-014: add protocol tag on every sample. Beating k6 which only
     // tags protocol on success (k6 cannot tell you which protocol failures
@@ -3639,6 +3640,13 @@ async fn eval_module_call_export(
     // blocking HTTP calls re-arm the per-eval deadline (backlog line 104).
     let (deadline, max_exec) = js_ctx.interrupt_deadline_handle();
     let group_stack: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // TR-207: k6 tags setup()/teardown() HTTP calls with `::setup`/`::teardown`,
+    // not the root default `""` or the old `"http"`. Push the group path before
+    // the call so the http bridges stamp it on every sample.
+    {
+        let mut gs = group_stack.lock().unwrap();
+        gs.push(format!("::{}", export));
+    }
     js_ctx.with_ctx(|rq_ctx| {
         register_http_bridges(
             rq_ctx,
@@ -7644,6 +7652,72 @@ mod tests {
             groups,
             vec!["::checkout::payment".to_string()],
             "http_req_duration must carry the full group path, got: {:?}",
+            groups
+        );
+    }
+
+    /// TR-207: the k6 root group is `""` (not `"http"`). A request outside
+    /// any group() must be tagged `group=""`, matching k6's root — the old
+    /// hardcoded `"http"` was neither k6's root nor a named group.
+    #[tokio::test]
+    async fn test_http_outside_group_tags_root_group_empty() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                http.get('http://example.com/');
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
+
+        let groups: Vec<String> = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "http_req_duration")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["".to_string()],
+            "root group must be empty string (k6 root), got: {:?}",
+            groups
+        );
+    }
+
+    /// TR-207: setup()/teardown() HTTP calls are tagged `::setup`/`::teardown`
+    /// (k6), not the root `""` or the old `"http"`.
+    #[tokio::test]
+    async fn test_setup_http_calls_tagged_group_setup() {
+        let driver = K6Driver;
+        let script = br#"
+            import http from 'k6/http';
+            export function setup() {
+                const res = http.get('http://example.com/setup');
+                return { status: res.status };
+            }
+            export default function () {}
+        "#;
+        let (client, sink) = test_ctx().await;
+        let data = driver
+            .setup(script, None, &HashMap::new(), client, sink.clone())
+            .await;
+        assert!(data.is_some(), "setup must return data");
+
+        let samples = sink.lock().unwrap();
+        let groups: Vec<String> = samples
+            .iter()
+            .filter(|s| s.metric == "http_req_duration")
+            .filter_map(|s| s.tags.get("group").map(|g| g.to_string()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["::setup".to_string()],
+            "setup() http calls must be tagged group=::setup, got: {:?}",
             groups
         );
     }
