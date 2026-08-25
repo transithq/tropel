@@ -321,6 +321,6 @@ Full register: `TROPEL_PARITY_POSTMAN.md`.
 ## TR-263 · Arbitrary local-file read driven by collection content
 **Effort:** S · **Blocked by:** none · **Human sign-off**
 
-- [ ] `tropel-collection/src/parser.rs:550` does `std::fs::read` on a path taken from the collection, and `:422,455` do the same for file bodies
-- [ ] Expected for a self-authored collection; **not** acceptable for a collection imported from a URL or a shared repo — and knockport imports untrusted collections by design
-- [ ] Confine reads to the collection root, require explicit opt-in for anything outside it, and report a refusal rather than silently sending an empty body
+- [x] `tropel-collection/src/parser.rs:550` does `std::fs::read` on a path taken from the collection, and `:422,455` do the same for file bodies — **fixed**: `collection_to_scenario_with_file_reads(…, false)` disables both; empty part + warning
+- [x] Expected for a self-authored collection; **not** acceptable for a collection imported from a URL or a shared repo — the wasm/browser tier now uses the untrusted adapter; the CLI keeps the trusted default
+- [x] Confine reads to the collection root, require explicit opt-in for anything outside it, and report a refusal rather than silently sending an empty body — reads are gated off entirely for untrusted collections (refusal is loud); a per-root jail is the follow-up if a legit use case needs it

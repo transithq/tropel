@@ -3,9 +3,55 @@
 //! Input adapter that reads Postman Collection v2.1/v2.0 files and
 //! produces a protocol-agnostic `Scenario`.
 
-use tropel_collection::{collection_to_scenario, parse_collection};
+use tropel_collection::{
+    collection_to_scenario, collection_to_scenario_with_file_reads, parse_collection,
+};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, Scenario, TropelError};
+
+/// Parse Postman bytes with the TRUSTED default (self-authored CLI
+/// collections may read local files referenced by `mode:"file"` bodies and
+/// form-data file parts).
+pub fn parse_postman_trusted(bytes: &[u8]) -> Result<Scenario> {
+    let collection = parse_collection(bytes)
+        .map_err(|e| TropelError::Parse(format!("Failed to parse Postman collection: {}", e)))?;
+    Ok(collection_to_scenario(
+        collection,
+        std::collections::HashMap::new(),
+    ))
+}
+
+/// Parse Postman bytes with the UNTRUSTED boundary: local-file reads are
+/// DISABLED. Use this for submitted collections (web, distributed, shared)
+/// where `mode:"file"` / form-data file parts must not read arbitrary paths
+/// off the disk (TR-263).
+pub fn parse_postman_untrusted(bytes: &[u8]) -> Result<Scenario> {
+    let collection = parse_collection(bytes)
+        .map_err(|e| TropelError::Parse(format!("Failed to parse Postman collection: {}", e)))?;
+    Ok(collection_to_scenario_with_file_reads(
+        collection,
+        std::collections::HashMap::new(),
+        false,
+    ))
+}
+
+/// Postman input adapter with local-file reads DISABLED — for the browser /
+/// distributed tiers that parse submitted (untrusted) collections (TR-263).
+pub struct PostmanUntrustedInputAdapter;
+
+impl InputAdapter for PostmanUntrustedInputAdapter {
+    fn id(&self) -> &str {
+        "postman"
+    }
+
+    fn detect(&self, bytes: &[u8]) -> bool {
+        PostmanInputAdapter.detect(bytes)
+    }
+
+    fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
+        parse_postman_untrusted(bytes)
+    }
+}
 
 /// Input adapter for Postman Collection files.
 pub struct PostmanInputAdapter;
@@ -57,14 +103,7 @@ impl InputAdapter for PostmanInputAdapter {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
-        let collection = parse_collection(bytes).map_err(|e| {
-            TropelError::Parse(format!("Failed to parse Postman collection: {}", e))
-        })?;
-
-        Ok(collection_to_scenario(
-            collection,
-            std::collections::HashMap::new(),
-        ))
+        parse_postman_trusted(bytes)
     }
 }
 
