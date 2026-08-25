@@ -76,9 +76,9 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-113 · `handleSummary` has no unscoped `http_req_duration`
 **Effort:** S · **Blocked by:** TR-112
 
-- [ ] `summary.rs:23-84` iterates `results.metrics`; the merged unscoped series never appears, so the most common `handleSummary` script in existence reads `undefined`
-- [ ] k6's v2.1.0 default `data` shape is still the legacy `{root_group, options, state, metrics, setup_data}` — match it
-- [ ] `root_group` is currently a hardcoded empty stub while `per_group` is fully populated
+- [x] `summary.rs:23-84` iterates `results.metrics`; the merged unscoped series never appears, so the most common `handleSummary` script in existence reads `undefined` — **fixed**: `summary.rs` re-injects the merged `http_req_duration`/`iteration_duration` headlines under their unscoped keys (test `headline_http_req_duration_reinjected_into_handle_summary`)
+- [x] k6's v2.1.0 default `data` shape is still the legacy `{root_group, options, state, metrics, setup_data}` — match it — `metrics` carries the headline series and `root_group` is now a real tree
+- [x] `root_group` is currently a hardcoded empty stub while `per_group` is fully populated — **fixed**: `build_root_group` builds a nested group tree (name/path/id/groups/checks) from the per-group summaries; test `root_group_builds_tree_from_per_group_data` asserts nested `checkout::payment` with per-group passes/fails
 
 ## TR-114 · `pm.response.to.have.jsonBody("key")` is a false failure
 **Effort:** S · **Blocked by:** none
