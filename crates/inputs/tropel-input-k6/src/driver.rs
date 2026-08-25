@@ -10839,6 +10839,41 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         });
     }
 
+    /// TR-242: k6 exposes the WHATWG TextEncoder/TextDecoder globals. They
+    /// must exist in the shim bundle, round-trip UTF-8, and not throw.
+    #[test]
+    fn test_k6_shim_bundle_has_text_encoder_decoder() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let bundle = format!(
+                "{}\n{}\n",
+                include_str!("../../../../js/k6-shim/k6-shim.js"),
+                include_str!("../../../../js/k6-shim/open-data-shim.js")
+            );
+            ctx.eval::<(), _>(bundle.as_str())
+                .expect("shims in production order must eval");
+            let roundtrip: String = ctx
+                .eval(
+                    "var enc = new TextEncoder(); \
+                     var bytes = enc.encode('héllo'); \
+                     var dec = new TextDecoder(); \
+                     dec.decode(bytes)",
+                )
+                .expect("TextEncoder/TextDecoder must eval");
+            assert_eq!(roundtrip, "héllo", "UTF-8 round-trip must survive");
+            // ArrayBuffer input to decode is accepted.
+            let len: i32 = ctx
+                .eval(
+                    "var dec2 = new TextDecoder(); \
+                     var buf = new Uint8Array([104, 105]).buffer; \
+                     dec2.decode(buf).length",
+                )
+                .expect("TextDecoder must accept an ArrayBuffer");
+            assert_eq!(len, 2);
+        });
+    }
+
     #[test]
     fn test_reserved_metric_name_guard() {
         // W1 line 24-26: user code cannot create custom metrics with builtin

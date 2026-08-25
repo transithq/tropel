@@ -345,12 +345,13 @@ impl JsContext {
                         );
                     }),
                 );
-                // Backlog line 98: console.info/debug/trace/dir were missing —
-                // a script calling console.info('x') threw TypeError and
-                // ABORTED the iteration (k6/Node both define all of these).
-                // info ≈ log at info level; debug/trace map to their tracing
-                // levels; dir prints the inspected first arg like Node's
-                // console.dir (reuses the shared stringifier).
+                // Backlog line 98: console.info/debug were missing — a script
+                // calling console.info('x') threw TypeError and ABORTED the
+                // iteration (k6/Node both define these). TR-242: k6's console
+                // has EXACTLY five methods (log/debug/info/warn/error) — the
+                // old trace/dir extras are removed so a script that relies on
+                // a non-k6 method fails loudly instead of silently working.
+                // info ≈ log at info level; debug maps to its tracing level.
                 let _ = console.set(
                     "info",
                     Func::from(|ctx, args| {
@@ -367,26 +368,6 @@ impl JsContext {
                         let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
                         tracing::debug!(
                             "[JS console.debug] {}",
-                            console_args_to_string(&ctx, &args.0)
-                        );
-                    }),
-                );
-                let _ = console.set(
-                    "trace",
-                    Func::from(|ctx, args| {
-                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
-                        tracing::trace!(
-                            "[JS console.trace] {}",
-                            console_args_to_string(&ctx, &args.0)
-                        );
-                    }),
-                );
-                let _ = console.set(
-                    "dir",
-                    Func::from(|ctx, args| {
-                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
-                        tracing::info!(
-                            "[JS console.dir] {}",
                             console_args_to_string(&ctx, &args.0)
                         );
                     }),
@@ -1311,19 +1292,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn console_info_debug_trace_dir_do_not_throw() {
-        // Backlog line 98: console.info/debug/trace/dir were missing — a
-        // script calling console.info('x') threw TypeError and ABORTED the
-        // iteration (k6/Node define all of them). They must exist, accept
-        // arbitrary args (incl. objects), and never throw.
+    async fn console_info_debug_do_not_throw() {
+        // Backlog line 98: console.info/debug were missing — a script
+        // calling console.info('x') threw TypeError and ABORTED the
+        // iteration (k6/Node define them). They must exist, accept
+        // arbitrary args (incl. objects), and never throw. TR-242: k6's
+        // console has EXACTLY five methods (log/debug/info/warn/error) —
+        // trace/dir are NOT defined (a script relying on them fails loudly).
         let mut ctx = new_ctx().await;
         let r = ctx
-            .eval_async(
-                "console.info('a', 1); console.debug({d: 2}); console.trace('t'); console.dir({o: 3}); 'done'",
-            )
+            .eval_async("console.info('a', 1); console.debug({d: 2}); 'done'")
             .await
             .unwrap();
         assert_eq!(r, "done");
+        // trace/dir must be undefined (k6 parity — exactly five methods).
+        let trace = ctx.eval_async("typeof console.trace").await.unwrap();
+        assert_eq!(trace, "undefined", "console.trace must be absent (TR-242)");
+        let dir = ctx.eval_async("typeof console.dir").await.unwrap();
+        assert_eq!(dir, "undefined", "console.dir must be absent (TR-242)");
     }
 
     #[tokio::test]
