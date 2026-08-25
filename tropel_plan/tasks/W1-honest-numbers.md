@@ -42,10 +42,10 @@ The worst class. A user ships on a number that was never true.
 ## TR-105 · stdout prints "✓ PASS" on runs that exit 1
 **Effort:** S · **Blocked by:** none
 
-- [ ] `stdout.rs:294-299` derives the banner from a different source than the exit code
+- [x] `stdout.rs:294-299` derives the banner from a different source than the exit code — **fixed**: banner uses `MetricsResult::run_failed()` (checks/script/VU-init), the same predicate the CLI exit code uses
 - [x]  `summary.rs` keys the top-level `thresholds` map **by expression**, so duplicate expressions erase failures
-- [ ] One verdict, computed once, used by the banner, the summary, the reporters and the exit code
-- [ ] A test asserts banner and exit code agree across pass, fail, and no-data runs
+- [x] One verdict, computed once, used by the banner, the summary, the reporters and the exit code — `run_failed()` added to `MetricsResult`, consumed by both `stdout.rs` and `cli.rs`
+- [x] A test asserts banner and exit code agree across pass, fail, and no-data runs — `stdout::banner_and_exit_code_agree_across_pass_fail_and_no_data` renders the banner for pass/threshold-fail/checks-fail/VU-init-fail/script-fail/no-data and asserts the printed verdict equals the CLI exit predicate (`thresholds_failed || run_failed()`, cli.rs:667-679)
 
 ---
 
