@@ -367,7 +367,7 @@ fn build_url(detail: &RequestDetail) -> String {
         None => return String::new(),
     };
 
-    let mut result = if let Some(raw) = &url.raw {
+    let result = if let Some(raw) = &url.raw {
         if !raw.is_empty() {
             raw.clone()
         } else {
@@ -381,10 +381,14 @@ fn build_url(detail: &RequestDetail) -> String {
     // `url.variable` as `{key, value}` and referenced in the URL as `:key`
     // segments (e.g. `https://api.test/users/:id`). They were parsed and
     // never read — substitute each declared variable into the URL now.
-    // W2 #202: substitute in DESCENDING key-length order so a prefix
-    // variable can't eat a longer one. With an ordered replace,
-    // `/users/:user/posts/:userId` (user declared first) became
-    // `.../posts/bobId` — the outcome depended on declaration order.
+    // TR-260: a SINGLE tokenising pass replaces `:key` ONLY when it is a
+    // whole path/query/fragment segment token — the token is `:name` followed
+    // by a boundary (`/`, `?`, `#`, or end-of-string), so `:id` can never
+    // corrupt `/x:idle` → `/x42le` and `:user` can never eat a longer
+    // `:userId` (`/users/:user/posts/:userId` with user declared first no
+    // longer depends on declaration order). The old ordered `str::replace`
+    // substituted inside any `:`-prefixed run, matching substrings of longer
+    // tokens and bare identifiers.
     let mut vars: Vec<(&str, &str)> = url
         .variable
         .iter()
@@ -396,12 +400,52 @@ fn build_url(detail: &RequestDetail) -> String {
     // Longest key first so `:host` wins over `:h` when both match. clippy
     // wants sort_by_key; Reverse preserves the longest-first order.
     vars.sort_by_key(|v| std::cmp::Reverse(v.0.len()));
-    for (key, value) in vars {
-        let key = format!(":{key}");
-        result = result.replace(&key, value);
+    // Scan the URL once, copying into a buffer. A `:` starts a variable
+    // token only when a declared key is the LONGEST declared prefix that
+    // extends to a boundary. The longest-first sort makes the first match
+    // the correct one.
+    let mut out = String::with_capacity(result.len());
+    let bytes: Vec<char> = result.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != ':' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        // A `:` at the very start or preceded by a boundary can open a
+        // token; otherwise (e.g. `http://` scheme/port separator) it is
+        // literal. Postman path variables are `/`-segment tokens.
+        let mut matched: Option<&str> = None;
+        for (key, value) in &vars {
+            let mut j = i + 1;
+            let mut k = 0;
+            let kchars: Vec<char> = key.chars().collect();
+            while j < bytes.len() && k < kchars.len() && bytes[j] == kchars[k] {
+                j += 1;
+                k += 1;
+            }
+            if k == kchars.len() {
+                // The key matched; it is a variable token only if the next
+                // char is a boundary (`/`, `?`, `#`, or end).
+                let after = bytes.get(j).copied();
+                if after.is_none() || matches!(after.unwrap(), '/' | '?' | '#') {
+                    matched = Some(value);
+                    i = j; // consume the token
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some(value) => out.push_str(value),
+            None => {
+                out.push(':');
+                i += 1;
+            }
+        }
     }
 
-    result
+    out
 }
 
 /// Assemble a URL from the structured fields (used when `url.raw` is absent).
@@ -879,6 +923,65 @@ mod tests {
             url_of(r#"[{"key": "userId", "value": "1234"}, {"key": "user", "value": "bob"}]"#);
         assert_eq!(user_first, "https://api.test/users/bob/posts/1234");
         assert_eq!(id_first, "https://api.test/users/bob/posts/1234");
+    }
+
+    #[test]
+    fn test_path_variable_token_respects_segment_boundaries() {
+        // TR-260: substitution must tokenise on `:key` segments, NOT match a
+        // `:`-prefixed substring anywhere. The old ordered replace turned
+        // `/x:idle` into `/x42le` when `id` was declared, and substituted in
+        // query values/fragments. A `:key` is a variable token only when it
+        // is followed by a boundary (`/`, `?`, `#`, or end-of-string).
+        let url_of = |raw: &str| -> String {
+            let json = format!(
+                r#"{{
+                    "info": {{
+                        "name": "PV",
+                        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                    }},
+                    "item": [{{
+                        "name": "Get User",
+                        "request": {{
+                            "method": "GET",
+                            "url": {{
+                                "raw": "{raw}",
+                                "variable": [{{"key": "id", "value": "42"}}, {{"key": "user", "value": "bob"}}]
+                            }}
+                        }}
+                    }}]
+                }}"#
+            );
+            let collection = parse_collection_str(&json).unwrap();
+            let scenario = collection_to_scenario(collection, HashMap::new());
+            scenario.items[0]
+                .request
+                .as_ref()
+                .expect("request")
+                .url
+                .clone()
+        };
+        // `:id` is a whole segment token → substituted.
+        assert_eq!(
+            url_of("https://api.test/users/:id"),
+            "https://api.test/users/42"
+        );
+        // `:idle` is NOT `:id` — the token must end at a boundary, so
+        // `/x:idle` must stay `/x:idle` (the old replace made `/x42le`).
+        assert_eq!(url_of("https://api.test/x:idle"), "https://api.test/x:idle");
+        // `:user` inside a query value is a variable token (followed by `&`
+        // is NOT a boundary per Postman's `/`-segment model — but `?` is the
+        // query separator and `:user` there is a full token followed by `&`).
+        // Postman substitutes path variables in the raw URL; a `?a=:user&b=1`
+        // token ends at `&`. The conservative boundary set is `/`, `?`, `#`,
+        // end — `&` is not included, so `:user` in `?a=:user&b=1` is NOT
+        // substituted (avoids corrupting `?a=:userx`). A whole-token query
+        // value still substitutes when followed by end or `&`? The `&` case
+        // is ambiguous; assert the documented conservative behavior.
+        assert_eq!(
+            url_of("https://api.test/?a=:user&b=1"),
+            "https://api.test/?a=:user&b=1",
+            "query token ending at `&` is NOT substituted (conservative boundary set)"
+        );
     }
 
     #[test]

@@ -298,9 +298,9 @@ Full register: `TROPEL_PARITY_POSTMAN.md`.
 ## TR-260 · Path-variable substitution is a naive ordered `str::replace`
 **Effort:** S · **Blocked by:** none
 
-- [ ] `parser.rs:361-371` — `/users/:user/posts/:userId` substitutes `:user` inside `:userId`
-- [ ] Descending-length sort works only when **both** tokens are present; the general fix is a single tokenising pass
-- [ ] Same bug class as knockport `KP-425`'s importer — fix it here, since import parsing is Rust-side by decision D4
+- [x] `parser.rs:361-371` — `/users/:user/posts/:userId` substitutes `:user` inside `:userId` — **fixed**: a single tokenising pass replaces `:key` only when it is a whole segment token ending at a boundary (`/`, `?`, `#`, or end), so `:user` can never eat `:userId` and `:id` can never corrupt `/x:idle`
+- [x] Descending-length sort works only when **both** tokens are present; the general fix is a single tokenising pass — the tokenising pass IS the general fix (declaration-order independent)
+- [x] Same bug class as knockport `KP-425`'s importer — fixed here, since import parsing is Rust-side by decision D4
 
 ## TR-261 · Duplicate headers and form fields collapse into `HashMap`s
 **Effort:** M · **Blocked by:** none
