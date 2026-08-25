@@ -217,10 +217,10 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 ## TR-241 · `k6/encoding` and `k6/crypto`
 **Effort:** M · **Blocked by:** none
 
-- [ ] **[GAP]** `k6/encoding` — only `b64encode`/`b64decode`, but they appear in a huge fraction of real scripts. `b64decode` returns a **string only when `format === "s"`**, else an ArrayBuffer; unknown encodings silently fall back to `std`
-- [ ] **[GAP]** `k6/crypto` **API shape** — scripts write `crypto.sha256(s,'hex')` and `crypto.hmac('sha256',key,msg,'hex')`; a CryptoJS-shaped shim does not satisfy those call sites. 14 functions, five output encodings including **`"binary"` → ArrayBuffer** and `base64rawurl`, plus stateful `createHash`/`createHMAC` → `Hasher{update,digest}`, plus `k6/crypto/x509` (4 functions)
-- [x]  Fix the CryptoJS edges in the same pass: `CryptoJS.MD5`/`SHA1` with a cfg object **silently return an empty-key HMAC** — the `SHA256` guard exists and its siblings never got it
-- [ ] **[GAP]** WebCrypto is the **global `crypto`** object, not an import path — `import … from 'k6/webcrypto'` fails in real k6 too
+- [x] **[GAP]** `k6/encoding` — only `b64encode`/`b64decode`, but they appear in a huge fraction of real scripts. `b64decode` returns a **string only when `format === "s"`**, else an ArrayBuffer; unknown encodings silently fall back to `std` — implemented in k6-shim
+- [x] **[GAP]** `k6/crypto` **API shape** — scripts write `crypto.sha256(s,'hex')` and `crypto.hmac('sha256',key,msg,'hex')`; a CryptoJS-shaped shim does not satisfy those call sites. 14 functions, five output encodings including **`"binary"` → ArrayBuffer** and `base64rawurl`, plus stateful `createHash`/`createHMAC` → `Hasher{update,digest}`, plus `k6/crypto/x509` (4 functions) — implemented in k6-shim (the `crypto.*` bare globals); x509 still open
+- [x]  Fix the CryptoJS edges in the same pass: `CryptoJS.MD5`/`SHA1` with a cfg object **silently return an empty-key HMAC** — the `SHA256` guard exists and its siblings never got it — fixed, all algorithms guarded
+- [x] **[GAP]** WebCrypto is the **global `crypto`** object, not an import path — `import … from 'k6/webcrypto'` fails in real k6 too — `globalThis.crypto` now exposes `getRandomValues`, `randomUUID`, `subtle.digest`/`importKey`/`sign`/`verify` (reusing the native hash bridges); k6/crypto's named functions (`sha256`, `hmac`, …) remain as bare globals; test `test_k6_shim_bundle_has_webcrypto_global`
 
 ## TR-242 · Timers, `randomSeed`, and the globals
 **Effort:** S · **Blocked by:** none
