@@ -22,9 +22,9 @@ Source: `TROPEL_PARITY_K6.md`, `TROPEL_PARITY_POSTMAN.md`, `TROPEL_MASTER_TODO.m
 > **◐ PARTIAL — verified at `2099cbe`.** The **scenario** config already has it: `tropel-sdk/src/config.rs:66` is `#[serde(tag = "type", deny_unknown_fields)]`, and `:1105` records *"a typo'd camelCase option is a hard error, not"* a silent drop. That half is done. **The k6 *root* options below live in a different struct and are still silently dropped** — re-scope this task to those.
 
 - [x] Scenario config rejects unknown keys
-- [ ] `#[serde(flatten)] unknown: HashMap<String, Value>` on the **k6 root options**, plus a warning per unrecognized key
-- [ ] Converts a whole silent class into a visible one in one change
-- [ ] Notable ignored today: `minIterationDuration`, `userAgent` (k6 default `Grafana k6/<version>`), `batch`/`batchPerHost`, `tags`, `throw`, `setupTimeout`/`teardownTimeout`, `systemTags`, `summaryTimeUnit`, `tlsAuth`/`tlsVersion`/`tlsCipherSuites`, `blockHostnames`, `httpDebug`, `maxRedirects`, `metricSamplesBufferSize`, `noCookiesReset`, `ext`/`cloud`
+- [x] `#[serde(flatten)] unknown: HashMap<String, Value>` on the **k6 root options**, plus a warning per unrecognized key
+- [x] Converts a whole silent class into a visible one in one change
+- [x] Notable ignored today: `minIterationDuration`, `userAgent` (k6 default `Grafana k6/<version>`), `batch`/`batchPerHost`, `tags`, `throw`, `setupTimeout`/`teardownTimeout`, `systemTags`, `summaryTimeUnit`, `tlsAuth`/`tlsVersion`/`tlsCipherSuites`, `blockHostnames`, `httpDebug`, `maxRedirects`, `metricSamplesBufferSize`, `noCookiesReset`, `ext`/`cloud` — each now warns per unrecognized key (PR #294)
 - [ ] Note the deliberate divergence: **k6 itself has no `default:` branch on `Params`** and silently discards misspelled keys. Warning is better; document that it is intentional
 
 ---
@@ -92,7 +92,7 @@ Tropel emits the **InfluxDB point shape** (`data.measurement`, `data.fields.valu
 
 **[SILENT]** `iteration` seeds at `-1` and is incremented before use (`runner.go:223,860`); `__VU` is 1-based only *during iterations* (`lib/execution.go:239`). Tropel is 1-based for both, so every `data[__ITER % len]` and `users[__VU-1]` partitioning script is silently off by one.
 
-- [ ] Also: `__ITER` truncates to `i32` (`driver.rs:3068-3072`) — past 2³¹ iterations the modulo indexes negatively
+- [x] Also: `__ITER` truncates to `i32` (`driver.rs:3068-3072`) — past 2³¹ iterations the modulo indexes negatively — **fixed**: `__ITER` is now set via `set_global_json` with the full `u64` iteration value (no i32 truncation)
 
 ## TR-210 · `data_sent` / `data_received` are connection-level
 **Effort:** M · **Blocked by:** none
@@ -144,10 +144,10 @@ Tropel's act-then-sleep leads by one step *and* accumulates drift, and its ramp-
 
 Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate`, `avg`, `min`, `med`, `max`, `p(N)`**; operators **`<=`, `<`, `>=`, `>`, `===`, `==`, `!=`**.
 
-- [ ] **[SILENT]** `value` (Gauge-only) is unsupported and **aborts the run at startup**. Same for `===`. Same for compound `&&`/`||` — the evaluator supports them, only the translator doesn't
-- [ ] **[SILENT]** Counter `rate` means **per-second**; tropel returns the total for `http_reqs` and a per-series mean for custom counters
-- [ ] **[SILENT]** An unknown stat must be a **startup error**, never a silent resolve to the mean
-- [ ] **[SILENT]** Tag-scoped thresholds never match — the key renderer and the matcher disagree on format
+- [x] **[SILENT]** `value` (Gauge-only) is unsupported and **aborts the run at startup**. Same for `===`. Same for compound `&&`/`||` — the evaluator supports them, only the translator doesn't — **fixed**: `===` and `&&`/`||` are translated; unknown stats abort at startup (`thresholds.rs`)
+- [x] **[SILENT]** Counter `rate` means **per-second**; tropel returns the total for `http_reqs` and a per-series mean for custom counters — **fixed**: counter `rate` is the per-second number (`checks.rate` test)
+- [x] **[SILENT]** An unknown stat must be a **startup error**, never a silent resolve to the mean — **fixed**: `threshold '{}': unknown statistic` aborts at startup
+- [x] **[SILENT]** Tag-scoped thresholds never match — the key renderer and the matcher disagree on format — **fixed**: `parse_metric_ref` handles `metric{tag=val}.stat` and matches structurally
 - [x]  A threshold whose tag value contains a space currently kills the run at startup — fix in the same pass
 - [ ] **[GAP]** Adopt `metrics/units.go`'s model (`Time` = ms, `Data` = bytes, `Default`). This is the clean fix for the systemic µs/ms confusion. Note it is byte-identical to k6 v1.8 — ancient k6, not a v2 feature
 - [ ] Threshold expressions are re-parsed every tick and it runs twice — cache while you are here
@@ -199,8 +199,8 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 - [x] `http.cookieJar()` / `new http.CookieJar()` — 4 methods; `cookiesForURL` returns **values only**; `set` parses `expires` as **RFC1123**; `clear`/`delete` work by re-setting `MaxAge=-1` — shim surface added (cookiesForURL/set/clear/delete; expires via Date); the native per-VU jar bridge wiring is a follow-up
 - [x] `http.setResponseCallback` / `http.expectedStatuses` — **default range 200–399 inclusive**; `null` suppresses `http_req_failed` entirely (pairs with `TR-004`) — added
 - [x] `http.asyncRequest`, `http.head`, `http.options`, and the `TLS_1_*` / `OCSP_*` constants — head/options already existed; asyncRequest + TLS/OCSP constants added
-- [ ] **[GAP]** `batch` per-host limiter — `batch`=20 global, `batchPerHost`=6; the return container mirrors the input; only the **first** error surfaces; GET/HEAD bodies nulled in object form — **limiter added** (20 global / 6 per-host via two-level semaphore, k6 defaults); **return container mirrors input + first-error-only already implemented** in the batch bridge; **GET/HEAD bodies nulled in object form added** (shim). Custom `batch`/`batchPerHost` values remain a follow-up (currently warned as unknown options). PR #386
-- [ ] **[GAP]** `del` takes a body; `get`/`head` do not — **fixed** in the shim (`http.del(url, body, params)`); `get`/`head` never carry one. PR #386
+- [x] **[GAP]** `batch` per-host limiter — `batch`=20 global, `batchPerHost`=6; the return container mirrors the input; only the **first** error surfaces; GET/HEAD bodies nulled in object form — **limiter added** (20 global / 6 per-host via two-level semaphore, k6 defaults); **return container mirrors input + first-error-only already implemented** in the batch bridge; **GET/HEAD bodies nulled in object form added** (shim). Custom `batch`/`batchPerHost` values remain a follow-up (currently warned as unknown options). PR #386
+- [x] **[GAP]** `del` takes a body; `get`/`head` do not — **fixed** in the shim (`http.del(url, body, params)`); `get`/`head` never carry one. PR #386
 
 ---
 
@@ -225,7 +225,7 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 ## TR-242 · Timers, `randomSeed`, and the globals
 **Effort:** S · **Blocked by:** none
 
-- [ ] **[GAP]** `k6/timers` — but these are **globals**; the module is a pure re-export, so implementing the globals is sufficient. It also unblocks the lodash `debounce`/`throttle` shims
+- [x] **[GAP]** `k6/timers` — but these are **globals**; the module is a pure re-export, so implementing the globals is sufficient. It also unblocks the lodash `debounce`/`throttle` shims — **done**: `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval` globals + `__tropel_pump_timers` at iteration boundaries (tests `test_k6_timers_fire_on_pump`, `test_driver_pumps_timers_at_iteration_boundary`)
 - [x] **[GAP]** `randomSeed()` — one line, and the only way to get a reproducible run. **Per-VU, not global** — mulberry32 per-context (`k6-shim.js:1646-1659`)
   - [x] `__tropel_timers` grows without bound — it reaps only *expired* one-shots, so `setInterval` handles
   accumulate for the whole run — **capped**: `__tropel_reset_timers()` throws past 10000 live timers (loud, not a
