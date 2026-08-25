@@ -3787,8 +3787,29 @@ fn call_module_handle_summary(
         result
     };
 
+    // TR-246: k6 falls back to the DEFAULT summary when handleSummary
+    // returns any falsy value (undefined, null, false, 0, or ""). The old
+    // code only treated undefined/null as "no custom summary", so
+    // `return "";` produced an EMPTY stdout instead of the default report.
+    // rquickjs::Value has no generic is_truthy — the falsy primitives are
+    // checked explicitly.
     if result.is_undefined() || result.is_null() {
         return Ok(None);
+    }
+    if let Some(b) = result.as_bool() {
+        if !b {
+            return Ok(None);
+        }
+    }
+    if let Some(n) = result.as_number() {
+        if n == 0.0 {
+            return Ok(None);
+        }
+    }
+    if let Some(s) = result.as_string().and_then(|s| s.to_string().ok()) {
+        if s.is_empty() {
+            return Ok(None);
+        }
     }
 
     let stringify: rquickjs::Function = json_obj.get("stringify")?;
@@ -9097,6 +9118,28 @@ mod tests {
         });
         let map = result.expect("async handleSummary must produce output");
         assert_eq!(map.get("stdout").map(|s| s.as_str()), Some("async 3"));
+    }
+
+    #[test]
+    fn test_module_eval_handle_summary_falsy_returns_none() {
+        // TR-246: k6 falls back to the DEFAULT summary when handleSummary
+        // returns any falsy value (false, 0, ""), not just undefined/null.
+        // The old code treated "" as an empty-map result, so `return "";`
+        // produced an EMPTY stdout instead of the default report.
+        for source in [
+            r#"export function handleSummary(data) { return ""; } export default function(){}"#,
+            r#"export function handleSummary(data) { return false; } export default function(){}"#,
+            r#"export function handleSummary(data) { return 0; } export default function(){}"#,
+        ] {
+            let rt = rquickjs::Runtime::new().unwrap();
+            let ctx = rquickjs::Context::full(&rt).unwrap();
+            let result: Option<HashMap<String, String>> =
+                ctx.with(|ctx| call_module_handle_summary(&ctx, source, "{}").unwrap());
+            assert!(
+                result.is_none(),
+                "falsy handleSummary return must fall back to the default summary, got {result:?}"
+            );
+        }
     }
 
     // ── k6 `open()` + `k6/data` SharedArray ──
