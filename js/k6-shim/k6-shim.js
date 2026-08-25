@@ -2220,6 +2220,28 @@ if (typeof getSubject === 'undefined') { var getSubject = x509.getSubject; }
 if (typeof getIssuer === 'undefined') { var getIssuer = x509.getIssuer; }
 if (typeof getAltNames === 'undefined') { var getAltNames = x509.getAltNames; }
 
+// ── k6/secrets (TR-245) ──
+// k6 v2.1: `import secrets from 'k6/secrets'` → `secrets.get(key)` returns a
+// Promise<string>. Tropel is synchronous and has no secretsource manager, so
+// this stub throws a clear error on access, matching the httpx/papaparse
+// jslib pattern.
+if (typeof secrets === 'undefined') {
+    var secrets = new Proxy({}, {
+        get: function (_, prop) {
+            if (prop === '__esModule') return false;
+            if (prop === 'get' || prop === 'source') {
+                return function () {
+                    throw new Error(
+                        'k6/secrets is not supported by Tropel yet (no secretsource manager). '
+                        + 'Use environment variables or a config file instead.'
+                    );
+                };
+            }
+            throw new Error('k6/secrets has no property "' + prop + '"');
+        }
+    });
+}
+
 // ══════════════════════════════════════════════════════════════════
 // Helpers
 // ══════════════════════════════════════════════════════════════════
