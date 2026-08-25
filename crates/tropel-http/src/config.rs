@@ -110,8 +110,14 @@ pub struct HttpConfig {
     pub max_response_bytes: Option<u64>,
     /// Log every HTTP request/response at debug level (method, URL, status,
     /// timing). Off by default; enable with the `--http-debug` CLI flag.
+    /// k6's `--http-debug=full` also prints request/response bodies — that
+    /// extra mode is `http_debug_full`.
     #[serde(default)]
     pub http_debug: bool,
+    /// `--http-debug=full` (k6 parity): also print the request/response
+    /// bodies, not just the head lines. Only meaningful with `http_debug`.
+    #[serde(default)]
+    pub http_debug_full: bool,
 }
 
 fn default_expected_statuses() -> Vec<ExpectedStatus> {
@@ -155,6 +161,7 @@ impl Default for HttpConfig {
             blacklist_ips: Vec::new(),
             max_response_bytes: None,
             http_debug: false,
+            http_debug_full: false,
         }
     }
 }
