@@ -1097,18 +1097,31 @@ var _ = _ || {};
         };
     };
     _.padStart = function (string, length, chars) {
+        // TR-246: the old `chars.slice(0, padLen)` never REPEATED a
+        // multi-char pad — `_.padStart('7',4,'0')` returned '07' instead of
+        // '0007' (lodash repeats the pad string to fill the target length).
         string = String(string);
         length = length || 0;
-        chars = chars || ' ';
+        chars = chars === undefined || chars === null ? ' ' : String(chars);
         var padLen = Math.max(0, length - string.length);
-        return chars.slice(0, padLen).split('').join('').slice(0, padLen) + string;
+        if (padLen === 0 || chars.length === 0) return string;
+        var padded = '';
+        while (padded.length < padLen) {
+            padded += chars;
+        }
+        return padded.slice(0, padLen) + string;
     };
     _.padEnd = function (string, length, chars) {
         string = String(string);
         length = length || 0;
-        chars = chars || ' ';
+        chars = chars === undefined || chars === null ? ' ' : String(chars);
         var padLen = Math.max(0, length - string.length);
-        return string + chars.slice(0, padLen).split('').join('').slice(0, padLen);
+        if (padLen === 0 || chars.length === 0) return string;
+        var padded = '';
+        while (padded.length < padLen) {
+            padded += chars;
+        }
+        return string + padded.slice(0, padLen);
     };
     _.deburr = function (string) {
         return string
