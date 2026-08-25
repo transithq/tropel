@@ -256,4 +256,64 @@ mod tests {
             "force-stop flag must interrupt a busy-loop eval, got Ok"
         );
     }
+
+    /// TR-131: the web slice must behave like the engine's VU context on the
+    /// bridge surface — the four divergences are closed, and this test pins
+    /// the parity so a future edit cannot silently re-fork the web context.
+    /// Mirrors the engine's behavior-parity checks: `check()`/`pm.test`
+    /// record the check sample, custom metrics aggregate, and the group path
+    /// stamps full `::a::b`.
+    #[tokio::test]
+    async fn web_context_matches_engine_bridge_surface() {
+        let pm_state = new_pm_state();
+        let force_stop = Arc::new(AtomicBool::new(false));
+        let mut ctx =
+            create_web_js_context(&pm_state, &SandboxConfig::default(), force_stop.clone())
+                .await
+                .expect("context must be created");
+
+        // check() records a checks sample with a value.
+        ctx.eval(
+            "pm.test('status is 200', function () { return true; }); \
+             pm.test('body has id', function () { return false; });",
+        )
+        .await
+        .expect("pm.test must eval");
+        {
+            let st = pm_state.lock().unwrap();
+            assert_eq!(st.assertions.total, 2, "two pm.test calls recorded");
+            assert_eq!(st.assertions.passed, 1);
+            assert_eq!(st.assertions.failed, 1);
+            let check_samples: Vec<_> =
+                st.samples.iter().filter(|s| s.metric == "checks").collect();
+            assert_eq!(check_samples.len(), 2, "two checks samples emitted");
+            // The checks Rate carries value 1.0 (pass) / 0.0 (fail).
+            let values: Vec<f64> = check_samples.iter().map(|s| s.value).collect();
+            assert!(values.contains(&1.0) && values.contains(&0.0));
+        }
+
+        // group() stamps the FULL ::a::b path on group_duration (TR-133 parity).
+        ctx.eval(
+            "group('checkout', function () { \
+               group('payment', function () { \
+                 pm.metrics.add('latency', 42.0, 'trend'); \
+               }); \
+             });",
+        )
+        .await
+        .expect("group must eval");
+        {
+            let st = pm_state.lock().unwrap();
+            let latency = st
+                .samples
+                .iter()
+                .find(|s| s.metric == "latency")
+                .expect("latency sample recorded");
+            assert_eq!(
+                latency.tags.get("group"),
+                Some("::checkout::payment"),
+                "web slice must stamp the full group path like the engine (TR-133)"
+            );
+        }
+    }
 }
