@@ -102,7 +102,7 @@ Tropel emits the **InfluxDB point shape** (`data.measurement`, `data.fields.valu
 ## TR-211 · `vus` / `vus_max` are scheduler-sampled once per second
 **Effort:** S · **Blocked by:** none
 
-**[SILENT]** Tropel has every VU emit its own pair every 100 iterations — **~1000 duplicate samples/s at 1000 VUs**, which is both wrong and a measurable egress cost.
+- [x] **[SILENT]** Tropel has every VU emit its own pair every 100 iterations — **~1000 duplicate samples/s at 1000 VUs**, which is both wrong and a measurable egress cost — **fixed**: a single scheduler-wide sampler task (landed) now runs on a **1s cadence** (k6 parity) — the old 2s cadence was off by one floor
 
 ## TR-212 · `systemTags` and the indexable/metadata split
 **Effort:** M · **Blocked by:** TR-204, TR-207
