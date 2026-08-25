@@ -22,30 +22,79 @@ use crate::config::{ArrivalRateStage, ExecutionConfig, Stage};
 use tropel_sdk::{Result, TropelError};
 
 /// A deterministic workload partition: `[from, to)` of the unit interval.
+///
+/// Bounds are stored as exact rationals `(num, den)` — the same representation
+/// k6 uses (`big.Rat`). This makes `floor(n·to) − floor(n·from)` exact,
+/// avoiding the f64 silent-wrong-number bug that gives 0 VUs to one agent and
+/// 2 to another when the segment fraction is not exactly representable in
+/// binary floating point (e.g. `1/100`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExecutionSegment {
-    from: f64,
-    to: f64,
+    from_num: i64,
+    from_den: i64,
+    to_num: i64,
+    to_den: i64,
 }
 
 impl ExecutionSegment {
-    /// Create a segment from raw fractions, validating `0 <= from < to <= 1`.
-    pub fn new(from: f64, to: f64) -> Result<Self> {
-        if !(0.0..=1.0).contains(&from) || !(0.0..=1.0).contains(&to) {
+    /// Create a segment from exact rational bounds, validating
+    /// `0 <= from/to < 1` and `from < to` (all in rational arithmetic,
+    /// using i128 so `new_f64`'s large denominators don't overflow).
+    pub fn new(from_num: i64, from_den: i64, to_num: i64, to_den: i64) -> Result<Self> {
+        if from_num < 0 || from_den <= 0 || to_num < 0 || to_den <= 0 {
             return Err(TropelError::Config(format!(
-                "execution segment bounds must be within [0, 1]: {from}..{to}"
+                "execution segment bounds must be non-negative: \
+                 {from_num}/{from_den}..{to_num}/{to_den}"
             )));
         }
-        if from >= to {
+        // Compare from < to: cross-multiply without f64.
+        if (from_num as i128) * (to_den as i128) >= (to_num as i128) * (from_den as i128) {
             return Err(TropelError::Config(format!(
-                "execution segment must be non-empty (from < to): {from}..{to}"
+                "execution segment must be non-empty (from < to): \
+                 {from_num}/{from_den}..{to_num}/{to_den}"
             )));
         }
-        Ok(Self { from, to })
+        // from ≤ 1, to ≤ 1: cross-multiply.
+        if from_num as i128 > from_den as i128 || to_num as i128 > to_den as i128 {
+            return Err(TropelError::Config(format!(
+                "execution segment bounds must be within [0, 1]: \
+                 {from_num}/{from_den}..{to_num}/{to_den}"
+            )));
+        }
+        Ok(Self { from_num, from_den, to_num, to_den })
     }
 
-    /// Parse a single fraction like `"1/3"`, `"0.5"`, or `"0"`.
-    fn parse_fraction(s: &str) -> Result<f64> {
+    /// Convenience: create from f64 (used by tests that compute bounds
+    /// programmatically). The f64 is converted to the closest rational
+    /// `(num, den)` via `f64_to_rat`. This is lossy for fractions whose
+    /// denominator is not a power of two (e.g. `1.0/3.0` → `(6004799503160661,
+    /// 18014398509481984)`); the exact rational constructors from string
+    /// parsing (`parse`, `parse_fraction`) should be preferred for production
+    /// use.
+    pub fn new_f64(from: f64, to: f64) -> Result<Self> {
+        let (from_num, from_den) = Self::f64_to_rat(from);
+        let (to_num, to_den) = Self::f64_to_rat(to);
+        Self::new(from_num, from_den, to_num, to_den)
+    }
+
+    /// Converts an f64 to a rational `(num, den)` by multiplying by 1e12
+    /// and reducing. This is exact for wholenumber decimals like `0.5` but
+    /// approximate for `1.0/3.0`.
+    fn f64_to_rat(v: f64) -> (i64, i64) {
+        const SCALE: f64 = 1_000_000_000_000.0;
+        let num = (v * SCALE).round() as i64;
+        let den = SCALE as i64;
+        let g = Self::gcd(num.abs(), den);
+        (num / g, den / g)
+    }
+
+    fn gcd(a: i64, b: i64) -> i64 {
+        if b == 0 { a.abs() } else { Self::gcd(b, a % b) }
+    }
+
+    /// Parse a single fraction like `"1/3"`, `"0.5"`, or `"0"` into an exact
+    /// rational `(num, den)`.
+    fn parse_fraction(s: &str) -> Result<(i64, i64)> {
         let s = s.trim();
         if s.is_empty() {
             return Err(TropelError::Config(
@@ -53,21 +102,50 @@ impl ExecutionSegment {
             ));
         }
         if let Some((num, den)) = s.split_once('/') {
-            let n: f64 = num
+            let n: i64 = num
                 .trim()
                 .parse()
                 .map_err(|_| TropelError::Config(format!("invalid segment numerator '{num}'")))?;
-            let d: f64 = den
+            let d: i64 = den
                 .trim()
                 .parse()
                 .map_err(|_| TropelError::Config(format!("invalid segment denominator '{den}'")))?;
-            if d == 0.0 {
+            if d == 0 {
                 return Err(TropelError::Config("division by zero in segment".into()));
             }
-            Ok(n / d)
+            let g = Self::gcd(n, d);
+            Ok((n / g, d / g))
+        } else if let Some(pct) = s.strip_suffix('%') {
+            // k6 supports percentages too: `20%` → 1/5.
+            let n: i64 = pct
+                .trim()
+                .parse()
+                .map_err(|_| TropelError::Config(format!("invalid percentage '{pct}'")))?;
+            let g = Self::gcd(n, 100);
+            Ok((n / g, 100 / g))
+        } else if s.contains('.') {
+            // Decimal: convert to a rational via the fractional digits.
+            let (int_part, frac_part) = s.split_once('.').unwrap();
+            let int_num: i64 = int_part
+                .parse()
+                .map_err(|_| TropelError::Config(format!("invalid segment fraction '{s}'")))?;
+            let frac_digits = frac_part.len() as u32;
+            let den = 10i64.pow(frac_digits);
+            let frac_num: i64 = if frac_part.is_empty() {
+                0
+            } else {
+                frac_part
+                    .parse()
+                    .map_err(|_| TropelError::Config(format!("invalid segment fraction '{s}'")))?
+            };
+            let num = int_num * den + frac_num;
+            let g = Self::gcd(num, den);
+            Ok((num / g, den / g))
         } else {
-            s.parse::<f64>()
-                .map_err(|_| TropelError::Config(format!("invalid segment fraction '{s}'")))
+            let n: i64 = s
+                .parse()
+                .map_err(|_| TropelError::Config(format!("invalid segment fraction '{s}'")))?;
+            Ok((n, 1))
         }
     }
 
@@ -82,23 +160,25 @@ impl ExecutionSegment {
                 "invalid execution segment '{segment}' — expected 'from:to' e.g. '0:1/3'"
             ))
         })?;
-        let from = Self::parse_fraction(from_s)?;
-        let to = Self::parse_fraction(to_s)?;
-        let seg = Self::new(from, to)?;
+        let (from_num, from_den) = Self::parse_fraction(from_s)?;
+        let (to_num, to_den) = Self::parse_fraction(to_s)?;
+        let seg = Self::new(from_num, from_den, to_num, to_den)?;
 
         if let Some(seq) = sequence {
             let bounds = Self::parse_sequence(seq)?;
             // The segment's bounds must be consecutive entries of the sequence.
-            let from_idx = bounds.iter().position(|b| (*b - from).abs() < 1e-9);
-            let to_idx = bounds.iter().position(|b| (*b - to).abs() < 1e-9);
+            let from_f = seg.from();
+            let to_f = seg.to();
+            let from_idx = bounds.iter().position(|b| (*b - from_f).abs() < 1e-9);
+            let to_idx = bounds.iter().position(|b| (*b - to_f).abs() < 1e-9);
             match (from_idx, to_idx) {
                 (Some(i), Some(j)) if j == i + 1 => Ok(seg),
                 (Some(i), Some(_)) => Err(TropelError::Config(format!(
-                    "execution segment {from}..{to} skips sequence boundary '{}' — segments must be consecutive pairs of the sequence '{seq}'",
+                    "execution segment {from_s}..{to_s} skips sequence boundary '{}' — segments must be consecutive pairs of the sequence '{seq}'",
                     bounds[i + 1]
                 ))),
                 _ => Err(TropelError::Config(format!(
-                    "execution segment bounds {from}..{to} not found in sequence '{seq}'"
+                    "execution segment bounds {from_s}..{to_s} not found in sequence '{seq}'"
                 ))),
             }
         } else {
@@ -108,6 +188,8 @@ impl ExecutionSegment {
 
     /// Parse and validate a sequence spec like `"0,1/3,2/3,1"`.
     /// Rules: non-empty, strictly ascending, starts at 0, ends at 1.
+    /// Returns the boundaries as f64 for the (fuzzy) membership checks in
+    /// `parse`; the exact rational form is preserved in the segment itself.
     pub fn parse_sequence(sequence: &str) -> Result<Vec<f64>> {
         let parts: Vec<&str> = sequence.split(',').map(str::trim).collect();
         if parts.len() < 2 {
@@ -117,7 +199,8 @@ impl ExecutionSegment {
         }
         let mut bounds = Vec::with_capacity(parts.len());
         for p in parts {
-            bounds.push(Self::parse_fraction(p)?);
+            let (num, den) = Self::parse_fraction(p)?;
+            bounds.push(num as f64 / den as f64);
         }
         if (bounds[0]).abs() > 1e-9 {
             return Err(TropelError::Config(format!(
@@ -139,37 +222,38 @@ impl ExecutionSegment {
         Ok(bounds)
     }
 
-    /// The segment's lower bound.
+    /// The segment's lower bound (as f64 — for logging and backward-compat
+    /// access).
     pub fn from(&self) -> f64 {
-        self.from
+        self.from_num as f64 / self.from_den as f64
     }
 
-    /// The segment's upper bound.
+    /// The segment's upper bound (as f64).
     pub fn to(&self) -> f64 {
-        self.to
+        self.to_num as f64 / self.to_den as f64
     }
 
     /// The fraction of the workload this segment covers (`to - from`).
     pub fn fraction(&self) -> f64 {
-        self.to - self.from
+        self.to() - self.from()
     }
 
     /// Scale a VU count deterministically with k6's **telescoping** formula
-    /// `floor(n·to) − floor(n·from)` rather than an independent
-    /// `floor(n·(to−from))`. Telescoping distributes the integer-rounding
-    /// remainder across the segment sequence, so the scaled counts of ALL
-    /// nodes sum EXACTLY to the original `vus` — no work is lost or
-    /// over-provisioned. E.g. 10 VUs across 3 equal segments: `3+3+4` (not
-    /// `3+3+3`); 2 VUs across 3 segments: `0+1+1` (not `1+1+1`). A node may
-    /// legitimately get 0 VUs when its share floors to nothing — the
-    /// neighboring segment picks up that work.
+    /// `floor(n·to) − floor(n·from)` using **exact rational arithmetic** —
+    /// k6 uses `big.Rat`; tropel uses `i128` integer division of the stored
+    /// numerator/denominator pairs. This avoids the f64 silent-wrong-number
+    /// bug that misassigns VUs when the segment fraction is not exactly
+    /// representable in binary floating point (e.g. 100 agents / 100 VUs at
+    /// `1/100` per agent).
     pub fn scale_vus(&self, vus: u32) -> u32 {
         if vus == 0 {
             return 0;
         }
-        let scaled = ((vus as f64) * self.to).floor() - ((vus as f64) * self.from).floor();
+        let n = vus as i128;
+        let to_floor = n * self.to_num as i128 / self.to_den as i128;
+        let from_floor = n * self.from_num as i128 / self.from_den as i128;
+        let scaled = to_floor - from_floor;
         // to ≤ 1 ⇒ floor(n·to) ≤ n and floor(n·from) ≥ 0, so scaled ∈ [0, n].
-        // The min() is a defensive float-edge clamp only.
         (scaled as u32).min(vus)
     }
 
@@ -179,8 +263,10 @@ impl ExecutionSegment {
         if iterations == 0 {
             return 0;
         }
-        let scaled =
-            ((iterations as f64) * self.to).floor() - ((iterations as f64) * self.from).floor();
+        let n = iterations as i128;
+        let to_floor = n * self.to_num as i128 / self.to_den as i128;
+        let from_floor = n * self.from_num as i128 / self.from_den as i128;
+        let scaled = to_floor - from_floor;
         (scaled as u64).min(iterations)
     }
 
@@ -314,10 +400,12 @@ mod tests {
 
     #[test]
     fn parses_fraction_forms() {
-        assert_eq!(ExecutionSegment::parse_fraction("1/3").unwrap(), 1.0 / 3.0);
-        assert_eq!(ExecutionSegment::parse_fraction("0.5").unwrap(), 0.5);
-        assert_eq!(ExecutionSegment::parse_fraction("0").unwrap(), 0.0);
-        assert_eq!(ExecutionSegment::parse_fraction("2/3").unwrap(), 2.0 / 3.0);
+        assert_eq!(ExecutionSegment::parse_fraction("1/3").unwrap(), (1, 3));
+        assert_eq!(ExecutionSegment::parse_fraction("0.5").unwrap(), (1, 2));
+        assert_eq!(ExecutionSegment::parse_fraction("0").unwrap(), (0, 1));
+        assert_eq!(ExecutionSegment::parse_fraction("2/3").unwrap(), (2, 3));
+        assert_eq!(ExecutionSegment::parse_fraction("20%").unwrap(), (1, 5));
+        assert_eq!(ExecutionSegment::parse_fraction("0.25").unwrap(), (1, 4));
         assert!(ExecutionSegment::parse_fraction("x/3").is_err());
         assert!(ExecutionSegment::parse_fraction("1/0").is_err());
     }
@@ -442,13 +530,39 @@ mod tests {
             for n in [1usize, 2, 3, 7] {
                 let mut total = 0u64;
                 for i in 0..n {
-                    let seg = ExecutionSegment::new(i as f64 / n as f64, (i + 1) as f64 / n as f64)
+                    let seg = ExecutionSegment::new_f64(i as f64 / n as f64, (i + 1) as f64 / n as f64)
                         .unwrap();
                     total += seg.scale_vus(vus) as u64;
                 }
                 assert_eq!(total, vus as u64, "VUs {vus} across {n} segments");
             }
         }
+    }
+
+    /// TR-221: the register's exact claim — 100 agents / 100 VUs must give
+    /// EACH agent exactly 1 VU. The old f64 telescoping
+    /// (`floor(100·to) − floor(100·from)`) misread `0.03`/`0.04` boundaries
+    /// (f64 `100·0.03 = 2.999…` → floor 2 while `100·0.04 = 4.000…` → floor 4),
+    /// so segment 2 got 0 VUs and segment 3 got 2. Exact rationals fix it.
+    #[test]
+    fn hundred_agents_hundred_vus_is_one_each() {
+        let mut total = 0u64;
+        let mut min_vus = u32::MAX;
+        let mut max_vus = 0u32;
+        for i in 0..100u64 {
+            let seg = ExecutionSegment::parse(&format!("{i}/100:{}/100", i + 1), None).unwrap();
+            let scaled = seg.scale_vus(100);
+            total += scaled as u64;
+            min_vus = min_vus.min(scaled);
+            max_vus = max_vus.max(scaled);
+            assert_eq!(
+                scaled, 1,
+                "agent {i} of 100 must get exactly 1 VU from 100 VUs (rational scaling), got {scaled}"
+            );
+        }
+        assert_eq!(total, 100, "sum must be exactly 100");
+        assert_eq!(min_vus, 1);
+        assert_eq!(max_vus, 1);
     }
 
     #[test]

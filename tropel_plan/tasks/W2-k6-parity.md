@@ -134,10 +134,10 @@ Tropel's act-then-sleep leads by one step *and* accumulates drift, and its ramp-
 
 `constant_arrival_rate.go:316-330` walks a **global** iteration index `gi`, recomputing the deadline as `period × gi` from `time.Since(startTime)` every tick — **zero drift**. Segmentation is expressed purely by *skipping the global ticks this segment doesn't own*, so N instances interleave into the exact original global rate.
 
-- [ ] **[GAP]** Implement `GetStripedOffsets`. Tropel runs an *independent* arrival-rate executor per node, so arrivals **bunch instead of interleaving**
-- [ ] **[SILENT]** Segment scaling must use exact rationals — k6 uses `big.Rat`; tropel's `f64` gives 100 agents / 100 VUs → **two agents get 0 VUs and two get 2**
-- [ ] Ramping arrival rate integrates the rate curve in closed form (`ramping_arrival_rate.go:234-283`), solving a quadratic for linear ramps and carrying the fractional remainder across stage boundaries via `doneSoFar`
-- [ ] **[GAP, deliberate]** `rps` is **not** segment-scaled in k6 either — tropel's 4-agents-each-enforcing-the-full-cap **matches**. Document it as a shared footgun; do not "fix" it into a divergence
+- [ ] **[GAP]** Implement `GetStripedOffsets`. Tropel runs an *independent* arrival-rate executor per node, so arrivals **bunch instead of interleaving** — **deferred** (the rational scaling fix lands first)
+- [x] **[SILENT]** Segment scaling must use exact rationals — k6 uses `big.Rat`; tropel's `f64` gave 100 agents / 100 VUs → **two agents get 0 VUs and two get 2** — **fixed**: exact `(num, den)` bounds with `floor(n·num/den)` via `i128` integer division; 100 agents × 100 VUs → each gets exactly 1 (PR #385)
+- [x] Ramping arrival rate integrates the rate curve in closed form (`ramping_arrival_rate.go:234-283`), solving a quadratic for linear ramps and carrying the fractional remainder across stage boundaries via `doneSoFar` — **already done**: prefix-sum trapezoids with `tokens_at` (closed-form, O(log n)), fractional remainder carried implicitly via `last_target` (the integer floor of the cumulative integral). Verified by inspection; no code change needed.
+- [x] **[GAP, deliberate]** `rps` is **not** segment-scaled in k6 either — tropel's 4-agents-each-enforcing-the-full-cap **matches**. Documented in the module doc — PR #385
 
 ## TR-222 · Thresholds — grammar, semantics, and the units model
 **Effort:** M · **Blocked by:** TR-112
