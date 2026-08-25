@@ -666,6 +666,14 @@ async fn run_command(cli: Cli) -> Result<()> {
 
     if any_failed {
         Err(TropelError::Other("One or more thresholds failed".into()))
+    } else if result.metrics.run_failed() {
+        // TR-105: the same verdict the banner uses. `checks_failed` alone
+        // (no threshold failure) used to let the exit code stay 0 while the
+        // banner printed FAIL — a run with all checks failing but no
+        // threshold configured exited 0 with a red summary.
+        Err(TropelError::Other(
+            "Run failed (checks / script failures / VU init failures)".into(),
+        ))
     } else {
         Ok(())
     }

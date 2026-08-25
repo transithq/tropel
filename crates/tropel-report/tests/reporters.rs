@@ -137,6 +137,8 @@ fn fixture() -> MetricsResult {
         // Wall-clock run duration — backs k6-style per-second rates
         // (`http_reqs: 1000 33.33/s`) in the stdout summary (backlog 154).
         run_duration: std::time::Duration::from_secs(30),
+        vu_init_failures: 0,
+        script_failures: 0,
     };
     result.metrics.extend(result.per_url.clone());
     result
