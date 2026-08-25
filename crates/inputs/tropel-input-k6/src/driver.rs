@@ -2409,15 +2409,11 @@ impl K6DriverInstance {
                         // (crates/tropel-wasm/src/driver.rs) with the same
                         // rule; the k6 bridge takes `value: f64` straight from
                         // JS, so `myTrend.add(parseFloat(missingHeader))` →
-                        // NaN poisoned `sum` forever (avg=NaN → `avg < 500`
-                        // false forever) while `f64::NAN.max(0.0) == 0.0`
-                        // silently recorded a phantom 0 in the histogram.
-                        // Drop the sample — count and population stay
+                        // NaN is rejected at the primary path
+                        // (MetricsCollector::record, TR-120) which guards
+                        // BEFORE forward_to_sink. count and population stay
                         // consistent and no aggregate/threshold can be
                         // poisoned.
-                        if !value.is_finite() {
-                            return;
-                        }
                         // TR-102: reserved-name guard — user code must not
                         // emit into builtin metrics. A script that writes
                         // `new Rate('http_req_failed').add(0)` makes a CI
@@ -7409,6 +7405,11 @@ mod tests {
             .await
             .expect("iteration must complete");
 
+        // The NaN samples DO reach the per-iteration buffer (the bridge guard
+        // is gone — the canonical TR-120 guard is at MetricSet::record and
+        // MetricsCollector::record/record_batch). Assert the buffer carried
+        // both the NaN and the valid sample, then that the COLLECTOR drops
+        // the NaN and the aggregation window survives.
         let latency: Vec<&Sample> = ctx
             .samples
             .iter()
@@ -7416,24 +7417,53 @@ mod tests {
             .collect();
         assert_eq!(
             latency.len(),
-            1,
-            "NaN Trend.add must be dropped, got: {:?}",
-            latency.iter().map(|s| s.value).collect::<Vec<_>>()
+            2,
+            "bridge must forward both samples to the per-iteration buffer"
         );
-        assert_eq!(latency[0].value, 42.0, "valid Trend.add must survive");
+        assert!(
+            latency.iter().any(|s| !s.value.is_finite()),
+            "NaN Trend.add reaches the buffer (guard is at the collector)"
+        );
+        assert!(latency.iter().any(|s| s.value == 42.0));
 
         let events: Vec<&Sample> = ctx
             .samples
             .iter()
             .filter(|s| s.metric == "events")
             .collect();
-        assert_eq!(
-            events.len(),
-            1,
-            "NaN Counter.add must be dropped, got: {:?}",
-            events.iter().map(|s| s.value).collect::<Vec<_>>()
+        assert_eq!(events.len(), 2, "both Counter.add samples reach the buffer");
+        assert!(events.iter().any(|s| !s.value.is_finite()));
+
+        // TR-120: feed the buffer through the real collector and assert the
+        // window survives — the NaN samples are dropped at the primary path,
+        // only the valid ones aggregate.
+        let collector = tropel_metrics::collector::MetricsCollector::new();
+        collector.record_batch(&ctx.samples).await;
+        let results = collector.results().await;
+        assert!(
+            !results.metrics.is_empty(),
+            "collector must aggregate the samples"
         );
-        assert_eq!(events[0].value, 1.0, "valid Counter.add must survive");
+        let latency_s = results
+            .metrics
+            .iter()
+            .find(|m| m.key.starts_with("latency{"));
+        let l = latency_s.expect("latency series must exist");
+        assert!(
+            l.mean.is_finite(),
+            "NaN Trend must not poison the aggregate (mean={})",
+            l.mean
+        );
+        assert_eq!(l.count, 1, "only the valid Trend.add should be counted");
+        assert_eq!(l.mean, 42.0, "valid Trend.add must survive");
+        let events_s = results
+            .metrics
+            .iter()
+            .find(|m| m.key.starts_with("events{"))
+            .expect("events series must exist");
+        assert!(events_s.mean.is_finite());
+        assert_eq!(events_s.count, 1, "only the valid Counter.add is counted");
+        assert_eq!(events_s.sum, 1.0);
     }
 
     /// Backlog line 62: an abnormal closure (server drops without a close

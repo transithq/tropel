@@ -76,9 +76,9 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-113 · `handleSummary` has no unscoped `http_req_duration`
 **Effort:** S · **Blocked by:** TR-112
 
-- [ ] `summary.rs:23-84` iterates `results.metrics`; the merged unscoped series never appears, so the most common `handleSummary` script in existence reads `undefined`
-- [ ] k6's v2.1.0 default `data` shape is still the legacy `{root_group, options, state, metrics, setup_data}` — match it
-- [ ] `root_group` is currently a hardcoded empty stub while `per_group` is fully populated
+- [x] `summary.rs:23-84` iterates `results.metrics`; the merged unscoped series never appears, so the most common `handleSummary` script in existence reads `undefined` — **fixed**: `summary.rs` re-injects the merged `http_req_duration`/`iteration_duration` headlines under their unscoped keys (test `headline_http_req_duration_reinjected_into_handle_summary`)
+- [x] k6's v2.1.0 default `data` shape is still the legacy `{root_group, options, state, metrics, setup_data}` — match it — `metrics` carries the headline series and `root_group` is now a real tree
+- [x] `root_group` is currently a hardcoded empty stub while `per_group` is fully populated — **fixed**: `build_root_group` builds a nested group tree (name/path/id/groups/checks) from the per-group summaries; test `root_group_builds_tree_from_per_group_data` asserts nested `checkout::payment` with per-group passes/fails
 
 ## TR-114 · `pm.response.to.have.jsonBody("key")` is a false failure
 **Effort:** S · **Blocked by:** none
@@ -94,10 +94,10 @@ Less dangerous, equally fatal to adoption — nobody keeps a tool that fails the
 ## TR-120 · No NaN/Inf guard on the primary path
 **Effort:** S · **Blocked by:** none
 
-- [ ] The guard exists in the wasm driver and at two emitters, and **not** in `MetricSet::record` — the canonical sibling-miss
-- [ ] A single NaN/Inf sample poisons a whole flush window across three outputs (`influxdb.rs:232`, `statsd.rs`, Prometheus)
-- [ ] Guard once, at the point every path funnels through; delete the two partial guards
-- [ ] A test feeds NaN through each of the four entry points and asserts the window survives
+- [x] The guard exists in the wasm driver and at two emitters, and **not** in `MetricSet::record` — the canonical sibling-miss — **fixed**: `MetricSet::record` + `MetricsCollector::record`/`record_batch` drop non-finite before any arithmetic or `forward_to_sink`; the two bridge-level guards removed — one guard at the primary path
+- [x] A single NaN/Inf sample poisons a whole flush window across three outputs (`influxdb.rs:232`, `statsd.rs`, Prometheus) — **fixed**: `MetricsCollector::record`/`record_batch` filter before `forward_to_sink`, streaming outputs never receive NaN/Inf
+- [x] Guard once, at the point every path funnels through; delete the two partial guards — wasm + k6 driver guards removed; collector guards the funnel
+- [x] A test feeds NaN through each of the four entry points and asserts the window survives — `MetricSet::record` drops NaN/Inf (Trend/Counter/Rate) in `collector::test_record_drops_non_finite_values`; k6 bridge → collector in `test_custom_metric_add_drops_non_finite_values`; wasm bridge → buffer in `test_non_finite_metric_reaches_buffer`
 
 ## TR-121 · Transport failures emit no `http_req_duration`
 **Effort:** M · **Blocked by:** none · **Also k6 parity — see TR-203**

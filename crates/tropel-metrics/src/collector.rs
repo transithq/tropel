@@ -501,9 +501,18 @@ impl MetricsCollector {
     /// If the aggregator has shut down (channel closed), the send silently
     /// drops the samples — acceptable during test teardown.
     pub async fn record_batch(&self, samples: &[Sample]) {
+        // TR-120: guard at the PRIMARY path, same as record().
+        let samples: Vec<Sample> = samples
+            .iter()
+            .filter(|s| s.value.is_finite())
+            .cloned()
+            .collect();
+        if samples.is_empty() {
+            return;
+        }
         self.ensure_aggregator();
         // Forward to streaming output sinks (best-effort, non-blocking)
-        self.forward_to_sink(samples);
+        self.forward_to_sink(&samples);
 
         let batch: Vec<Sample> = samples.to_vec();
         if self.tx.send(MetricsEvent::Samples(batch)).await.is_err() {
@@ -514,6 +523,15 @@ impl MetricsCollector {
     /// Record a single sample — bounded backpressure path.
     /// Also forwards to the streaming output sink if configured.
     pub async fn record(&self, sample: &Sample) {
+        // TR-120: guard at the PRIMARY path — before forward_to_sink (which
+        // bypasses the aggregator guard) AND before the aggregator channel.
+        // A single NaN/Inf sample poisons the flush window across all
+        // streaming outputs AND the aggregator; guard once here, not at the
+        // two bridge-level emitters.
+        if !sample.value.is_finite() {
+            tracing::trace!("MetricsCollector::record dropped non-finite sample");
+            return;
+        }
         self.ensure_aggregator();
         // Forward to streaming output sinks (best-effort, non-blocking)
         self.forward_to_sink(std::slice::from_ref(sample));
@@ -2157,6 +2175,36 @@ mod tests {
         assert_eq!(set.max, 1000.0, "max must reflect the Counter-typed sample");
         let stats = set.trend_stats();
         assert_eq!(stats.count, 2, "both samples must be in the histogram");
+    }
+
+    #[test]
+    fn test_record_drops_non_finite_values() {
+        // TR-120: MetricSet::record must reject NaN/Inf BEFORE any arithmetic
+        // — a single NaN sample poisoned sum forever (avg=NaN → `avg < 500`
+        // false forever) while f64::NAN.max(0.0) == 0.0 silently recorded a
+        // phantom 0 in the histogram. NaN/Inf must not even touch count/sum.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut set = MetricSet::new(MetricType::Trend, None, true);
+            set.record(bad, &SampleType::Trend);
+            set.record(42.0, &SampleType::Trend);
+            assert_eq!(set.count, 1.0, "NaN/Inf must not be counted");
+            assert_eq!(set.sum, 42.0, "NaN/Inf must not touch sum");
+            let mean = set.mean();
+            assert!(mean.is_finite(), "mean must stay finite, got {mean}");
+        }
+
+        // Same for Counter and Rate sets.
+        let mut counter = MetricSet::new(MetricType::Counter, None, true);
+        counter.record(f64::NAN, &SampleType::Counter);
+        counter.record(7.0, &SampleType::Counter);
+        assert_eq!(counter.count, 1.0);
+        assert_eq!(counter.sum, 7.0);
+
+        let mut rate = MetricSet::new(MetricType::Rate, None, true);
+        rate.record(f64::INFINITY, &SampleType::Rate);
+        rate.record(1.0, &SampleType::Rate);
+        assert_eq!(rate.count, 1.0);
+        assert_eq!(rate.sum, 1.0);
     }
 
     #[test]
