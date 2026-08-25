@@ -73,7 +73,7 @@ k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `bl
 ## TR-207 · Real group paths
 **Effort:** S · **Blocked by:** TR-133
 
-**[SILENT]** The `group` tag is hardcoded `"http"`. k6's is the `k6/group` nesting path with a **leading `::`** — `group("a")` → `"::a"`, nested → `"::a::b"`, root is `""` (`lib/models.go:25,162-170`). A name containing `::` is a hard error. `setup`/`teardown` are tagged `"::setup"`/`"::teardown"`.
+- [x] **[SILENT]** The `group` tag is hardcoded `"http"`. k6's is the `k6/group` nesting path with a **leading `::`** — `group("a")` → `"::a"`, nested → `"::a::b"`, root is `""` (`lib/models.go:25,162-170`). A name containing `::` is a hard error. `setup`/`teardown` are tagged `"::setup"`/`"::teardown"` — **fixed**: full `::a::b` paths landed with TR-133; root default is now `""` and setup/teardown HTTP calls carry `::setup`/`::teardown` (tests `test_http_outside_group_tags_root_group_empty` + `test_setup_http_calls_tagged_group_setup`)
 
 ## TR-208 · The `--out json` schema
 **Effort:** S · **Blocked by:** none
