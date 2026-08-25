@@ -917,6 +917,40 @@ fn metric_add_host(
             }
         }
     }
+    // TR-102: reserved-name guard — the wasm tier must reject builtin
+    // metric names the same way the k6 driver and sandbox do, or a guest
+    // module can forge the checks headline through the wasm bridge.
+    const RESERVED: &[&str] = &[
+        "http_reqs",
+        "http_req_duration",
+        "http_req_failed",
+        "http_req_blocked",
+        "http_req_connecting",
+        "http_req_tls_handshaking",
+        "http_req_receiving",
+        "http_req_sending",
+        "http_req_waiting",
+        "data_sent",
+        "data_received",
+        "iterations",
+        "vus",
+        "vus_max",
+        "checks",
+        "group_duration",
+        "ws_connecting",
+        "ws_sending",
+        "ws_receiving",
+        "ws_msgs_sent",
+        "ws_msgs_received",
+        "ws_session_duration",
+    ];
+    if RESERVED.iter().any(|r| *r == name) {
+        tracing::warn!(
+            "wasm metric '{}' clashes with built-in metric name — ignoring",
+            name
+        );
+        return;
+    }
     // Refuse non-finite values: a guest NaN/Inf sample would poison Counter/
     // Trend aggregates and thresholds downstream (avg/p95 become NaN).
     if !value.is_finite() {
@@ -1095,6 +1129,20 @@ mod tests {
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br_if $done (i32.gt_u (local.get $i) (i32.const 100001)))
         (br $loop)))
+    (i32.const 0))
+)
+"#;
+
+    const RESERVED_NAME_DRIVER_WAT: &str = r#"
+(module
+  (import "env" "metric_add" (func $metric_add (param i32 i32 f64 i32 i32 i32)))
+  (memory (export "memory") 64 256)
+  (data (i32.const 4096) "checks\00")
+  (data (i32.const 8192) "{}\00")
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    ;; metric_add("checks", 1.0, "{}", type=3 Rate) — must be dropped by the
+    ;; TR-102 reserved-name guard (checks is a builtin headline).
+    (call $metric_add (i32.const 4096) (i32.const 6) (f64.const 1.0) (i32.const 8192) (i32.const 2) (i32.const 3))
     (i32.const 0))
 )
 "#;
@@ -1678,6 +1726,30 @@ mod tests {
             ctx.samples.len() <= MAX_ITERATION_SAMPLES,
             "samples must be capped, got {}",
             ctx.samples.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reserved_metric_name_dropped() {
+        // TR-102: a guest emitting into a builtin metric name (checks, http_reqs,
+        // …) must be dropped — the wasm tier mirrors the k6 driver and sandbox
+        // guards so a module cannot forge the checks headline.
+        let driver = WasmDriver::default();
+        let mut inst = driver
+            .init(RESERVED_NAME_DRIVER_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        let result = inst.run_iteration(&mut ctx).await;
+        assert!(result.is_ok(), "iteration must succeed, got {:?}", result);
+        assert!(
+            ctx.samples.iter().all(|s| s.metric != "checks"),
+            "reserved metric 'checks' must be dropped, got {:?}",
+            ctx.samples
+                .iter()
+                .map(|s| s.metric.clone())
+                .collect::<Vec<_>>()
         );
     }
 
