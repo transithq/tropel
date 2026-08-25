@@ -102,7 +102,7 @@ Tropel emits the **InfluxDB point shape** (`data.measurement`, `data.fields.valu
 ## TR-211 · `vus` / `vus_max` are scheduler-sampled once per second
 **Effort:** S · **Blocked by:** none
 
-**[SILENT]** Tropel has every VU emit its own pair every 100 iterations — **~1000 duplicate samples/s at 1000 VUs**, which is both wrong and a measurable egress cost.
+- [x] **[SILENT]** Tropel has every VU emit its own pair every 100 iterations — **~1000 duplicate samples/s at 1000 VUs**, which is both wrong and a measurable egress cost — **fixed**: a single scheduler-wide sampler task (landed) now runs on a **1s cadence** (k6 parity) — the old 2s cadence was off by one floor
 
 ## TR-212 · `systemTags` and the indexable/metadata split
 **Effort:** M · **Blocked by:** TR-204, TR-207
@@ -226,19 +226,19 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 **Effort:** S · **Blocked by:** none
 
 - [ ] **[GAP]** `k6/timers` — but these are **globals**; the module is a pure re-export, so implementing the globals is sufficient. It also unblocks the lodash `debounce`/`throttle` shims
-- [ ] **[GAP]** `randomSeed()` — one line, and the only way to get a reproducible run. **Per-VU, not global**
+- [x] **[GAP]** `randomSeed()` — one line, and the only way to get a reproducible run. **Per-VU, not global** — mulberry32 per-context (`k6-shim.js:1646-1659`)
 - [ ] `__tropel_timers` grows without bound — it reaps only *expired* one-shots, so `setInterval` handles accumulate for the whole run
-- [ ] **[SILENT]** `console` has exactly 5 methods — `log`, `debug`, `info`, `warn`, `error`, with **`log` aliasing `info`**. No `trace`/`table`/`group`/`dir`/`time`/`assert`
-- [ ] **[GAP]** `TextEncoder`/`TextDecoder` globals
+- [x] **[SILENT]** `console` has exactly 5 methods — `log`, `debug`, `info`, `warn`, `error`, with **`log` aliasing `info`**. No `trace`/`table`/`group`/`dir`/`time`/`assert` — `trace`/`dir` removed (`context.rs`); log/info alias at info level
+- [x] **[GAP]** `TextEncoder`/`TextDecoder` globals — added to the k6-shim bundle (reuse `k6Utf8Encode`/`k6Utf8Decode`), test `test_k6_shim_bundle_has_text_encoder_decoder`
 - [ ] 34 generic globals currently leak from `k6-shim.js` — `parse`, `crypto`, `open`, `test`, `hmac`, `randomBytes` — and `globalThis.crypto` is the wrong object. Namespacing them is part of this task, not a follow-up
 
 ## TR-243 · `check()`, `group()`, and the metric constructors
 **Effort:** M · **Blocked by:** TR-207
 
-- [ ] **[SILENT]** `check()` returns a **plain bool**, never throws on failure; emits the builtin `checks` Rate tagged `check:<name>`; takes a **third `tags` argument**; **rejects async functions**; a throwing check emits a `false` sample *then* propagates
-- [ ] `group()` also rejects async callbacks and emits `group_duration`
-- [ ] **[SILENT]** `isTime` was dropped from metric constructors. The second arg switches the metric to `ValueType.Time` = **values are milliseconds** — it changes threshold semantics and summary units, not just formatting
-- [ ] `.name` is **read-only**; `.add()` **returns a boolean** and does not throw on a bad value unless `options.throw`; metrics **must** be constructed in init context
+- [x] **[SILENT]** `check()` returns a **plain bool**, never throws on failure; emits the builtin `checks` Rate tagged `check:<name>`; takes a **third `tags` argument**; **rejects async functions**; a throwing check emits a `false` sample *then* propagates — all but the async rejection were already fixed; async rejection added (pm.js + k6-shim)
+- [x] `group()` also rejects async callbacks and emits `group_duration` — async rejection added (pm.js + k6-shim)
+- [x] **[SILENT]** `isTime` was dropped from metric constructors. The second arg switches the metric to `ValueType.Time` = **values are milliseconds** — already fixed (TR-222/earlier)
+- [x] `.name` is **read-only**; `.add()` **returns a boolean** and does not throw on a bad value unless `options.throw`; metrics **must** be constructed in init context — `.name` read-only + `.add()` boolean added (pm.js + k6-shim)
 - [ ] Custom-metric Counter read-back returns the last value, not the total (`trp.rs:1131,1177`)
 
 ## TR-244 · `k6/execution` — the mutable tag objects
@@ -298,9 +298,9 @@ Full register: `TROPEL_PARITY_POSTMAN.md`.
 ## TR-260 · Path-variable substitution is a naive ordered `str::replace`
 **Effort:** S · **Blocked by:** none
 
-- [ ] `parser.rs:361-371` — `/users/:user/posts/:userId` substitutes `:user` inside `:userId`
-- [ ] Descending-length sort works only when **both** tokens are present; the general fix is a single tokenising pass
-- [ ] Same bug class as knockport `KP-425`'s importer — fix it here, since import parsing is Rust-side by decision D4
+- [x] `parser.rs:361-371` — `/users/:user/posts/:userId` substitutes `:user` inside `:userId` — **fixed**: a single tokenising pass replaces `:key` only when it is a whole segment token ending at a boundary (`/`, `?`, `#`, or end), so `:user` can never eat `:userId` and `:id` can never corrupt `/x:idle`
+- [x] Descending-length sort works only when **both** tokens are present; the general fix is a single tokenising pass — the tokenising pass IS the general fix (declaration-order independent)
+- [x] Same bug class as knockport `KP-425`'s importer — fixed here, since import parsing is Rust-side by decision D4
 
 ## TR-261 · Duplicate headers and form fields collapse into `HashMap`s
 **Effort:** M · **Blocked by:** none

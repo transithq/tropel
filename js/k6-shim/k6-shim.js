@@ -1131,6 +1131,12 @@ if (typeof check !== 'function') {
             var condition = conds[name];
             var passed = false;
             if (typeof condition === 'function') {
+                // TR-243: k6 rejects async predicates.
+                if (Object.prototype.toString.call(condition) === '[object AsyncFunction]') {
+                    throw new TypeError(
+                        'check() condition "' + name + '" is an async function; k6 rejects async conditions'
+                    );
+                }
                 try {
                     passed = !!condition(val);
                 } catch (e) {
@@ -1156,6 +1162,10 @@ if (typeof check !== 'function') {
 // group(name, fn) — defined in pm-api/pm.js if loaded, else here
 if (typeof group !== 'function') {
     var group = function (name, fn) {
+        // TR-243: k6 rejects async callbacks.
+        if (typeof fn === 'function' && Object.prototype.toString.call(fn) === '[object AsyncFunction]') {
+            throw new TypeError('group() does not support async callbacks (k6 rejects them)');
+        }
         if (typeof __tropel_pm_group_start === 'function') {
             __tropel_pm_group_start(name);
             var startTime = Date.now();
@@ -1217,6 +1227,26 @@ function __tropel_check_reserved(name) {
     }
 }
 if (typeof Counter !== 'function') {
+    // TR-243: k6's `.name` is read-only and `.add()` returns a boolean
+    // (false for a non-finite value, silently dropped unless options.throw —
+    // tropel has no options.throw; the collector guard drops non-finite).
+    var __tropel_metric_name = {
+        configurable: false,
+        enumerable: true,
+        get: function () { return this._name; },
+        set: function () { /* k6: name is read-only */ },
+    };
+    var __tropel_metric_add = function (value, tags) {
+        var v = Number(value);
+        if (!isFinite(v)) {
+            return false;
+        }
+        if (typeof __tropel_pm_custom_metric_add === 'function') {
+            var tagsStr = tags ? JSON.stringify(tags) : '{}';
+            __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
+        }
+        return true;
+    };
     var Counter = function (name) {
         if (!name || typeof name !== 'string') {
             throw new Error('Counter requires a metric name');
@@ -1226,13 +1256,8 @@ if (typeof Counter !== 'function') {
         this._type = 'counter';
         this._isTime = false;
     };
-    Counter.prototype.add = function (value, tags) {
-        if (typeof __tropel_pm_custom_metric_add === 'function') {
-            var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
-        }
-        return this;
-    };
+    Object.defineProperty(Counter.prototype, 'name', __tropel_metric_name);
+    Counter.prototype.add = __tropel_metric_add;
 }
 if (typeof Gauge !== 'function') {
     var Gauge = function (name) {
@@ -1244,13 +1269,8 @@ if (typeof Gauge !== 'function') {
         this._type = 'gauge';
         this._isTime = false;
     };
-    Gauge.prototype.add = function (value, tags) {
-        if (typeof __tropel_pm_custom_metric_add === 'function') {
-            var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
-        }
-        return this;
-    };
+    Object.defineProperty(Gauge.prototype, 'name', __tropel_metric_name);
+    Gauge.prototype.add = __tropel_metric_add;
 }
 if (typeof Rate !== 'function') {
     var Rate = function (name) {
@@ -1262,13 +1282,8 @@ if (typeof Rate !== 'function') {
         this._type = 'rate';
         this._isTime = false;
     };
-    Rate.prototype.add = function (value, tags) {
-        if (typeof __tropel_pm_custom_metric_add === 'function') {
-            var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
-        }
-        return this;
-    };
+    Object.defineProperty(Rate.prototype, 'name', __tropel_metric_name);
+    Rate.prototype.add = __tropel_metric_add;
 }
 if (typeof Trend !== 'function') {
     // Backlog line 154: k6's Trend takes (name, isTime). isTime marks the
@@ -1283,13 +1298,8 @@ if (typeof Trend !== 'function') {
         this._type = 'trend';
         this._isTime = isTime === true;
     };
-    Trend.prototype.add = function (value, tags) {
-        if (typeof __tropel_pm_custom_metric_add === 'function') {
-            var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
-        }
-        return this;
-    };
+    Object.defineProperty(Trend.prototype, 'name', __tropel_metric_name);
+    Trend.prototype.add = __tropel_metric_add;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1345,6 +1355,41 @@ function k6Utf8Decode(bytes) {
         }
     }
     return out;
+}
+
+// TR-242: TextEncoder/TextDecoder globals (k6 exposes the WHATWG
+// encoders; a script calling `new TextEncoder()` threw ReferenceError).
+// Reuse the k6Utf8Encode/Decode helpers (one implementation per behaviour).
+if (typeof TextEncoder === 'undefined') {
+    var TextEncoder = function () {};
+    TextEncoder.prototype.encode = function (str) {
+        if (str === undefined) str = '';
+        var bytes = k6Utf8Encode(String(str));
+        return new Uint8Array(bytes);
+    };
+    TextEncoder.prototype.encodeInto = function (str, dest) {
+        var bytes = k6Utf8Encode(String(str));
+        var n = Math.min(bytes.length, dest.length);
+        for (var i = 0; i < n; i++) dest[i] = bytes[i];
+        return { read: n, written: n };
+    };
+}
+if (typeof TextDecoder === 'undefined') {
+    var TextDecoder = function (label) {
+        this._label = label || 'utf-8';
+    };
+    TextDecoder.prototype.decode = function (input) {
+        if (input === undefined) return '';
+        var bytes;
+        if (input instanceof ArrayBuffer) {
+            bytes = new Uint8Array(input);
+        } else if (typeof Uint8Array !== 'undefined' && input instanceof Uint8Array) {
+            bytes = input;
+        } else {
+            throw new TypeError('TextDecoder.decode: expected a BufferSource');
+        }
+        return k6Utf8Decode(Array.prototype.slice.call(bytes));
+    };
 }
 
 // k6's common.ToBytes: string → UTF-8 bytes, ArrayBuffer → bytes.
