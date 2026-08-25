@@ -596,8 +596,8 @@ where
     dropped_sampler.abort();
 
     // Emit a guaranteed final vus/vus_max sample. The single scheduler-wide
-    // sampler runs on a 2s cadence (backlog line 165), so a run shorter than
-    // 2s would otherwise emit only the t=0 sample and the summary could read
+    // sampler runs on a 1s cadence (k6 parity, TR-211), so a run shorter than
+    // 1s would otherwise emit only the t=0 sample and the summary could read
     // a stale vus: 0. The active count uses the LAST KNOWN sampled value (not
     // 0) so the vus gauge's `last` reflects real concurrency (backlog line
     // 154).
@@ -1264,9 +1264,10 @@ async fn vus_sampler_task(
     last_active_vus: Arc<AtomicU32>,
     sc_tags: HashMap<String, String>,
 ) {
-    // First tick fires immediately, then every 2s — so a run shorter than
-    // the cadence still gets one sample (plus the final one after the run).
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    // First tick fires immediately, then every 1s (k6 parity — k6 samples
+    // vus/vus_max once per second, TR-211), so a run shorter than the
+    // cadence still gets one sample (plus the final one after the run).
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
@@ -1386,14 +1387,14 @@ mod tests {
     /// 1000 VUs used to emit ~1000 duplicate `record_batch` calls per 2s
     /// floor, corrupting the gauge's min/max/avg. Run the single sampler for
     /// ~2.3 real seconds and assert the sample count stays small (t=0 +
-    /// t=2s = ~2) REGARDLESS of the VU count — the old per-VU trigger would
-    /// have produced ~1000. Real time (not paused) so the spawned task and
-    /// the metrics aggregator actually get polled.
+    /// t=1s + t=2s = ~3) REGARDLESS of the VU count — the old per-VU trigger
+    /// would have produced ~1000. Real time (not paused) so the spawned task
+    /// and the metrics aggregator actually get polled.
     #[tokio::test]
     async fn vus_sampler_emits_bounded_cadence_not_per_vu() {
         let metrics = Arc::new(MetricsCollector::new());
         // 1000 VUs would have produced ~1000 samples per 2s floor under the
-        // old per-VU trigger; the single sampler must stay at ~2.
+        // old per-VU trigger; the single sampler must stay at ~3.
         let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
             vus: 1000,
             duration: "10s".to_string(),
@@ -1408,7 +1409,8 @@ mod tests {
             last_active.clone(),
             tags,
         ));
-        // t=0 tick fires immediately, then every 2s — ~2 samples in 2.3s.
+        // t=0 tick fires immediately, then every 1s (k6 parity, TR-211) —
+        // ~3 samples in 2.3s.
         tokio::time::sleep(Duration::from_millis(2300)).await;
         task.abort();
         let _ = task.await;
