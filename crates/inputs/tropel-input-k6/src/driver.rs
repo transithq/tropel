@@ -10707,6 +10707,65 @@ mod tests {
         );
     }
 
+    /// TR-242: `__tropel_timers` must not grow without bound. The reset now
+    /// throws when the live timer count exceeds the cap (10000) — a script
+    /// that arms setInterval in a loop without clearing is a broken artifact
+    /// and must fail loudly instead of leaking memory for the whole run.
+    #[tokio::test]
+    async fn test_timer_cap_fails_loudly_on_unbounded_growth() {
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                // Arm 10001 one-shots WITHOUT clearing — the reset must throw.
+                for (var i = 0; i < 10001; i++) { setTimeout(function () {}, 60000); }
+                try {
+                    __tropel_reset_timers();
+                    'no-throw';
+                } catch (e) {
+                    String(e);
+                }
+                "#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("Timer limit exceeded"),
+            "reset must name the cap, got: {out}"
+        );
+    }
+
+    /// TR-242: `globalThis.crypto` must be the WHATWG WebCrypto object, not
+    /// the k6/crypto module namespace (the register's "wrong object" leak).
+    /// k6/crypto's named functions are bare globals; WebCrypto lives at
+    /// `globalThis.crypto` — scripts use `crypto.getRandomValues` /
+    /// `crypto.subtle.digest`.
+    #[tokio::test]
+    async fn test_global_this_crypto_is_webcrypto_not_k6_module() {
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify({
+                    isWebCrypto: typeof globalThis.crypto.getRandomValues === 'function'
+                        && typeof globalThis.crypto.subtle === 'object'
+                        && typeof globalThis.crypto.subtle.digest === 'function',
+                    hasK6NamedFnOnGlobal: typeof globalThis.crypto.sha256,
+                    // k6/crypto named functions remain bare globals (module
+                    // exports surface, matching k6's import model).
+                    sha256IsBare: typeof sha256,
+                })
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            r#"{"isWebCrypto":true,"hasK6NamedFnOnGlobal":"undefined","sha256IsBare":"function"}"#,
+            "globalThis.crypto must be WebCrypto; k6/crypto fns stay bare globals"
+        );
+    }
+
     #[tokio::test]
     async fn test_driver_pumps_timers_at_iteration_boundary() {
         // Backlog line 131 (reviewer follow-up): the iteration-boundary pump

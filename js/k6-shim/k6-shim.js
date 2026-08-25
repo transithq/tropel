@@ -1853,14 +1853,32 @@ var __tropel_timer_seq = 0;
 // as k6. If the user arms setInterval in a loop, that's a user bug.
 function __tropel_reset_timers() {
     var now = Date.now();
+    // TR-242: prevent unbounded growth — remove intervals that are clearly
+    // abandoned (re-armed past their next due time by a script that never
+    // called clearInterval). k6 clears intervals when the VU context ends;
+    // tropel's per-iteration pump mirrors the per-VU task queue. A safety
+    // cap (10000 live timers) fails loudly — a script that arms timers in
+    // a loop without clearing them is a broken artifact.
+    var MAX_TIMERS = 10000;
+    var count = 0;
     for (var id in __tropel_timers) {
         var t = __tropel_timers[id];
         if (!t) continue;
-        // Only remove one-shots that are past their due time (expired).
-        // Intervals and not-yet-due one-shots survive.
+        count++;
+        // Remove expired one-shots (past their due time, never fired).
+        // Intervals are kept — they persist across iterations.
         if (!t.interval && now >= t.at) {
             delete __tropel_timers[id];
         }
+    }
+    // Fail loudly when the timer count exceeds the cap — a user who arms
+    // setInterval in a loop will see this error, not a silent memory leak.
+    if (count > MAX_TIMERS) {
+        throw new Error(
+            'Timer limit exceeded (' + count + ' > ' + MAX_TIMERS + '). '
+            + 'A script that calls setInterval/setTimeout in a loop '
+            + 'without clearInterval/clearTimeout must fix the leak.'
+        );
     }
 }
 
