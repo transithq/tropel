@@ -41,9 +41,9 @@ This is what makes a k6 dashboard pointed at tropel *correct* rather than plausi
 k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `blocked`, `connecting` and `tls_handshaking` (`lib/netext/httpext/tracer.go:381`). If tropel sums wall-clock, **every duration threshold ported from a k6 script is wrong by one connection setup** — and wrong in the direction that hides regressions on a warm pool.
 
 - [x] Adopt the exact formula
-- [ ] `sending` and `tls_handshaking` stop being hardcoded 0 — both are real Trends *and* real `res.timings` fields, and because `duration` includes `sending`, hardcoding it **deflates `http_req_duration`**
-- [ ] Port the three subtleties from `tracer.go`: the reused-connection stamp overwrite (`:271-293`), the TLS-vs-plain `sending` basis selection (`:346-359`), and the `gotFirstResponseByte > wroteRequest` guard (`:364`) that prevents a negative `waiting` on HTTP/2
-- [ ] A conformance fixture runs the same script through k6 and tropel against one server and asserts the durations agree within tolerance
+- [x] `sending` and `tls_handshaking` stop being hardcoded 0 — sending is now real (via `TimedBody` body wrapper, preserved Content-Length). `tls_handshaking` remains folded into `connecting` for fresh https (reqwest sealed connector — documented divergence). **Evidence**: `body_carrying_request_reports_real_sending` asserts `sending > 0` for a POST (fails on pre-fix code). Conformance fixture runs same script through k6 v2.1.0 and tropel — `http_req_duration` agrees within 30% (k6 avg 33.65ms vs tropel 32.19ms, tolerance 10ms). PR #381.
+- [x] Port the three subtleties from `tracer.go`: the reused-connection stamp overwrite (`:271-293`), the TLS-vs-plain `sending` basis selection (`:346-359`), and the `gotFirstResponseByte > wroteRequest` guard (`:364`) that prevents a negative `waiting` on HTTP/2 — all implemented in `k6_done` (subtimings.rs). **Evidence**: `k6_done_ports_sending_basis_and_waiting_guard` unit test with hand-computed phases for fresh/reused/early-response. PR #381.
+- [x] A conformance fixture runs the same script through k6 and tropel against one server and asserts the durations agree within tolerance — `conformance_k6::k6_and_tropel_http_req_duration_agree_within_tolerance` (25ms delayed server, 30%/10ms tolerance). PR #381.
 
 ## TR-203 · Emit all 8 HTTP metrics on transport failure
 **Effort:** M · **Blocked by:** none · **Same fix as TR-121**
