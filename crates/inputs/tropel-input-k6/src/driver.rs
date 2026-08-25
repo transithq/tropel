@@ -1241,10 +1241,12 @@ fn push_http_samples_for(
 
     let is_failed = !(200..400).contains(&status_code);
     let mut v = sink.lock().unwrap();
-    // TR-202: http_req_duration = sending + waiting + receiving.
-    // Since reqwest folds sending into waiting, use waiting + receiving.
+    // TR-202: http_req_duration = sending + waiting + receiving. The engine
+    // now measures `sending` for real (timed body wrapper) and excludes it
+    // from `waiting`, so the full k6 formula is required — using
+    // waiting + receiving alone would undercount by the request-write time.
     let duration_value = if let Some(t) = timings {
-        (t.waiting + t.receiving).as_secs_f64() * 1000.0
+        (t.sending + t.waiting + t.receiving).as_secs_f64() * 1000.0
     } else {
         duration.as_secs_f64() * 1000.0
     };
@@ -1258,13 +1260,15 @@ fn push_http_samples_for(
     // Backlog line 150: the k6 path now emits the same connection-phase
     // sub-timing samples as the declarative runner — real blocked/dns/
     // connecting/waiting/receiving (from reqwest's resolver + connector
-    // hooks); tls_handshaking/sending stay 0 (folded into connecting /
-    // waiting by reqwest, same as the declarative path). Emitted with the
+    // hooks) plus real `sending` (measured by the timed body wrapper, TR-202).
+    // tls_handshaking stays 0 — reqwest's sealed connector folds the TLS
+    // handshake into `connecting`, so it is genuinely 0 for plain http and
+    // folded for fresh https (see `subtimings::k6_done`). Emitted with the
     // same tags so thresholds like http_req_waiting:p(95) resolve.
     if let Some(t) = timings {
-        // Emit all 8 sub-timing metrics including tls_handshaking and
-        // sending (always zero on reqwest, but k6 thresholds reference
-        // them). TR-011: removing them broke two stock k6 thresholds.
+        // Emit all 8 sub-timing metrics including tls_handshaking (0 for the
+        // reasons above) and the real sending (TR-011: removing the always-zero
+        // samples broke two stock k6 thresholds).
         let sub = [
             ("http_req_blocked", t.blocked),
             ("http_req_dns", t.dns),
@@ -1687,10 +1691,11 @@ impl DriverInstance for K6DriverInstance {
 ///
 /// Backlog line 150: the object now carries REAL `timings` (blocked/dns/
 /// connecting/tls_handshaking/sending/waiting/receiving/duration in ms, from
-/// the reqwest resolver+connector hooks), k6's `error` ("" on success), and
-/// `error_code` (0 on success, 1xxx series on transport failure). For
-/// `responseType: "binary"` the body is a native JS ArrayBuffer instead of a
-/// UTF-8 string (binary payloads are no longer silently destroyed).
+/// the reqwest resolver+connector hooks plus the timed body wrapper for
+/// `sending`), k6's `error` ("" on success), and `error_code` (0 on success,
+/// 1xxx series on transport failure). For `responseType: "binary"` the body
+/// is a native JS ArrayBuffer instead of a UTF-8 string (binary payloads are
+/// no longer silently destroyed).
 ///
 /// W2 line 189: the PRODUCTION degradation path is [`k6_error_envelope`]
 /// (set_memory_limit is QuickJS's HARD limit — the pre-guard fires before
