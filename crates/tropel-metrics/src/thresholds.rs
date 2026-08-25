@@ -82,7 +82,7 @@ pub fn validate_thresholds(thresholds: &HashMap<String, ThresholdConfig>) -> Res
                     parts.len()
                 ));
             }
-            if !matches!(parts[1], "<" | "<=" | ">" | ">=" | "==" | "!=") {
+            if !matches!(parts[1], "<" | "<=" | ">" | ">=" | "==" | "!=" | "===") {
                 return Err(format!(
                     "threshold '{}': unknown operator '{}' in clause '{}' of '{}'",
                     name, parts[1], clause, expr
@@ -504,7 +504,7 @@ fn evaluate_single_threshold_opt(
         "<=" => actual <= threshold,
         ">" => actual > threshold,
         ">=" => actual >= threshold,
-        "==" => (actual - threshold).abs() < f64::EPSILON,
+        "==" | "===" => (actual - threshold).abs() < f64::EPSILON,
         "!=" => (actual - threshold).abs() > f64::EPSILON,
         _ => {
             tracing::error!(
@@ -1697,6 +1697,46 @@ mod tests {
             abort_config("http_req_duration.value < 500", false, None),
         );
         assert!(validate_thresholds(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_strict_equals_operator() {
+        // TR-222: k6 supports `===` (strict equality) as a threshold operator.
+        // The old validator whitelist rejected it, so `value === 1` aborted at
+        // startup.
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "a".to_string(),
+            abort_config("my_gauge.value === 1", false, None),
+        );
+        assert!(
+            validate_thresholds(&thresholds).is_ok(),
+            "=== must be a valid operator"
+        );
+        // Evaluation: `===` uses the same epsilon comparison as `==`.
+        let mut metrics = make_metrics();
+        // Inject a gauge series with last=1.0.
+        metrics.metrics.push(MetricSummary {
+            key: "my_gauge".into(),
+            tags: vec![],
+            metric_type: MetricType::Gauge,
+            count: 1,
+            sum: 1.0,
+            mean: 1.0,
+            min: 1.0,
+            max: 1.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            p99: 0.0,
+            last: 1.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        let result = evaluate_single_threshold("my_gauge.value === 1", &metrics);
+        assert!(result.0, "1.0 === 1.0 must pass");
+        let result = evaluate_single_threshold("my_gauge.value === 2", &metrics);
+        assert!(!result.0, "1.0 === 2.0 must fail");
     }
 
     #[test]
