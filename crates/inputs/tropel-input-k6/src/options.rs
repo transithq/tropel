@@ -559,7 +559,7 @@ fn translate_k6_clause(metric: &str, expr: &str) -> String {
     // silently passed (fail-open gate). `value` is k6's Gauge stat (backlog
     // line 121) and maps onto the evaluator's `.value`.
     let re = Regex::new(
-        r"^\s*(p\(\d+(?:\.\d+)?\)|avg|med|min|max|count|sum|rate|value)\s*(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$",
+        r"^\s*(p\(\d+(?:\.\d+)?\)|avg|med|min|max|count|sum|rate|value)\s*(<=|>=|===|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$",
     )
     .expect("threshold translation regex is valid");
     if let Some(caps) = re.captures(expr) {
@@ -882,6 +882,15 @@ mod tests {
         // Durations are ms end-to-end (backlog §0): 1.5 ms stays 1.5.
         let expr = translate_k6_expression("http_req_duration", "avg<1.5");
         assert_eq!(expr, "http_req_duration.avg < 1.5");
+    }
+
+    #[test]
+    fn test_threshold_strict_equals_translated() {
+        // TR-222: k6's `===` operator must translate like `==` — the old
+        // regex only accepted `==`, so a valid k6 threshold `value === 1`
+        // aborted the run at startup.
+        let expr = translate_k6_expression("my_gauge", "value === 1");
+        assert_eq!(expr, "my_gauge.value === 1");
     }
 
     #[test]
