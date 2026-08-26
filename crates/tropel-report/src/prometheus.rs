@@ -100,8 +100,26 @@ struct SeriesKey {
 
 /// Sanitize a string to a valid Prometheus label/metric name.
 /// Prometheus requires `[a-zA-Z_][a-zA-Z0-9_]*`; invalid chars
-/// are replaced with `_`.
-fn sanitize_prometheus_name(s: &str) -> String {
+/// are replaced with `_`. Returns `Cow` so an already-valid name (the
+/// overwhelmingly common case — metric names and tag keys are usually
+/// pre-sanitized) is borrowed, not allocated (TR-305: the sibling
+/// sanitizers in influxdb.rs and statsd.rs already do this).
+fn sanitize_prometheus_name(s: &str) -> std::borrow::Cow<'_, str> {
+    let mut needs_fix = false;
+    for (i, c) in s.chars().enumerate() {
+        let ok = if i == 0 {
+            c.is_ascii_alphabetic() || c == '_'
+        } else {
+            c.is_ascii_alphanumeric() || c == '_'
+        };
+        if !ok {
+            needs_fix = true;
+            break;
+        }
+    }
+    if !needs_fix && !s.is_empty() {
+        return std::borrow::Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     for (i, c) in s.chars().enumerate() {
         if i == 0 {
@@ -119,7 +137,7 @@ fn sanitize_prometheus_name(s: &str) -> String {
     if out.is_empty() {
         out.push('_');
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 impl SeriesKey {
@@ -127,9 +145,9 @@ impl SeriesKey {
         let mut labels: Vec<(String, String)> = tags
             .iter()
             .filter(|(k, _)| k != &"__name__") // avoid duplicate __name__ label
-            .map(|(k, v)| (sanitize_prometheus_name(k), v.to_string()))
+            .map(|(k, v)| (sanitize_prometheus_name(k).into_owned(), v.to_string()))
             .collect();
-        let metric_name = sanitize_prometheus_name(metric);
+        let metric_name = sanitize_prometheus_name(metric).into_owned();
         labels.push(("__name__".to_string(), metric_name.clone()));
         labels.sort();
         Self {

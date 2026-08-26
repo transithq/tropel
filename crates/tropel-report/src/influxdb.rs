@@ -228,8 +228,13 @@ impl InfluxdbOutput {
         }
         // field set — always emit float. InfluxDB pins the field type on
         // the first write; emitting `12i` then `12.5` on the same field
-        // causes a type conflict. k6 always emits float.
-        let value = sample.value.to_string();
+        // causes a type conflict. k6 always emits float. Rust's `to_string()`
+        // on `12.0_f64` produces `"12"` (integer syntax) — append `.0` so
+        // InfluxDB receives a float regardless (TR-305).
+        let mut value = sample.value.to_string();
+        if !value.contains('.') && !value.contains('e') {
+            value.push_str(".0");
+        }
         line.push_str(&format!(" value={value}"));
         if matches!(self.target, InfluxTarget::Http { .. }) {
             let ns = sample
@@ -451,7 +456,10 @@ mod tests {
         output.buffer(&sample("http_reqs", 1.0, &[("status", "200")]));
         output.buffer(&sample("http_req_duration", 12.5, &[("status", "200")]));
         let lines = output.buffer.lock().unwrap().clone();
-        assert_eq!(lines[0], "http_reqs,status=200 value=1");
+        // TR-305: a whole-number float must carry the `.0` suffix so InfluxDB
+        // pins the field as FLOAT (a bare `1` is integer syntax; a later
+        // `12.5` on the same field would be a type conflict).
+        assert_eq!(lines[0], "http_reqs,status=200 value=1.0");
         assert_eq!(lines[1], "http_req_duration,status=200 value=12.5");
     }
 
@@ -548,7 +556,7 @@ mod tests {
         udp.buffer(&sample("http_reqs", 1.0, &[]));
         let line = udp.buffer.lock().unwrap().first().unwrap().clone();
         assert_eq!(
-            line, "http_reqs value=1",
+            line, "http_reqs value=1.0",
             "UDP line has no timestamp: {line}"
         );
     }
@@ -571,6 +579,6 @@ mod tests {
         let mut buf = [0u8; 1024];
         let (n, _from) = receiver.recv_from(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf[..n]);
-        assert_eq!(text, "http_reqs,status=200 value=1");
+        assert_eq!(text, "http_reqs,status=200 value=1.0");
     }
 }

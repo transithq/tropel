@@ -247,8 +247,37 @@ impl Engine {
         // fixed-size struct (the tags HashMap is heap-allocated), so the
         // preallocated ring is a few tens of MB worst case.
         let mut output_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let (sample_tx, _) = broadcast::channel::<Sample>(SAMPLE_STREAM_CAPACITY);
-        metrics.set_sample_sink(Some(sample_tx.clone()));
+
+        // TR-313: allocate the ~2^18-slot broadcast ring ONLY when a
+        // streaming output will actually consume it. The old code allocated
+        // it unconditionally then set the sink to `None` when no output
+        // existed — the 24 MiB ring was wasted on every run with no output.
+        let has_stdout = config.output.reporters.iter().any(|r| r == "stdout");
+        let prometheus_via_extension = config.output.reporters.iter().any(|r| r == "prometheus")
+            && self
+                .extension_registry
+                .list_outputs()
+                .iter()
+                .any(|o| o == "prometheus");
+        let has_streaming_output = has_stdout
+            || (config.output.prometheus_remote_write_url.is_some() && !prometheus_via_extension)
+            || config.output.otlp_endpoint.is_some()
+            || config.output.json_stream.is_some()
+            || config.output.statsd_addr.is_some()
+            || config.output.influxdb_addr.is_some()
+            || config.output.reporters.iter().any(|r| {
+                create_reporter(r, None).is_none()
+                    && self.extension_registry.get_output(r).is_some()
+            });
+
+        let sample_tx = if has_streaming_output {
+            let (tx, _) = broadcast::channel::<Sample>(SAMPLE_STREAM_CAPACITY);
+            metrics.set_sample_sink(Some(tx.clone()));
+            Some(tx)
+        } else {
+            metrics.set_sample_sink(None);
+            None
+        };
 
         // Planned wall-clock length of the run (incl. grace) for the live
         // progress bar's 100% target. Resolved with the SAME precedence the
@@ -288,7 +317,10 @@ impl Engine {
 
         let has_stdout = config.output.reporters.iter().any(|r| r == "stdout");
         if has_stdout {
-            let rx = sample_tx.subscribe();
+            let rx = sample_tx
+                .as_ref()
+                .expect("sample_tx exists when stdout is enabled")
+                .subscribe();
             let handle = StreamingStdoutOutput::spawn(rx, progress_total);
             output_handles.push(handle);
         }
@@ -305,40 +337,49 @@ impl Engine {
         // built-in path so samples are not pushed twice. Only skip when the
         // extension output is actually registered: a custom binary built
         // without tropel-x-prometheus must not silently lose its stream.
-        let prometheus_via_extension = config.output.reporters.iter().any(|r| r == "prometheus")
-            && self
-                .extension_registry
-                .list_outputs()
-                .iter()
-                .any(|o| o == "prometheus");
         if let Some(url) = &config.output.prometheus_remote_write_url {
             if !prometheus_via_extension {
-                let rx = sample_tx.subscribe();
+                let rx = sample_tx
+                    .as_ref()
+                    .expect("sample_tx exists when prometheus is enabled")
+                    .subscribe();
                 let handle =
                     PrometheusRemoteWriteOutput::spawn(rx, url.clone(), tag_policy.clone());
                 output_handles.push(handle);
             }
         }
         if let Some(endpoint) = &config.output.otlp_endpoint {
-            let rx = sample_tx.subscribe();
+            let rx = sample_tx
+                .as_ref()
+                .expect("sample_tx exists when otlp is enabled")
+                .subscribe();
             let handle = OtlpOutput::spawn(rx, endpoint.clone(), tag_policy.clone());
             output_handles.push(handle);
         }
         // JSON-stream (NDJSON file) output.
         if let Some(path) = &config.output.json_stream {
-            let rx = sample_tx.subscribe();
+            let rx = sample_tx
+                .as_ref()
+                .expect("sample_tx exists when json-stream is enabled")
+                .subscribe();
             let handle = JsonStreamOutput::spawn(rx, path.clone());
             output_handles.push(handle);
         }
         // StatsD / Datadog output (UDP datagrams).
         if let Some(addr) = &config.output.statsd_addr {
-            let rx = sample_tx.subscribe();
+            let rx = sample_tx
+                .as_ref()
+                .expect("sample_tx exists when statsd is enabled")
+                .subscribe();
             let handle = StatsdOutput::spawn(rx, addr.clone(), tag_policy.clone());
             output_handles.push(handle);
         }
         // InfluxDB output (line protocol over UDP).
         if let Some(addr) = &config.output.influxdb_addr {
-            let rx = sample_tx.subscribe();
+            let rx = sample_tx
+                .as_ref()
+                .expect("sample_tx exists when influxdb is enabled")
+                .subscribe();
             let handle = InfluxdbOutput::spawn(rx, addr.clone(), tag_policy.clone());
             output_handles.push(handle);
         }
@@ -353,16 +394,17 @@ impl Engine {
             }
             if let Some(mut ext) = self.extension_registry.get_output(name) {
                 ext.configure(&config.output);
-                let rx = sample_tx.subscribe();
+                let rx = sample_tx
+                    .as_ref()
+                    .expect("sample_tx exists when an extension output is enabled")
+                    .subscribe();
                 let handle = spawn_extension_output(rx, ext);
                 output_handles.push(handle);
             }
         }
-        if output_handles.is_empty() {
-            metrics.set_sample_sink(None);
-        } // Build scenario configs. Script-declared scenarios/execution (from a
-          // k6 `export const options`) take precedence over the default profile
-          // but not over explicit user config (execution_explicit check above).
+        // Build scenario configs. Script-declared scenarios/execution (from a
+        // k6 `export const options`) take precedence over the default profile
+        // but not over explicit user config (execution_explicit check above).
         let scenario_configs: Vec<ScenarioConfigEntry> = if let Some(scs) = declared_scenarios {
             scs.iter()
                 .map(|(name, sc)| {

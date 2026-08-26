@@ -1523,11 +1523,14 @@ fn resolve_auth(
                     ..
                 } => match http_scheme.to_lowercase().as_str() {
                     "bearer" => Some(AuthConfig::Bearer {
-                        token: "__token__".to_string(),
+                        // TR-308: emit `{{var}}` template syntax (not the old
+                        // `__token__` literal) so the runner's resolve_auth
+                        // can substitute them like any other variable.
+                        token: "{{token}}".to_string(),
                     }),
                     "basic" => Some(AuthConfig::Basic {
-                        username: "__username__".to_string(),
-                        password: "__password__".to_string(),
+                        username: "{{username}}".to_string(),
+                        password: "{{password}}".to_string(),
                     }),
                     _ => None,
                 },
@@ -1541,15 +1544,15 @@ fn resolve_auth(
                     };
                     Some(AuthConfig::ApiKey {
                         key: key_name,
-                        value: "__api_key__".to_string(),
+                        value: "{{api_key}}".to_string(),
                         location: api_location,
                     })
                 }
                 OasSecurityScheme::OAuth2 { .. } => Some(AuthConfig::Bearer {
-                    token: "__access_token__".to_string(),
+                    token: "{{access_token}}".to_string(),
                 }),
                 OasSecurityScheme::OpenIdConnect { .. } => Some(AuthConfig::Bearer {
-                    token: "__id_token__".to_string(),
+                    token: "{{id_token}}".to_string(),
                 }),
             };
             if resolved.is_some() {
@@ -1977,7 +1980,7 @@ components:
             "OAuth2 security must map to an auth config"
         );
         match req.auth.as_ref().unwrap() {
-            AuthConfig::Bearer { token } => assert_eq!(token, "__access_token__"),
+            AuthConfig::Bearer { token } => assert_eq!(token, "{{access_token}}"),
             other => panic!("Expected Bearer placeholder, got {:?}", other),
         }
     }
