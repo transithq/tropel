@@ -1474,6 +1474,7 @@ impl TrpBridge {
                                 auth: None,
                                 certificate: None,
                                 follow_redirects: true,
+                                host: None,
                                 timeout,
                                 response_type: tropel_sdk::types::ResponseType::from_k6(
                                     &response_type,

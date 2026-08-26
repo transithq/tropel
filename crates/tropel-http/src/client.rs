@@ -788,7 +788,18 @@ impl HttpClient {
                 if strip_sensitive && is_credential_header(&key.to_ascii_lowercase()) {
                     continue;
                 }
+                // TR-230: k6 sets req.Host (a field), never a Host header.
+                // The host override lives in `request.host`; a stray Host
+                // header from another path must not double up.
+                if key.eq_ignore_ascii_case("host") {
+                    continue;
+                }
                 req_builder = req_builder.header(key.as_str(), value.as_str());
+            }
+            // TR-230: the k6 Host override rides on the wire as the Host
+            // header (reqwest honors a user-set Host header over the URL's).
+            if let Some(host) = &request.host {
+                req_builder = req_builder.header(reqwest::header::HOST, host.as_str());
             }
             // Backlog line 246: On redirect hops WITH a signer, skip replaying
             // stale signed_headers — the signing block below will re-sign the
@@ -988,7 +999,21 @@ impl HttpClient {
             for (k, v) in response.headers().iter() {
                 let name = canonical_header_name(k.as_str());
                 let value = v.to_str().unwrap_or("").to_string();
-                headers.insert(name.clone(), value.clone());
+                // TR-231: multi-valued headers are ", "-joined into one string
+                // (k6 parity — Go's Header.Get joins duplicate values that way,
+                // and Response.headers is the script-facing map). The old
+                // `insert` was last-write-wins, so a `Set-Cookie` or repeated
+                // `X-Foo` response lost all but the final value. raw_headers
+                // still keeps EVERY line for lossless consumers.
+                match headers.get_mut(&name) {
+                    Some(existing) => {
+                        existing.push_str(", ");
+                        existing.push_str(&value);
+                    }
+                    None => {
+                        headers.insert(name.clone(), value.clone());
+                    }
+                }
                 raw_headers.push((name, value));
             }
 
@@ -1889,6 +1914,7 @@ mod tests {
             auth: None,
             certificate: None,
             follow_redirects: true,
+            host: None,
             timeout: None,
             response_type: ResponseType::Text,
         }
@@ -2898,6 +2924,61 @@ mod tests {
         assert!(
             echo.contains("body=true"),
             "retried request must carry the request body, server saw: {echo}"
+        );
+    }
+
+    /// TR-230: a user-supplied `Host` key becomes `req.Host` (k6 parity) —
+    /// carried in `request.host`, applied on the wire as the Host header, and
+    /// skipped in the plain-header loop (so it never doubles up). A stray
+    /// Host header entry from another path is also skipped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_supplied_host_header_overrides_url_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let raw = String::from_utf8_lossy(&buf[..n]);
+                    // Echo the Host line as the response body.
+                    let host_line = raw
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+                        .map(|l| l.to_string())
+                        .unwrap_or_else(|| "no-host-line".to_string());
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        host_line.len(),
+                        host_line
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+        let req = Request {
+            url: format!("http://{}/x", addr),
+            method: Method::GET,
+            headers: vec![("Host".to_string(), "should-be-skipped".to_string())],
+            host: Some("custom.example.com".to_string()),
+            ..Default::default()
+        };
+        let resp = client.execute(&req, None).await.unwrap();
+        server.abort();
+
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(
+            body.contains("custom.example.com") && !body.contains("should-be-skipped"),
+            "request.host must be the wire Host (stray header skipped), server saw: {body}"
         );
     }
 }

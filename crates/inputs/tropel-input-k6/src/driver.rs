@@ -92,6 +92,23 @@ fn k6_deadline() -> Duration {
     )
 }
 
+/// TR-240: k6's `setupTimeout`/`teardownTimeout` default is 60 seconds.
+/// The throwaway context for setup() and teardown() uses this longer deadline
+/// so a login-in-setup pattern (HTTP call + response) doesn't time out.
+const SETUP_DEADLINE_S: u64 = 60;
+
+fn k6_setup_deadline() -> Duration {
+    Duration::from_secs(SETUP_DEADLINE_S)
+}
+
+/// TR-240: k6's `handleSummaryTimeout` default is 120 seconds.
+/// handleSummary often processes large result objects.
+const HANDLE_SUMMARY_DEADLINE_S: u64 = 120;
+
+fn k6_handle_summary_deadline() -> Duration {
+    Duration::from_secs(HANDLE_SUMMARY_DEADLINE_S)
+}
+
 pub struct K6Driver;
 
 #[async_trait]
@@ -1980,6 +1997,10 @@ struct K6RequestExtras {
     redirects: i64,
     compression: String,
     body_b64: bool,
+    // TR-230: a `Host` key in params.headers becomes req.Host (k6 parity) —
+    // carried separately so it can be applied as the wire Host while staying
+    // OFF res.request.headers (k6 keeps Host off req.Header).
+    host: Option<String>,
 }
 
 fn parse_k6_extras(extras: &serde_json::Value) -> K6RequestExtras {
@@ -2017,6 +2038,10 @@ fn parse_k6_extras(extras: &serde_json::Value) -> K6RequestExtras {
             .get("bodyB64")
             .and_then(|b| b.as_bool())
             .unwrap_or(false),
+        host: extras
+            .get("host")
+            .and_then(|h| h.as_str())
+            .map(str::to_string),
     }
 }
 
@@ -2075,6 +2100,7 @@ fn build_k6_request(
         auth: params.auth.clone(),
         certificate: None,
         follow_redirects: params.redirects != 0,
+        host: params.host.clone(),
         timeout: if params.timeout_ms > 0.0 {
             Some(Duration::from_millis(params.timeout_ms as u64))
         } else {
@@ -2590,6 +2616,20 @@ impl K6DriverInstance {
                         });
                     },
                 ),
+            );
+
+            // TR-262/327: pm.test.skip() — TrpBridge registers
+            // `__tropel_pm_test_skip` for the declarative path, but the k6
+            // driver never installed TrpBridge, so `pm.test.skip(name)` was a
+            // silent no-op here (pm.js:575 guards on the function's
+            // existence). Register the k6 equivalent: skips are not pass/fail
+            // checks (k6 has no skipped metric), so nothing is recorded —
+            // but the call is no longer silently swallowed.
+            let _ = globals.set(
+                "__tropel_pm_test_skip",
+                Func::from(move |name: String| {
+                    tracing::debug!("pm.test.skip (k6 path): {}", name);
+                }),
             );
 
             // Custom metric .add() → typed sample (Counter/Gauge/Rate/Trend).
@@ -3731,7 +3771,7 @@ async fn eval_module_handle_summary(
     env: &HashMap<String, String>,
     script_dir: Option<PathBuf>,
 ) -> Result<Option<HashMap<String, String>>> {
-    let mut js_ctx = JsContext::new(Some(k6_vu_heap_bytes()), Some(k6_deadline()))
+    let mut js_ctx = JsContext::new(Some(k6_vu_heap_bytes()), Some(k6_handle_summary_deadline()))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
@@ -3809,7 +3849,10 @@ async fn eval_module_call_export(
     http_client: Arc<dyn DriverHttpClient + Send + Sync>,
     sink: Arc<Mutex<Vec<Sample>>>,
 ) -> Result<Option<String>> {
-    let mut js_ctx = JsContext::new(Some(k6_vu_heap_bytes()), Some(k6_deadline()))
+    // TR-240: setup()/teardown() get k6's 60s `setupTimeout`/`teardownTimeout`
+    // default, not the 10s per-VU iteration deadline — a login-in-setup
+    // pattern (HTTP + response processing) must not be interrupted.
+    let mut js_ctx = JsContext::new(Some(k6_vu_heap_bytes()), Some(k6_setup_deadline()))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
@@ -4942,7 +4985,9 @@ mod tests {
                 var res = http.get('https://example.com/', { headers: { 'X-Request-Id': 'req-7' } });
                 globalThis.__out = JSON.stringify([
                     res.cookies.sid ? res.cookies.sid[0].value : null,
-                    res.cookies.sid ? res.cookies.sid[0].httpOnly : null,
+                    // TR-231: k6's cookie field is `http_only` (snake_case),
+                    // not `httpOnly`. The old camelCase key pinned the bug.
+                    res.cookies.sid ? res.cookies.sid[0].http_only : null,
                     res.request.method,
                     res.request.url,
                     res.request.headers['X-Request-Id'],
@@ -8807,6 +8852,7 @@ mod tests {
             auth: None,
             certificate: None,
             follow_redirects: true,
+            host: None,
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         };
@@ -11630,9 +11676,344 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         });
     }
 
+    /// TR-206: `http.url` tagged template builds the real URL from
+    /// interpolated values and a `name` with `${}` collapsed in place of
+    /// each interpolation, so `/users/1`, `/users/2` collapse into one
+    /// series `/users/${}`. The `.name` must reach `params.tags.name` when
+    /// passed to http.get (the native bridge then applies TR-205's url
+    /// overwrite with the name value, bounding cardinality).
+    #[test]
+    fn test_k6_shim_json_annotated_and_cached_selector_undefined() {
+        // TR-231: res.json() no-selector form must throw with a line/char
+        // annotation on bad JSON and CACHE the parsed object (mutations
+        // persist — k6's res.cachedJSON); the selector form returns undefined
+        // on bad JSON or a missing gjson path, never throws.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body) {
+                    return { code: 200, status: 200,
+                             body: '{"a":{"b":[1,2]},"n":7}',
+                             headers: {}, responseTime: 5 };
+                };
+                globalThis.__tropel_k6_http_request_bad = function (method, url, headersJson, body) {
+                    return { code: 200, status: 200,
+                             body: '{"a": 1,',
+                             headers: {}, responseTime: 5 };
+                };
+            "#,
+            )
+            .expect("stub should eval");
+
+            // Valid JSON, no selector → cached: a mutation on the returned
+            // object must persist on the next call (k6 caches, no re-parse).
+            let cache_ok: bool = ctx
+                .eval(
+                    r#"
+                    var res = http.get('http://x/');
+                    var first = res.json();
+                    first.a.b.push(3);
+                    var second = res.json();
+                    second.a.b.length === 3;
+                    "#,
+                )
+                .expect("cached json must eval");
+            assert!(
+                cache_ok,
+                "res.json() must CACHE: a mutation must be visible on the next call (k6 res.cachedJSON)"
+            );
+
+            // Selector form → undefined on a missing path (no throw).
+            let missing_ok: bool = ctx
+                .eval(
+                    r#"
+                    var res = http.get('http://x/');
+                    var missing = res.json('a.does_not_exist');
+                    missing === undefined;
+                    "#,
+                )
+                .expect("missing selector must eval");
+            assert!(missing_ok, "res.json(selector) on a missing path must return undefined");
+
+            // Selector form → undefined on bad JSON (no throw).
+            let bad_selector_ok: bool = ctx
+                .eval(
+                    r#"
+                    globalThis.__tropel_k6_http_request = globalThis.__tropel_k6_http_request_bad;
+                    var res = http.get('http://x/');
+                    try {
+                        var v = res.json('a');
+                        v === undefined;
+                    } catch (e) { false; }
+                    "#,
+                )
+                .expect("bad-json selector must eval");
+            assert!(
+                bad_selector_ok,
+                "res.json(selector) on bad JSON must return undefined, not throw"
+            );
+
+            // No-selector form on bad JSON → throws with k6's line/char shape.
+            let annotated: String = ctx
+                .eval(
+                    r#"
+                    var res = http.get('http://x/');
+                    try {
+                        res.json();
+                        'NO_THROW';
+                    } catch (e) { String(e.message); }
+                    "#,
+                )
+                .expect("bad-json no-selector must eval");
+            assert!(
+                annotated.contains("cannot parse json due to an error at line") &&
+                    annotated.contains("character"),
+                "no-selector bad JSON must throw k6's line/char annotated error, got: {annotated}"
+            );
+
+            // Null body (1xx/204/304) throws k6's exact message for BOTH forms.
+            let null_body: String = ctx
+                .eval(
+                    r#"
+                    globalThis.__tropel_k6_http_request = function (m, u, h, b) {
+                        return { code: 204, status: 204, body: '', headers: {}, responseTime: 5 };
+                    };
+                    var res = http.get('http://x/');
+                    try { res.json(); 'NO_THROW'; }
+                    catch (e) { String(e.message); }
+                    "#,
+                )
+                .expect("null-body json must eval");
+            assert!(
+                null_body.contains("body is null"),
+                "null body must throw k6's body-is-null error, got: {null_body}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_k6_shim_cookies_shape_snake_case_max_age_expires_ms() {
+        // TR-231: res.cookies shape is {name: [{name, value, domain, path,
+        // http_only, secure, max_age, expires}]} with expires in Unix ms.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body) {
+                    return {
+                        code: 200, status: 200, body: '{}', headers: {}, responseTime: 5,
+                        cookies: {
+                            sid: [{ name: 'sid', value: 'abc123', domain: 'example.com',
+                                    path: '/', httpOnly: true, secure: true,
+                                    max_age: 3600, expires: 'Wed, 21 Oct 2026 07:28:00 GMT' }]
+                        }
+                    };
+                };
+                var res = http.get('http://x/');
+                globalThis.__c = res.cookies.sid[0];
+                globalThis.__shape = [
+                    res.cookies.sid[0].name,
+                    res.cookies.sid[0].value,
+                    res.cookies.sid[0].domain,
+                    res.cookies.sid[0].path,
+                    res.cookies.sid[0].http_only,
+                    res.cookies.sid[0].secure,
+                    res.cookies.sid[0].max_age,
+                    typeof res.cookies.sid[0].expires
+                ];
+            "#,
+            )
+            .expect("stub should eval");
+            let shape: Vec<rquickjs::Value> = ctx.eval("globalThis.__shape").expect("read shape");
+            assert_eq!(shape.len(), 8);
+            assert_eq!(
+                shape[0]
+                    .as_string()
+                    .map(|s| s.to_string().unwrap())
+                    .unwrap(),
+                "sid"
+            );
+            assert_eq!(
+                shape[1]
+                    .as_string()
+                    .map(|s| s.to_string().unwrap())
+                    .unwrap(),
+                "abc123"
+            );
+            assert_eq!(
+                shape[2]
+                    .as_string()
+                    .map(|s| s.to_string().unwrap())
+                    .unwrap(),
+                "example.com"
+            );
+            assert_eq!(
+                shape[3]
+                    .as_string()
+                    .map(|s| s.to_string().unwrap())
+                    .unwrap(),
+                "/"
+            );
+            assert_eq!(
+                shape[4].as_bool(),
+                Some(true),
+                "http_only must be true (snake_case)"
+            );
+            assert_eq!(shape[5].as_bool(), Some(true), "secure must be true");
+            assert_eq!(shape[6].as_int(), Some(3600), "max_age must be 3600");
+            assert_eq!(
+                shape[7]
+                    .as_string()
+                    .map(|s| s.to_string().unwrap())
+                    .unwrap(),
+                "number",
+                "expires must be a Unix-ms NUMBER, not a string"
+            );
+            let expires_ms: i64 = ctx.eval("globalThis.__c.expires").expect("expires read");
+            // Wed, 21 Oct 2026 07:28:00 GMT = 1792567680000 ms (verified
+            // against V8's Date.parse; TZ-free GMT input).
+            assert_eq!(expires_ms, 1792567680000, "expires must be Unix ms");
+        });
+    }
+
+    /// TR-206: `http.url` tagged template builds the real URL from
+    /// interpolated values and a `name` with `${}` collapsed in place of
+    /// each interpolation, so `/users/1`, `/users/2` collapse into one
+    /// series `/users/${}`. The `.name` must reach `params.tags.name` when
+    /// passed to http.get (the native bridge then applies TR-205's url
+    /// overwrite with the name value, bounding cardinality).
+    #[test]
+    fn test_k6_shim_bundle_has_http_url_tagged_template() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            // Stub the native bridges the k6-shim probes at load.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_native_random_bytes = function (n) {
+                    var b = new Uint8Array(n);
+                    for (var i = 0; i < n; i++) b[i] = (i * 37 + n) % 256;
+                    return b;
+                };
+                globalThis.__tropel_native_hmac = function (alg, key, data) {
+                    var out = new Uint8Array(32);
+                    for (var i = 0; i < 32; i++) out[i] = (key.length + data.length + alg.length + i) % 256;
+                    return out;
+                };
+                globalThis.__tropel_native_sha256 = function (d) { return globalThis.__tropel_native_hmac('sha256', new Uint8Array(0), d); };
+                globalThis.__tropel_native_sha1 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_sha384 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_sha512 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_base64_encode = function (b) { return ''; };
+                globalThis.__tropel_native_base64url_encode = function (b) { return ''; };
+                globalThis.__tropel_native_base64_decode = function (s) { return new Uint8Array(0); };
+            "#,
+            )
+            .expect("native bridge stubs must eval");
+            let bundle = format!(
+                "{}\n{}\n",
+                include_str!("../../../../js/k6-shim/k6-shim.js"),
+                include_str!("../../../../js/k6-shim/open-data-shim.js")
+            );
+            ctx.eval::<(), _>(bundle.as_str())
+                .expect("shims in production order must eval");
+
+            // Basic tagged template: no interpolations.
+            let no_interp: String = ctx
+                .eval(
+                    "var u = http.url`http://host:8080/plain`; \
+                     JSON.stringify(u)",
+                )
+                .expect("http.url with no interpolation must eval");
+            let expected_no_interp = r#"{"url":"http://host:8080/plain","name":"http://host:8080/plain"}"#;
+            assert_eq!(
+                no_interp, expected_no_interp,
+                "no-interpolation http.url must produce identical url and name"
+            );
+
+            // Single interpolation: name collapses `${}`.
+            let single_interp: String = ctx
+                .eval(
+                    "var u = http.url`http://host:8080/users/${42}`; \
+                     JSON.stringify(u)",
+                )
+                .expect("http.url with one interpolation must eval");
+            let expected_single =
+                r#"{"url":"http://host:8080/users/42","name":"http://host:8080/users/${}"}"#;
+            assert_eq!(
+                single_interp, expected_single,
+                "single-interpolation http.url must collapse literal dollar-curly-brace in name"
+            );
+
+            // Multiple interpolations.
+            let multi_interp: String = ctx
+                .eval(
+                    "var u = http.url`http://host:8080/users/${'a'}/posts/${'b'}`; \
+                     JSON.stringify(u)",
+                )
+                .expect("http.url with multiple interpolations must eval");
+            let expected_multi =
+                r#"{"url":"http://host:8080/users/a/posts/b","name":"http://host:8080/users/${}/posts/${}"}"#;
+            assert_eq!(
+                multi_interp, expected_multi,
+                "multi-interpolation http.url must collapse each dollar-curly-brace in name"
+            );
+
+            // http.get passes the URL and name to the native bridge.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body, responseType, extrasJson) {
+                    var extras = JSON.parse(extrasJson);
+                    globalThis.__captured = { method: method, url: url, tags: extras.tags };
+                    return '{"status":200,"body":"","headers":{}}';
+                };
+                var published = 42;
+                var res = http.get(http.url`http://host:8080/users/${published}`);
+                "#,
+            )
+            .expect("http.get with http.url must eval");
+            let captured: String = ctx
+                .eval("JSON.stringify(globalThis.__captured)")
+                .expect("captured bridge args must be readable");
+            let expected_captured =
+                r#"{"method":"GET","url":"http://host:8080/users/42","tags":{"name":"http://host:8080/users/${}"}}"#;
+            assert_eq!(
+                captured, expected_captured,
+                "http.get must unwrap http.url: real URL on wire, collapsed name in tags"
+            );
+
+            // Explicit tags.name overrides the http.url name (k6 parity).
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body, responseType, extrasJson) {
+                    var extras = JSON.parse(extrasJson);
+                    globalThis.__captured2 = { method: method, url: url, tags: extras.tags };
+                    return '{"status":200,"body":"","headers":{}}';
+                };
+                var res = http.get(http.url`http://host:8080/users/${1}`, { tags: { name: 'custom' } });
+                "#,
+            )
+            .expect("http.get with explicit tags.name must override http.url name");
+            let explicit_wins: String = ctx
+                .eval("JSON.stringify(globalThis.__captured2)")
+                .expect("captured bridge args must be readable");
+            let expected_explicit = r#"{"method":"GET","url":"http://host:8080/users/1","tags":{"name":"custom"}}"#;
+            assert_eq!(
+                explicit_wins, expected_explicit,
+                "explicit tags.name must override http.url's name"
+            );
+        });
+    }
+
     #[test]
     fn test_reserved_metric_name_guard() {
-        // W1 line 24-26: user code cannot create custom metrics with builtin
         // names like http_reqs, checks, etc. — the guard throws a clear error.
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();

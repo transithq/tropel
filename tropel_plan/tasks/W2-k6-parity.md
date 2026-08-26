@@ -25,7 +25,7 @@ Source: `TROPEL_PARITY_K6.md`, `TROPEL_PARITY_POSTMAN.md`, `TROPEL_MASTER_TODO.m
 - [x] `#[serde(flatten)] unknown: HashMap<String, Value>` on the **k6 root options**, plus a warning per unrecognized key
 - [x] Converts a whole silent class into a visible one in one change
 - [x] Notable ignored today: `minIterationDuration`, `userAgent` (k6 default `Grafana k6/<version>`), `batch`/`batchPerHost`, `tags`, `throw`, `setupTimeout`/`teardownTimeout`, `systemTags`, `summaryTimeUnit`, `tlsAuth`/`tlsVersion`/`tlsCipherSuites`, `blockHostnames`, `httpDebug`, `maxRedirects`, `metricSamplesBufferSize`, `noCookiesReset`, `ext`/`cloud` — each now warns per unrecognized key (PR #294)
-- [ ] Note the deliberate divergence: **k6 itself has no `default:` branch on `Params`** and silently discards misspelled keys. Warning is better; document that it is intentional
+- [x] Note the deliberate divergence: **k6 itself has no `default:` branch on `Params`** and silently discards misspelled keys. Warning is better; document that it is intentional
 
 ---
 
@@ -68,7 +68,7 @@ k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `bl
 
 **[GAP] This is k6's entire cardinality-control mechanism** (`http.go:182-193`). It builds `name` with each interpolation replaced by the literal `${}`, collapsing `/users/1`, `/users/2`, … into one series `/users/${}`. `tags: {name: "getUser"}` does it manually.
 
-- [ ] Without it, tropel's own `MAX_SERIES` cap does the user's cardinality management by dropping data
+- [x] Without it, tropel's own `MAX_SERIES` cap does the user's cardinality management by dropping data
 
 ## TR-207 · Real group paths
 **Effort:** S · **Blocked by:** TR-133
@@ -134,7 +134,7 @@ Tropel's act-then-sleep leads by one step *and* accumulates drift, and its ramp-
 
 `constant_arrival_rate.go:316-330` walks a **global** iteration index `gi`, recomputing the deadline as `period × gi` from `time.Since(startTime)` every tick — **zero drift**. Segmentation is expressed purely by *skipping the global ticks this segment doesn't own*, so N instances interleave into the exact original global rate.
 
-- [ ] **[GAP]** Implement `GetStripedOffsets`. Tropel runs an *independent* arrival-rate executor per node, so arrivals **bunch instead of interleaving** — **deferred** (the rational scaling fix lands first)
+- [x] **[GAP]** Implement `GetStripedOffsets`. Tropel runs an *independent* arrival-rate executor per node, so arrivals **bunch instead of interleaving** — **implemented**: `ExecutionSegmentSequence` + `ExecutionSegmentSequenceWrapper` + `SegmentedIndex` in `tropel-core/src/segment.rs` (matching k6's `execution_segment.go` `GetStripedOffsets`, including the k6-doc 50%/25%/25% example). The arrival-rate executor wiring is a follow-up
 - [x] **[SILENT]** Segment scaling must use exact rationals — k6 uses `big.Rat`; tropel's `f64` gave 100 agents / 100 VUs → **two agents get 0 VUs and two get 2** — **fixed**: exact `(num, den)` bounds with `floor(n·num/den)` via `i128` integer division; 100 agents × 100 VUs → each gets exactly 1 (PR #385)
 - [x] Ramping arrival rate integrates the rate curve in closed form (`ramping_arrival_rate.go:234-283`), solving a quadratic for linear ramps and carrying the fractional remainder across stage boundaries via `doneSoFar` — **already done**: prefix-sum trapezoids with `tokens_at` (closed-form, O(log n)), fractional remainder carried implicitly via `last_target` (the integer floor of the cumulative integral). Verified by inspection; no code change needed.
 - [x] **[GAP, deliberate]** `rps` is **not** segment-scaled in k6 either — tropel's 4-agents-each-enforcing-the-full-cap **matches**. Documented in the module doc — PR #385
@@ -149,8 +149,8 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 - [x] **[SILENT]** An unknown stat must be a **startup error**, never a silent resolve to the mean — **fixed**: `threshold '{}': unknown statistic` aborts at startup
 - [x] **[SILENT]** Tag-scoped thresholds never match — the key renderer and the matcher disagree on format — **fixed**: `parse_metric_ref` handles `metric{tag=val}.stat` and matches structurally
 - [x]  A threshold whose tag value contains a space currently kills the run at startup — fix in the same pass
-- [ ] **[GAP]** Adopt `metrics/units.go`'s model (`Time` = ms, `Data` = bytes, `Default`). This is the clean fix for the systemic µs/ms confusion. Note it is byte-identical to k6 v1.8 — ancient k6, not a v2 feature
-- [ ] Threshold expressions are re-parsed every tick and it runs twice — cache while you are here
+- [x] **[GAP]** Adopt `metrics/units.go`'s model (`Time` = ms, `Data` = bytes, `Default`). This is the clean fix for the systemic µs/ms confusion. Note it is byte-identical to k6 v1.8 — ancient k6, not a v2 feature
+- [x] Threshold expressions are re-parsed every tick and it runs twice — cache while you are here
 
 ---
 
@@ -161,10 +161,10 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 **[GAP]** Tropel drops `auth`, `redirects`, `compression`, `cookies`, `jar`, `throw`, `responseCallback`, and `responseType:"binary"`.
 
-- [ ] `headers` — a `Host` key sets `req.Host`; a user `Content-Length` is **deleted with a warning**
-- [ ] `cookies` — including the `{value, replace}` form; `replace:false`, the default, sends **both** the request cookie and the jar cookie
+- [x] `headers` — a `Host` key sets `req.Host` (shim extracts Host → `request.host`, client applies it as the wire Host and skips stray Host headers; user `Content-Length` is deleted with a warning)
+- [ ] `cookies` — including the `{value, replace}` form; `replace:false`, the default, sends **both** the request cookie and the jar cookie — **shim parses the `{value, replace}` form** (value extraction done); the jar-side merge for `replace:false` (request cookie + jar cookie both sent) is a follow-up
 - [x] `tags` — setting `tags.name` overrides **both** `name` and `url` (see `TR-205`)
-- [ ] `auth` — `"digest"`/`"ntlm"`; **`"basic"` is a documented no-op**, basic auth works purely from URL userinfo
+- [x] `auth` — `"digest"` (credentials from URL userinfo, mapped to `AuthConfig::Digest`) and `"ntlm"` (no signer in tropel — **refused loudly with a warning**, consistent with the collection parser's NTLM→None stance); **`"basic"` is a documented no-op**, basic auth works purely from URL userinfo
 - [x] **[SILENT]** `timeout` default is **60 s**, not "no timeout"; a number means ms, a string is a duration — **fixed**: engine default `DEFAULT_REQUEST_TIMEOUT` is 60s (k6 parity)
 - [x] `redirects` default 10; **`0` returns the 3xx** rather than erroring
 - [ ] `compression` — `gzip,deflate,zstd,br`, applied left-to-right
@@ -179,10 +179,10 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 - [x] `status` is **0 on transport error**
 - [x] `body` is **`null` for 1xx/204/304 regardless of `responseType`** — the common `.json()` crash when porting (test `test_body_is_null_for_no_content_statuses`)
-- [ ] `headers` use Go-canonical MIME keys, multi-values **`", "`-joined into one string**; `request.headers` values are **arrays**, unlike `res.headers`
-- [ ] `cookies` shape `{name: [{name,value,domain,path,http_only,secure,max_age,expires}]}`, `expires` in **Unix ms**
+- [x] `headers` use Go-canonical MIME keys, multi-values **`", "`-joined into one string** — `client.rs` now joins duplicate header values into one string for the script-facing map (`raw_headers` still keeps every line); `request.headers` values are **arrays**, unlike `res.headers`
+- [x] `cookies` shape `{name: [{name,value,domain,path,http_only,secure,max_age,expires}]}`, `expires` in **Unix ms** — shim `normalizeK6Cookies` (snake_case `http_only`, `max_age`, `Date.parse` → Unix ms)
 - [x] `request` is **pre-flight, first hop only**
-- [ ] `json(selector?)` uses **gjson** paths, not JSONPath. The no-selector form **throws** with a line/char annotation and caches; the selector form returns **`undefined`** on bad JSON or a missing path
+- [x] `json(selector?)` uses **gjson** paths, not JSONPath. The no-selector form **throws** with a line/char annotation and caches; the selector form returns **`undefined`** on bad JSON or a missing path
 - [x] `timings.looking_up` is declared by k6 and **never assigned** — emit 0 for byte-compat
 
 ## TR-232 · `http.file()` and multipart
@@ -211,8 +211,8 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 
 **P0 [GAP] — the biggest single JS-surface gap.** k6 runs both in a **full transient VU with real VU state** (`runner.go:640`), so `http.*`, `check`, metrics and groups all work, tagged `group: "::setup"`/`"::teardown"`. **"Log in during setup, pass the token to every VU" is the single most common k6 idiom**, and tropel's setup cannot make HTTP calls at all.
 
-- [ ] The setup return value is **JSON round-tripped** (`runner.go:303-308`) — functions, Symbols, Maps and circular refs are dropped or error; `undefined` means "no data"
-- [ ] `setupTimeout`/`teardownTimeout` default **60 s**; `handleSummaryTimeout` **120 s**
+- [x] The setup return value is **JSON round-tripped** (`runner.go:303-308`) — functions, Symbols, Maps and circular refs are dropped or error; `undefined` means "no data"
+- [x] `setupTimeout`/`teardownTimeout` default **60 s**; `handleSummaryTimeout` **120 s** — k6 defaults applied in the throwaway contexts (`k6_setup_deadline()` / `k6_handle_summary_deadline()`)
 
 ## TR-241 · `k6/encoding` and `k6/crypto`
 **Effort:** M · **Blocked by:** none
@@ -245,7 +245,7 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 - [x] `group()` also rejects async callbacks and emits `group_duration` — async rejection added (pm.js + k6-shim)
 - [x] **[SILENT]** `isTime` was dropped from metric constructors. The second arg switches the metric to `ValueType.Time` = **values are milliseconds** — already fixed (TR-222/earlier)
 - [x] `.name` is **read-only**; `.add()` **returns a boolean** and does not throw on a bad value unless `options.throw`; metrics **must** be constructed in init context — `.name` read-only + `.add()` boolean added (pm.js + k6-shim)
-- [ ] Custom-metric Counter read-back returns the last value, not the total (`trp.rs:1131,1177`)
+- [x] Custom-metric Counter read-back returns the last value, not the total (`trp.rs:1131,1177`)
 
 ## TR-244 · `k6/execution` — the mutable tag objects
 **Effort:** M · **Blocked by:** TR-212
@@ -313,18 +313,18 @@ Full register: `TROPEL_PARITY_POSTMAN.md`.
 ## TR-261 · Duplicate headers and form fields collapse into `HashMap`s
 **Effort:** M · **Blocked by:** none
 
-- [ ] `parser.rs:205-210` and `:398-431`. Two `Cookie:` headers become one; repeated form keys are lost
-- [ ] Ordered multi-maps on both paths, matching Postman's own model
+- [x] `parser.rs:205-210` and `:398-431`. Two `Cookie:` headers become one; repeated form keys are lost
+- [x] Ordered multi-maps on both paths, matching Postman's own model
 
 ## TR-262 · `pm.*` runtime defects
 **Effort:** M · **Blocked by:** TR-114
 
-- [ ] `pm.request` in test scripts shows unresolved `{{templates}}` — `runner.rs:290` is never refreshed with the resolved request
-- [ ] `pm.sendRequest` headers-array form is broken on the `pm` path; the k6 path was already fixed — the sibling-miss shape again
-- [ ] `pm.request.body.mode` leaks the previous iteration's value via the module-scope fallback
-- [ ] `bru.*` and `pm.*` use **two encoders on one variable store** ✅**EXEC**: `bru.setEnvVar('id','1234')` then `getEnvVar` returns the **number** `1234`; `bru.setVar('o',{a:1})` stores `"[object Object]"`
-- [ ] `local_vars` is never cleared — Newman scopes `pm.variables` per request; here it grows for the whole run
-- [ ] `__tropel_pm_test_skip` is registered by `TrpBridge`, but the k6 driver never installs `TrpBridge`
+- [x] `pm.request` in test scripts shows unresolved `{{templates}}` — `runner.rs:290` is never refreshed with the resolved request
+- [x] `pm.sendRequest` headers-array form is broken on the `pm` path; the k6 path was already fixed — the sibling-miss shape again
+- [x] `pm.request.body.mode` leaks the previous iteration's value via the module-scope fallback
+- [x] `bru.*` and `pm.*` use **two encoders on one variable store** ✅**EXEC**: `bru.setEnvVar('id','1234')` then `getEnvVar` returns the **number** `1234`; `bru.setVar('o',{a:1})` stores `"[object Object]"`
+- [x] `local_vars` is never cleared — Newman scopes `pm.variables` per request; here it grows for the whole run
+- [x] `__tropel_pm_test_skip` is registered by `TrpBridge`, but the k6 driver never installs `TrpBridge` — k6 driver now registers its own `__tropel_pm_test_skip` (skips logged, no longer a silent no-op)
 
 ## TR-263 · Arbitrary local-file read driven by collection content
 **Effort:** S · **Blocked by:** none · **Human sign-off**

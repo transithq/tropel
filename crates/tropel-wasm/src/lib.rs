@@ -1117,6 +1117,7 @@ fn convert_request(wr: &WasmRequest) -> Result<Request> {
         auth: wr.auth.as_ref().and_then(convert_auth),
         certificate: None,
         follow_redirects: wr.follow_redirects,
+        host: None,
         timeout: wr.timeout_ms.map(std::time::Duration::from_millis),
         response_type: tropel_sdk::types::ResponseType::Text,
     })
