@@ -20,6 +20,10 @@ tokio.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
 snap.workspace = true
+# TR-304: gzip compression for OTLP request bodies (flate2 is a workspace
+# dep, ~54 KB, used by tropel-input-k6 and tropel-http; no new transitive
+# deps).
+flate2.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

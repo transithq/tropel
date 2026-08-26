@@ -353,23 +353,26 @@ impl InputAdapter for SubprocessAdapter {
         // typed struct) and deep-cloned every array element.
         let items: Vec<ScenarioItem> = serde_json::from_slice::<Vec<ScenarioItem>>(&output)
             .or_else(|_| {
-                // If direct deserialization fails (e.g. items have extra fields),
-                // fall back to Value-then-convert for robustness.
-                let values: Vec<serde_json::Value> =
-                    serde_json::from_slice(&output).map_err(|e2| {
-                        TropelError::Parse(format!(
-                            "Subprocess '{}' returned invalid JSON: {}. Raw output: {}",
-                            self.command,
-                            e2,
-                            String::from_utf8_lossy(&output[..output.len().min(200)])
-                        ))
-                    })?;
-                Ok::<_, TropelError>(
-                    values
-                        .into_iter()
-                        .filter_map(|v| serde_json::from_value(v).ok())
-                        .collect(),
-                )
+                // TR-307: if direct deserialization fails (e.g. items have extra
+                // fields), stream-deserialize the array elements one at a time
+                // instead of building a full `Vec<Value>` tree of the entire 16
+                // MiB output (the old path materialized the whole JSON value tree
+                // and then re-deserialized each element from it — double allocation).
+                use serde_json::Deserializer;
+                let de = Deserializer::from_slice(&output);
+                let items: Vec<ScenarioItem> = de
+                    .into_iter::<serde_json::Value>()
+                    .filter_map(|r| r.ok())
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect();
+                if items.is_empty() {
+                    return Err(TropelError::Parse(format!(
+                        "Subprocess '{}' returned invalid JSON array. Raw: {}",
+                        self.command,
+                        String::from_utf8_lossy(&output[..output.len().min(200)])
+                    )));
+                }
+                Ok(items)
             })?;
 
         // Treat a JSON array as items, auto-generate a name
