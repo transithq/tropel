@@ -381,142 +381,191 @@ fn evaluate_single_threshold_opt(
     expression: &str,
     metrics: &MetricsResult,
 ) -> Option<(bool, f64, f64)> {
-    // Backlog line 154: compound AND/OR expressions (k6 supports them,
-    // e.g. `p(95) < 500 && p(99) < 1000`). `&&` binds tighter than `||`:
-    // split on `||` first, every group must contain only AND-passing
-    // clauses, and any passing group passes the whole threshold. The
-    // reported (actual, threshold) pair comes from the LAST clause that
-    // determined the outcome (the group's final clause).
-    if expression.contains("&&") || expression.contains("||") {
-        let groups: Vec<Vec<&str>> = expression
-            .split("||")
-            .map(|g| {
-                g.split("&&")
-                    .map(|c| c.trim())
-                    .filter(|c| !c.is_empty())
-                    .collect()
-            })
-            .filter(|g: &Vec<&str>| !g.is_empty())
+    let parsed = get_or_parse(expression);
+    parsed.evaluate(metrics)
+}
+
+/// A parsed threshold expression (TR-222 line 153). Threshold expressions
+/// were re-parsed from the raw string on EVERY tick and evaluated TWICE per
+/// threshold (once for the no-data verdict, once for the reported pair), so a
+/// run with a handful of thresholds re-tokenized the same strings thousands
+/// of times. k6 parses each threshold ONCE at init and evaluates the AST from
+/// then on — this mirrors that: [`get_or_parse`] caches by expression string
+/// and [`ParsedThreshold::evaluate`] walks the parsed form.
+struct ParsedThreshold {
+    expression: String,
+    /// Compound AND/OR structure: groups split on `||`, each holding its
+    /// AND-split clauses (already parsed). `None` for a single clause.
+    compound: Option<Vec<Vec<ParsedThreshold>>>,
+    // Single-clause components (valid when `compound` is None).
+    operator: String,
+    threshold: f64,
+    metric_name: String,
+    tag_filters: Vec<(String, String)>,
+    stat: Option<String>,
+}
+
+/// Parse cache: keyed by expression string. The expression set is bounded by
+/// the run's config (a handful of thresholds), so the cache cannot grow
+/// unboundedly.
+static THRESHOLD_PARSE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ParsedThreshold>>>,
+> = std::sync::OnceLock::new();
+
+fn get_or_parse(expression: &str) -> std::sync::Arc<ParsedThreshold> {
+    let cache = THRESHOLD_PARSE_CACHE.get_or_init(Default::default);
+    if let Some(p) = cache.lock().unwrap().get(expression) {
+        return p.clone();
+    }
+    let parsed = std::sync::Arc::new(ParsedThreshold::parse(expression));
+    cache
+        .lock()
+        .unwrap()
+        .insert(expression.to_string(), parsed.clone());
+    parsed
+}
+
+impl ParsedThreshold {
+    /// Parse an expression into its structural components WITHOUT touching
+    /// any metric data — the parse is pure string work, so it can be cached
+    /// for the whole run.
+    fn parse(expression: &str) -> Self {
+        // Compound AND/OR: `&&` binds tighter than `||`. Same split the old
+        // evaluator used — moved into the parse step so the hot path never
+        // re-splits.
+        if expression.contains("&&") || expression.contains("||") {
+            let groups: Vec<Vec<ParsedThreshold>> = expression
+                .split("||")
+                .map(|g| {
+                    g.split("&&")
+                        .map(|c| c.trim())
+                        .filter(|c| !c.is_empty())
+                        .map(ParsedThreshold::parse)
+                        .collect()
+                })
+                .filter(|g: &Vec<ParsedThreshold>| !g.is_empty())
+                .collect();
+            return Self {
+                expression: expression.to_string(),
+                compound: Some(groups),
+                operator: String::new(),
+                threshold: 0.0,
+                metric_name: String::new(),
+                tag_filters: Vec::new(),
+                stat: None,
+            };
+        }
+
+        let parts: Vec<&str> = expression.split_whitespace().collect();
+        let metric_ref = parts.first().copied().unwrap_or("").to_string();
+        let operator = parts.get(1).copied().unwrap_or("").to_string();
+        let threshold: f64 = parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let (name, tags, stat) = parse_metric_ref(&metric_ref);
+        let metric_name = name.to_string();
+        let tag_filters: Vec<(String, String)> = tags
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        // W1-B line 150: a NO-DATA clause must not abort the whole compound.
-        // The old `evaluate_single_threshold_opt(clause, metrics)?` propagated
-        // `None` out of the entire expression, so `rate<0.01 || count<10`
-        // false-reds even when the rate clause passed and only count had no
-        // samples. A no-data clause now just fails its AND-group (it cannot
-        // prove the group) while the other groups still get evaluated — an OR
-        // sibling with real data can still decide the compound.
-        let mut deciding_pair = (0.0f64, 0.0f64);
-        let mut any_group_passed = false;
-        let mut any_clause_had_data = false;
-        for group in groups {
-            let mut group_passed = true;
-            let mut group_had_data = false;
-            let mut group_pair = (0.0f64, 0.0f64);
-            for clause in group {
-                match evaluate_single_threshold_opt(clause, metrics) {
-                    Some((passed, actual, threshold)) => {
-                        any_clause_had_data = true;
-                        group_had_data = true;
-                        group_pair = (actual, threshold);
-                        if !passed {
+        let stat = stat.map(str::to_string);
+        Self {
+            expression: expression.to_string(),
+            compound: None,
+            operator,
+            threshold,
+            metric_name,
+            tag_filters,
+            stat,
+        }
+    }
+
+    /// Evaluate the parsed expression against aggregated metrics.
+    fn evaluate(&self, metrics: &MetricsResult) -> Option<(bool, f64, f64)> {
+        // Compound AND/OR — the exact semantics of the old string-based
+        // evaluator, operating on the parsed clauses.
+        if let Some(groups) = &self.compound {
+            let mut deciding_pair = (0.0f64, 0.0f64);
+            let mut any_group_passed = false;
+            let mut any_clause_had_data = false;
+            for group in groups {
+                let mut group_passed = true;
+                let mut group_had_data = false;
+                let mut group_pair = (0.0f64, 0.0f64);
+                for clause in group {
+                    match clause.evaluate(metrics) {
+                        Some((passed, actual, threshold)) => {
+                            any_clause_had_data = true;
+                            group_had_data = true;
+                            group_pair = (actual, threshold);
+                            if !passed {
+                                group_passed = false;
+                            }
+                        }
+                        None => {
+                            // No data for this clause — it cannot pass its group.
                             group_passed = false;
                         }
                     }
-                    None => {
-                        // No data for this clause — it cannot pass its group.
-                        group_passed = false;
-                    }
                 }
-            }
-            if group_passed {
-                // First passing group DECIDES the OR — its last clause's
-                // (actual, threshold) is what the summary reports, not a
-                // later no-data clause's fabricated 0.0.
-                if !any_group_passed {
+                if group_passed {
+                    if !any_group_passed {
+                        deciding_pair = group_pair;
+                    }
+                    any_group_passed = true;
+                } else if group_had_data && !any_group_passed {
                     deciding_pair = group_pair;
                 }
-                any_group_passed = true;
-            } else if group_had_data && !any_group_passed {
-                // A failing group only supplies the reported pair when it
-                // actually carried data — a trailing all-no-data group must
-                // not clobber the meaningful actual with (0.0, 0.0).
-                deciding_pair = group_pair;
             }
+            if any_clause_had_data {
+                return Some((any_group_passed, deciding_pair.0, deciding_pair.1));
+            }
+            return None;
         }
-        if any_clause_had_data {
-            return Some((any_group_passed, deciding_pair.0, deciding_pair.1));
-        }
-        // Every clause had no data → the compound as a whole has no data.
-        return None;
-    }
 
-    // Fail CLOSED: any parse error or unknown operator must FAIL the
-    // threshold (and, via `validate_thresholds` at startup, abort the run).
-    // The old code returned `(true, …)` on malformed input, so a typo'd
-    // metric or a bogus operator silently reported green. k6 rejects bad
-    // threshold syntax at startup instead.
-    let parts: Vec<&str> = expression.split_whitespace().collect();
-    if parts.len() != 3 {
-        tracing::error!(
-            "Invalid threshold expression '{}' — expected '<metric> <op> <value>' (3 tokens), got {}",
-            expression,
-            parts.len()
-        );
-        return Some((false, 0.0, 0.0));
-    }
-
-    // Format: "metric_ref operator value"
-    // metric_ref can be "http_req_duration.p95", "http_req_duration{status=200}.p95",
-    // or just "http_reqs"
-    let metric_ref = parts[0];
-    let operator = parts[1];
-    let threshold: f64 = match parts[2].parse() {
-        Ok(v) => v,
-        Err(_) => {
+        // Fail CLOSED: any parse error or unknown operator must FAIL the
+        // threshold (and, via `validate_thresholds` at startup, abort the run).
+        // validate_thresholds rejects these at startup; a malformed string
+        // reaching evaluation (e.g. a compound clause) fails closed.
+        if self.operator.is_empty() {
             tracing::error!(
-                "Invalid threshold value in '{}': '{}'",
-                expression,
-                parts[2]
+                "Invalid threshold expression '{}' — expected '<metric> <op> <value>' (3 tokens)",
+                self.expression
             );
             return Some((false, 0.0, 0.0));
         }
-    };
 
-    // Parse metric reference into (metric_name, tags, stat)
-    let (metric_name, tag_filters, stat) = parse_metric_ref(metric_ref);
+        let actual = if !self.tag_filters.is_empty() {
+            let filters: Vec<(&str, &str)> = self
+                .tag_filters
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            get_tag_scoped_metric_value(metrics, &self.metric_name, &filters, self.stat.as_deref())
+        } else {
+            get_metric_value(metrics, &self.metric_name, self.stat.as_deref())
+        };
 
-    // Look up the actual metric value. `None` means the metric has NO
-    // samples at all — distinguish that from a real measured 0.0: a missing
-    // metric must fail the threshold (k6 marks no-data thresholds as failed),
-    // never pass a `<` comparison against an invented 0.0.
-    let actual = if !tag_filters.is_empty() {
-        // Tag-scoped threshold: search metrics.metrics for matching entries
-        get_tag_scoped_metric_value(metrics, metric_name, &tag_filters, stat)
-    } else {
-        // No tag filter — use the existing top-level lookup
-        get_metric_value(metrics, metric_name, stat)
-    };
+        let actual = actual?; // None → metric has no samples yet — no data.
 
-    let actual = actual?; // None → metric has no samples yet — no data.
+        let threshold = self.threshold;
+        let passed = match self.operator.as_str() {
+            "<" => actual < threshold,
+            "<=" => actual <= threshold,
+            ">" => actual > threshold,
+            ">=" => actual >= threshold,
+            "==" | "===" => (actual - threshold).abs() < f64::EPSILON,
+            "!=" => (actual - threshold).abs() > f64::EPSILON,
+            _ => {
+                tracing::error!(
+                    "Unknown operator '{}' in threshold '{}'",
+                    self.operator,
+                    self.expression
+                );
+                return Some((false, 0.0, threshold));
+            }
+        };
 
-    let passed = match operator {
-        "<" => actual < threshold,
-        "<=" => actual <= threshold,
-        ">" => actual > threshold,
-        ">=" => actual >= threshold,
-        "==" | "===" => (actual - threshold).abs() < f64::EPSILON,
-        "!=" => (actual - threshold).abs() > f64::EPSILON,
-        _ => {
-            tracing::error!(
-                "Unknown operator '{}' in threshold '{}'",
-                operator,
-                expression
-            );
-            return Some((false, 0.0, threshold));
-        }
-    };
-
-    Some((passed, actual, threshold))
+        Some((passed, actual, threshold))
+    }
 }
 
 /// Fail-closed wrapper used by the final summary: no data → FAILED (k6 marks

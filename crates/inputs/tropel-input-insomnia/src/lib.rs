@@ -335,6 +335,7 @@ fn request_to_item(r: &InsomniaResource) -> Result<ScenarioItem> {
             auth,
             certificate: None,
             follow_redirects: true,
+            host: None,
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         }),

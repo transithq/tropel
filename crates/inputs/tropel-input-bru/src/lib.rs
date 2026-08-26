@@ -406,6 +406,7 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
             auth,
             certificate: None,
             follow_redirects: true,
+            host: None,
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         }),

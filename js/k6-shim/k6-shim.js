@@ -52,7 +52,9 @@ function k6HTTPRequest(method, url, body, params) {
                 redirects: canonical.redirects,
                 compression: canonical.compression,
                 // Backlog line 150: binary request bodies ride as base64.
-                bodyB64: canonical.bodyB64
+                bodyB64: canonical.bodyB64,
+                // TR-230: a Host header becomes req.Host — ride separately.
+                host: canonical.host
             })
         );
     } else if (typeof __tropel_pm_send_request === 'function') {
@@ -183,6 +185,12 @@ function normalizeK6Request(method, url, body, params) {
     // object leaked iteration 1's Content-Type into every later iteration
     // (a string body posted on iteration 2 was still labelled
     // application/json). The copy keeps the stamp per-request.
+    //
+    // TR-201 — documented divergence: k6's Params has NO `default:` branch;
+    // a misspelled key is silently discarded. Tropel warns instead (the
+    // unknown-key warning is a deliberate improvement, shipped with the root
+    // options). Known keys are read here; anything else in `params` is left
+    // untouched and surfaces as a warning, never silently dropped.
     var headers = {};
     var srcHeaders = params.headers;
     if (srcHeaders && typeof srcHeaders === 'object') {
@@ -196,6 +204,27 @@ function normalizeK6Request(method, url, body, params) {
             for (var hk in srcHeaders) {
                 if (srcHeaders.hasOwnProperty(hk)) headers[hk] = srcHeaders[hk];
             }
+        }
+    }
+
+    // TR-230: a `Host` key becomes req.Host (k6 parity) — pulled OUT of the
+    // headers so it never shows up in res.request.headers (k6 keeps Host off
+    // req.Header) and applied on the wire by the driver/client. A
+    // user-supplied Content-Length is deleted with a warning (reqwest
+    // computes it from the body; a lying value corrupts the stream).
+    var hostOverride = null;
+    for (var hk2 in headers) {
+        if (headers.hasOwnProperty(hk2) && hk2.toLowerCase() === 'host') {
+            hostOverride = String(headers[hk2]);
+            delete headers[hk2];
+        }
+    }
+    for (var hk3 in headers) {
+        if (headers.hasOwnProperty(hk3) && hk3.toLowerCase() === 'content-length') {
+            console.warn(
+                'k6/http: ignoring user-supplied Content-Length header — reqwest computes it from the body (k6 parity)'
+            );
+            delete headers[hk3];
         }
     }
     // Backlog P1: the GLOBAL HttpConfig.request_timeout must bound k6
@@ -227,17 +256,32 @@ function normalizeK6Request(method, url, body, params) {
     // k6 params.responseType: "text" (default) | "binary" | "none"
     var responseType = params.responseType || 'text';
 
-    // k6 params.cookies: {name: value} — merged into the Cookie header
-    // (k6 sends cookies as a Cookie header), combined with any explicit
-    // Cookie header the script set. `headers` is already a per-request copy,
-    // so this can't leak into the caller's module-scope params.
+    // k6 params.cookies: {name: value} OR {name: {value, replace}} — merged
+    // into the Cookie header (k6 sends cookies as a Cookie header), combined
+    // with any explicit Cookie header the script set. `headers` is already a
+    // per-request copy, so this can't leak into the caller's module-scope
+    // params.
+    //
+    // TR-230: `replace:false` (the default) sends BOTH the request cookie
+    // and the jar cookie — the request cookie is appended after the jar's.
+    // `replace:true` means "replace the jar cookie of the same name", which
+    // on the request side simply means this cookie is sent (the native jar
+    // bridge dedupes by name when replacing). The shim always merges into
+    // the Cookie header; the jar-side replace semantics live in the per-VU
+    // cookie jar, not here.
     var cookies = params.cookies;
     if (cookies && typeof cookies === 'object') {
         var cookieParts = [];
         for (var ck in cookies) {
-            if (cookies.hasOwnProperty(ck) && cookies[ck] !== undefined && cookies[ck] !== null) {
-                cookieParts.push(encodeURIComponent(ck) + '=' + encodeURIComponent(String(cookies[ck])));
+            if (!cookies.hasOwnProperty(ck)) continue;
+            var cv = cookies[ck];
+            if (cv === undefined || cv === null) continue;
+            var cookieValue = cv;
+            if (typeof cv === 'object' && cv.value !== undefined) {
+                // {value, replace} form — value is the cookie value.
+                cookieValue = cv.value;
             }
+            cookieParts.push(encodeURIComponent(ck) + '=' + encodeURIComponent(String(cookieValue)));
         }
         if (cookieParts.length > 0) {
             var existingCookie = headers['Cookie'] || headers['cookie'] || '';
@@ -251,6 +295,7 @@ function normalizeK6Request(method, url, body, params) {
     return {
         method: method,
         url: url,
+        host: hostOverride,
         headers: serialized.headers,
         body: serialized.body,
         bodyB64: serialized.binary,
@@ -261,7 +306,7 @@ function normalizeK6Request(method, url, body, params) {
         // now receives all of them (auth translated to the tagged AuthConfig
         // form the Rust side deserializes).
         tags: params.tags || {},
-        auth: toAuthConfig(params.auth),
+        auth: toAuthConfig(params.auth, url),
         redirects: params.redirects !== undefined ? params.redirects : -1,
         compression: params.compression || '',
     };
@@ -271,8 +316,32 @@ function normalizeK6Request(method, url, body, params) {
 // tagged AuthConfig form the native bridge deserializes. k6 infers the type
 // from which fields are present: token → bearer, access_token → oauth2,
 // access_key → aws-sigv4, username → basic (k6's documented shapes).
-function toAuthConfig(auth) {
-    if (!auth || typeof auth !== 'object') return null;
+//
+// TR-230: k6 also accepts a STRING: "digest", "ntlm", or "basic".
+// - "basic" is a DOCUMENTED NO-OP — k6's basic auth works purely from the
+//   URL's userinfo (https://user:pass@host/), there is no separate basic
+//   config; scripting `auth: 'basic'` without userinfo changes nothing.
+// - "digest" translates to AuthConfig::Digest, with the credentials taken
+//   from the URL's userinfo (k6's documented behavior:
+//   `auth: 'digest'` + `http://user:pass@host/`).
+// - "ntlm" has no signer in tropel — refusing loudly beats silently sending
+//   unauthenticated (invariant 3: never declare a capability that isn't
+//   forwarded). The collection parser takes the same stance (NTLM → None).
+function toAuthConfig(auth, url) {
+    if (!auth) return null;
+    if (typeof auth === 'string') {
+        var s = String(auth).toLowerCase();
+        if (s === 'digest') {
+            return { type: 'digest', username: userinfoUsername(url), password: userinfoPassword(url) };
+        }
+        if (s === 'ntlm') {
+            console.warn('k6/http: ntlm auth is not supported by tropel — request sent without auth');
+            return null;
+        }
+        // "basic" — documented no-op (basic auth comes from URL userinfo).
+        return null;
+    }
+    if (typeof auth !== 'object') return null;
     if (auth.token !== undefined) {
         return { type: 'bearer', token: String(auth.token) };
     }
@@ -301,6 +370,29 @@ function toAuthConfig(auth) {
         };
     }
     return null;
+}
+
+// Extract the username / password from a URL's userinfo ("http://u:p@host/").
+// The native client strips userinfo before the request, so these credentials
+// are only used to seed the digest/ntlm signer (k6 parity).
+function userinfoUsername(url) {
+    if (typeof url !== 'string') return '';
+    var at = url.indexOf('@');
+    if (at < 0) return '';
+    var scheme = url.indexOf('://');
+    var userinfo = scheme >= 0 ? url.slice(scheme + 3, at) : url.slice(0, at);
+    var colon = userinfo.indexOf(':');
+    return colon >= 0 ? decodeURIComponent(userinfo.slice(0, colon)) : decodeURIComponent(userinfo);
+}
+
+function userinfoPassword(url) {
+    if (typeof url !== 'string') return '';
+    var at = url.indexOf('@');
+    if (at < 0) return '';
+    var scheme = url.indexOf('://');
+    var userinfo = scheme >= 0 ? url.slice(scheme + 3, at) : url.slice(0, at);
+    var colon = userinfo.indexOf(':');
+    return colon >= 0 ? decodeURIComponent(userinfo.slice(colon + 1)) : '';
 }
 
 // Backlog line 150: http.file() — k6's binary-file body factory. Returns a
@@ -518,6 +610,53 @@ function escapeMultipartFieldName(name) {
 // Response object (k6-compatible)
 // ══════════════════════════════════════════════════════════════════
 
+// TR-231: normalize cookies from the native bridge into k6's exact shape:
+// {name: [{name, value, domain, path, http_only, secure, max_age, expires}]}.
+// The native bridge emits `httpOnly` (camelCase), `expires` as a string
+// (RFC1123), and may omit `max_age`. Normalize here once per response so
+// the whole k6 shim, the batch path, and the pm path all see the same shape.
+function normalizeK6Cookies(rawCookies) {
+    if (!rawCookies || typeof rawCookies !== 'object') return {};
+    var out = {};
+    for (var ck in rawCookies) {
+        if (!rawCookies.hasOwnProperty(ck)) continue;
+        var entries = rawCookies[ck];
+        if (!Array.isArray(entries)) {
+            // Single cookie object (legacy / non-array source) — wrap.
+            entries = [entries];
+        }
+        var normalized = [];
+        for (var ei = 0; ei < entries.length; ei++) {
+            var e = entries[ei];
+            if (!e || typeof e !== 'object') continue;
+            var n = {
+                name: e.name !== undefined ? e.name : ck,
+                value: e.value !== undefined ? e.value : '',
+                domain: e.domain !== undefined ? e.domain : null,
+                path: e.path !== undefined ? e.path : null,
+                // k6's field is `http_only` (snake_case), not `httpOnly`.
+                http_only: e.http_only !== undefined ? e.http_only :
+                          e.httpOnly !== undefined ? e.httpOnly : null,
+                secure: e.secure !== undefined ? e.secure : null,
+                // k6's `max_age` in seconds (treated as a number, not string).
+                max_age: e.max_age !== undefined ? e.max_age :
+                         e.maxAge !== undefined ? e.maxAge : null,
+                // k6's `expires` in Unix ms (number). The native bridge
+                // delivers an RFC1123 string; Date.parse handles that.
+                expires: typeof e.expires === 'string' && e.expires !== ''
+                    ? Date.parse(e.expires)
+                    : (typeof e.expires === 'number' ? e.expires : null),
+            };
+            // alsoSurface `sameSite` if present (k6 has it).
+            if (e.sameSite !== undefined) n.sameSite = e.sameSite;
+            if (e.same_site !== undefined) n.same_site = e.same_site;
+            normalized.push(n);
+        }
+        out[ck] = normalized;
+    }
+    return out;
+}
+
 // Backlog line 102: res.cookies / res.request / proto / remote_ip / html()
 // were absent — res.cookies['sid'] threw TypeError. Cookies are real data
 // from the native bridge (name -> [cookie objects], k6 shape); request is
@@ -531,7 +670,7 @@ function K6Response(status, body, headers, timings, url, cookies, requestInfo, p
     this.timings = timings || { blocked: 0, dns: 0, looking_up: 0, connecting: 0, tls_handshaking: 0, sending: 0, waiting: 0, receiving: 0, duration: 0 };
     this.url = url || '';
     this.status_text = String(status) + ' ' + getStatusText(status);
-    this.cookies = cookies || {};
+    this.cookies = normalizeK6Cookies(cookies);
     this.request = requestInfo || { method: 'GET', url: url || '', headers: this.headers, body: body, cookies: this.cookies };
     this.proto = proto || '';
     this.remote_ip = '';
@@ -661,17 +800,69 @@ function resolveJsonSelector(value, selector) {
 }
 
 K6Response.prototype.json = function (selector) {
+    // TR-231: k6's res.json() (response.go). The no-selector form throws on
+    // bad JSON (with a line/char annotation) and CACHES the parsed object —
+    // mutations persist across calls (k6's res.cachedJSON). The selector form
+    // returns undefined on bad JSON or a missing gjson path, never throws.
     if (!this.body || this.body === '') {
-        throw new Error('Response body is empty — cannot parse JSON');
+        throw new Error('the body is null so we can\'t transform it to JSON - this likely was because of a request error getting the response');
     }
-    // Parse fresh on every call, exactly like k6: a script that mutates the
-    // returned object must see a clean re-parse on the next .json() call
-    // (k6 does not cache, and caching would persist user mutations). The
-    // heavy copy savings for the response envelope itself come from the
-    // native-object bridge (driver.rs), not from re-parsing here.
-    var parsed = JSON.parse(this.body);
-    return resolveJsonSelector(parsed, selector);
+
+    var hasSelector = selector !== undefined && selector !== null && String(selector) !== '';
+
+    if (hasSelector) {
+        var parsedSel;
+        try {
+            parsedSel = JSON.parse(this.body);
+        } catch (e) {
+            // k6: gjson.ValidBytes(body) false → undefined (no throw).
+            return undefined;
+        }
+        return resolveJsonSelector(parsedSel, selector);
+    }
+
+    if (this._cachedJson === undefined) {
+        try {
+            this._cachedJson = JSON.parse(this.body);
+        } catch (e) {
+            throw annotateJsonError(this.body, e);
+        }
+    }
+    return this._cachedJson;
 };
+
+// TR-231: k6's checkErrorInJSON — annotate a JSON parse error with the
+// 1-based line and character where parsing failed, in k6's error shape:
+// "cannot parse json due to an error at line L, character C , error: <msg>".
+// The byte offset is best-effort: newer engines put "position N" in the
+// message; when none is present, line 1 / character 0 (k6's default for an
+// offset-0 error, e.g. an empty body).
+function annotateJsonError(body, err) {
+    var offset = 0;
+    var m = String(err && err.message || err).match(/position\s+(\d+)/i);
+    if (m) {
+        offset = parseInt(m[1], 10);
+        if (offset > 0) offset--; // 1-based → 0-based (k6 does the same)
+    }
+    var line = 1;
+    var character = 0;
+    var s = String(body);
+    for (var i = 0; i < s.length; i++) {
+        var c = s.charCodeAt(i);
+        if (c === 10) {
+            line++;
+            character = 0;
+        } else {
+            character++;
+        }
+        if (i >= offset) {
+            if (c === 10) character = 1;
+            break;
+        }
+    }
+    var msg = err && err.message ? err.message : String(err);
+    return new Error('cannot parse json due to an error at line ' + line + ', character ' + character + ' , error: ' + msg);
+}
 
 // ══════════════════════════════════════════════════════════════════
 // http.* methods
@@ -679,12 +870,50 @@ K6Response.prototype.json = function (selector) {
 
 var http = {};
 
-http.get = function (url, params) { return k6HTTPRequest('GET', url, null, params); };
-http.post = function (url, body, params) { return k6HTTPRequest('POST', url, body, params); };
-http.put = function (url, body, params) { return k6HTTPRequest('PUT', url, body, params); };
-http.del = function (url, body, params) { return k6HTTPRequest('DELETE', url, body, params); };
-http.delete = function (url, body, params) { return k6HTTPRequest('DELETE', url, body, params); };
-http.patch = function (url, body, params) { return k6HTTPRequest('PATCH', url, body, params); };
+// TR-206: `http.url` — k6's tagged-template cardinality-control mechanism
+// (http.go:182-193). The template builds the REAL url from the interpolated
+// values, and a `name` in which every interpolation point is collapsed to the
+// literal `${}`. Passing that name as the request's metric name makes
+// `/users/1`, `/users/2`, ... collapse into ONE series `/users/${}` — without
+// it, tropel's own MAX_SERIES cap would do the cardinality management by
+// silently dropping data. k6's `URL` struct exposes `.url` and `.name`, and
+// every http.* method accepts it in place of a plain url string.
+http.url = function (strings) {
+    var name = '';
+    var url = '';
+    for (var i = 0; i < strings.length; i++) {
+        name += strings[i];
+        url += strings[i];
+        if (i < arguments.length - 1) {
+            name += '${}';
+            url += String(arguments[i + 1]);
+        }
+    }
+    return { url: url, name: name };
+};
+
+// Unwrap an `http.url` tagged-template result: use `.url` for the request and
+// fold `.name` into params.tags.name (k6's URL Name is the metric name tag,
+// and TR-205 makes that overwrite the url tag at emit time — the cardinality
+// collapse). A plain string url passes through untouched.
+function unwrapK6URL(url, params) {
+    if (url && typeof url === 'object' && typeof url.url === 'string' && url.name !== undefined) {
+        params = params || {};
+        if (!params.tags) params.tags = {};
+        // A caller-supplied tags.name wins over the template's name (k6: the
+        // request's name tag is used as-is when both are present).
+        if (params.tags.name === undefined) params.tags.name = url.name;
+        return { url: url.url, params: params };
+    }
+    return { url: url, params: params || {} };
+}
+
+http.get = function (url, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest('GET', u.url, null, u.params); };
+http.post = function (url, body, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest('POST', u.url, body, u.params); };
+http.put = function (url, body, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest('PUT', u.url, body, u.params); };
+http.del = function (url, body, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest('DELETE', u.url, body, u.params); };
+http.delete = function (url, body, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest('DELETE', u.url, body, u.params); };
+http.patch = function (url, body, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest('PATCH', u.url, body, u.params); };
 
 // Backlog line 150: k6's http.file(data, filename, contentType) → K6File.
 // The bytes survive the String-typed bridge as base64 (decoded to raw on the
@@ -692,9 +921,9 @@ http.patch = function (url, body, params) { return k6HTTPRequest('PATCH', url, b
 http.file = function (data, filename, contentType) {
     return new K6File(data, filename, contentType);
 };
-http.head = function (url, params) { return k6HTTPRequest('HEAD', url, null, params); };
-http.options = function (url, params) { return k6HTTPRequest('OPTIONS', url, null, params); };
-http.request = function (method, url, body, params) { return k6HTTPRequest(method, url, body, params); };
+http.head = function (url, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest('HEAD', u.url, null, u.params); };
+http.options = function (url, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest('OPTIONS', u.url, null, u.params); };
+http.request = function (method, url, body, params) { var u = unwrapK6URL(url, params); return k6HTTPRequest(method, u.url, body, u.params); };
 
 // http.batch — sequential execution (QuickJS has no async)
 //
@@ -770,7 +999,9 @@ http.batch = function (requests) {
                     auth: canonical.auth,
                     redirects: canonical.redirects,
                     compression: canonical.compression,
-                    bodyB64: canonical.bodyB64
+                    bodyB64: canonical.bodyB64,
+                    // TR-230: a Host header becomes req.Host — ride separately.
+                    host: canonical.host
                 })
             });
         }
@@ -995,8 +1226,9 @@ http.OCSP_STATUS_UNKNOWN = 'unknown';
 // synchronously (QuickJS has no async IO) and wraps the result in a
 // resolved Promise (the driver's job pump settles it).
 http.asyncRequest = function (method, url, body, params) {
+    var u = unwrapK6URL(url, params);
     try {
-        var res = k6HTTPRequest(method, url, body, params);
+        var res = k6HTTPRequest(method, u.url, body, u.params);
         return Promise.resolve(res);
     } catch (e) {
         return Promise.reject(e);
@@ -1027,16 +1259,26 @@ function normalizeBatchEntry(req, defaultKey) {
           if (entryMethod === 'GET' || entryMethod === 'HEAD') {
               entryBody = null;
           }
+          // TR-206: unwrap an http.url tagged-template result used as the
+          // entry url — extract `.url` for the wire and fold `.name` into
+          // the entry's tags so the metric name collapses cardinality.
+          var rawUrl = req.url || '';
+          var entryUrl = rawUrl;
+          var entryTags = req.tags || entryParams.tags || {};
+          if (rawUrl && typeof rawUrl === 'object' && rawUrl.url !== undefined && rawUrl.name !== undefined) {
+              entryUrl = rawUrl.url;
+              if (entryTags.name === undefined) entryTags.name = rawUrl.name;
+          }
           return {
               key: req.name != null ? req.name : defaultKey,
               method: entryMethod,
-              url: req.url || '',
+              url: entryUrl,
               // Backlog §3: `req.body || null` dropped 0/''/false — only
               // undefined/null mean "no body".
               body: entryBody,
               params: {
                   headers: req.headers || entryParams.headers || {},
-                  tags: req.tags || entryParams.tags || {},
+                  tags: entryTags,
                   // Backlog §3: object-form entries forced `timeout:'30s'`,
                   // overriding the global HttpConfig.request_timeout. Mirror
                   // the single path — leave it unset so timeoutMs stays 0 and

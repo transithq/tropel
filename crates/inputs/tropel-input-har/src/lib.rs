@@ -366,6 +366,7 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
             auth: None,
             certificate: None,
             follow_redirects: true,
+            host: None,
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         }),

@@ -247,6 +247,17 @@ impl ExecutionSegment {
         self.to() - self.from()
     }
 
+    /// The segment's length as an exact rational `(num, den)` — `to − from`
+    /// in rational arithmetic (`to_num/to_den − from_num/from_den`), reduced.
+    /// k6 pre-computes `length` on construction; this is the same value,
+    /// computed on demand. Used by the striped-offset algorithm.
+    fn length_rat(&self) -> (i64, i64) {
+        let num = self.to_num * self.from_den - self.from_num * self.to_den;
+        let den = self.to_den * self.from_den;
+        let g = Self::gcd(num, den);
+        (num / g, den / g)
+    }
+
     /// Scale a VU count deterministically with k6's **telescoping** formula
     /// `floor(n·to) − floor(n·from)` using **exact rational arithmetic** —
     /// k6 uses `big.Rat`; tropel uses `i128` integer division of the stored
@@ -400,6 +411,214 @@ impl ExecutionSegment {
                 think_time: think_time.clone(),
             },
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// TR-221: striped offsets (k6 execution_segment.go) — the interleaving
+// primitive for distributed execution.
+//
+// Segment *scaling* (`scale_vus`/`scale_iterations`/`scale_rate`) tells each
+// node how much work it owns. Striped *offsets* tell it WHERE in the global
+// iteration sequence that work sits, so N nodes interleave their ticks into
+// the exact original global rate instead of running independent (bunching)
+// executors. This is k6's `ExecutionSegmentSequence` +
+// `NewExecutionSegmentSequenceWrapper` + `GetStripedOffsets` +
+// `SegmentedIndex` — ported 1:1, including the `big.Rat`-free integer
+// arithmetic (rationals here are `i128` pairs, the same representation the
+// rational-scaling fix already uses).
+// ──────────────────────────────────────────────────────────────────────
+
+/// An ordered chain of execution segments: `[0, b1), [b1, b2), ..., [b_{n-1}, 1)`.
+/// k6's `ExecutionSegmentSequence`. The boundaries come from
+/// `executionSegmentSequence` (`"0,1/3,2/3,1"` → three segments).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionSegmentSequence(pub Vec<ExecutionSegment>);
+
+impl ExecutionSegmentSequence {
+    /// Greatest common divisor (module-level helper shared by the sequence).
+    fn gcd(a: i64, b: i64) -> i64 {
+        if b == 0 {
+            a.abs()
+        } else {
+            Self::gcd(b, a % b)
+        }
+    }
+
+    /// Lowest common denominator of all segment-length denominators —
+    /// k6's `ExecutionSegmentSequence.LCD()`. The striping algorithm walks
+    /// exactly `lcd` global ticks before the assignment pattern repeats.
+    pub fn lcd(&self) -> i64 {
+        let mut acc = self.0[0].length_rat().1;
+        for seg in &self.0[1..] {
+            let n = seg.length_rat().1;
+            if acc == n || acc % n == 0 {
+                continue;
+            }
+            acc *= n / Self::gcd(acc, n);
+        }
+        acc
+    }
+
+    /// Parse a sequence spec like `"0,1/3,2/3,1"` into segments (k6's
+    /// `NewExecutionSegmentSequenceFromString`). Reuses `parse_fraction` for
+    /// the boundary values.
+    pub fn parse(sequence: &str) -> Result<Self> {
+        let bounds = ExecutionSegment::parse_sequence(sequence)?;
+        let mut segments = Vec::with_capacity(bounds.len() - 1);
+        // Re-derive exact rational bounds from the parsed f64 set is lossy;
+        // instead re-parse the string tokens for exactness.
+        let tokens: Vec<&str> = sequence.split(',').map(str::trim).collect();
+        let mut prev = ExecutionSegment::parse_fraction(tokens[0])?;
+        for tok in &tokens[1..] {
+            let cur = ExecutionSegment::parse_fraction(tok)?;
+            segments.push(ExecutionSegment::new(prev.0, prev.1, cur.0, cur.1)?);
+            prev = cur;
+        }
+        Ok(Self(segments))
+    }
+}
+
+/// The pre-computed striping cache: the LCD plus each segment's offset list.
+/// k6's `ExecutionSegmentSequenceWrapper`. Construction runs the striping
+/// algorithm once; `get_striped_offsets` then returns cached values.
+pub struct ExecutionSegmentSequenceWrapper {
+    lcd: i64,
+    offsets: Vec<Vec<i64>>,
+}
+
+impl ExecutionSegmentSequenceWrapper {
+    /// Build the wrapper for a filled (full `[0,1]`) sequence, running the
+    /// striping algorithm — k6's `NewExecutionSegmentSequenceWrapper`.
+    pub fn new(sequence: &ExecutionSegmentSequence) -> Result<Self> {
+        if sequence.0.is_empty() {
+            return Err(TropelError::Config(
+                "cannot build striped offsets from an empty segment sequence".into(),
+            ));
+        }
+        // k6 panics on a non-full sequence — we error instead (invariant 2:
+        // loud, not silent). Exact rational comparison: from == 0 and to == 1.
+        let first = &sequence.0[0];
+        let last = &sequence.0[sequence.0.len() - 1];
+        let full = first.from_num == 0 && last.to_num == last.to_den;
+        if !full {
+            return Err(TropelError::Config(format!(
+                "striped-offset sequence must be full (start at 0, end at 1): {sequence:?}"
+            )));
+        }
+        let n = sequence.0.len();
+        let lcd = sequence.lcd();
+        let mut offsets: Vec<Vec<i64>> = vec![Vec::new(); n];
+
+        // Normalize each segment's length to the LCD: 3/5 @ LCD 15 → 9/15.
+        // Bigger normalized numerators are served first (k6 sorts descending)
+        // so the segments that need the most ticks have the hardest time
+        // landing sequentially.
+        let mut items: Vec<(i64, usize)> = (0..n)
+            .map(|i| {
+                let (ln, ld) = sequence.0[i].length_rat();
+                (ln * (lcd / ld), i)
+            })
+            .collect();
+        items.sort_by(|a, b| b.0.cmp(&a.0)); // stable in Rust sort
+
+        let mut prev = vec![0i64; n];
+        let mut chosen_counts = vec![0i64; n];
+
+        for gi in 0..lcd {
+            for (sorted_index, chosen) in chosen_counts.iter().enumerate() {
+                let num = *chosen * lcd;
+                let denom = items[sorted_index].0;
+                if denom == 0 {
+                    continue; // zero-length segment claims nothing
+                }
+                if gi > num / denom || (gi == num / denom && num % denom == 0) {
+                    chosen_counts[sorted_index] += 1;
+                    let idx = items[sorted_index].1;
+                    offsets[idx].push(gi - prev[idx]);
+                    prev[idx] = gi;
+                    if offsets[idx].len() as i64 == denom {
+                        // Wrap-around: offset from the last claim in this
+                        // cycle to the first claim of the next cycle.
+                        let wrap = offsets[idx][0] + lcd - gi;
+                        offsets[idx].push(wrap);
+                    }
+                    break;
+                }
+            }
+        }
+
+        Ok(Self { lcd, offsets })
+    }
+
+    /// The cached least common denominator (number of global ticks in one
+    /// full striping cycle).
+    pub fn lcd(&self) -> i64 {
+        self.lcd
+    }
+
+    /// k6's `GetStripedOffsets`: `(start, offsets, lcd)`. `start` is the
+    /// first global tick this segment owns; `offsets` are the gaps from one
+    /// owned tick to the next, cycling every `lcd` ticks. The caller walks
+    /// the global tick space via `SegmentedIndex`.
+    pub fn get_striped_offsets(&self, segment_index: usize) -> (i64, Vec<i64>, i64) {
+        let offsets = &self.offsets[segment_index];
+        (offsets[0], offsets[1..].to_vec(), self.lcd)
+    }
+
+    /// k6's `SegmentedIndex`: an iterator over the global tick space that
+    /// yields only this segment's ticks — `(scaled, unscaled)` pairs where
+    /// `unscaled` is the global iteration index and `scaled` is how many of
+    /// this segment's iterations have elapsed. N nodes each run a
+    /// `SegmentedIndex` for their own segment and interleave into the exact
+    /// original global rate.
+    pub fn segmented_index(&self, segment_index: usize) -> SegmentedIndex {
+        let (start, offsets, lcd) = self.get_striped_offsets(segment_index);
+        SegmentedIndex {
+            start,
+            lcd,
+            offsets,
+            scaled: 0,
+            unscaled: 0,
+        }
+    }
+}
+
+/// k6's `SegmentedIndex` — the non-thread-safe striped iterator over the
+/// global tick space. See `ExecutionSegmentSequenceWrapper::segmented_index`.
+#[allow(dead_code)]
+pub struct SegmentedIndex {
+    start: i64,
+    lcd: i64,
+    offsets: Vec<i64>,
+    scaled: i64,
+    unscaled: i64,
+}
+
+impl SegmentedIndex {
+    /// Advance to the next tick owned by this segment. First call yields
+    /// `(1, start+1)` (k6 indexes the first element as 1, not 0); subsequent
+    /// calls add this segment's offset to the global index.
+    ///
+    /// Implemented via [`Iterator`] (not a bare `next`) so the method can't be
+    /// confused with the standard trait, and callers can `for (scaled,
+    /// unscaled) in idx { … }`.
+    fn advance(&mut self) -> (i64, i64) {
+        if self.scaled == 0 {
+            self.unscaled += self.start + 1;
+        } else {
+            self.unscaled += self.offsets[((self.scaled - 1) % self.offsets.len() as i64) as usize];
+        }
+        self.scaled += 1;
+        (self.scaled, self.unscaled)
+    }
+}
+
+impl Iterator for SegmentedIndex {
+    type Item = (i64, i64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.advance())
     }
 }
 
@@ -706,6 +925,157 @@ mod tests {
                 assert_eq!(iterations, 30);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    /// TR-221: k6's 50%/25%/25% example from execution_segment.go's doc
+    /// comment. 3 instances: 0:1/2, 1/2:3/4, 3/4:1. Combined they MUST
+    /// produce every global tick exactly once, interleaved.
+    #[test]
+    fn striped_offsets_three_segments_cover_every_tick() {
+        let seq = ExecutionSegmentSequence::parse("0,1/2,3/4,1").unwrap();
+        let wrapper = ExecutionSegmentSequenceWrapper::new(&seq).unwrap();
+
+        // The sequence is 3 segments of length 1/2, 1/4, 1/4.
+        // LCD of denominators {2, 4, 4} = 4.
+        assert_eq!(wrapper.lcd, 4);
+
+        // Walk 100 global ticks and verify every tick is claimed by exactly
+        // one segment.
+        let mut covered = vec![false; 100];
+        for si in 0..3 {
+            let mut idx = wrapper.segmented_index(si);
+            loop {
+                let (_scaled, unscaled) = idx.next().expect("segmented index is unbounded");
+                if unscaled > 100 {
+                    break;
+                }
+                let gu = unscaled as usize - 1; // k6's index is 1-based
+                if gu < 100 {
+                    assert!(
+                        !covered[gu],
+                        "global tick {} claimed by more than one segment",
+                        gu
+                    );
+                    covered[gu] = true;
+                }
+            }
+        }
+        for (gi, c) in covered.iter().enumerate() {
+            assert!(c, "global tick {} was never claimed", gi);
+        }
+    }
+
+    /// TR-221: the 50%/25%/25% example's exact writer output:
+    /// Instance 1 (0:1/2) owns ticks: 0, 2, 4, 6, 8, 10, ...
+    /// Instance 2 (1/2:3/4) owns: 1, 5, 9, 13, ...
+    /// Instance 3 (3/4:1) owns: 3, 7, 11, 15, ...
+    #[test]
+    fn striped_offsets_exact_example_from_k6_doc() {
+        let seq = ExecutionSegmentSequence::parse("0,1/2,3/4,1").unwrap();
+        let wrapper = ExecutionSegmentSequenceWrapper::new(&seq).unwrap();
+
+        let (start, offsets, lcd) = wrapper.get_striped_offsets(0);
+        assert_eq!(lcd, 4);
+        assert_eq!(start, 0);
+        // offsets = [2, 2] (one LCD cycle of 4 ticks: claim at 0, then +2 → 2, then +2 → 4 = wrap)
+        assert_eq!(offsets, vec![2, 2]);
+
+        let (start, offsets, lcd) = wrapper.get_striped_offsets(1);
+        assert_eq!(lcd, 4);
+        assert_eq!(start, 1);
+        assert_eq!(offsets, vec![4]);
+
+        let (start, offsets, lcd) = wrapper.get_striped_offsets(2);
+        assert_eq!(lcd, 4);
+        assert_eq!(start, 3);
+        assert_eq!(offsets, vec![4]);
+
+        // Walk 20 ticks for segment 0 (50%): 0, 2, 4, 6, ... 18.
+        let mut si = wrapper.segmented_index(0);
+        for expect_unscaled in [1i64, 3, 5, 7, 9, 11, 13, 15, 17, 19] {
+            let (scaled, unscaled) = si.next().expect("segmented index is unbounded");
+            assert_eq!(unscaled, expect_unscaled, "segment 0 tick {scaled}");
+        }
+
+        // Segment 1 (25%): 1, 5, 9, 13, 17.
+        let mut si = wrapper.segmented_index(1);
+        for expect_unscaled in [2i64, 6, 10, 14, 18] {
+            let (scaled, unscaled) = si.next().expect("segmented index is unbounded");
+            assert_eq!(unscaled, expect_unscaled, "segment 1 tick {scaled}");
+        }
+
+        // Segment 2 (25%): 3, 7, 11, 15, 19.
+        let mut si = wrapper.segmented_index(2);
+        for expect_unscaled in [4i64, 8, 12, 16, 20] {
+            let (scaled, unscaled) = si.next().expect("segmented index is unbounded");
+            assert_eq!(unscaled, expect_unscaled, "segment 2 tick {scaled}");
+        }
+    }
+
+    /// TR-221: 100 equal segments (each 1/100). Every segment should own
+    /// exactly 1 of every 100 ticks, offset = i.
+    #[test]
+    fn striped_offsets_hundred_equal_segments() {
+        let tokens: Vec<String> = (0..=100u64).map(|i| format!("{i}/100")).collect();
+        let seq_str = tokens.join(",");
+        let seq = ExecutionSegmentSequence::parse(&seq_str).unwrap();
+        let wrapper = ExecutionSegmentSequenceWrapper::new(&seq).unwrap();
+
+        assert_eq!(wrapper.lcd, 100);
+
+        for si in 0..100 {
+            let (start, offsets, lcd) = wrapper.get_striped_offsets(si);
+            assert_eq!(lcd, 100);
+            assert_eq!(start, si as i64, "segment {si} start");
+            assert_eq!(offsets, vec![100], "segment {si} single offset"); // one claim per 100 ticks
+        }
+    }
+
+    /// TR-221: Unequal 3 instances (1/2, 1/3, 1/6). LCD = 6. Verify the
+    /// striping covers every tick.
+    #[test]
+    fn striped_offsets_three_unequal_segments() {
+        // 1/2 = 3/6, 1/3 = 2/6, 1/6 = 1/6 @ LCD 6
+        let seq = ExecutionSegmentSequence::parse("0,1/2,5/6,1").unwrap();
+        let wrapper = ExecutionSegmentSequenceWrapper::new(&seq).unwrap();
+
+        // Segment 0 (3/6): 3 of 6 ticks
+        let (start, offsets, lcd) = wrapper.get_striped_offsets(0);
+        assert_eq!(lcd, 6);
+        assert_eq!(start, 0);
+        assert_eq!(offsets.len(), 3);
+
+        // Segment 1 (2/6): 2 of 6 ticks
+        let (start, offsets, lcd) = wrapper.get_striped_offsets(1);
+        assert_eq!(lcd, 6);
+        assert_eq!(offsets.len(), 2);
+        assert!(start < 6, "segment 1 must start inside the first cycle");
+
+        // Segment 2 (1/6): 1 of 6 ticks
+        let (start, offsets, lcd) = wrapper.get_striped_offsets(2);
+        assert_eq!(lcd, 6);
+        assert_eq!(offsets.len(), 1);
+        assert!(start < 6, "segment 2 must start inside the first cycle");
+
+        // Walk 24 ticks and verify full coverage
+        let mut covered = vec![false; 24];
+        for si in 0..3 {
+            let mut idx = wrapper.segmented_index(si);
+            loop {
+                let (_scaled, unscaled) = idx.next().expect("segmented index is unbounded");
+                if unscaled > 24 {
+                    break;
+                }
+                let gu = unscaled as usize - 1;
+                if gu < 24 {
+                    assert!(!covered[gu], "tick {gu} claimed twice");
+                    covered[gu] = true;
+                }
+            }
+        }
+        for (gi, c) in covered.iter().enumerate() {
+            assert!(c, "global tick {gi} was never claimed");
         }
     }
 }

@@ -280,6 +280,7 @@ fn block_to_item(
             auth: None,
             certificate: None,
             follow_redirects: true,
+            host: None,
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         }),

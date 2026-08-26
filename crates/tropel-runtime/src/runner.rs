@@ -442,6 +442,7 @@ impl ScenarioRunner {
                             .map(|a| resolve_auth(a, &resolver, &scope)),
                         certificate: request.certificate.clone(),
                         follow_redirects: request.follow_redirects,
+                        host: request.host.clone(),
                         timeout: request.timeout,
                         response_type: request.response_type,
                     };
@@ -1230,6 +1231,7 @@ mod tests {
                 auth: None,
                 certificate: None,
                 follow_redirects: true,
+                host: None,
                 timeout: None,
                 response_type: ResponseType::None,
             }),
