@@ -39,13 +39,30 @@ const SAMPLE_STREAM_CAPACITY: usize = 1 << 18; // 262_144
 /// The engine orchestrates a complete load test job.
 pub struct Engine {
     extension_registry: ExtensionRegistry,
+    /// TR-309: optional periodic-snapshot sink. Distributed agents set this
+    /// so the controller sees progress mid-run instead of being blind until
+    /// the engine completes. `None` → the single-node path (no periodic
+    /// snapshot task spawned).
+    snapshot_tx: Option<tokio::sync::mpsc::Sender<tropel_metrics::collector::MetricsSnapshot>>,
 }
 
 impl Engine {
     pub fn new(registry: ExtensionRegistry) -> Self {
         Self {
             extension_registry: registry,
+            snapshot_tx: None,
         }
+    }
+
+    /// TR-309: enable periodic snapshots to the given channel. The engine
+    /// spawns a task that calls `metrics.snapshot()` on the aggregator every
+    /// 2 s (the single-node flush cadence) and forwards it.
+    pub fn with_snapshot_sink(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<tropel_metrics::collector::MetricsSnapshot>,
+    ) -> Self {
+        self.snapshot_tx = Some(tx);
+        self
     }
 
     pub async fn run(&self, config: &JobConfig) -> Result<EngineResult> {
@@ -64,6 +81,25 @@ impl Engine {
         metrics
             .set_histogram_max(config.http.histogram_max_ms)
             .await;
+
+        // TR-309: if the agent set a snapshot channel, spawn a periodic task
+        // that polls the aggregator every 2 s (the single-node flush cadence)
+        // and forwards the snapshot. The task runs on the current runtime.
+        if let Some(snapshot_tx) = self.snapshot_tx.clone() {
+            let metrics_clone = metrics.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let snap = metrics_clone.snapshot().await;
+                    if snapshot_tx.send(snap).await.is_err() {
+                        // Receiver dropped (run finished) — stop.
+                        break;
+                    }
+                }
+            });
+        }
 
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
