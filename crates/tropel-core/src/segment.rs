@@ -520,7 +520,9 @@ impl ExecutionSegmentSequenceWrapper {
                 (ln * (lcd / ld), i)
             })
             .collect();
-        items.sort_by(|a, b| b.0.cmp(&a.0)); // stable in Rust sort
+        // `sort_by_key` with `Reverse` is a stable descending sort, like the
+        // k6 `sort.SliceStable` — ties keep the original (declaration) order.
+        items.sort_by_key(|a| std::cmp::Reverse(a.0));
 
         let mut prev = vec![0i64; n];
         let mut chosen_counts = vec![0i64; n];
