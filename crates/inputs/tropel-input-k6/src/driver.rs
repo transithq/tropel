@@ -895,7 +895,7 @@ fn intern_method(s: &str) -> Arc<str> {
 }
 
 /// Intern common HTTP status code strings to avoid per-sample allocation.
-fn intern_status(s: &str) -> Arc<str> {
+fn intern_status(code: u16) -> Arc<str> {
     use std::sync::OnceLock;
     static S200: OnceLock<Arc<str>> = OnceLock::new();
     static S201: OnceLock<Arc<str>> = OnceLock::new();
@@ -910,21 +910,21 @@ fn intern_status(s: &str) -> Arc<str> {
     static S500: OnceLock<Arc<str>> = OnceLock::new();
     static S502: OnceLock<Arc<str>> = OnceLock::new();
     static S503: OnceLock<Arc<str>> = OnceLock::new();
-    match s {
-        "200" => S200.get_or_init(|| Arc::from("200")).clone(),
-        "201" => S201.get_or_init(|| Arc::from("201")).clone(),
-        "204" => S204.get_or_init(|| Arc::from("204")).clone(),
-        "301" => S301.get_or_init(|| Arc::from("301")).clone(),
-        "302" => S302.get_or_init(|| Arc::from("302")).clone(),
-        "304" => S304.get_or_init(|| Arc::from("304")).clone(),
-        "400" => S400.get_or_init(|| Arc::from("400")).clone(),
-        "401" => S401.get_or_init(|| Arc::from("401")).clone(),
-        "403" => S403.get_or_init(|| Arc::from("403")).clone(),
-        "404" => S404.get_or_init(|| Arc::from("404")).clone(),
-        "500" => S500.get_or_init(|| Arc::from("500")).clone(),
-        "502" => S502.get_or_init(|| Arc::from("502")).clone(),
-        "503" => S503.get_or_init(|| Arc::from("503")).clone(),
-        other => Arc::from(other),
+    match code {
+        200 => S200.get_or_init(|| Arc::from("200")).clone(),
+        201 => S201.get_or_init(|| Arc::from("201")).clone(),
+        204 => S204.get_or_init(|| Arc::from("204")).clone(),
+        301 => S301.get_or_init(|| Arc::from("301")).clone(),
+        302 => S302.get_or_init(|| Arc::from("302")).clone(),
+        304 => S304.get_or_init(|| Arc::from("304")).clone(),
+        400 => S400.get_or_init(|| Arc::from("400")).clone(),
+        401 => S401.get_or_init(|| Arc::from("401")).clone(),
+        403 => S403.get_or_init(|| Arc::from("403")).clone(),
+        404 => S404.get_or_init(|| Arc::from("404")).clone(),
+        500 => S500.get_or_init(|| Arc::from("500")).clone(),
+        502 => S502.get_or_init(|| Arc::from("502")).clone(),
+        503 => S503.get_or_init(|| Arc::from("503")).clone(),
+        other => Arc::from(other.to_string()),
     }
 }
 
@@ -937,7 +937,7 @@ fn intern_status(s: &str) -> Arc<str> {
 #[allow(clippy::too_many_arguments)] // mirrors http_tags_for's field set
 fn http_tags(
     req: &Request,
-    status: &str,
+    status: u16,
     scenario: &Arc<str>,
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
@@ -971,7 +971,7 @@ fn http_tags(
 fn http_tags_for(
     url: &str,
     method: &str,
-    status: &str,
+    status: u16,
     scenario: &Arc<str>,
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
@@ -1006,10 +1006,7 @@ fn http_tags_for(
     // TR-204: `expected_response` is a k6 systemTag — true for 2xx/3xx, false
     // for 4xx/5xx and transport failures (status 0). k6's `expectedResponse`
     // option can override, but the default is the status-class rule.
-    let expected = status
-        .parse::<u16>()
-        .map(|s| (200..400).contains(&s))
-        .unwrap_or(false);
+    let expected = (200..400).contains(&status);
     tags.insert(
         interned("expected_response"),
         Arc::from(if expected { "true" } else { "false" }),
@@ -1259,7 +1256,7 @@ fn push_http_samples_for(
     let tags = Arc::new(http_tags_for(
         url,
         method,
-        &status_code.to_string(),
+        status_code,
         scenario,
         extra_tags,
         group,
@@ -1550,7 +1547,7 @@ fn push_http_failure(
     let now = tropel_js::clock::monotonic_wall_now();
     let mut tags = http_tags(
         req,
-        "0",
+        0,
         scenario,
         extra_tags,
         group,
@@ -8451,7 +8448,7 @@ mod tests {
             let tags = http_tags_for(
                 "http://x/",
                 "GET",
-                &status.to_string(),
+                status,
                 &Arc::from("default"),
                 None,
                 None,
