@@ -208,32 +208,34 @@ impl ExtensionRegistry {
     /// `detect()` claims the bytes, the one with the highest `priority` wins
     /// (ties fall back to registration order — stable IndexMap iteration).
     /// This removes the dependency on `inventory` link order.
+    ///
+    /// TR-307: iterate by descending priority and RETURN on the FIRST match
+    /// instead of probing every adapter. The old code called every adapter's
+    /// `detect()` (most of which do a full-document parse) to find the best
+    /// priority — an 80 MB file was parsed ~5 times in `detect()` before
+    /// `parse()` parsed it again. Since `detect()` is deterministic, the
+    /// highest-priority match is the same result as scanning all.
     pub fn resolve_input(&self, bytes: &[u8]) -> Option<Box<dyn InputAdapter>> {
-        let mut best: Option<(u8, Box<dyn InputAdapter>)> = None;
-        for registration in self.input_adapters.values() {
+        // Collect registrations sorted by priority descending (ties preserve
+        // registration order). Return on the first `detect() == true` —
+        // equivalent to the old best-priority scan because detect() is
+        // deterministic and the highest priority wins either way.
+        let mut sorted: Vec<Arc<InputAdapterRegistration>> =
+            self.input_adapters.values().cloned().collect();
+        sorted.sort_by_key(|a| std::cmp::Reverse(a.priority));
+        for registration in &sorted {
             let adapter = (registration.create)();
-            // Strictly-greater: on equal priority the FIRST registration wins
-            // (ties → registration order), and inventory adapters beat
-            // equal-priority factory adapters (factories are probed after).
-            if adapter.detect(bytes)
-                && best
-                    .as_ref()
-                    .map(|(p, _)| registration.priority > *p)
-                    .unwrap_or(true)
-            {
-                best = Some((registration.priority, adapter));
+            if adapter.detect(bytes) {
+                return Some(adapter);
             }
         }
         for factory in self.input_adapter_factories.values() {
             let adapter = (factory)();
             if adapter.detect(bytes) {
-                let p = 0;
-                if best.as_ref().map(|(bp, _)| p > *bp).unwrap_or(true) {
-                    best = Some((p, adapter));
-                }
+                return Some(adapter);
             }
         }
-        best.map(|(_, adapter)| adapter)
+        None
     }
 
     /// Resolve a driver from raw bytes using content detection.

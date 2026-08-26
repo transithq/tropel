@@ -79,6 +79,14 @@ pub struct GrpcProtocol {
     pools: Mutex<HashMap<u64, (PoolKey, Arc<DescriptorPool>)>>,
     /// Insertion order for the pool cache (FIFO eviction key).
     pool_order: Mutex<VecDeque<u64>>,
+    /// TR-306: memoized identity of the LAST seen pool key. The proto
+    /// source is stable within a run (same config/header/env), so after the
+    /// first request the SipHash over up to 1 MiB is skipped entirely —
+    /// a byte-identity `memcmp` (cheap for the common file-path source)
+    /// reuses the previously computed hash instead of re-hashing the full
+    /// text on every request.
+    last_key: Mutex<Option<PoolKey>>,
+    last_hash: std::sync::atomic::AtomicU64,
     /// Tonic channels pooled by authority (`scheme://host:port`).
     channels: Mutex<HashMap<String, Channel>>,
     /// Insertion order for the channel cache (FIFO eviction key).
@@ -90,10 +98,27 @@ use std::hash::{Hash, Hasher};
 
 /// Precompute a hash of the pool key outside any lock. The proto source
 /// can be up to 1 MiB — hashing it inside the mutex is the bottleneck.
-fn pool_hash(key: &PoolKey) -> u64 {
+/// TR-306: the hash is memoized per unique key so the (potentially MiB-
+/// sized) SipHash runs once per distinct source, not once per request.
+fn pool_hash(
+    memo_key: &Mutex<Option<PoolKey>>,
+    memo_hash: &std::sync::atomic::AtomicU64,
+    key: &PoolKey,
+) -> u64 {
+    {
+        let last = memo_key.lock().unwrap();
+        if let Some(prev) = last.as_ref() {
+            if prev.0 == key.0 && prev.1 == key.1 {
+                return memo_hash.load(std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     let mut h = DefaultHasher::new();
     key.hash(&mut h);
-    h.finish()
+    let hash = h.finish();
+    *memo_key.lock().unwrap() = Some(key.clone());
+    memo_hash.store(hash, std::sync::atomic::Ordering::Relaxed);
+    hash
 }
 
 /// Insert into a bounded cache: when the map is at capacity, evict the oldest
@@ -266,7 +291,7 @@ impl Protocol for GrpcProtocol {
             // SipHash over up to 1 MiB of proto source doesn't happen while
             // holding the mutex. Then hold the lock across compilation to
             // prevent a cold-start stampede.
-            let hash = pool_hash(&key);
+            let hash = pool_hash(&self.last_key, &self.last_hash, &key);
             let mut pools = self.pools.lock().unwrap();
             let mut order = self.pool_order.lock().unwrap();
             if let Some((_, p)) = pools.get(&hash) {

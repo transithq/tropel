@@ -148,18 +148,29 @@ impl OtlpOutput {
         }
 
         // Move the CPU-heavy payload build off the async worker.
-        let body_str = tokio::task::spawn_blocking(move || {
+        // TR-304: gzip the JSON body — OTLP JSON payloads are dominated by
+        // repeated tag names/values; gzip typically cuts the wire bytes
+        // 8-15× (the old code shipped uncompressed JSON, so a 100 ms window
+        // of samples cost 140-750 ms of collector CPU and kept the tool
+        // permanently oversubscribed on the network path).
+        let body_gz = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
             let body = build_export_request(&metrics);
-            body.to_string()
+            let json = body.to_string();
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(json.as_bytes())
+                .and_then(|_| enc.finish())
+                .map_err(|e| TropelError::Other(format!("otlp gzip failed: {e}")))
         })
         .await
-        .map_err(|e| TropelError::Other(format!("otlp payload build panicked: {e}")))?;
+        .map_err(|e| TropelError::Other(format!("otlp payload build panicked: {e}")))??;
 
         let resp = self
             .client
             .post(&self.endpoint)
             .header("Content-Type", "application/json")
-            .body(body_str)
+            .header("Content-Encoding", "gzip")
+            .body(body_gz)
             .send()
             .await
             .map_err(|e| TropelError::Http(format!("otlp POST failed: {e}")))?;
@@ -501,7 +512,12 @@ mod tests {
         output.flush().await.unwrap();
 
         let received = server.await.unwrap();
-        let text = String::from_utf8(received).unwrap();
+        // TR-304: the body is gzip-compressed now — decompress before parsing.
+        use std::io::Read;
+        let mut dec = flate2::read::GzDecoder::new(received.as_slice());
+        let mut text_bytes = Vec::new();
+        dec.read_to_end(&mut text_bytes).unwrap();
+        let text = String::from_utf8(text_bytes).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         let metrics = &json["resourceMetrics"][0]["scopeMetrics"][0]["metrics"];
         assert!(metrics.is_array() && !metrics.as_array().unwrap().is_empty());

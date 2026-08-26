@@ -30,14 +30,25 @@ pub struct K6ScriptAdapter;
 /// detect() copies in this crate so they can never drift; the Postman
 /// adapter's detect() is the canonical third copy (cross-crate).
 pub(crate) fn is_postman_collection(text: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+    // TR-307: deserialize ONLY the `info.schema` field via a tiny serde probe
+    // instead of materializing a full `Value` tree of the whole document.
+    // The old `serde_json::from_str::<Value>` parsed every byte of an 80 MB
+    // input inside detect() — once per adapter probe. serde skips the
+    // (potentially huge) `item`/`entries` subtree without building it.
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        info: Option<InfoProbe>,
+    }
+    #[derive(serde::Deserialize)]
+    struct InfoProbe {
+        #[serde(default)]
+        schema: Option<String>,
+    }
+    let Ok(probe) = serde_json::from_str::<Probe>(text) else {
         return false;
     };
-    let schema = value
-        .get("info")
-        .and_then(|info| info.get("schema"))
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
+    let schema = probe.info.and_then(|info| info.schema).unwrap_or_default();
     schema.contains("getpostman.com") && schema.contains("collection")
 }
 

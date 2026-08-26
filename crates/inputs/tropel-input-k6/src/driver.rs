@@ -3792,37 +3792,69 @@ fn preprocess_k6_source_module(source: &str) -> String {
 /// Build the final source for ES-module evaluation: pre-process (keep
 /// exports, drop k6 virtual imports) and transpile TypeScript while keeping
 /// the `export` modifiers intact (script-mode transpilation strips them).
+///
+/// TR-313: the result is cached by `(path, mtime)`. The script's prepared
+/// source is re-computed by `declared_options` + `setup` + N× `init` (one
+/// per VU) + `teardown` + `handle_summary` — the "N+2 startup oxc parses"
+/// and the 200 MB memcpy when N × script size. A single process-global
+/// cache collapses them into ONE parse. The k6-module-loader per-VU
+/// transpiles of helper files go through the same cache.
 fn prepare_module_source(original: &str, source_path: Option<&Path>) -> Result<String> {
+    // Cache key: (path, mtime). `source_path` is always Some on the driver
+    // path; the heuristic (pathless) branch is rare and cheap enough to
+    // skip caching.
+    let cache = if let Some(path) = source_path {
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let key = (path.to_string_lossy().to_string(), mtime);
+        let cache = MODULE_SOURCE_CACHE.get_or_init(Default::default);
+        if let Some(cached) = cache.lock().unwrap().get(&key) {
+            return Ok(cached.clone());
+        }
+        Some((cache, key))
+    } else {
+        None
+    };
+
     let preprocessed = preprocess_k6_source_module(original);
 
-    if let Some(path) = source_path {
+    let result = if let Some(path) = source_path {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("js")
             .to_lowercase();
         if matches!(ext.as_str(), "ts" | "mts" | "tsx") {
-            return tropel_es::typescript_to_javascript_keep_exports(
-                &preprocessed,
-                &path.to_string_lossy(),
-            )
-            .map_err(|e| TropelError::Parse(format!("TS transpile error: {}", e)));
+            tropel_es::typescript_to_javascript_keep_exports(&preprocessed, &path.to_string_lossy())
+                .map_err(|e| TropelError::Parse(format!("TS transpile error: {}", e)))
+        } else {
+            Ok(preprocessed)
         }
-        return Ok(preprocessed);
-    }
-
-    // No path hint — detect TS patterns heuristically.
-    if preprocessed.contains(": string")
+    } else if preprocessed.contains(": string")
         || preprocessed.contains(": number")
         || preprocessed.contains(": boolean")
         || preprocessed.contains("interface ")
     {
-        return tropel_es::typescript_to_javascript_keep_exports(&preprocessed, "script.js")
-            .map_err(|e| TropelError::Parse(format!("TS transpile error: {}", e)));
-    }
+        // No path hint — detect TS patterns heuristically.
+        tropel_es::typescript_to_javascript_keep_exports(&preprocessed, "script.js")
+            .map_err(|e| TropelError::Parse(format!("TS transpile error: {}", e)))
+    } else {
+        Ok(preprocessed)
+    };
 
-    Ok(preprocessed)
+    if let Some((cache, key)) = cache {
+        if let Ok(src) = &result {
+            cache.lock().unwrap().insert(key, src.clone());
+        }
+    }
+    result
 }
+
+/// Process-global cache of prepared module source keyed by
+/// `(path, mtime)` — bounded by the (small) number of distinct script and
+/// helper files in a run, so it cannot grow unboundedly.
+type ModuleSourceCache =
+    std::sync::Mutex<std::collections::HashMap<(String, Option<std::time::SystemTime>), String>>;
+static MODULE_SOURCE_CACHE: std::sync::OnceLock<ModuleSourceCache> = std::sync::OnceLock::new();
 
 /// Evaluate an ES module and return the named export serialized as JSON.
 ///
@@ -12262,6 +12294,63 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         assert_eq!(k6_http_error_code(404), 1404);
         assert_eq!(k6_http_error_code(500), 1500);
         assert_eq!(k6_http_error_code(503), 1503);
+    }
+
+    /// TR-313: `prepare_module_source` caches by (path, mtime) — the script
+    /// is transpiled once per process, not N+2 times (declared_options +
+    /// setup + N× init). Two calls with the same path return the identical
+    /// prepared source, and a file whose mtime changes gets a fresh
+    /// re-parse (the cache must not serve stale content).
+    #[test]
+    fn test_prepare_module_source_cached_by_path_and_mtime() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("tropel-test-module-cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("s.ts");
+        let mut f = std::fs::File::create(&script_path).unwrap();
+        writeln!(
+            f,
+            "export function greet(name: string): string {{ return name; }}"
+        )
+        .unwrap();
+        f.sync_all().unwrap();
+
+        let original = std::fs::read_to_string(&script_path).unwrap();
+        let first =
+            prepare_module_source(&original, Some(&script_path)).expect("first transpile works");
+        assert!(
+            !first.contains(": string"),
+            "TS types must be stripped: {first}"
+        );
+        assert!(first.contains("greet"), "export must survive: {first}");
+
+        let second =
+            prepare_module_source(&original, Some(&script_path)).expect("cached reparse works");
+        assert_eq!(
+            first, second,
+            "same path+mtime must return the identical prepared source"
+        );
+
+        // Change the file (new mtime) → the cache must not serve stale content.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut f2 = std::fs::File::create(&script_path).unwrap();
+        writeln!(
+            f2,
+            "export function other(x: number): number {{ return x + 1; }}"
+        )
+        .unwrap();
+        f2.sync_all().unwrap();
+        let changed = std::fs::read_to_string(&script_path).unwrap();
+        let third =
+            prepare_module_source(&changed, Some(&script_path)).expect("re-transpile works");
+        assert!(
+            third.contains("other") && !third.contains("greet"),
+            "mtime change must invalidate the cache: {third}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TR-245: deferred modules surface — parseHTML, csv, streams, grpc

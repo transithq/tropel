@@ -96,23 +96,29 @@ impl Engine {
         let mut declared_scenarios: Option<HashMap<String, ScenarioConfig>> = None;
         let mut declared_execution: Option<ExecutionConfig> = None;
         let mut declared_trend_stats: Option<Vec<String>> = None;
+        // TR-313: read the script ONCE, share the bytes across the
+        // declared_options resolution AND the scenario-loop resolution
+        // (which used to re-read the file independently). The bytes are
+        // also cached for the scenario tasks.
+        let script_bytes = std::fs::read(&config.input).ok();
+        let script_bytes_ref = script_bytes.as_deref();
         {
             let input_path = std::path::Path::new(&config.input);
-            let bytes = std::fs::read(&config.input).ok();
             if let (Some(bytes), Ok(ResolvedInput::Driver(driver))) = (
-                bytes,
+                script_bytes_ref,
                 resolve_input_or_driver(
                     &config.input,
                     config.input_type.as_deref(),
                     &registry,
                     &config.env,
+                    script_bytes_ref,
                 ),
             ) {
                 // Backlog line 153: a script that DECLARES malformed options
                 // (e.g. a type mismatch in `stages`) aborts the run instead of
                 // silently falling back to the CLI profile — k6 hard-errors.
                 let declared = driver
-                    .declared_options(&bytes, Some(input_path), &config.env)
+                    .declared_options(bytes, Some(input_path), &config.env)
                     .await?;
                 if let Some(decl) = declared {
                     // Script-declared global body handling (k6
@@ -524,6 +530,9 @@ impl Engine {
             let fmt_hint = format_hint.clone();
             let control_port = config.control_port;
             let rps_limiter_sc = rps_limiter.clone();
+            // TR-313: the scenario task reuses the bytes read at startup
+            // instead of re-reading the script file.
+            let script_bytes_sc = script_bytes.clone();
 
             let handle = tokio::spawn(async move {
                 let resolved = resolve_input_or_driver(
@@ -531,6 +540,7 @@ impl Engine {
                     fmt_hint.as_deref(),
                     &registry_sc,
                     &base_env,
+                    script_bytes_sc.as_deref(),
                 );
                 let resolved = match resolved {
                     Ok(r) => r,

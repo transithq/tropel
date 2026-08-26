@@ -1118,14 +1118,16 @@ fn resolve_ref(
     if let Some(cached) = cache.get(ref_str) {
         return Some(cached.clone());
     }
-    let target = resolve_pointer(root, ref_str)?;
+    // TR-308: check the cycle BEFORE resolving the pointer (which deep-
+    // clones the target). The old code resolved the pointer FIRST, then
+    // checked in_progress — a cycle deep-copied the target (potentially
+    // megabytes) only to discard it at the cycle check.
     if in_progress.contains(ref_str) {
-        // Cycle (recursive schema): cut the recursion with a bounded
-        // placeholder instead of inlining forever (P0: k¹⁶ explosion).
         return Some(Value::Object(serde_json::Map::new()));
     }
+    let target = resolve_pointer(root, ref_str)?;
     in_progress.insert(ref_str.to_string());
-    let resolved = resolve_value(&target, root, cache, in_progress);
+    let resolved = resolve_value(target, root, cache, in_progress);
     in_progress.remove(ref_str);
     cache.insert(ref_str.to_string(), resolved.clone());
     Some(resolved)
@@ -1133,14 +1135,13 @@ fn resolve_ref(
 
 /// Resolve a JSON Reference pointer (`#/components/schemas/Foo`) against a
 /// document Value. Returns `None` for external refs or missing targets.
-fn resolve_pointer(root: &Value, pointer: &str) -> Option<Value> {
+fn resolve_pointer<'a>(root: &'a Value, pointer: &str) -> Option<&'a Value> {
     let pointer = pointer.strip_prefix('#')?;
     if pointer.is_empty() {
-        return Some(root.clone());
+        return Some(root);
     }
     let mut cur = root;
     for part in pointer.trim_start_matches('/').split('/') {
-        // Decode JSON-pointer escapes: ~1 → '/', ~0 → '~'.
         let decoded = part.replace("~1", "/").replace("~0", "~");
         cur = match cur {
             Value::Object(map) => map.get(&decoded)?,
@@ -1148,7 +1149,7 @@ fn resolve_pointer(root: &Value, pointer: &str) -> Option<Value> {
             _ => return None,
         };
     }
-    Some(cur.clone())
+    Some(cur)
 }
 
 // ── Type array helpers (OpenAPI 3.1) ──────────────────────────

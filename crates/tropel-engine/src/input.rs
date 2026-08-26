@@ -19,10 +19,18 @@ pub(crate) fn resolve_input_or_driver(
     format_hint: Option<&str>,
     registry: &ExtensionRegistry,
     base_env: &HashMap<String, String>,
+    pre_read: Option<&[u8]>,
 ) -> Result<ResolvedInput> {
     let input_p = std::path::Path::new(input_path);
-    let bytes = std::fs::read(input_path)
-        .map_err(|e| TropelError::Parse(format!("Failed to read '{}': {}", input_path, e)))?;
+    // TR-313: reuse the bytes already read by the caller (engine startup
+    // reads the file once for `declared_options`; this function used to
+    // re-read it on EVERY call — twice per run, back-to-back with the
+    // caller's own read). `None` → read here (the standalone path).
+    let bytes: Vec<u8> = match pre_read {
+        Some(b) => b.to_vec(),
+        None => std::fs::read(input_path)
+            .map_err(|e| TropelError::Parse(format!("Failed to read '{}': {}", input_path, e)))?,
+    };
 
     // 1. Try drivers first
     let driver: Option<Box<dyn Driver>> = if let Some(fmt) = format_hint {
