@@ -51,6 +51,7 @@ fn fixture() -> MetricsResult {
         errors: 0,
         series_dropped: 0,
         output_samples_dropped: 0,
+        aggregator_samples_dropped: 0,
         summary_trend_stats: k6_default_trend_stats(),
         effective_thresholds: HashMap::from([
             (

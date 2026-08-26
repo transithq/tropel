@@ -21,6 +21,15 @@ pub use thresholds::*;
 pub static OUTPUT_SAMPLES_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// TR-301: samples dropped at the AGGREGATOR boundary because the bounded
+/// mpsc channel (`MAX_PENDING_SAMPLES`) was full — the aggregator was
+/// starved by a slow output on the same runtime. The blocking send was
+/// replaced with `try_send` so a slow output can never block every VU;
+/// the drop is COUNTED here and surfaced in the summary (TR-001 makes the
+/// drop visible — a run that lost samples is never reported clean).
+pub static AGGREGATOR_SAMPLES_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The k6 metric unit model (backlog line 32): a metric carries BOTH an
 /// aggregation type (`MetricType`: Counter/Gauge/Rate/Trend) AND a unit
 /// (`Time`/`Data`/`Default`). `Time` values are fractional milliseconds

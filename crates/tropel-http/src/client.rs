@@ -107,14 +107,21 @@ type CertClientMap = Arc<Mutex<HashMap<(String, String, bool), reqwest::Client>>
 /// Per-VU HTTP client with auth and response tracking.
 #[derive(Clone)]
 pub struct HttpClient {
-    /// Primary client: follows redirects per `HttpConfig.max_redirects`.
-    inner: reqwest::Client,
-    /// Twin client that never follows redirects (`Policy::none()`), used when
+    /// HTTP/2 connection lanes (TR-303): `config.http2_connections`
+    /// independent reqwest::Client instances, each with its OWN connection
+    /// pool. hyper runs a single h2 connection per pool, so N concurrent
+    /// streams beyond the server's MAX_CONCURRENT_STREAMS queue on the one
+    /// connection. N lanes = N h2 connections = stream acquisition
+    /// parallelized. Round-robin via `next_lane`.
+    inner: Vec<reqwest::Client>,
+    /// Twin clients that never follow redirects (`Policy::none()`), used when
     /// a request sets `follow_redirects: false` (reqwest bakes the redirect
     /// policy into the client at build time, so per-request redirect control
     /// needs a second client). `None` when `max_redirects == 0` — the primary
     /// client already never follows.
-    no_redirect: Option<reqwest::Client>,
+    no_redirect: Option<Vec<reqwest::Client>>,
+    /// Round-robin lane cursor (Arc so clones — one per VU — share the cursor).
+    next_lane: Arc<std::sync::atomic::AtomicUsize>,
     /// Lazily-built clients for per-request mTLS identities, keyed by
     /// `(cert_path, key_path, follow_redirects)`. The identity is baked into
     cert_clients: CertClientMap,
@@ -189,12 +196,22 @@ impl HttpClient {
         // context + resumption cache. Building both with Policy::none()
         // eliminates that waste. The no_redirect twin is still needed for
         // per-request `follow_redirects: false` when max_redirects > 0.
-        let inner = Self::build_client(
-            config,
-            tls,
-            identity.clone(),
-            reqwest::redirect::Policy::none(),
-        )?;
+        // TR-303: build `http2_connections` lanes (default 1 — a single
+        // client, preserving the pre-lane behaviour). Each lane is an
+        // independent reqwest::Client with its own pool, so an h2 server with
+        // a low MAX_CONCURRENT_STREAMS sees N parallel connections instead of
+        // N streams queued on one. The no_redirect twin mirrors the lanes.
+        let lane_count = config.http2_connections.max(1);
+        let inner: Vec<reqwest::Client> = (0..lane_count)
+            .map(|_| {
+                Self::build_client(
+                    config,
+                    tls,
+                    identity.clone(),
+                    reqwest::redirect::Policy::none(),
+                )
+            })
+            .collect::<Result<_>>()?;
         let no_redirect = if config.max_redirects > 0 {
             Some(inner.clone())
         } else {
@@ -204,6 +221,7 @@ impl HttpClient {
         Ok(Self {
             inner,
             no_redirect,
+            next_lane: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cert_clients: Arc::new(Mutex::new(HashMap::new())),
             config: config.clone(),
             tls: tls.clone(),
@@ -435,7 +453,9 @@ impl HttpClient {
         let mut handles = Vec::with_capacity(warm_urls.len());
         for url in warm_urls {
             let sem = semaphore.clone();
-            let client = self.inner.clone();
+            // Pre-warm lane 0 only — all lanes share the DNS/TLS machinery;
+            // the other lanes warm on first use.
+            let client = self.inner[0].clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await;
                 let resp = client
@@ -526,14 +546,28 @@ impl HttpClient {
             }
             None => {
                 if follow {
-                    Ok(self.inner.clone())
+                    Ok(self.pick_lane(&self.inner).clone())
                 } else if let Some(no_redirect) = &self.no_redirect {
-                    Ok(no_redirect.clone())
+                    Ok(self.pick_lane(no_redirect).clone())
                 } else {
-                    Ok(self.inner.clone())
+                    Ok(self.pick_lane(&self.inner).clone())
                 }
             }
         }
+    }
+
+    /// Round-robin lane selection (TR-303). A single `HttpClient` is shared
+    /// per VU, so a global atomic cursor spreads load across the
+    /// `http2_connections` pools regardless of VU count.
+    fn pick_lane<'a>(&self, lanes: &'a [reqwest::Client]) -> &'a reqwest::Client {
+        if lanes.len() == 1 {
+            return &lanes[0];
+        }
+        let idx = self
+            .next_lane
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % lanes.len();
+        &lanes[idx]
     }
 
     /// Execute an HTTP request with sub-timing instrumentation.
@@ -2413,6 +2447,41 @@ mod tests {
             };
             assert!(client.select_client(&req).is_ok(), "follow={}", follow);
         }
+    }
+
+    /// TR-303: `http2_connections` builds N independent reqwest clients and
+    /// lane selection round-robins across them. The config field existed but
+    /// was never wired into the client — a flag set but nothing read it.
+    #[test]
+    fn http2_connections_builds_lanes_and_round_robins() {
+        let cfg = HttpConfig {
+            http2_connections: 3,
+            ..Default::default()
+        };
+        let client = HttpClient::new(&cfg).unwrap();
+        assert_eq!(client.inner.len(), 3, "3 lanes must be built");
+        assert_eq!(
+            client.no_redirect.as_ref().unwrap().len(),
+            3,
+            "no_redirect twin must mirror the lanes"
+        );
+
+        // Round-robin: three picks must hit three distinct lanes, then wrap.
+        // `pick_lane` returns a reference into the Vec, so the address
+        // comparison is stable (distinct elements → distinct addresses).
+        let a = client.pick_lane(&client.inner) as *const _ as usize;
+        let b = client.pick_lane(&client.inner) as *const _ as usize;
+        let c = client.pick_lane(&client.inner) as *const _ as usize;
+        assert_ne!(a, b, "lane 0 != lane 1 (round-robin)");
+        assert_ne!(b, c, "lane 1 != lane 2 (round-robin)");
+        let d = client.pick_lane(&client.inner) as *const _ as usize;
+        assert_eq!(d, a, "lane selection wraps around after N picks");
+
+        // A second client (new VU) shares the cursor (Arc) — it continues the
+        // rotation, not restarts it.
+        let client2 = client.clone();
+        let e = client2.pick_lane(&client2.inner) as *const _ as usize;
+        assert_ne!(e, a, "shared cursor must not restart the rotation");
     }
 
     #[test]

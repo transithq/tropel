@@ -418,8 +418,12 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             .map(resolve_server_url)
             .unwrap_or_default()
     } else {
-        // No servers: fall back to BASE_URL env var, then empty string.
-        std::env::var("BASE_URL").unwrap_or_default()
+        // No servers: emit a `{{base_url}}` variable placeholder. TR-307:
+        // the old code read `std::env::var("BASE_URL")` at PARSE time, making
+        // the parse non-deterministic and environment-dependent. The engine
+        // injects the job's env into scenario.variables AFTER parse, so the
+        // placeholder resolves from config env (or stays literal if unset).
+        "{{base_url}}".to_string()
     };
 
     // Flatten global security requirements
@@ -1939,13 +1943,14 @@ components:
 
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
-        // Path params should be resolved
+        // Path params should be resolved (the `{{base_url}}` placeholder is a
+        // variable template, not an unresolved path param).
         assert!(
-            !req.url.contains('{'),
+            !req.url.contains("{users") && !req.url.contains("{order"),
             "Path params should be resolved: {}",
             req.url
         );
-        assert_eq!(req.url, "/users/1/orders/example");
+        assert_eq!(req.url, "{{base_url}}/users/1/orders/example");
     }
 
     #[test]
@@ -2464,7 +2469,7 @@ components:
         let scenario = adapter.parse(data).unwrap();
         assert_eq!(scenario.items.len(), 1);
         let req = scenario.items[0].request.as_ref().unwrap();
-        assert_eq!(req.url, "/items");
+        assert_eq!(req.url, "{{base_url}}/items");
     }
 
     #[test]
