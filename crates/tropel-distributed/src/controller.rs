@@ -199,10 +199,19 @@ pub async fn run_controller(
     merge_snapshots(snapshots, config.thresholds.clone(), test_start)
 }
 
-/// Read an agent's snapshot frame (drain any prior frames defensively).
+/// Read an agent's snapshot frames until the final one (`done: true`).
+/// Periodic progress frames (`done: false`) are logged but not merged.
 async fn read_agent_snapshot(stream: &mut tokio::net::TcpStream) -> Result<MetricsSnapshot> {
-    let msg = read_frame::<_, SnapshotMsg>(stream).await?;
-    Ok(msg.snapshot)
+    loop {
+        let msg = read_frame::<_, SnapshotMsg>(stream).await?;
+        if msg.done {
+            return Ok(msg.snapshot);
+        }
+        tracing::debug!(
+            "Controller: periodic progress snapshot ({} series)",
+            msg.snapshot.series.len()
+        );
+    }
 }
 
 /// A per-agent timeout bounded by the job's own declared duration: base

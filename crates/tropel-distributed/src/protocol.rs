@@ -78,6 +78,16 @@ pub fn generate_token() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMsg {
     pub snapshot: MetricsSnapshot,
+    /// TR-309: `false` → a periodic progress snapshot (controller logs it but
+    /// does NOT merge); `true` → the final snapshot, which the controller
+    /// merges into the run results. Defaults to true for backward compat
+    /// with a single-frame agent.
+    #[serde(default = "default_done")]
+    pub done: bool,
+}
+
+fn default_done() -> bool {
+    true
 }
 
 /// Maximum accepted frame size (guard against corrupt/hostile streams).

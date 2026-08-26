@@ -69,24 +69,55 @@ pub async fn run_agent(controller_addr: &str, token: &str) -> Result<()> {
     config.execution_segment = Some(assign.segment);
     config.execution_segment_sequence = assign.sequence;
 
+    // TR-309: create a channel for periodic snapshots. The engine will send
+    // a snapshot every 2s; we forward them to the controller as progress.
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<tropel_metrics::collector::MetricsSnapshot>(16);
+
     // Run the engine with the applied segment. The engine scales the
     // workload deterministically to this node's share.
     let registry = ExtensionRegistry::new();
-    let engine = Engine::new(registry);
-    let result = engine.run(&config).await?;
+    let engine = Engine::new(registry).with_snapshot_sink(progress_tx);
+    let mut engine_task = tokio::spawn(async move {
+        let result = engine.run(&config).await;
+        result
+    });
 
-    tracing::info!(
-        "Agent: finished — {}/{} iterations, {} reqs — shipping snapshot",
-        result.metrics.iterations,
-        total,
-        result.metrics.http_reqs
-    );
-
-    let msg = SnapshotMsg {
-        snapshot: result.snapshot,
-    };
-    write_frame(&mut stream, &msg).await?;
-    tracing::info!("Agent: snapshot shipped");
+    // Forward periodic snapshots to the controller while the engine runs.
+    // The final snapshot is sent after engine finishes.
+    loop {
+        tokio::select! {
+            snap = progress_rx.recv() => match snap {
+                Some(snap) => {
+                    let msg = SnapshotMsg {
+                        snapshot: snap,
+                        done: false,
+                    };
+                    if let Err(e) = write_frame(&mut stream, &msg).await {
+                        tracing::warn!("Agent: periodic snapshot write failed: {e}");
+                    }
+                }
+                None => break, // engine finished
+            },
+            result = &mut engine_task => {
+                // Engine finished — send the final snapshot.
+                let result = result.map_err(|e| TropelError::Other(format!("engine panicked: {e}")))??;
+                tracing::info!(
+                    "Agent: finished — {}/{} iterations, {} reqs — shipping final snapshot",
+                    result.metrics.iterations,
+                    total,
+                    result.metrics.http_reqs
+                );
+                let msg = SnapshotMsg {
+                    snapshot: result.snapshot,
+                    done: true,
+                };
+                write_frame(&mut stream, &msg).await?;
+                tracing::info!("Agent: final snapshot shipped");
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
