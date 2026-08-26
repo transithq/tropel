@@ -32,6 +32,11 @@ http.workspace = true
 flate2.workspace = true
 simd-json.workspace = true
 url.workspace = true
+# TR-245: k6/net/grpc — the k6 Client.invoke bridge reuses the same
+# tropel-x-grpc protocol executor the declarative runner uses (one
+# implementation per behaviour, invariant 4). It is an existing in-workspace
+# crate, already compiled for the engine; no new transitive deps.
+tropel-x-grpc.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
