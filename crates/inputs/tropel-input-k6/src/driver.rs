@@ -2081,7 +2081,9 @@ fn parse_k6_extras(extras: &serde_json::Value) -> K6RequestExtras {
             .map(str::to_string),
         cookies: extras
             .get("cookies")
-            .and_then(|c| serde_json::from_value::<Vec<tropel_sdk::types::RequestCookie>>(c.clone()).ok())
+            .and_then(|c| {
+                serde_json::from_value::<Vec<tropel_sdk::types::RequestCookie>>(c.clone()).ok()
+            })
             .unwrap_or_default(),
     }
 }
@@ -5515,8 +5517,12 @@ mod tests {
         // TR-230: algorithms apply LEFT-TO-RIGHT (k6 compression.go) —
         // "gzip,deflate" gzips then deflates the gzip output, and
         // Content-Encoding lists BOTH in order.
-        let (double, ce3) = compress_k6_body("gzip,deflate", &data).expect("double should compress");
-        assert_eq!(ce3, "gzip, deflate", "Content-Encoding must list both, in order");
+        let (double, ce3) =
+            compress_k6_body("gzip,deflate", &data).expect("double should compress");
+        assert_eq!(
+            ce3, "gzip, deflate",
+            "Content-Encoding must list both, in order"
+        );
         let mut dec3 = flate2::read::DeflateDecoder::new(double.as_slice());
         let mut mid = Vec::new();
         dec3.read_to_end(&mut mid).unwrap();

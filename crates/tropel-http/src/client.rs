@@ -841,9 +841,10 @@ impl HttpClient {
                                 for (name, value) in
                                     parse_cookie_header_value(jar_value.to_str().unwrap_or(""))
                                 {
-                                    let replaced = request.cookies.iter().any(|c| {
-                                        c.replace && c.name.eq_ignore_ascii_case(&name)
-                                    });
+                                    let replaced = request
+                                        .cookies
+                                        .iter()
+                                        .any(|c| c.replace && c.name.eq_ignore_ascii_case(&name));
                                     if !replaced {
                                         parts.push(format!("{name}={value}"));
                                     }
