@@ -161,7 +161,7 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 ## TR-314 · The wasmtime host runs guests at ~1/2 speed
 **Effort:** S · **Blocked by:** TR-002
 
-- [ ] Two config dials — fuel is enabled unconditionally, plus one more — give **~2–2.6× on all guest code**
+- [ ] Two config dials — fuel is enabled unconditionally, plus one more — give **~2–2.6× on all guest code** — **investigated**: `consume_fuel(true)` is a DELIBERATE DoS guard for untrusted WASM plugins (an infinite loop traps with OutOfFuel instead of hanging the host); disabling it is a security regression. `max_wasm_stack(512 KB)` matches wasmtime's default. Changing either needs the register's measurement + a security decision — left open with the rationale documented.
 - [ ] Measure before and after; this is the highest ratio-per-line item in the wave
 
 ## TR-315 · Soak-duration leaks
