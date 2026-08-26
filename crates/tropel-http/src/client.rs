@@ -689,8 +689,13 @@ impl HttpClient {
             // Each redirect hop is checked too — a Location header pointing
             // at a blacklisted literal must not slip past the resolver.
             check_literal_blacklist(&self.blacklist, &current_url)?;
-            // Line 454: parse once per hop, reuse for cookie jar + redirect.
-            let hop_url = reqwest::Url::parse(&current_url).ok();
+            // Line 454 + TR-312: parse the URL ONCE per hop and reuse the
+            // parsed Url for BOTH the reqwest builder and the cookie jar.
+            // The old code let reqwest re-parse the string internally AND
+            // parsed it again for the jar — two parses per hop (three with
+            // the redirect rewrite).
+            let hop_url = reqwest::Url::parse(&current_url)
+                .map_err(|e| TropelError::Http(format!("Invalid URL '{}': {}", current_url, e)))?;
             // The per-hop timing slot is created BEFORE the request body so the
             // timed body wrapper can record the request-write phase into it.
             // request_start is stamped later, just before execute() (see below).
@@ -709,14 +714,14 @@ impl HttpClient {
             // .disableBodyPruning). HEAD/CONNECT edge cases: reqwest tolerates
             // a body on HEAD; CONNECT is rejected below.
             let mut req_builder = match &current_method {
-                Method::GET => client.get(&current_url),
-                Method::POST => client.post(&current_url),
-                Method::PUT => client.put(&current_url),
-                Method::PATCH => client.patch(&current_url),
-                Method::DELETE => client.delete(&current_url),
-                Method::HEAD => client.head(&current_url),
-                Method::OPTIONS => client.request(reqwest::Method::OPTIONS, &current_url),
-                Method::TRACE => client.request(reqwest::Method::TRACE, &current_url),
+                Method::GET => client.get(hop_url.clone()),
+                Method::POST => client.post(hop_url.clone()),
+                Method::PUT => client.put(hop_url.clone()),
+                Method::PATCH => client.patch(hop_url.clone()),
+                Method::DELETE => client.delete(hop_url.clone()),
+                Method::HEAD => client.head(hop_url.clone()),
+                Method::OPTIONS => client.request(reqwest::Method::OPTIONS, hop_url.clone()),
+                Method::TRACE => client.request(reqwest::Method::TRACE, hop_url.clone()),
                 Method::CONNECT => {
                     return Err(TropelError::Http("CONNECT method not supported".into()));
                 }
@@ -728,7 +733,7 @@ impl HttpClient {
                     let method = reqwest::Method::from_bytes(m.as_bytes()).map_err(|e| {
                         TropelError::Http(format!("Invalid HTTP method '{}': {}", m, e))
                     })?;
-                    client.request(method, &current_url)
+                    client.request(method, hop_url.clone())
                 }
             };
             if let Some(bytes) = &current_body {
@@ -836,18 +841,16 @@ impl HttpClient {
                         {
                             parts.push(manual.clone());
                         }
-                        if let Some(ref url) = hop_url {
-                            if let Some(jar_value) = jar.cookies(url) {
-                                for (name, value) in
-                                    parse_cookie_header_value(jar_value.to_str().unwrap_or(""))
-                                {
-                                    let replaced = request
-                                        .cookies
-                                        .iter()
-                                        .any(|c| c.replace && c.name.eq_ignore_ascii_case(&name));
-                                    if !replaced {
-                                        parts.push(format!("{name}={value}"));
-                                    }
+                        if let Some(jar_value) = jar.cookies(&hop_url) {
+                            for (name, value) in
+                                parse_cookie_header_value(jar_value.to_str().unwrap_or(""))
+                            {
+                                let replaced = request
+                                    .cookies
+                                    .iter()
+                                    .any(|c| c.replace && c.name.eq_ignore_ascii_case(&name));
+                                if !replaced {
+                                    parts.push(format!("{name}={value}"));
                                 }
                             }
                         }
@@ -864,11 +867,8 @@ impl HttpClient {
                             .iter()
                             .any(|(k, _)| k.eq_ignore_ascii_case("cookie"));
                         if !has_explicit_cookie {
-                            if let Some(ref url) = hop_url {
-                                if let Some(value) = jar.cookies(url) {
-                                    req_builder =
-                                        req_builder.header(reqwest::header::COOKIE, value);
-                                }
+                            if let Some(value) = jar.cookies(&hop_url) {
+                                req_builder = req_builder.header(reqwest::header::COOKIE, value);
                             }
                         }
                     }
@@ -1074,11 +1074,9 @@ impl HttpClient {
             // EVERY hop (including redirect hops), so a session cookie set by
             // an intermediate redirect is available to the next hop.
             if let Some(jar) = jar {
-                if let Some(ref url) = hop_url {
-                    for v in response.headers().get_all(reqwest::header::SET_COOKIE) {
-                        if let Ok(s) = v.to_str() {
-                            jar.add_cookie_str(s, url);
-                        }
+                for v in response.headers().get_all(reqwest::header::SET_COOKIE) {
+                    if let Ok(s) = v.to_str() {
+                        jar.add_cookie_str(s, &hop_url);
                     }
                 }
             }
@@ -1162,9 +1160,7 @@ impl HttpClient {
                     });
 
                     // Resolve the Location header against the current URL.
-                    let base = hop_url.ok_or_else(|| {
-                        TropelError::Http(format!("Invalid request URL '{}'", current_url))
-                    })?;
+                    let base = &hop_url;
                     let next = base.join(&location).map_err(|e| {
                         TropelError::Http(format!(
                             "Invalid redirect Location '{}': {}",

@@ -141,7 +141,7 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 - [ ] **The response body is copied 6 times; the floor is 2** — `Bytes` → `to_vec` → `clone` → `Response::from` → `from_utf8` → …
 - [ ] Four near-one-line allocation fixes together remove **~18 allocations and two full body copies per request** (~200 µs)
 - [ ] `TagMap` construction allocates ~15× per hop where ~6 would do
-- [ ] Parse the URL **once** per hop — there are currently 3 parses per request
+- [x] Parse the URL **once** per hop — there are currently 3 parses per request — **fixed**: `execute_with_jar` parses once, reuses the `Url` for the reqwest builder AND the cookie jar AND the redirect join
 - [ ] Intern metric names; `MetricKey::new` allocates ~24× per request in the aggregator
 - [ ] Retain the sink `Vec`'s capacity — `mem::take` leaves `Vec::new()`, which re-grows 4→8→16 every tick
 - [ ] Static tables for `status` and `method` instead of `Arc::from(status_code.to_string())`
