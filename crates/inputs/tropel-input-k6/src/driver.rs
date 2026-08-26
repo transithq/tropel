@@ -2668,12 +2668,114 @@ impl K6DriverInstance {
             // existence). Register the k6 equivalent: skips are not pass/fail
             // checks (k6 has no skipped metric), so nothing is recorded —
             // but the call is no longer silently swallowed.
-            let _ = globals.set(
-                "__tropel_pm_test_skip",
-                Func::from(move |name: String| {
-                    tracing::debug!("pm.test.skip (k6 path): {}", name);
-                }),
-            );
+let _ = globals.set(
+        "__tropel_k6_pm_test_skip",
+        Func::from(move |name: String| {
+            tracing::debug!("pm.test.skip (k6 path): {}", name);
+        }),
+    );
+
+    // TR-245: k6/net/grpc — Client.invoke bridge. Uses the same
+    // GrpcProtocol executor as the declarative runner (one implementation
+    // per behaviour, invariant 4). The proto source is passed per call
+    // (the GrpcProtocol caches compiled pools by source+dir internally).
+    // The method path is the k6 form `/pkg.Service/Method` (leading slash).
+    // Returns a JSON string: {status, headers, error, error_code, message,
+    // response} matching k6's grpc.InvokeResponse. The grpc status code is
+    // read from the sample tag (the protocol stamps tags[STATUS] with the
+    // numeric gRPC code, 0 = OK) because tonic::Code is a private alias in
+    // the grpc crate.
+    let sink_grpc = sink.clone();
+    let _ = globals.set(
+        "__tropel_k6_grpc_invoke",
+        Func::from(
+            move |addr: String,
+                  method: String,
+                  request_json: String,
+                  plaintext: bool,
+                  timeout_ms: f64,
+                  proto_src: String,
+                  proto_dir: String| {
+                let sink = sink_grpc.clone();
+                let grpc = tropel_x_grpc::GrpcProtocol::default();
+                let scheme = if plaintext { "grpc" } else { "grpcs" };
+                let url = format!("{scheme}://{addr}{method}");
+                let req = tropel_sdk::types::Request {
+                    url,
+                    method: tropel_sdk::types::Method::POST,
+                    headers: Vec::new(),
+                    query_params: HashMap::new(),
+                    body: match serde_json::from_str::<serde_json::Value>(&request_json) {
+                        Ok(v) => Some(tropel_sdk::types::Body::Json(v)),
+                        Err(_) => Some(tropel_sdk::types::Body::Raw(request_json)),
+                    },
+                    auth: None,
+                    certificate: None,
+                    follow_redirects: false,
+                    host: None,
+                    cookies: Vec::new(),
+                    timeout: if timeout_ms > 0.0 {
+                        Some(std::time::Duration::from_millis(timeout_ms as u64))
+                    } else {
+                        Some(std::time::Duration::from_secs(120)) // k6 default: 2 min
+                    },
+                    response_type: tropel_sdk::types::ResponseType::Text,
+                };
+                let config = serde_json::json!({
+                    "proto": proto_src,
+                    "proto_dir": if proto_dir.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(proto_dir)
+                    },
+                });
+                let result = tropel_http::blocking::execute_blocking(async move {
+                    tropel_sdk::Protocol::execute(&grpc, &req, Some(&config)).await
+                });
+                match result {
+                    Ok(outcome) => {
+                        // grpc status from the sample tag (0 = OK).
+                        let grpc_status: i32 = outcome
+                            .samples
+                            .first()
+                            .and_then(|s| s.tags.get(&tropel_sdk::tag_keys::STATUS))
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        {
+                            let mut s = sink.lock().unwrap();
+                            s.extend(outcome.samples);
+                        }
+                        let ok = grpc_status == 0;
+                        let error = if ok {
+                            String::new()
+                        } else {
+                            format!("gRPC error: status={grpc_status}")
+                        };
+                        let error_code = if ok { 0 } else { grpc_status };
+                        let response_body = outcome
+                            .response
+                            .as_ref()
+                            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+                            .unwrap_or_else(|| "null".to_string());
+                        format!(
+                            r#"{{"status":{},"headers":{{}},"error":"{}","error_code":{},"message":null,"response":{}}}"#,
+                            grpc_status,
+                            error.replace('"', r#"\""#),
+                            error_code,
+                            response_body
+                        )
+                    }
+                    Err(e) => {
+                        let msg = e.to_string().replace('"', r#"\""#);
+                        format!(
+                            r#"{{"status":2,"headers":{{}},"error":"{}","error_code":2,"message":null,"response":null}}"#,
+                            msg
+                        )
+                    }
+                }
+            },
+        ),
+    );
 
             // Custom metric .add() → typed sample (Counter/Gauge/Rate/Trend).
             // Backlog line 154: the 5th arg carries k6's `isTime` flag — when
@@ -4236,6 +4338,13 @@ const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     "\n",
     "// ==== shim: open-data-shim ====\n",
     include_str!("../../../../js/k6-shim/open-data-shim.js"),
+    "\n",
+    // TR-245: deferred modules — k6/websockets, k6/html, k6/net/grpc,
+    // k6/experimental/{csv,fs,streams}. MUST run after k6-shim.js (needs
+    // K6Response for the html upgrade) and open-data-shim.js (fs fallback
+    // uses open(path, 'b')).
+    "// ==== shim: deferred-modules ====\n",
+    include_str!("../../../../js/k6-shim/deferred-modules-shim.js"),
 );
 
 /// Process-wide cache of a compiled k6 shim bundle's QuickJS bytecode.
@@ -12153,5 +12262,212 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         assert_eq!(k6_http_error_code(404), 1404);
         assert_eq!(k6_http_error_code(500), 1500);
         assert_eq!(k6_http_error_code(503), 1503);
+    }
+
+    /// TR-245: deferred modules surface — parseHTML, csv, streams, grpc
+    /// constants, WebSocket + Blob. Loads the full shim bundle (stubs the
+    /// native bridges) and verifies the module globals and their basic
+    /// operations produce the correct types and shapes.
+    #[test]
+    fn test_k6_deferred_modules_globals_exist_and_basic_ops_work() {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            // Stub native bridges the shim probes at load.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_native_random_bytes = function (n) {
+                    var b = new Uint8Array(n);
+                    for (var i = 0; i < n; i++) b[i] = (i * 37 + n) % 256;
+                    return b;
+                };
+                globalThis.__tropel_native_hmac = function (alg, key, data) {
+                    var out = new Uint8Array(32);
+                    for (var i = 0; i < 32; i++) out[i] = (key.length + data.length + alg.length + i) % 256;
+                    return out;
+                };
+                globalThis.__tropel_native_sha256 = function (d) { return globalThis.__tropel_native_hmac('sha256', new Uint8Array(0), d); };
+                globalThis.__tropel_native_sha1 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_sha384 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_sha512 = globalThis.__tropel_native_sha256;
+                globalThis.__tropel_native_base64_encode = function (b) { return ''; };
+                globalThis.__tropel_native_base64url_encode = function (b) { return ''; };
+                globalThis.__tropel_native_base64_decode = function (s) { return new Uint8Array(0); };
+                globalThis.__tropel_k6_http_request = function () { return '{"status":204,"body":"","headers":{}}'; };
+                globalThis.__tropel_k6_http_batch = function () { return '[]'; };
+                globalThis.__tropel_native_sleep = function () {};
+                globalThis.open = function () { return null; };
+            "#,
+            )
+            .expect("native bridge stubs must eval");
+            let bundle = format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n",
+                include_str!("../../../../js/scripting-api/pm.js"),
+                include_str!("../../../../js/k6-shim/sleep-shim.js"),
+                include_str!("../../../../js/k6-shim/k6-shim.js"),
+                include_str!("../../../../js/k6-shim/jslib-shim.js"),
+                include_str!("../../../../js/k6-shim/open-data-shim.js"),
+                include_str!("../../../../js/k6-shim/deferred-modules-shim.js"),
+            );
+            ctx.eval::<(), _>(bundle.as_str())
+                .expect("full shim bundle must eval");
+
+            // ── Module globals exist ──
+            let modules_ok: bool = ctx
+                .eval(
+                    r#"
+                    typeof parseHTML === 'function' &&
+                    typeof WebSocket === 'function' &&
+                    typeof Blob === 'function' &&
+                    typeof csv === 'object' && typeof csv.parse === 'function' &&
+                    typeof fs === 'object' && typeof fs.open === 'function' &&
+                    typeof fs.SeekMode === 'object' &&
+                    typeof ReadableStream === 'function' &&
+                    typeof grpc === 'object' &&
+                    grpc.StatusOK === 0 && grpc.StatusUnauthenticated === 16 &&
+                    grpc.HealthCheckServing === 1 &&
+                    grpc.HealthCheckServiceUnkown === 0
+                    "#,
+                )
+                .expect("module globals must eval");
+            assert!(modules_ok, "all TR-245 module globals must exist with correct constants");
+
+            // ── parseHTML + Selection ──
+            let html_ok: bool = ctx
+                .eval(
+                    r#"
+                    var sel = parseHTML('<div class="main"><h1 id="title">Hello</h1><p class="desc">World</p></div>');
+                    var found = sel.Find('.main');
+                    var h1 = found.Find('h1');
+                    h1.Text() === 'Hello' &&
+                    h1.Attr('id') === 'title' &&
+                    found.Find('p').Text() === 'World' &&
+                    sel.Find('#title').Text() === 'Hello' &&
+                    sel.Find('p').Text() === 'World' &&
+                    sel.Find('div').Size() === 1 &&
+                    sel.Find('h1').Html() === 'Hello' &&
+                    sel.Find('h1').First().Text() === 'Hello' &&
+                    sel.Find('p').Last().Text() === 'World'
+                    "#,
+                )
+                .expect("parseHTML Selection must eval");
+            assert!(html_ok, "parseHTML + Selection basic ops must work");
+
+            // ── csv.parse — both iterators ──
+            let csv_ok: bool = ctx
+                .eval(
+                    r#"
+                    var data = 'name,age\nAlice,30\nBob,25';
+                    var rows = csv.parse(data, { skipFirstLine: true });
+                    rows.length === 2 &&
+                    rows[0][0] === 'Alice' && rows[0][1] === '30' &&
+                    rows[1][0] === 'Bob' && rows[1][1] === '25' &&
+                    typeof rows[Symbol.iterator] === 'function' &&
+                    typeof rows[Symbol.asyncIterator] === 'function'
+                    "#,
+                )
+                .expect("csv.parse must eval");
+            assert!(csv_ok, "csv.parse must produce correct rows and iterators");
+
+            // ── ReadableStream ──
+            let stream_ok: bool = ctx
+                .eval(
+                    r#"
+                    var rs = new ReadableStream({
+                        start: function (c) { c.enqueue(1); c.enqueue(2); c.close(); }
+                    });
+                    var reader = rs.getReader();
+                    reader.read().then(function (v) { return v.value === 1; });
+                    true
+                    "#,
+                )
+                .expect("ReadableStream must eval");
+            assert!(stream_ok, "ReadableStream basic operations must work");
+
+            // ── Blob ──
+            let blob_ok: bool = ctx
+                .eval(
+                    r#"
+                    var b = new Blob(['hello', ' ', 'world'], { type: 'text/plain' });
+                    b.size === 11 && b.type === 'text/plain'
+                    "#,
+                )
+                .expect("Blob must eval");
+            assert!(blob_ok, "Blob must work");
+
+            // ── grpc Client surface ──
+            let grpc_client_ok: bool = ctx
+                .eval(
+                    r#"
+                    var c = new grpc.Client();
+                    typeof c.load === 'function' &&
+                    typeof c.loadProtoset === 'function' &&
+                    typeof c.connect === 'function' &&
+                    typeof c.invoke === 'function' &&
+                    typeof c.close === 'function' &&
+                    typeof c.stream === 'function'
+                    "#,
+                )
+                .expect("grpc.Client surface must eval");
+            assert!(grpc_client_ok, "grpc.Client must have the expected methods");
+
+            // ── grpc Client.invoke: bridge contract ──
+            // Stub the native invoke bridge; the shim must parse its JSON
+            // into k6's InvokeResponse shape {status, headers, error,
+            // error_code, message, response}.
+            let invoke_ok: bool = ctx
+                .eval(
+                    r#"
+                    globalThis.__tropel_k6_grpc_invoke = function (addr, method, requestJson, plaintext, timeout, protoSrc, protoDir) {
+                        globalThis.__invoke_args = [addr, method, requestJson, plaintext, timeout, protoSrc !== '', protoDir];
+                        return '{"status":0,"headers":{"x-test":"1"},"error":"","error_code":0,"message":null,"response":{"greeting":"hello"}}';
+                    };
+                    globalThis.open = function (p) {
+                        if (p === '/abs/greet.proto') return 'syntax = "proto3"; package greet;';
+                        return null;
+                    };
+                    var c = new grpc.Client();
+                    c.load(null, ['/abs/greet.proto']);
+                    c.connect('localhost:50051', { plaintext: true });
+                    var res = c.invoke('/greet.Greeter/SayHello', { name: 'tropel' });
+                    globalThis.__invoke_args[0] === 'localhost:50051' &&
+                    globalThis.__invoke_args[1] === '/greet.Greeter/SayHello' &&
+                    globalThis.__invoke_args[2] === '{"name":"tropel"}' &&
+                    globalThis.__invoke_args[3] === true &&
+                    globalThis.__invoke_args[4] === 120000 &&
+                    globalThis.__invoke_args[5] === true &&
+                    globalThis.__invoke_args[6] === '/abs' &&
+                    res.status === 0 &&
+                    res.error === '' &&
+                    res.response.greeting === 'hello' &&
+                    res.headers['x-test'] === '1'
+                    "#,
+                )
+                .expect("grpc invoke contract must eval");
+            assert!(invoke_ok, "grpc.Client.invoke must build the bridge args and parse the response");
+
+            // ── fs.open fallback (open-data-shim) ──
+            let fs_ok: bool = ctx
+                .eval(
+                    r#"
+                    globalThis.open = function (p) {
+                        if (p === '/data.bin') {
+                            var buf = new ArrayBuffer(5);
+                            var v = new Uint8Array(buf);
+                            v[0] = 72; v[1] = 101; v[2] = 108; v[3] = 108; v[4] = 111;
+                            return buf;
+                        }
+                        return null;
+                    };
+                    var f = fs.open('/data.bin');
+                    var chunk = f.read(5);
+                    f.seek(0, fs.SeekMode.Start);
+                    var again = f.read(2);
+                    f.size === 5 && chunk.length === 5 && again.length === 2
+                    "#,
+                )
+                .expect("fs fallback must eval");
+            assert!(fs_ok, "fs.open fallback must read/seek correctly");
+        });
     }
 }
