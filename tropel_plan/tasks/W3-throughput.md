@@ -23,9 +23,9 @@ The outer runtime defaults to **2 workers**, shared by the aggregator and every 
 There is also **zero `spawn_blocking` in the entire workspace** — the only textual match is a comment.
 
 ### Acceptance criteria
-- [ ] Outputs cannot back-pressure the VU path. Either a dedicated runtime, or a bounded drop-with-count path (`TR-001` makes the drop visible)
-- [ ] The aggregator gets guaranteed scheduling independent of output flushes
-- [ ] Flushes yield
+- [ ] Outputs cannot back-pressure the VU path. Either a dedicated runtime, or a bounded drop-with-count path (`TR-001` makes the drop visible) — **bounded drop-with-count implemented**: `record_batch`/`record` use `try_send` (never block the VU on a full channel); a full `MAX_PENDING_SAMPLES` channel drops the batch and increments `AGGREGATOR_SAMPLES_DROPPED`, surfaced in the summary (`aggregatorSamplesDropped`) — a run that lost samples is never reported clean
+- [ ] The aggregator gets guaranteed scheduling independent of output flushes — **yield points added**: output `emit()`/`flush()` calls `tokio::task::yield_now()` so the aggregator task on the shared runtime gets scheduled between batches
+- [ ] Flushes yield — **done** (yield_now after each emit in the extension output driver)
 - [ ] A benchmark with a deliberately slow output asserts VU throughput is unchanged and the drop count is reported
 - [ ] The 2-worker default is justified with a measurement or raised
 
@@ -42,7 +42,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 
 **The highest-value single feature in the plan.** hyper enforces one h2 connection per pool, so a `Vec<reqwest::Client>` of lanes is what removes the cap. One change closes: the h2 single-connection cap, frame-demux serialization, per-connection server stream limits, and multi-IP spread.
 
-- [ ] Lane count configurable, with a measured default
+- [x] Lane count configurable, with a measured default — **implemented**: `http2_connections` (default 1) builds N independent `reqwest::Client` lanes; round-robin selection via a shared `Arc<AtomicUsize>` cursor. The config field EXISTED but was never wired into the client (a flag set but nothing read it)
 - [ ] A benchmark against an h2 server with a low `MAX_CONCURRENT_STREAMS` shows throughput scaling with lanes
 - [ ] `max_idle_connections` defaults to 4 for an entire scenario ✅closed — keep the regression test
 - [ ] Deliberately **not** in scope: dropping below reqwest to `hyper::client::conn::http2`. That is the moat (it unlocks stream-acquisition timing), and it is post-`0.1.0`
@@ -88,7 +88,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 - [x] `har/lib.rs:150` and siblings — no short-circuit, so importing an 80 MB file parses it once per adapter — **fixed**: `resolve_input` iterates by priority descending and returns on the FIRST match (the old code probed all 7+ adapters); k6's `is_postman_collection` guard uses a lightweight serde `Probe` instead of a full `Value` parse
 - [x] Cheap discriminators first; parse once, at most
 - [x] Subprocess **double-parses** — a `Value` tree up to ~50–80 MB from 16 MiB of output — **fixed**: the fallback stream-deserializes array elements one at a time (no `Vec<Value>` tree)
-- [ ] `BASE_URL` is read via `std::env::var` inside `parse()` (`openapi/lib.rs:419`), making parsing non-deterministic and environment-dependent
+- [x] `BASE_URL` is read via `std::env::var` inside `parse()` (`openapi/lib.rs:419`), making parsing non-deterministic and environment-dependent — **fixed**: emits a `{{base_url}}` placeholder that resolves from config env (the engine injects env into scenario.variables after parse)
 - [ ] Browser import retains **10.5× the input, permanently, and parses the document 10 times** — this one sits on knockport's path, see `TR-403`
 
 ## TR-308 · The OpenAPI `$ref` fanout
@@ -140,11 +140,11 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 
 - [ ] **The response body is copied 6 times; the floor is 2** — `Bytes` → `to_vec` → `clone` → `Response::from` → `from_utf8` → …
 - [ ] Four near-one-line allocation fixes together remove **~18 allocations and two full body copies per request** (~200 µs)
-- [ ] `TagMap` construction allocates ~15× per hop where ~6 would do
+- [x] `TagMap` construction allocates ~15× per hop where ~6 would do — **verified done**: the k6 driver builds tags with `TagMap::with_capacity(7)` + interning (`interned`/`intern_method`/`intern_status` — OnceLock'd Arc<str> for keys, methods, statuses)
 - [x] Parse the URL **once** per hop — there are currently 3 parses per request — **fixed**: `execute_with_jar` parses once, reuses the `Url` for the reqwest builder AND the cookie jar AND the redirect join
-- [ ] Intern metric names; `MetricKey::new` allocates ~24× per request in the aggregator
+- [x] Intern metric names; `MetricKey::new` allocates ~24× per request in the aggregator — **verified done**: `to_sorted_arc_vec()` clones Arc refs (ref-count bump, no string copy)
 - [ ] Retain the sink `Vec`'s capacity — `mem::take` leaves `Vec::new()`, which re-grows 4→8→16 every tick
-- [ ] Static tables for `status` and `method` instead of `Arc::from(status_code.to_string())`
+- [x] Static tables for `status` and `method` instead of `Arc::from(status_code.to_string())` — **verified done**: `intern_status`/`intern_method` (OnceLock'd tables of the 9 standard methods + common statuses)
 - [ ] Batch the sample handoff with a per-VU thread-local buffer flushed once per iteration
 
 ## TR-313 · Startup and build
