@@ -33,7 +33,10 @@ pub(crate) fn spawn_extension_output(
                     Ok(sample) => {
                         batch.push(sample);
                         if batch.len() >= MAX_BATCH {
-                            let b = std::mem::take(&mut batch);
+                            // TR-312: retain the Vec's capacity instead of
+                            // mem::take (which leaves Vec::new() → re-grows
+                            // 4→8→16→… every flush).
+                            let b = std::mem::replace(&mut batch, Vec::with_capacity(1024));
                             if let Err(e) = output.emit(&b).await {
                                 tracing::warn!("extension output '{}' emit failed: {e}", output.name());
                             }
@@ -51,11 +54,11 @@ pub(crate) fn spawn_extension_output(
                 },
                 _ = tick.tick() => {
                     if !batch.is_empty() {
-                        let b = std::mem::take(&mut batch);
+                        let b = std::mem::replace(&mut batch, Vec::with_capacity(1024));
                         if let Err(e) = output.emit(&b).await {
                             tracing::warn!("extension output '{}' emit failed: {e}", output.name());
                         }
-                        // TR-301: yield so the aggregator gets scheduled.
+// TR-301: yield so the aggregator gets scheduled.
                         tokio::task::yield_now().await;
                     }
                 }
