@@ -942,7 +942,7 @@ mod tests {
 
         // Walk 100 global ticks and verify every tick is claimed by exactly
         // one segment.
-        let mut covered = vec![false; 100];
+        let mut covered = [false; 100];
         for si in 0..3 {
             let mut idx = wrapper.segmented_index(si);
             loop {
@@ -1059,7 +1059,7 @@ mod tests {
         assert!(start < 6, "segment 2 must start inside the first cycle");
 
         // Walk 24 ticks and verify full coverage
-        let mut covered = vec![false; 24];
+        let mut covered = [false; 24];
         for si in 0..3 {
             let mut idx = wrapper.segmented_index(si);
             loop {

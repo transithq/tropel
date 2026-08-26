@@ -23,6 +23,7 @@ fn make_request(url: &str, body: Option<Body>) -> Request {
         auth: None,
         certificate: None,
         follow_redirects: true,
+        host: None,
         timeout: Some(Duration::from_secs(5)),
         response_type: ResponseType::Text,
     }
