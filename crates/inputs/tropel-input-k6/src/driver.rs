@@ -1346,29 +1346,62 @@ fn push_http_samples_for(
     });
 }
 
-/// k6 `params.compression`: gzip/deflate the request body (flate2). Returns
-/// the compressed bytes, or `None` when the requested algorithm is unsupported
-/// (k6 accepts "gzip", "deflate", or both comma-separated; anything else is
-/// silently ignored — matching k6, which warns but proceeds uncompressed).
-/// Only called when a body exists (the shim always sends one for POST etc.).
-fn compress_k6_body(kind: &str, data: &[u8]) -> Option<Vec<u8>> {
+/// k6 `params.compression`: a comma-separated list of algorithms applied
+/// LEFT-TO-RIGHT (each compresses the output of the previous — k6
+/// `compression.go` `compressBody`), with `Content-Encoding` listing them in
+/// the same order. k6 supports `gzip`, `deflate`, `zstd`, `br`.
+///
+/// Tropel implements gzip/deflate (flate2, already a dependency). zstd and
+/// br need the `zstd`/`brotli` crates — a CONVENTIONS dep gate (each >100 KB,
+/// human sign-off), so they warn LOUDLY rather than silently sending the body
+/// uncompressed (invariant 3 / TR-201: a requested capability is never a
+/// silent no-op). An unknown algorithm also warns (k6 ABORTS the request on
+/// an unknown algorithm; a warning keeps the run alive but says so).
+///
+/// Returns the compressed bytes and the `Content-Encoding` header value.
+fn compress_k6_body(kind: &str, data: &[u8]) -> Option<(Vec<u8>, String)> {
     use flate2::write::{DeflateEncoder, GzEncoder};
     use flate2::Compression;
     use std::io::Write;
     if data.is_empty() {
         return None;
     }
-    if kind.contains("gzip") {
-        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
-        enc.write_all(data).ok()?;
-        enc.finish().ok()
-    } else if kind.contains("deflate") {
-        let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
-        enc.write_all(data).ok()?;
-        enc.finish().ok()
-    } else {
-        None
+    let mut out: Vec<u8> = data.to_vec();
+    let mut encodings: Vec<String> = Vec::new();
+    for part in kind.split(',') {
+        let algo = part.trim();
+        match algo {
+            "gzip" => {
+                let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+                enc.write_all(&out).ok()?;
+                out = enc.finish().ok()?;
+                encodings.push("gzip".to_string());
+            }
+            "deflate" => {
+                let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+                enc.write_all(&out).ok()?;
+                out = enc.finish().ok()?;
+                encodings.push("deflate".to_string());
+            }
+            "zstd" | "br" => {
+                // k6 supports these; tropel's request-body encoders don't
+                // (zstd/brotli crates are a CONVENTIONS dep gate).
+                tracing::warn!(
+                    "k6 params.compression: '{algo}' request-body compression is not supported by tropel — sending the body uncompressed"
+                );
+            }
+            "" => {} // k6 ignores empty segments ("gzip,,deflate")
+            other => {
+                tracing::warn!(
+                    "k6 params.compression: unknown algorithm '{other}' — k6 aborts the request; tropel warns and sends the body uncompressed"
+                );
+            }
+        }
     }
+    if encodings.is_empty() {
+        return None;
+    }
+    Some((out, encodings.join(", ")))
 }
 
 /// k6-style error codes for `res.error_code`. k6 defines a 1xxx series
@@ -2001,6 +2034,10 @@ struct K6RequestExtras {
     // carried separately so it can be applied as the wire Host while staying
     // OFF res.request.headers (k6 keeps Host off req.Header).
     host: Option<String>,
+    // TR-230: params.cookies ride structured (name/value/replace) so the
+    // client can do k6's jar merge (replace:false sends both the request and
+    // jar cookie; replace:true suppresses the jar's).
+    cookies: Vec<tropel_sdk::types::RequestCookie>,
 }
 
 fn parse_k6_extras(extras: &serde_json::Value) -> K6RequestExtras {
@@ -2042,6 +2079,10 @@ fn parse_k6_extras(extras: &serde_json::Value) -> K6RequestExtras {
             .get("host")
             .and_then(|h| h.as_str())
             .map(str::to_string),
+        cookies: extras
+            .get("cookies")
+            .and_then(|c| serde_json::from_value::<Vec<tropel_sdk::types::RequestCookie>>(c.clone()).ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -2078,16 +2119,15 @@ fn build_k6_request(
     };
     if !params.compression.is_empty() {
         if let Some(Body::Raw(text)) = &req_body {
-            if let Some(compressed) = compress_k6_body(&params.compression, text.as_bytes()) {
+            // TR-230: k6 applies the compression algorithms LEFT-TO-RIGHT
+            // (gzip then deflate double-compresses) and lists them in
+            // Content-Encoding. The old code picked gzip OR deflate (first
+            // match) and hardcoded a single Content-Encoding value.
+            if let Some((compressed, content_encoding)) =
+                compress_k6_body(&params.compression, text.as_bytes())
+            {
                 req_body = Some(Body::Binary(compressed));
-                headers.push((
-                    "Content-Encoding".to_string(),
-                    if params.compression.contains("gzip") {
-                        "gzip".to_string()
-                    } else {
-                        "deflate".to_string()
-                    },
-                ));
+                headers.push(("Content-Encoding".to_string(), content_encoding));
             }
         }
     }
@@ -2101,6 +2141,7 @@ fn build_k6_request(
         certificate: None,
         follow_redirects: params.redirects != 0,
         host: params.host.clone(),
+        cookies: params.cookies.clone(),
         timeout: if params.timeout_ms > 0.0 {
             Some(Duration::from_millis(params.timeout_ms as u64))
         } else {
@@ -5323,10 +5364,12 @@ mod tests {
                 first.contains("\\\"compression\\\":\\\"gzip\\\""),
                 "object-form compression dropped: {first}"
             );
-            // cookies are merged into the Cookie header by normalizeK6Request.
+            // TR-230: object-form cookies ride STRUCTURED (name/value/replace)
+            // in the extras so the client does k6's jar merge — no longer
+            // folded into a Cookie header by the shim.
             assert!(
-                first.contains("sid=s1"),
-                "object-form cookies not merged into Cookie header: {first}"
+                first.contains("\\\"cookies\\\":[{\\\"name\\\":\\\"sid\\\",\\\"value\\\":\\\"s1\\\",\\\"replace\\\":false}]"),
+                "object-form cookies dropped or not structured: {first}"
             );
             assert!(
                 first.contains("\"body\":\"0\""),
@@ -5453,7 +5496,8 @@ mod tests {
         // produce valid gzip/deflate and pass through the uncompressed bytes
         // (no-op) for an unsupported algorithm.
         let data = b"{\"hello\":\"world\"}".repeat(3);
-        let gz = compress_k6_body("gzip", &data).expect("gzip should compress");
+        let (gz, ce) = compress_k6_body("gzip", &data).expect("gzip should compress");
+        assert_eq!(ce, "gzip", "Content-Encoding must list the algorithm");
         assert_ne!(gz, data, "gzip must change the bytes");
         let mut dec = flate2::read::GzDecoder::new(gz.as_slice());
         use std::io::Read;
@@ -5461,16 +5505,32 @@ mod tests {
         dec.read_to_end(&mut out).unwrap();
         assert_eq!(out, data, "gzip round-trip must restore the body");
 
-        let df = compress_k6_body("deflate", &data).expect("deflate should compress");
+        let (df, ce2) = compress_k6_body("deflate", &data).expect("deflate should compress");
+        assert_eq!(ce2, "deflate");
         let mut dec2 = flate2::read::DeflateDecoder::new(df.as_slice());
         let mut out2 = Vec::new();
         dec2.read_to_end(&mut out2).unwrap();
         assert_eq!(out2, data, "deflate round-trip must restore the body");
 
-        // Unsupported algorithm → None (k6 proceeds uncompressed).
+        // TR-230: algorithms apply LEFT-TO-RIGHT (k6 compression.go) —
+        // "gzip,deflate" gzips then deflates the gzip output, and
+        // Content-Encoding lists BOTH in order.
+        let (double, ce3) = compress_k6_body("gzip,deflate", &data).expect("double should compress");
+        assert_eq!(ce3, "gzip, deflate", "Content-Encoding must list both, in order");
+        let mut dec3 = flate2::read::DeflateDecoder::new(double.as_slice());
+        let mut mid = Vec::new();
+        dec3.read_to_end(&mut mid).unwrap();
+        let mut dec4 = flate2::read::GzDecoder::new(mid.as_slice());
+        let mut out3 = Vec::new();
+        dec4.read_to_end(&mut out3).unwrap();
+        assert_eq!(out3, data, "double round-trip must restore the body");
+
+        // zstd/br are k6-supported but tropel's request encoders don't have
+        // them (dep gate) — they warn and produce None (never silently
+        // uncompressed). Empty body → None.
         assert!(
             compress_k6_body("br", &data).is_none(),
-            "unsupported must be None"
+            "brotli must be None (warned, not silently uncompressed)"
         );
         assert!(
             compress_k6_body("gzip", b"").is_none(),
@@ -8853,6 +8913,7 @@ mod tests {
             certificate: None,
             follow_redirects: true,
             host: None,
+            cookies: Vec::new(),
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         };

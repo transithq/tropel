@@ -281,6 +281,7 @@ fn block_to_item(
             certificate: None,
             follow_redirects: true,
             host: None,
+            cookies: Vec::new(),
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         }),

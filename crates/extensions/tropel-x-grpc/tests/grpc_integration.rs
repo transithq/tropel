@@ -295,6 +295,7 @@ fn make_req(url: String) -> TpRequest {
         certificate: None,
         follow_redirects: true,
         host: None,
+        cookies: Vec::new(),
         timeout: None,
         response_type: ResponseType::Text,
     }

@@ -1118,6 +1118,7 @@ fn convert_request(wr: &WasmRequest) -> Result<Request> {
         certificate: None,
         follow_redirects: wr.follow_redirects,
         host: None,
+        cookies: Vec::new(),
         timeout: wr.timeout_ms.map(std::time::Duration::from_millis),
         response_type: tropel_sdk::types::ResponseType::Text,
     })

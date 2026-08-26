@@ -557,6 +557,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                     certificate: None,
                     follow_redirects: true,
                     host: None,
+                    cookies: Vec::new(),
                     timeout: None,
                     response_type: tropel_sdk::ResponseType::Text,
                 }),

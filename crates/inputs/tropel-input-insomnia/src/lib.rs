@@ -336,6 +336,7 @@ fn request_to_item(r: &InsomniaResource) -> Result<ScenarioItem> {
             certificate: None,
             follow_redirects: true,
             host: None,
+            cookies: Vec::new(),
             timeout: None,
             response_type: tropel_sdk::ResponseType::Text,
         }),

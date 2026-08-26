@@ -262,6 +262,7 @@ mod tests {
                     certificate: None,
                     follow_redirects: true,
                     host: None,
+                    cookies: Vec::new(),
                     timeout: None,
                     response_type: tropel_sdk::types::ResponseType::Text,
                 }),

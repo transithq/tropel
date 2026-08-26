@@ -24,6 +24,7 @@ fn make_request(url: &str, body: Option<Body>) -> Request {
         certificate: None,
         follow_redirects: true,
         host: None,
+        cookies: Vec::new(),
         timeout: Some(Duration::from_secs(5)),
         response_type: ResponseType::Text,
     }
