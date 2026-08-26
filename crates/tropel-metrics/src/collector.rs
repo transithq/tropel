@@ -71,7 +71,7 @@ impl MetricKey {
     pub fn new(metric: &str, tags: &tropel_sdk::types::TagMap) -> Self {
         let tags = tags.to_sorted_arc_vec();
         Self {
-            metric: Arc::from(metric),
+            metric: intern_metric(metric),
             tags,
         }
     }
@@ -115,6 +115,50 @@ impl PartialEq for MetricKey {
     fn eq(&self, other: &Self) -> bool {
         self.metric == other.metric && self.tags == other.tags
     }
+}
+
+/// TR-312: intern metric names to avoid allocating an `Arc<str>` per sample
+/// for the same metric name. The hot path (MetricKey::new) calls this once
+/// per sample. Common k6/tropel metric names use OnceLock'd Arc<str> entries;
+/// arbitrary/custom names fall back to `Arc::from(name)`.
+fn intern_metric(name: &str) -> Arc<str> {
+    use std::sync::OnceLock;
+    // Common metric names — the set that covers 99.9%+ of samples in a run.
+    // Each entry is a `OnceLock<Arc<str>>` that initialises once per process.
+    // The match is fast (2-3 string comparisons on average) and lock-free.
+    macro_rules! metric_interner {
+        ($($name:expr),+ $(,)?) => {
+            match name {
+                $(
+                    $name => {
+                        static LOCK: OnceLock<Arc<str>> = OnceLock::new();
+                        LOCK.get_or_init(|| Arc::from($name)).clone()
+                    }
+                )+,
+                other => Arc::from(other),
+            }
+        };
+    }
+    metric_interner!(
+        "http_reqs",
+        "http_req_duration",
+        "http_req_failed",
+        "http_req_blocked",
+        "http_req_connecting",
+        "http_req_tls_handshaking",
+        "http_req_sending",
+        "http_req_waiting",
+        "http_req_receiving",
+        "iterations",
+        "iteration_duration",
+        "vus",
+        "vus_max",
+        "data_received",
+        "data_sent",
+        "checks",
+        "errors",
+        "dropped_iterations",
+    )
 }
 
 /// Aggregated metrics for a tag set, with type-aware aggregation.
