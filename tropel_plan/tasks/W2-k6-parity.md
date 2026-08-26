@@ -162,13 +162,13 @@ Grammar (`metrics/thresholds_parser.go`): aggregations **`value`, `count`, `rate
 **[GAP]** Tropel drops `auth`, `redirects`, `compression`, `cookies`, `jar`, `throw`, `responseCallback`, and `responseType:"binary"`.
 
 - [x] `headers` — a `Host` key sets `req.Host` (shim extracts Host → `request.host`, client applies it as the wire Host and skips stray Host headers; user `Content-Length` is deleted with a warning)
-- [ ] `cookies` — including the `{value, replace}` form; `replace:false`, the default, sends **both** the request cookie and the jar cookie — **shim parses the `{value, replace}` form** (value extraction done); the jar-side merge for `replace:false` (request cookie + jar cookie both sent) is a follow-up
+- [x] `cookies` — including the `{value, replace}` form; `replace:false`, the default, sends **both** the request cookie and the jar cookie — **k6 SetRequestCookies merge**: structured `RequestCookie` (name/value/replace) passed from shim → `Request.cookies`, client merges jar + request cookies; `replace:true` suppresses the jar's; `replace:false` sends both
 - [x] `tags` — setting `tags.name` overrides **both** `name` and `url` (see `TR-205`)
 - [x] `auth` — `"digest"` (credentials from URL userinfo, mapped to `AuthConfig::Digest`) and `"ntlm"` (no signer in tropel — **refused loudly with a warning**, consistent with the collection parser's NTLM→None stance); **`"basic"` is a documented no-op**, basic auth works purely from URL userinfo
 - [x] **[SILENT]** `timeout` default is **60 s**, not "no timeout"; a number means ms, a string is a duration — **fixed**: engine default `DEFAULT_REQUEST_TIMEOUT` is 60s (k6 parity)
 - [x] `redirects` default 10; **`0` returns the 3xx** rather than erroring
-- [ ] `compression` — `gzip,deflate,zstd,br`, applied left-to-right
-- [ ] `responseType` — `text` / `binary`→ArrayBuffer / `none`
+- [x] `compression` — `gzip,deflate,zstd,br`, applied left-to-right — **gzip/deflate left-to-right** (each compresses the previous output; Content-Encoding lists all in order); `zstd`/`br` warn loudly (no signer — the `zstd`/`brotli` crates are a CONVENTIONS dep gate, human sign-off)
+- [x] `responseType` — `text` / `binary`→ArrayBuffer / `none`
 - [x] **[SILENT]** `params.headers` in Postman array form is silently dropped (`k6-shim.js:184` requires a non-Array) ✅**EXEC** — array form accepted (`k6-shim.js:189-194`)
 - [x] **[SILENT]** `http.post(url, {obj})` sends JSON; k6 sends **form-urlencoded** ✅closed — keep the regression test
 

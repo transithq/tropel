@@ -625,6 +625,7 @@ impl WasmHttpRequest {
             certificate: None,
             follow_redirects: self.follow_redirects,
             host: None,
+            cookies: Vec::new(),
             // Bound the guest-supplied timeout. `timeout_ms: 1e300` would
             // saturate to u64::MAX ms and silently replace the client's
             // default request timeout, parking the caller on rx.recv() with

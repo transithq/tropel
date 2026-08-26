@@ -54,7 +54,10 @@ function k6HTTPRequest(method, url, body, params) {
                 // Backlog line 150: binary request bodies ride as base64.
                 bodyB64: canonical.bodyB64,
                 // TR-230: a Host header becomes req.Host — ride separately.
-                host: canonical.host
+                host: canonical.host,
+                // TR-230: params.cookies ride structured (with replace flags)
+                // so the client does k6's jar merge.
+                cookies: canonical.cookies
             })
         );
     } else if (typeof __tropel_pm_send_request === 'function') {
@@ -256,38 +259,35 @@ function normalizeK6Request(method, url, body, params) {
     // k6 params.responseType: "text" (default) | "binary" | "none"
     var responseType = params.responseType || 'text';
 
-    // k6 params.cookies: {name: value} OR {name: {value, replace}} — merged
-    // into the Cookie header (k6 sends cookies as a Cookie header), combined
-    // with any explicit Cookie header the script set. `headers` is already a
-    // per-request copy, so this can't leak into the caller's module-scope
-    // params.
-    //
-    // TR-230: `replace:false` (the default) sends BOTH the request cookie
-    // and the jar cookie — the request cookie is appended after the jar's.
-    // `replace:true` means "replace the jar cookie of the same name", which
-    // on the request side simply means this cookie is sent (the native jar
-    // bridge dedupes by name when replacing). The shim always merges into
-    // the Cookie header; the jar-side replace semantics live in the per-VU
-    // cookie jar, not here.
+    // k6 params.cookies: {name: value} OR {name: {value, replace}} — carried
+    // STRUCTURED to the native bridge (not folded into the Cookie header) so
+    // the client can implement k6's jar merge (SetRequestCookies): a
+    // `replace:false` (the default) request cookie is sent ALONGSIDE the
+    // per-VU jar cookie of the same name; `replace:true` suppresses the jar's.
+    // A manual Cookie header the script set stays in `headers` and is kept
+    // by the client's merge. `headers` is already a per-request copy, so this
+    // can't leak into the caller's module-scope params.
+    var requestCookies = [];
     var cookies = params.cookies;
     if (cookies && typeof cookies === 'object') {
-        var cookieParts = [];
         for (var ck in cookies) {
             if (!cookies.hasOwnProperty(ck)) continue;
             var cv = cookies[ck];
             if (cv === undefined || cv === null) continue;
-            var cookieValue = cv;
             if (typeof cv === 'object' && cv.value !== undefined) {
-                // {value, replace} form — value is the cookie value.
-                cookieValue = cv.value;
+                // {value, replace} form.
+                requestCookies.push({
+                    name: String(ck),
+                    value: String(cv.value),
+                    replace: cv.replace === true
+                });
+            } else {
+                requestCookies.push({
+                    name: String(ck),
+                    value: String(cv),
+                    replace: false
+                });
             }
-            cookieParts.push(encodeURIComponent(ck) + '=' + encodeURIComponent(String(cookieValue)));
-        }
-        if (cookieParts.length > 0) {
-            var existingCookie = headers['Cookie'] || headers['cookie'] || '';
-            headers['Cookie'] = existingCookie
-                ? existingCookie + '; ' + cookieParts.join('; ')
-                : cookieParts.join('; ');
         }
     }
 
@@ -296,6 +296,7 @@ function normalizeK6Request(method, url, body, params) {
         method: method,
         url: url,
         host: hostOverride,
+        cookies: requestCookies,
         headers: serialized.headers,
         body: serialized.body,
         bodyB64: serialized.binary,
@@ -1001,7 +1002,9 @@ http.batch = function (requests) {
                     compression: canonical.compression,
                     bodyB64: canonical.bodyB64,
                     // TR-230: a Host header becomes req.Host — ride separately.
-                    host: canonical.host
+                    host: canonical.host,
+                    // TR-230: params.cookies ride structured (with replace flags).
+                    cookies: canonical.cookies
                 })
             });
         }

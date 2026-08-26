@@ -91,6 +91,7 @@ fn fixture_run_request() -> RunRequest {
             certificate: None,
             follow_redirects: true,
             host: None,
+            cookies: Vec::new(),
             timeout: None,
             response_type: ResponseType::Text,
         }),

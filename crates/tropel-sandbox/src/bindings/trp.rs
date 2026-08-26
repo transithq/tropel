@@ -1475,6 +1475,7 @@ impl TrpBridge {
                                 certificate: None,
                                 follow_redirects: true,
                                 host: None,
+                                cookies: Vec::new(),
                                 timeout,
                                 response_type: tropel_sdk::types::ResponseType::from_k6(
                                     &response_type,

@@ -814,19 +814,61 @@ impl HttpClient {
             // ── Per-VU cookie jar: inject stored cookies for this hop ──
             // Skipped on cross-origin redirect hops (credentials must not
             // leak to another origin — the same rule as the `strip_sensitive`
-            // header check above) and when the request carries an explicit
-            // Cookie header (the caller wins, matching k6). `Jar::cookies`
-            // applies domain/path/secure rules for the hop URL.
+            // header check above). `Jar::cookies` applies domain/path/secure
+            // rules for the hop URL.
+            //
+            // TR-230: k6's SetRequestCookies merge. When the request carries
+            // structured `request.cookies` (k6 params.cookies), the jar
+            // cookies are sent ALONGSIDE them — a `replace:false` (default)
+            // request cookie coexists with the jar cookie of the same name,
+            // while `replace:true` suppresses the jar's. The script's manual
+            // Cookie header (params.headers) is kept first. Without
+            // request.cookies, the old rule holds: an explicit Cookie header
+            // wins and the jar is skipped.
             if !strip_sensitive {
                 if let Some(jar) = jar {
-                    let has_explicit_cookie = request
-                        .headers
-                        .iter()
-                        .any(|(k, _)| k.eq_ignore_ascii_case("cookie"));
-                    if !has_explicit_cookie {
+                    if !request.cookies.is_empty() {
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some((_, manual)) = request
+                            .headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                        {
+                            parts.push(manual.clone());
+                        }
                         if let Some(ref url) = hop_url {
-                            if let Some(value) = jar.cookies(url) {
-                                req_builder = req_builder.header(reqwest::header::COOKIE, value);
+                            if let Some(jar_value) = jar.cookies(url) {
+                                for (name, value) in
+                                    parse_cookie_header_value(jar_value.to_str().unwrap_or(""))
+                                {
+                                    let replaced = request
+                                        .cookies
+                                        .iter()
+                                        .any(|c| c.replace && c.name.eq_ignore_ascii_case(&name));
+                                    if !replaced {
+                                        parts.push(format!("{name}={value}"));
+                                    }
+                                }
+                            }
+                        }
+                        for c in &request.cookies {
+                            parts.push(format!("{}={}", c.name, c.value));
+                        }
+                        if !parts.is_empty() {
+                            req_builder =
+                                req_builder.header(reqwest::header::COOKIE, parts.join("; "));
+                        }
+                    } else {
+                        let has_explicit_cookie = request
+                            .headers
+                            .iter()
+                            .any(|(k, _)| k.eq_ignore_ascii_case("cookie"));
+                        if !has_explicit_cookie {
+                            if let Some(ref url) = hop_url {
+                                if let Some(value) = jar.cookies(url) {
+                                    req_builder =
+                                        req_builder.header(reqwest::header::COOKIE, value);
+                                }
                             }
                         }
                     }
@@ -1627,6 +1669,22 @@ fn parse_set_cookie(header: &str) -> Option<Cookie> {
     Some(cookie)
 }
 
+/// Parse a `Cookie` header value into `(name, value)` pairs. Cookie values
+/// may contain `=` but never `;` (the pair separator), so splitting on `;`
+/// and then on the FIRST `=` is correct — the same split the jar merge uses
+/// to apply k6's replace semantics per cookie name.
+fn parse_cookie_header_value(value: &str) -> Vec<(String, String)> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|pair| {
+            let (name, val) = pair.split_once('=')?;
+            Some((name.trim().to_string(), val.trim().to_string()))
+        })
+        .collect()
+}
+
 /// Parse a TLS version string ("1.2", "tls1.2", "1.3", ...) into a reqwest
 /// TLS version. Returns None for unrecognized/empty values (builder defaults).
 fn parse_tls_version(s: &Option<String>) -> Option<reqwest::tls::Version> {
@@ -1915,6 +1973,7 @@ mod tests {
             certificate: None,
             follow_redirects: true,
             host: None,
+            cookies: Vec::new(),
             timeout: None,
             response_type: ResponseType::Text,
         }
@@ -1966,9 +2025,65 @@ mod tests {
         });
     }
 
+    /// TR-230: k6 SetRequestCookies merge — `request.cookies` with
+    /// `replace:false` (default) sends BOTH the jar cookie and the request
+    /// cookie; `replace:true` suppresses the jar's same-name cookie.
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_cookies_replace_false_sends_both_jar_and_request_cookie() {
+        let (addr, _server) = spawn_cookie_test_server();
+        let shared = HttpClient::new(&HttpConfig::default()).unwrap();
+        let vu = VuCookieClient::new(shared);
+        let base = format!("http://{addr}");
+
+        // Plant a jar cookie.
+        let set = vu
+            .execute(&get_request(&format!("{base}/set")), None)
+            .await
+            .unwrap();
+        assert_eq!(set.status_code, 200);
+
+        // Request with a cookie that has replace:false (default) — the jar
+        // cookie "sid=abc123" AND the request cookie "sid=s1" must both arrive.
+        let mut req = get_request(&format!("{base}/echo"));
+        req.cookies.push(tropel_sdk::RequestCookie {
+            name: "sid".to_string(),
+            value: "s1".to_string(),
+            replace: false,
+        });
+        let echo = vu.execute(&req, None).await.unwrap();
+        assert_eq!(echo.status_code, 200);
+        let body = echo.body_text().unwrap();
+        assert!(
+            body.contains("sid=abc123"),
+            "jar cookie must be present (replace:false), server saw: {body}"
+        );
+        assert!(
+            body.contains("sid=s1"),
+            "request cookie must be present (replace:false), server saw: {body}"
+        );
+
+        // Request with replace:true — the jar cookie "sid=abc123" is
+        // suppressed, only the request cookie "sid=s1" arrives.
+        let mut req2 = get_request(&format!("{base}/echo"));
+        req2.cookies.push(tropel_sdk::RequestCookie {
+            name: "sid".to_string(),
+            value: "s2".to_string(),
+            replace: true,
+        });
+        let echo2 = vu.execute(&req2, None).await.unwrap();
+        let body2 = echo2.body_text().unwrap();
+        assert!(
+            !body2.contains("sid=abc123"),
+            "jar cookie must be suppressed (replace:true), server saw: {body2}"
+        );
+        assert!(
+            body2.contains("sid=s2"),
+            "request cookie must be present (replace:true), server saw: {body2}"
+        );
+    }
+
     #[test]
     fn shared_jar_clone_lets_bridge_cookie_reach_runner_requests() {
-        // Regression (backlog line 159): the scenario runner and the PM
         // bridge each constructed a FRESH `VuCookieClient::new`, giving every
         // VU two empty jars. The canonical Postman auth pattern — prerequest
         // `pm.sendRequest` → `/login` → `Set-Cookie` — landed the session
