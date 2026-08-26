@@ -23,9 +23,9 @@ The outer runtime defaults to **2 workers**, shared by the aggregator and every 
 There is also **zero `spawn_blocking` in the entire workspace** — the only textual match is a comment.
 
 ### Acceptance criteria
-- [ ] Outputs cannot back-pressure the VU path. Either a dedicated runtime, or a bounded drop-with-count path (`TR-001` makes the drop visible)
-- [ ] The aggregator gets guaranteed scheduling independent of output flushes
-- [ ] Flushes yield
+- [ ] Outputs cannot back-pressure the VU path. Either a dedicated runtime, or a bounded drop-with-count path (`TR-001` makes the drop visible) — **bounded drop-with-count implemented**: `record_batch`/`record` use `try_send` (never block the VU on a full channel); a full `MAX_PENDING_SAMPLES` channel drops the batch and increments `AGGREGATOR_SAMPLES_DROPPED`, surfaced in the summary (`aggregatorSamplesDropped`) — a run that lost samples is never reported clean
+- [ ] The aggregator gets guaranteed scheduling independent of output flushes — **yield points added**: output `emit()`/`flush()` calls `tokio::task::yield_now()` so the aggregator task on the shared runtime gets scheduled between batches
+- [ ] Flushes yield — **done** (yield_now after each emit in the extension output driver)
 - [ ] A benchmark with a deliberately slow output asserts VU throughput is unchanged and the drop count is reported
 - [ ] The 2-worker default is justified with a measurement or raised
 

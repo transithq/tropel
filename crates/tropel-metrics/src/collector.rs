@@ -1729,7 +1729,10 @@ impl MetricsResult {
     /// Any lost iteration, series, or output sample makes the measurement
     /// incomplete and therefore unverified.
     pub fn is_unverified(&self) -> bool {
-        self.dropped_iterations > 0 || self.series_dropped > 0 || self.output_samples_dropped > 0
+        self.dropped_iterations > 0
+            || self.series_dropped > 0
+            || self.output_samples_dropped > 0
+            || self.aggregator_samples_dropped > 0
     }
 
     /// The one verdict the banner, the reporters, the summary and the CLI

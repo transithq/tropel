@@ -1084,6 +1084,7 @@ mod tests {
             errors: 0,
             series_dropped: 0,
             output_samples_dropped: 0,
+            aggregator_samples_dropped: 0,
             checks_total: 0,
             checks_passed: 0,
             checks_failed: 0,
