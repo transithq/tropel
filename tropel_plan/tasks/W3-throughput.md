@@ -42,7 +42,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 
 **The highest-value single feature in the plan.** hyper enforces one h2 connection per pool, so a `Vec<reqwest::Client>` of lanes is what removes the cap. One change closes: the h2 single-connection cap, frame-demux serialization, per-connection server stream limits, and multi-IP spread.
 
-- [ ] Lane count configurable, with a measured default
+- [x] Lane count configurable, with a measured default — **implemented**: `http2_connections` (default 1) builds N independent `reqwest::Client` lanes; round-robin selection via a shared `Arc<AtomicUsize>` cursor. The config field EXISTED but was never wired into the client (a flag set but nothing read it)
 - [ ] A benchmark against an h2 server with a low `MAX_CONCURRENT_STREAMS` shows throughput scaling with lanes
 - [ ] `max_idle_connections` defaults to 4 for an entire scenario ✅closed — keep the regression test
 - [ ] Deliberately **not** in scope: dropping below reqwest to `hyper::client::conn::http2`. That is the moat (it unlocks stream-acquisition timing), and it is post-`0.1.0`
@@ -88,7 +88,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 - [x] `har/lib.rs:150` and siblings — no short-circuit, so importing an 80 MB file parses it once per adapter — **fixed**: `resolve_input` iterates by priority descending and returns on the FIRST match (the old code probed all 7+ adapters); k6's `is_postman_collection` guard uses a lightweight serde `Probe` instead of a full `Value` parse
 - [x] Cheap discriminators first; parse once, at most
 - [x] Subprocess **double-parses** — a `Value` tree up to ~50–80 MB from 16 MiB of output — **fixed**: the fallback stream-deserializes array elements one at a time (no `Vec<Value>` tree)
-- [ ] `BASE_URL` is read via `std::env::var` inside `parse()` (`openapi/lib.rs:419`), making parsing non-deterministic and environment-dependent
+- [x] `BASE_URL` is read via `std::env::var` inside `parse()` (`openapi/lib.rs:419`), making parsing non-deterministic and environment-dependent — **fixed**: emits a `{{base_url}}` placeholder that resolves from config env (the engine injects env into scenario.variables after parse)
 - [ ] Browser import retains **10.5× the input, permanently, and parses the document 10 times** — this one sits on knockport's path, see `TR-403`
 
 ## TR-308 · The OpenAPI `$ref` fanout

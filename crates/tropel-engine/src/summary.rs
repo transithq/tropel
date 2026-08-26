@@ -136,6 +136,7 @@ pub(crate) fn build_summary_data(
             "checksFailed": results.checks_failed,
             "seriesDropped": results.series_dropped,
             "samplesDropped": results.output_samples_dropped,
+            "aggregatorSamplesDropped": results.aggregator_samples_dropped,
             "unverified": results.is_unverified(),
             "verification": if results.is_unverified() { "unverified" } else { "verified" },
         },

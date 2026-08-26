@@ -37,6 +37,10 @@ pub(crate) fn spawn_extension_output(
                             if let Err(e) = output.emit(&b).await {
                                 tracing::warn!("extension output '{}' emit failed: {e}", output.name());
                             }
+                            // TR-301: flushes yield — a CPU-heavy emit (tag
+                            // expansion, serialization) must not starve the
+                            // aggregator task that shares this runtime.
+                            tokio::task::yield_now().await;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -51,6 +55,8 @@ pub(crate) fn spawn_extension_output(
                         if let Err(e) = output.emit(&b).await {
                             tracing::warn!("extension output '{}' emit failed: {e}", output.name());
                         }
+                        // TR-301: yield so the aggregator gets scheduled.
+                        tokio::task::yield_now().await;
                     }
                 }
             }

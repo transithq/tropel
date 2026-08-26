@@ -515,8 +515,26 @@ impl MetricsCollector {
         self.forward_to_sink(&samples);
 
         let batch: Vec<Sample> = samples.to_vec();
-        if self.tx.send(MetricsEvent::Samples(batch)).await.is_err() {
-            tracing::trace!("Metrics channel closed, dropping {} samples", samples.len());
+        // TR-301: `try_send` instead of the blocking `send().await`. A slow
+        // output can starve the aggregator task on the shared runtime; the
+        // old `send().await` then blocked EVERY VU on the full channel
+        // (record_batch().await in the VU hot path). A full channel now drops
+        // the batch and COUNTS it — the summary surfaces the drop (TR-001),
+        // so a run that lost samples is never reported clean. The channel is
+        // sized for 100k pending samples (~a second of peak load), so this
+        // only fires under genuine output back-pressure.
+        if let Err(e) = self.tx.try_send(MetricsEvent::Samples(batch)) {
+            let dropped = match &e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => samples.len(),
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => 0,
+            };
+            if dropped > 0 {
+                crate::AGGREGATOR_SAMPLES_DROPPED
+                    .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    "aggregator backlog full: dropped {dropped} samples (slow output back-pressure)"
+                );
+            }
         }
     }
 
@@ -536,13 +554,16 @@ impl MetricsCollector {
         // Forward to streaming output sinks (best-effort, non-blocking)
         self.forward_to_sink(std::slice::from_ref(sample));
 
-        if self
+        // TR-301: try_send — never block the caller on a full channel (see
+        // record_batch for the full rationale); count any drop.
+        if let Err(e) = self
             .tx
-            .send(MetricsEvent::Samples(vec![sample.clone()]))
-            .await
-            .is_err()
+            .try_send(MetricsEvent::Samples(vec![sample.clone()]))
         {
-            tracing::trace!("Metrics channel closed, dropping sample");
+            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                crate::AGGREGATOR_SAMPLES_DROPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -1231,6 +1252,8 @@ impl Aggregator {
             series_dropped: self.series_dropped,
             output_samples_dropped: crate::OUTPUT_SAMPLES_DROPPED
                 .load(std::sync::atomic::Ordering::Relaxed),
+            aggregator_samples_dropped: crate::AGGREGATOR_SAMPLES_DROPPED
+                .load(std::sync::atomic::Ordering::Relaxed),
             dropped_iterations: self
                 .totals
                 .get("dropped_iterations")
@@ -1675,6 +1698,11 @@ pub struct MetricsResult {
     /// Samples dropped by streaming output consumers due to broadcast lag
     /// (P0: backlog line 332). Surfaced so reporters warn on data loss.
     pub output_samples_dropped: u64,
+    /// TR-301: samples dropped at the AGGREGATOR boundary because the bounded
+    /// mpsc channel was full (a slow output starved the aggregator task on
+    /// the shared runtime). The blocking send was replaced with `try_send`;
+    /// the drop is counted here so the run is never reported clean.
+    pub aggregator_samples_dropped: u64,
     /// Iterations dropped because the VU pool was saturated (arrival-rate mode).
     pub dropped_iterations: u64,
     /// HTTP request failure rate (0.0 - 1.0).
@@ -1734,6 +1762,7 @@ impl Default for MetricsResult {
             errors: 0,
             series_dropped: 0,
             output_samples_dropped: 0,
+            aggregator_samples_dropped: 0,
             dropped_iterations: 0,
             http_req_failed: 0.0,
             iterations: 0,
