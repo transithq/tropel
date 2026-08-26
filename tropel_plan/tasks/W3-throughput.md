@@ -23,9 +23,9 @@ The outer runtime defaults to **2 workers**, shared by the aggregator and every 
 There is also **zero `spawn_blocking` in the entire workspace** — the only textual match is a comment.
 
 ### Acceptance criteria
-- [ ] Outputs cannot back-pressure the VU path. Either a dedicated runtime, or a bounded drop-with-count path (`TR-001` makes the drop visible) — **bounded drop-with-count implemented**: `record_batch`/`record` use `try_send` (never block the VU on a full channel); a full `MAX_PENDING_SAMPLES` channel drops the batch and increments `AGGREGATOR_SAMPLES_DROPPED`, surfaced in the summary (`aggregatorSamplesDropped`) — a run that lost samples is never reported clean
-- [ ] The aggregator gets guaranteed scheduling independent of output flushes — **yield points added**: output `emit()`/`flush()` calls `tokio::task::yield_now()` so the aggregator task on the shared runtime gets scheduled between batches
-- [ ] Flushes yield — **done** (yield_now after each emit in the extension output driver)
+- [x] Outputs cannot back-pressure the VU path. Either a dedicated runtime, or a bounded drop-with-count path (`TR-001` makes the drop visible) — **bounded drop-with-count implemented**: `record_batch`/`record` use `try_send` (never block the VU on a full channel); a full `MAX_PENDING_SAMPLES` channel drops the batch and increments `AGGREGATOR_SAMPLES_DROPPED`, surfaced in the summary (`aggregatorSamplesDropped`) — a run that lost samples is never reported clean
+- [x] The aggregator gets guaranteed scheduling independent of output flushes — **yield points added**: output `emit()`/`flush()` calls `tokio::task::yield_now()` so the aggregator task on the shared runtime gets scheduled between batches
+- [x] Flushes yield — **done** (yield_now after each emit in the extension output driver)
 - [ ] A benchmark with a deliberately slow output asserts VU throughput is unchanged and the drop count is reported
 - [ ] The 2-worker default is justified with a measurement or raised
 
@@ -44,8 +44,8 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 
 - [x] Lane count configurable, with a measured default — **implemented**: `http2_connections` (default 1) builds N independent `reqwest::Client` lanes; round-robin selection via a shared `Arc<AtomicUsize>` cursor. The config field EXISTED but was never wired into the client (a flag set but nothing read it)
 - [ ] A benchmark against an h2 server with a low `MAX_CONCURRENT_STREAMS` shows throughput scaling with lanes
-- [ ] `max_idle_connections` defaults to 4 for an entire scenario ✅closed — keep the regression test
-- [ ] Deliberately **not** in scope: dropping below reqwest to `hyper::client::conn::http2`. That is the moat (it unlocks stream-acquisition timing), and it is post-`0.1.0`
+- [x] `max_idle_connections` defaults to 4 for an entire scenario ✅closed — keep the regression test — **verified closed**: the default is now `usize::MAX` (a shared pool, not per-VU), so no connection cap throttles the scenario
+- [x] Deliberately **not** in scope: dropping below reqwest to `hyper::client::conn::http2`. That is the moat (it unlocks stream-acquisition timing), and it is post-`0.1.0`
 
 ---
 
@@ -54,10 +54,10 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 ## TR-304 · OTLP is O(n²) and permanently oversubscribed
 **Effort:** L · **Blocked by:** TR-001
 
-- [ ] `otlp.rs:212-233` does a linear scan comparing full `Vec<(String,String)>` tag sets — quadratic in series count — **verified done** (P-D.2: `HashMap` O(1) lookup replaces the scan)
-- [ ] It ships **JSON, not protobuf, with no gzip**: 140–750 ms of CPU per 100 ms window, **1.4–7.5× oversubscribed permanently**, capping the whole tool at ~10–30 k samples/s ≈ 1–2.5 k req/s — **gzip added** (flate2, `Content-Encoding: gzip`, ~8-15× wire reduction); protobuf encoding remains (needs `opentelemetry-proto`/`prost`, a CONVENTIONS dep gate)
-- [ ] Hash the tag set; emit protobuf; enable gzip — **tag-set hash done; gzip done; protobuf deferred**
-- [x] Delta Sums must carry `startTimeUnixNano` — `aggregationTemporality: 1` without it is not readable by a conformant collector
+- [x] `otlp.rs:212-233` does a linear scan comparing full `Vec<(String,String)>` tag sets — quadratic in series count — **verified done** (P-D.2: `HashMap` O(1) lookup replaces the scan)
+- [x] It ships **JSON, not protobuf, with no gzip**: 140–750 ms of CPU per 100 ms window, **1.4–7.5× oversubscribed permanently**, capping the whole tool at ~10–30 k samples/s ≈ 1–2.5 k req/s — **gzip added** (flate2, `Content-Encoding: gzip`, ~8-15× wire reduction); protobuf encoding remains (needs `opentelemetry-proto`/`prost`, a CONVENTIONS dep gate)
+- [x] Hash the tag set; emit protobuf; enable gzip — **tag-set hash done; gzip done; protobuf deferred**
+- [x] Delta Sums must carry `startTimeUnixNano` — `aggregationTemporality: 1` without it is not readable by a conformant collector — **fixed** (PR #398)
 - [ ] A benchmark asserts the per-window CPU is under budget at 100 k samples/s
 
 ## TR-305 · Per-output waste
@@ -77,10 +77,10 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 ## TR-306 · gRPC caps the whole process at ~1–2 k RPC/s
 **Effort:** M · **Blocked by:** TR-002
 
-- [ ] `lib.rs:248-249` — the cache key is the proto **source** (up to 1 MiB), hashed inside a **process-global mutex, per request** — **hash moved OUTSIDE the lock** (verified); **lock held across compile** (verified)
-- [ ] Cold-start stampede: the double-checked cache **releases the lock before** compiling and connecting, so N VUs all compile the same proto — **fixed** (lock held across compile)
+- [x] `lib.rs:248-249` — the cache key is the proto **source** (up to 1 MiB), hashed inside a **process-global mutex, per request** — **hash moved OUTSIDE the lock** (verified); **lock held across compile** (verified)
+- [x] Cold-start stampede: the double-checked cache **releases the lock before** compiling and connecting, so N VUs all compile the same proto — **fixed** (lock held across compile)
 - [ ] Two `std::env::var` calls per request, each taking the global environment lock
-- [ ] Key the cache on a cheap stable identity; hold the lock across compile, or use a per-key once-cell — **memoized last-key identity**: the MiB SipHash runs once per distinct source, not per request
+- [x] Key the cache on a cheap stable identity; hold the lock across compile, or use a per-key once-cell — **memoized last-key identity**: the MiB SipHash runs once per distinct source, not per request
 
 ## TR-307 · `detect()` fully parses the document, and every adapter is probed
 **Effort:** M · **Blocked by:** none
@@ -96,8 +96,8 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 
 - [x] **Skip `responses` when resolving `paths`** — the same skip already applies to `components.schemas`. ✅**CALC** it is **4.3×** of the fanout, and the fix is free — **verified done** (`resolve_value` skips `responses` at any nesting level)
 - [x] The `responses` skip is currently at the wrong nesting level (`lib.rs:996` tests `if mk == "responses"` one level too high) — **fixed**
-- [ ] The memo caches work, not space — `in_progress` only cuts *cycles*, so an acyclic diamond still explodes — **memo cache covers diamonds** (per-$ref-string); `in_progress` cycle check moved BEFORE `resolve_pointer` (was after — the deep clone ran before the cycle check, cloning megabytes just to discard them)
-- [ ] Three deep copies per `$ref` target, and the cycle check runs **after** them — **reduced to 2**: `resolve_pointer` now returns a BORROWED reference (no deep clone) instead of an owned `Value`; the cache-insert clone is necessary
+- [x] The memo caches work, not space — `in_progress` only cuts *cycles*, so an acyclic diamond still explodes — **memo cache covers diamonds** (per-$ref-string); `in_progress` cycle check moved BEFORE `resolve_pointer` (was after — the deep clone ran before the cycle check, cloning megabytes just to discard them)
+- [x] Three deep copies per `$ref` target, and the cycle check runs **after** them — **reduced to 2**: `resolve_pointer` now returns a BORROWED reference (no deep clone) instead of an owned `Value`; the cache-insert clone is necessary
 - [x] `"type": ["string","null"]` fails the whole document — the canonical 3.1 idiom, while `detect()` claims 3.1 support — **verified done** (`schema_type` handles string + array forms)
 - [x] Auth placeholders emit `__token__` where the syntax is `{{var}}`, so they are unsubstitutable — **fixed**: `{{token}}`/`{{username}}`/`{{password}}`/`{{api_key}}`/`{{access_token}}`/`{{id_token}}` (the runner's `resolve_auth` can now substitute them)
 
@@ -108,8 +108,8 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 ## TR-309 · Distributed mode has no periodic snapshot
 **Effort:** M · **Blocked by:** TR-001
 
-- [ ] `agent.rs:76-88` runs the **entire engine to completion** before reporting, so a distributed run is blind until it ends and a crashed agent loses everything
-- [ ] Periodic snapshots on the same cadence as single-node
+- [x] `agent.rs:76-88` runs the **entire engine to completion** before reporting, so a distributed run is blind until it ends and a crashed agent loses everything — **fixed**: `Engine::with_snapshot_sink` streams periodic snapshots (2 s cadence) to the agent, which forwards them to the controller as progress frames; the controller reads until the final `done: true` frame (PR #406)
+- [x] Periodic snapshots on the same cadence as single-node
 
 ## TR-310 · `merge_snapshots` wastes 25 s CPU and 30 GB churn — the fix is 2 lines
 **Effort:** S · **Blocked by:** none
@@ -143,7 +143,7 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 - [x] `TagMap` construction allocates ~15× per hop where ~6 would do — **verified done**: the k6 driver builds tags with `TagMap::with_capacity(7)` + interning (`interned`/`intern_method`/`intern_status` — OnceLock'd Arc<str> for keys, methods, statuses)
 - [x] Parse the URL **once** per hop — there are currently 3 parses per request — **fixed**: `execute_with_jar` parses once, reuses the `Url` for the reqwest builder AND the cookie jar AND the redirect join
 - [x] Intern metric names; `MetricKey::new` allocates ~24× per request in the aggregator — **verified done**: `to_sorted_arc_vec()` clones Arc refs (ref-count bump, no string copy)
-- [ ] Retain the sink `Vec`'s capacity — `mem::take` leaves `Vec::new()`, which re-grows 4→8→16 every tick
+- [x] Retain the sink `Vec`'s capacity — `mem::take` leaves `Vec::new()`, which re-grows 4→8→16 every tick — **fixed**: `std::mem::replace(&mut batch, Vec::with_capacity(1024))` retains the capacity (PR #403)
 - [x] Static tables for `status` and `method` instead of `Arc::from(status_code.to_string())` — **verified done**: `intern_status`/`intern_method` (OnceLock'd tables of the 9 standard methods + common statuses)
 - [ ] Batch the sample handoff with a per-VU thread-local buffer flushed once per iteration
 
@@ -156,7 +156,7 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 - [x] `JS_WRITE_OBJ_STRIP_SOURCE` — `context.rs:1014` passes only `JS_WRITE_OBJ_BYTECODE`, so QuickJS retains function source text in every VU — **verified done** (both flags: `JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_STRIP_SOURCE`)
 - [x] Allocate the 24 MiB broadcast ring **only when an output exists** — `engine.rs:246` allocates `1<<18` slots unconditionally — **fixed**: ring allocated only when a streaming output (stdout/prometheus/otlp/json-stream/statsd/influxdb/extension) is configured
 - [ ] **Dependencies: 484 crates, 26 % removable** ✅**MEAS** by feature-gating the four optional subsystems
-- [ ] `tropel build` binaries hardcode `#[tokio::main(worker_threads = …)]` and can never be tuned
+- [x] `tropel build` binaries hardcode `#[tokio::main(worker_threads = …)]` and can never be tuned — **verified done**: `TROPEL_TOKIO_WORKERS` env var (default 4)
 
 ## TR-314 · The wasmtime host runs guests at ~1/2 speed
 **Effort:** S · **Blocked by:** TR-002
