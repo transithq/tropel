@@ -222,7 +222,7 @@ impl ExtensionRegistry {
         // deterministic and the highest priority wins either way.
         let mut sorted: Vec<Arc<InputAdapterRegistration>> =
             self.input_adapters.values().cloned().collect();
-        sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted.sort_by_key(|a| std::cmp::Reverse(a.priority));
         for registration in &sorted {
             let adapter = (registration.create)();
             if adapter.detect(bytes) {

@@ -3852,9 +3852,8 @@ fn prepare_module_source(original: &str, source_path: Option<&Path>) -> Result<S
 /// Process-global cache of prepared module source keyed by
 /// `(path, mtime)` — bounded by the (small) number of distinct script and
 /// helper files in a run, so it cannot grow unboundedly.
-type ModuleSourceCache = std::sync::Mutex<
-    std::collections::HashMap<(String, Option<std::time::SystemTime>), String>,
->;
+type ModuleSourceCache =
+    std::sync::Mutex<std::collections::HashMap<(String, Option<std::time::SystemTime>), String>>;
 static MODULE_SOURCE_CACHE: std::sync::OnceLock<ModuleSourceCache> = std::sync::OnceLock::new();
 
 /// Evaluate an ES module and return the named export serialized as JSON.
