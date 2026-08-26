@@ -64,11 +64,11 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 **Effort:** M · **Blocked by:** TR-002
 
 - [x] `TagPolicy::apply` deep-copies every tag when the policy is a no-op (`output.rs:40-65`) — **11 allocs/sample × 4 outputs = 44/sample**. Return the `Arc` unchanged when the policy is empty
-- [ ] `sanitize_prometheus_name` is the one sanitizer that never got `Cow` — the sibling-miss shape
-- [ ] Prometheus `cumulative` is **never evicted** — ~140 MB at max cardinality; tag limits ship disabled with no CLI flag to enable them
-- [ ] InfluxDB int/float flap — `12.0 → 12i`, `12.5 → 12.5` on the same field; the first sample pins the type and the next one is rejected
-- [ ] Newline unescaped in Influx tag values
-- [ ] NDJSON writes ~**1.7 TB in 24 h** — `.append(true)` with no rotation, no size cap, no sampling
+- [x] `sanitize_prometheus_name` is the one sanitizer that never got `Cow` — the sibling-miss shape
+- [x] Prometheus `cumulative` is **never evicted** — ~140 MB at max cardinality; tag limits ship disabled with no CLI flag to enable them — **verified done** (`max_cumulative` cap + warning; `TagPolicy` allowlist/max_tags)
+- [x] InfluxDB int/float flap — `12.0 → 12i`, `12.5 → 12.5` on the same field; the first sample pins the type and the next one is rejected — **fixed**: whole-number floats now carry the `.0` suffix so InfluxDB pins FLOAT
+- [x] Newline unescaped in Influx tag values — **verified done** (`escape` handles `\n`/`\r`/`\t`)
+- [x] NDJSON writes ~**1.7 TB in 24 h** — `.append(true)` with no rotation, no size cap, no sampling — **verified done** (1 GB rotation with `.1`/`.2` suffixes)
 
 ---
 
@@ -94,12 +94,12 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 ## TR-308 · The OpenAPI `$ref` fanout
 **Effort:** M · **Blocked by:** none
 
-- [ ] **Skip `responses` when resolving `paths`** — the same skip already applies to `components.schemas`. ✅**CALC** it is **4.3×** of the fanout, and the fix is free
-- [ ] The `responses` skip is currently at the wrong nesting level (`lib.rs:996` tests `if mk == "responses"` one level too high)
+- [x] **Skip `responses` when resolving `paths`** — the same skip already applies to `components.schemas`. ✅**CALC** it is **4.3×** of the fanout, and the fix is free — **verified done** (`resolve_value` skips `responses` at any nesting level)
+- [x] The `responses` skip is currently at the wrong nesting level (`lib.rs:996` tests `if mk == "responses"` one level too high) — **fixed**
 - [ ] The memo caches work, not space — `in_progress` only cuts *cycles*, so an acyclic diamond still explodes
 - [ ] Three deep copies per `$ref` target, and the cycle check runs **after** them
-- [ ] `"type": ["string","null"]` fails the whole document — the canonical 3.1 idiom, while `detect()` claims 3.1 support
-- [ ] Auth placeholders emit `__token__` where the syntax is `{{var}}`, so they are unsubstitutable
+- [x] `"type": ["string","null"]` fails the whole document — the canonical 3.1 idiom, while `detect()` claims 3.1 support — **verified done** (`schema_type` handles string + array forms)
+- [x] Auth placeholders emit `__token__` where the syntax is `{{var}}`, so they are unsubstitutable — **fixed**: `{{token}}`/`{{username}}`/`{{password}}`/`{{api_key}}`/`{{access_token}}`/`{{id_token}}` (the runner's `resolve_auth` can now substitute them)
 
 ---
 
@@ -117,7 +117,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 > **✅ CLOSED — verified at `2099cbe`.** `collector.rs:1357` now reads *"NOTE: rebuild_merged() is NOT called here — it is hoisted out of"* the absorb loop, with the single call at `:1493`. The hoist landed.
 
 - [x] `rebuild_merged` is out of the absorb loop
-- [x] `absorb_snapshot` still silently drops a Trend histogram on a cross-worker type conflict — **not** covered by the hoist, still open
+- [x] `absorb_snapshot` still silently drops a Trend histogram on a cross-worker type conflict — **fixed**: warns loudly (TR-310), stats still merge, test added
 
 ---
 
@@ -153,8 +153,8 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 - [ ] The script file is **read 4×** before the ramp, two of them back-to-back
 - [ ] Cache `prepare_module_source` by `(path, mtime)` — closes the N+2 startup oxc parses, the per-VU parse, and a 200 MB memcpy
 - [x] The shim bytecode cache is dead for the common case — `js_bootstrap.rs:401` takes the per-VU **source-eval** path
-- [ ] `JS_WRITE_OBJ_STRIP_SOURCE` — `context.rs:1014` passes only `JS_WRITE_OBJ_BYTECODE`, so QuickJS retains function source text in every VU
-- [ ] Allocate the 24 MiB broadcast ring **only when an output exists** — `engine.rs:246` allocates `1<<18` slots unconditionally
+- [x] `JS_WRITE_OBJ_STRIP_SOURCE` — `context.rs:1014` passes only `JS_WRITE_OBJ_BYTECODE`, so QuickJS retains function source text in every VU — **verified done** (both flags: `JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_STRIP_SOURCE`)
+- [x] Allocate the 24 MiB broadcast ring **only when an output exists** — `engine.rs:246` allocates `1<<18` slots unconditionally — **fixed**: ring allocated only when a streaming output (stdout/prometheus/otlp/json-stream/statsd/influxdb/extension) is configured
 - [ ] **Dependencies: 484 crates, 26 % removable** ✅**MEAS** by feature-gating the four optional subsystems
 - [ ] `tropel build` binaries hardcode `#[tokio::main(worker_threads = …)]` and can never be tuned
 

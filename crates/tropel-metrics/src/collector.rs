@@ -1347,6 +1347,20 @@ impl Aggregator {
                                 })
                                 .merge(h);
                         }
+                    } else if histogram.is_some() {
+                        // TR-310: a cross-worker type conflict would silently
+                        // drop the incoming Trend histogram here (the guard
+                        // above only merges into a Trend). The count/sum/etc.
+                        // still merge, producing a statistically corrupt
+                        // aggregate that looks like a clean run — say so.
+                        tracing::warn!(
+                            "absorb_snapshot: dropping Trend histogram for '{}' — \
+                             existing series is {existing_type:?} but the incoming \
+                             worker snapshot carries a histogram (cross-worker metric \
+                             type conflict). The counts still merge; percentiles are lost.",
+                            s.metric,
+                            existing_type = existing.metric_type,
+                        );
                     }
                     existing.count += s.count;
                     existing.sum += s.sum;
@@ -3204,6 +3218,72 @@ mod tests {
         assert_eq!(
             res.http_req_failed, 0.5,
             "rate must cover the dropped-series PASS too (1 failed / 2 total)"
+        );
+    }
+
+    #[test]
+    fn test_absorb_snapshot_trend_conflict_does_not_panic_and_warns() {
+        // TR-310: a cross-worker type conflict (Trend histogram from one
+        // worker, Counter from another for the same metric+tags) must not
+        // panic and must warn (not silently drop). The stats still merge;
+        // the histogram percentiles are lost.
+        let mut agg = Aggregator::new();
+        let ts = std::time::SystemTime::now();
+
+        // Record a non-Trend (Counter) series first.
+        let tags = Arc::new(tropel_sdk::types::TagMap::from_pairs([
+            ("url", "/x"),
+            ("name", "/x"),
+        ]));
+        agg.record(Sample {
+            metric: "http_req_duration".into(),
+            value: 1.0,
+            tags: tags.clone(),
+            timestamp: ts,
+            sample_type: SampleType::Counter,
+        });
+
+        // Build a snapshot — the Counter series has no histogram.
+        let snap = agg.build_snapshot();
+        // The Counter series should have no histogram.
+        assert!(
+            snap.series.iter().all(|s| s.histogram.is_none()),
+            "Counter series should have no histogram in snapshot"
+        );
+
+        // Now simulate a cross-worker conflict: create a second aggregator
+        // with a Trend series for the same metric+tags, record some samples,
+        // build a snapshot, and absorb into the first (non-Trend) aggregator.
+        let mut agg2 = Aggregator::new();
+        for ms in [10u64, 20, 30] {
+            agg2.record(Sample {
+                metric: "http_req_duration".into(),
+                value: ms as f64,
+                tags: tags.clone(),
+                timestamp: ts,
+                sample_type: SampleType::Trend,
+            });
+        }
+        let snap2 = agg2.build_snapshot();
+        // The Trend series MUST have a histogram.
+        assert!(
+            snap2.series.iter().any(|s| s.histogram.is_some()),
+            "Trend series must carry a histogram in the snapshot"
+        );
+
+        // The absorb must not panic (and the warning fires via tracing).
+        agg.absorb_snapshot(&snap2).unwrap();
+
+        // The stats (count, sum) still merge even though the histogram is
+        // dropped on the non-Trend side.
+        let key = MetricKey::new("http_req_duration", &tags);
+        let entry = agg.data.get(&key).unwrap();
+        // Count: 1 (Counter) + 3 (Trend) = 4
+        assert_eq!(entry.count, 4.0, "count must merge across type conflict");
+        // Sum: 1.0 + 10 + 20 + 30 = 61.0
+        assert!(
+            (entry.sum - 61.0).abs() < f64::EPSILON,
+            "sum must merge across type conflict"
         );
     }
 
