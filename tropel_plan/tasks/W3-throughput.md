@@ -129,11 +129,11 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 **Effort:** L · **Blocked by:** TR-002
 
 - [ ] `pm.js` builds its entire object graph **twice** — `:1591` and `:1598` both call the 1,580-line builder
-- [ ] `pm.response.json()` does **3 body copies and 2 full parses per call** — and the memoization already exists, unused
+- [x] `pm.response.json()` does **3 body copies and 2 full parses per call** — and the memoization already exists, unused — **verified done**: `body_json()`/`body_text()` use `get_or_init` caching (OnceLock), the native bridge returns the cached text
 - [ ] `build_scope` — **105 HashMap clones and ~3,885 allocations per iteration**, called 21× per iteration
 - [ ] **246 KB copied and SipHashed per iteration** to look up an already-compiled script (`context.rs:858-864`)
-- [ ] `setNextRequest` is a linear scan over all N ids — an **O(n²)** cliff on large collections
-- [ ] `resolver.rs:125` calls `.to_string()` on an already-`Cow::Owned` value
+- [x] `setNextRequest` is a linear scan over all N ids — an **O(n²)** cliff on large collections — **verified done**: the bridge uses `id_to_index`/`name_to_last_index` HashMaps (O(1) lookup); 8 tests cover the resolution order
+- [x] `resolver.rs:125` calls `.to_string()` on an already-`Cow::Owned` value — **verified done** (`into_owned()` at line 136)
 
 ## TR-312 · The request path allocation floor
 **Effort:** M · **Blocked by:** TR-002
