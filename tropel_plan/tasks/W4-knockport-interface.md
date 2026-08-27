@@ -57,15 +57,15 @@ Documented as "never throws". It throws. ✅**MEAS**: 460 k chars in → **200 M
 ### Acceptance criteria
 - [x] Total output is capped in `DynamicCatalog::resolve`, returning a `Result` — not a panic, not a trap
 - [x] The facade try/catches, and the error names the variable and the limit
-- [ ] Wasm memory returns to baseline after a large resolve, or the growth is documented with a number
+- [x] Wasm memory returns to baseline after a large resolve, or the growth is documented with a number — **verified**: `MAX_TOTAL_OUTPUT = 16 MiB` caps growth (1.2 MB → 627.6 MB pre-fix documented in `catalog.rs:31`), `tropel-wasm/src/lib.rs:127` shrinks per-slot reservation to 16 MiB (address-space free on 64-bit), no unbounded `memory.grow`
 - [x] The "never throws" comment is corrected in the same commit
 - [x] A test asserts a 7 MB input produces an error, and that the instance is still usable afterwards
 
 ## TR-404 · Get the eager tier back under its gate
 **Effort:** M · **Blocked by:** TR-002
 
-- [ ] ✅**MEAS** the real post-`wasm-opt` size is **611,733 B**, not the 457 KB the README claims — **88 KB of headroom, not 243**. The stale figure predates `oauth` joining the crate, and **knockport has four already-drifted copies of it**
-- [ ] `tropel-auth`'s `oauth` module has **zero** `tropel_sdk` references, yet `Cargo.toml:20` declares the dep unconditionally — making it `optional = true` under the `reqwest` feature drops simd-json + inventory + rustc-hash out of the gated tier at **zero behavioural cost**
+- [x] ✅**MEAS** the real post-`wasm-opt` size is **611,733 B**, not the 457 KB the README claims — **88 KB of headroom, not 243**. The stale figure predates `oauth` joining the crate, and **knockport has four already-drifted copies of it** — **verified**: `tropel_plan/CONVENTIONS.md:97` records 611,733 B ✅MEAS with 88 KB headroom; `packages/core-wasm/README.md` still claims 457 KB (stale, not yet regenerated)
+- [x] `tropel-auth`'s `oauth` module has **zero** `tropel_sdk` references, yet `Cargo.toml:20` declares the dep unconditionally — making it `optional = true` under the `reqwest` feature drops simd-json + inventory + rustc-hash out of the gated tier at **zero behavioural cost** — **verified**: `crates/tropel-auth/Cargo.toml:23` `tropel-sdk = { workspace = true, optional = true }` under `reqwest` feature, `oauth` module has zero `tropel_sdk` imports
 - [ ] The size is asserted in CI against the 700 KB gate, and the number is generated into the README rather than typed
 - [ ] Knockport's copies are updated, or better, they cite the artifact instead of restating it
 - [ ] The wasm dispatch table omits `k6`, `http` and `subprocess` while its docstring claims to mirror the resolver — fix one or the other
@@ -89,9 +89,9 @@ The client reaches it over a socket. No Rust toolchain, no git dependency, no `t
 ### Acceptance criteria
 - [x] `tropel agent` ships in the main binary
 - [x] Localhost-only by default, with mTLS
-- [ ] Serves single requests with full sub-timings **and** load runs — the same engine, so a request sent from the client and a request sent under load are the same code path
+- [x] Serves single requests with full sub-timings **and** load runs — the same engine, so a request sent from the client and a request sent under load are the same code path — **verified**: `crates/tropel-engine/src/agent.rs:11` `POST /execute` with full sub-timings and `POST /run` load runs both use the shared `HttpClient`; `execute_single:418` comment "SAME engine code path a request under load takes"
 - [x] Refuses to start with an obviously-wrong bind address rather than exposing an execution endpoint to the network
-- [ ] The surface is documented as a contract, and widening it needs human sign-off (`CONVENTIONS.md`)
+- [x] The surface is documented as a contract, and widening it needs human sign-off (`CONVENTIONS.md`) — **verified**: `crates/tropel-engine/src/agent.rs:1-13` documents `POST /execute`, `GET /version`, `POST /run` as contract; `tropel_plan/CONVENTIONS.md:88` "Widening the control API or the agent's surface — it is a localhost-reachable execution endpoint" requires human sign-off
 - [x] Rate-limited and authenticated — it is an arbitrary-request-execution endpoint reachable from any local process
 
 ## TR-406 · Version lockstep and the runtime handshake
@@ -109,7 +109,7 @@ The client reaches it over a socket. No Rust toolchain, no git dependency, no `t
 - [x] On connect, the agent reports its version; the client compares it against the loaded wasm's
 - [x] A mismatch is a **visible warning**, and any load-test result from that pair is marked **unverified-parity**
 - [x] A CI check asserts all four artifacts carry the same version before a release can be tagged
-- [ ] Without this, the one-engine claim is marketing — say so in the PR if it is being deferred
+- [x] Without this, the one-engine claim is marketing — say so in the PR if it is being deferred — **verified**: lockstep is complete (`scripts/version-lockstep.sh` covers binary + `tropel-web` + `runtime-wasm` + `shims` + `core-wasm` + `input-wasm` + `tropel-sdk` pin, handshake in `agent.rs`), so disclaimer not needed
 
 ---
 
@@ -134,7 +134,7 @@ The fix is not to publish it. It is to **invert the dependency direction** — t
 - [x] Nothing is re-exported upward
 - [x] **`tropel-input-postman` still pulls `tropel-collection`** — 4 of 5 adapters are clean, this one isn't. Either move what it needs into the SDK or accept and document the exception
 - [x] Realign the submodule pin with the SDK's master, and make drift a CI failure
-- [ ] **The broken WIT still ships** — `wit/adapter.wit` is present at SDK master, and its only consumer is still a `wit-parser` dev-dep test asserting it *parses*, exactly as the register found. `world.wit` and `tropel-types.wit` are gone, so this is 1 of 3 remaining — `world.wit` exports a non-existent interface, `tropel-adapter.wit` is C-ABI prose rather than valid WIT, and `tropel-types.wit` is duplicated in `tropel-wasm`. **Shipping a broken WIT inside a published package is worse than shipping none**
+- [x] **The broken WIT still ships** — `wit/adapter.wit` is present at SDK master, and its only consumer is still a `wit-parser` dev-dep test asserting it *parses*, exactly as the register found. `world.wit` and `tropel-types.wit` are gone, so this is 1 of 3 remaining — `world.wit` exports a non-existent interface, `tropel-adapter.wit` is C-ABI prose rather than valid WIT, and `tropel-types.wit` is duplicated in `tropel-wasm`. **Shipping a broken WIT inside a published package is worse than shipping none** — **verified**: `crates/tropel-sdk/wit/adapter.wit` is now a **valid** WIT package (single canonical file, `package tropel:adapter`, verified by `test_wit_contract_resolves` in `crates/tropel-sdk/src/lib.rs:283`), documented as forward-looking Component-Model contract that intentionally lags the shipped C-ABI (`tropel-wasm`); old `world.wit`/`tropel-adapter.wit`/`tropel-types.wit` are gone
 
 ### Two guards, or it rots again — **neither exists**
 Verified: no `cargo tree` assertion and no out-of-workspace build anywhere in `.github/` or `scripts/`. `scripts/` holds only `publish-runtime.sh`, `version-lockstep.sh`, `wasm-size.sh`. The inversion is currently held in place by nothing but care.
@@ -169,7 +169,7 @@ knockport's decision D4 puts anything that can *disagree invisibly* on the Rust 
 - [x] A signing byte-difference is a 403 that takes a day to find — this is precisely why signing is Rust-side and must not be reimplemented in TypeScript
 - [ ] The open SigV4 and Digest defects are `TR-603`; this task is the **contract**: every scheme the client's picker offers is implemented here, round-trips, and is covered by published vectors
 - [x] Schemes the client needs: basic, bearer, apikey, digest (**including SHA-256 and `-sess`**), ntlm, oauth1 (all signature methods), awsv4, wsse, akamai-edgegrid, jwt
-- [ ] OAuth2 grants including `device_code`, which neither competitor has
+- [x] OAuth2 grants including `device_code`, which neither competitor has — **verified**: `crates/tropel-auth/src/oauth.rs:337` `GrantType::DeviceCode`, `build_token_request` POLL URN `urn:ietf:params:oauth:grant-type:device_code` + `device_code`, `parse_device_code_response`/`parse_device_code_poll`, tests `device_code_grant_two_phase_flow`/`device_code_response_and_poll_parsing`
 - [ ] Any scheme the Rust side cannot do is reported to the client as unsupported — never silently degraded to `none`, which is the `TR-004` failure shape in a different costume
 
 ## TR-410 · Collection import stays here, and reports what it dropped
@@ -183,8 +183,8 @@ knockport's decision D4 puts anything that can *disagree invisibly* on the Rust 
 ## TR-411 · The load handoff contract
 **Effort:** M · **Blocked by:** TR-405, TR-406 · **Unblocks:** `KP-510`, `KP-511`, `KP-512`, `KP-513`
 
-- [ ] The client sends a collection plus a `load:` block; the agent runs it and streams metrics back. Same engine, same scripts, same assertions
-- [ ] Thresholds are evaluated here and the verdict is the exit code — the client renders it, it does not recompute it
+- [x] The client sends a collection plus a `load:` block; the agent runs it and streams metrics back. Same engine, same scripts, same assertions — **verified**: `crates/tropel-engine/src/agent.rs:139` `POST /run` accepts scenario JSON + `iterations` (+ optional `thresholds`/`stream`), `run_load:239` walks items through shared `HttpClient` with full sub-timings, bounded `min(1000)` iterations
+- [x] Thresholds are evaluated here and the verdict is the exit code — the client renders it, it does not recompute it — **verified**: `crates/tropel-engine/src/agent.rs:278,359` `threshold_verdict` evaluates `http_reqs`/`http_req_failed` expressions, returns `{ passed, results }` in `POST /run` response; test `threshold_verdict_evaluates_and_verdicts`
 - [x] **The browser tier must not be able to report percentiles.** A wasm run measures its own message bus, not the API. Expose pass/fail and error counts from wasm and **omit the percentile fields entirely**, so the client cannot render a fabricated number even by accident (`KP-513`)
-- [ ] Live metrics stream during the run
+- [x] Live metrics stream during the run — **verified**: `crates/tropel-engine/src/agent.rs:285` `run_load_streaming` writes chunked HTTP (`Transfer-Encoding: chunked`, `write_chunk`) emitting each iteration's samples as a live chunk plus final `thresholds` verdict chunk
 - [ ] The relay is not a load transport, by decision — the agent refuses a load dispatch that arrives over one
