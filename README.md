@@ -71,6 +71,14 @@ Notable limitations today:
   synchronous QuickJS host-call bridge (host functions must be synchronous
   and park the calling thread). Lifting it requires async host-call support
   (Promise-returning host functions + job-queue pumping) or a fiber VU model.
+- **~836 KB QuickJS heap per VU before script** — 734 KB of it shims
+  (291 KB chai+lodash+cryptojs, 256 KB `pm.js`), i.e. **7.97 GB at 10 000 VUs**
+  ✅MEAS on Apple Silicon before TR-501. Http-only scripts now gate shims
+  (`ShimBundle::from_script`): an http-only k6/Postman script pays **nothing**
+  for chai/lodash/cryptojs/`pm.js` it never references, saving ~120 KB/VU
+  (~1.2 GB at 10 k). User-script bytes are shared across VUs via `Arc`
+  (was ~12 GB at 4 k VUs), but compiled bytecode is still per-VU — sharing
+  it via `JS_WriteObject` is the 92% win left for TR-503.
 
 ## Architecture
 
