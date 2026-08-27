@@ -402,57 +402,68 @@ pub(crate) async fn create_vu_js_context(
 async fn bootstrap_shims(
     ctx: &mut tropel_js::JsContext,
     vu_id: u32,
-    _shim: &ShimBundle,
+    shim: &ShimBundle,
 ) -> Result<()> {
-    // P1 line 156: always use the bytecode cache. The old code skipped
-    // the cache for minimal bundles (from_script source-gated split),
-    // but the extra unused shims in the compiled bytecode are harmless
-    // and the cache saves ~135KB of re-parse per VU. For non-default
-    // bundles we still compile from their source but cache the result.
-
-    let bytecode = SHIM_BYTECODE.get_or_init(|| {
-        if SHIM_BYTECODE_FAILED.load(Ordering::Relaxed) {
-            return None;
-        }
-        match ctx.compile_global_bytecode(JS_SHIM_BUNDLE) {
-            Ok(bc) => {
-                tracing::info!(
-                    "Compiled JS shim bundle to bytecode once ({} bytes) — reusing across VUs",
-                    bc.len()
-                );
-                Some(bc)
+    // TR-501: respect the ShimBundle gating — an http-only script must not pay
+    // for chai/lodash/cryptojs/pm.js it never uses. The old code ignored `shim`
+    // (param named `_shim`) and always loaded the full 7-shim bundle, so the
+    // per-VU heap stayed at 835k. Now: default bundle uses the bytecode cache
+    // (fast), minimal bundles evaluate only their gated source (memory win).
+    if shim.is_default() {
+        let bytecode = SHIM_BYTECODE.get_or_init(|| {
+            if SHIM_BYTECODE_FAILED.load(Ordering::Relaxed) {
+                return None;
             }
-            Err(e) => {
-                SHIM_BYTECODE_FAILED.store(true, Ordering::Relaxed);
+            match ctx.compile_global_bytecode(JS_SHIM_BUNDLE) {
+                Ok(bc) => {
+                    tracing::info!(
+                        "Compiled JS shim bundle to bytecode once ({} bytes) — reusing across VUs",
+                        bc.len()
+                    );
+                    Some(bc)
+                }
+                Err(e) => {
+                    SHIM_BYTECODE_FAILED.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        "Shim bytecode compilation failed ({}); falling back to per-VU source eval",
+                        e
+                    );
+                    None
+                }
+            }
+        });
+
+        if let (Some(bc), false) = (bytecode, SHIM_BYTECODE_RUN_FAILED.load(Ordering::Relaxed)) {
+            if let Err(e) = ctx.run_global_bytecode(bc).await {
+                SHIM_BYTECODE_RUN_FAILED.store(true, Ordering::Relaxed);
                 tracing::warn!(
-                    "Shim bytecode compilation failed ({}); falling back to per-VU source eval",
+                    "VU {}: Failed to run JS shim bytecode: {} (disabling bytecode path; falling back to source eval)",
+                    vu_id,
                     e
                 );
-                None
+                return ctx.bootstrap_library(JS_SHIM_BUNDLE).await.map_err(|e2| {
+                    TropelError::Js(format!(
+                        "VU {vu_id}: shim source eval failed after bytecode run error: {e2}"
+                    ))
+                });
             }
+            return Ok(());
         }
-    });
-
-    if let (Some(bc), false) = (bytecode, SHIM_BYTECODE_RUN_FAILED.load(Ordering::Relaxed)) {
-        if let Err(e) = ctx.run_global_bytecode(bc).await {
-            SHIM_BYTECODE_RUN_FAILED.store(true, Ordering::Relaxed);
-            tracing::warn!(
-                "VU {}: Failed to run JS shim bytecode: {} (disabling bytecode path; falling back to source eval)",
-                vu_id,
-                e
-            );
-            return ctx.bootstrap_library(JS_SHIM_BUNDLE).await.map_err(|e2| {
-                TropelError::Js(format!(
-                    "VU {vu_id}: shim source eval failed after bytecode run error: {e2}"
-                ))
-            });
-        }
-        Ok(())
-    } else {
-        ctx.bootstrap_library(JS_SHIM_BUNDLE)
+        return ctx
+            .bootstrap_library(JS_SHIM_BUNDLE)
             .await
-            .map_err(|e| TropelError::Js(format!("VU {vu_id}: shim source eval failed: {e}")))
+            .map_err(|e| TropelError::Js(format!("VU {vu_id}: shim source eval failed: {e}")));
     }
+
+    // Minimal bundle — evaluate only the gated shims, no bytecode cache.
+    // The saving is ~77KB (cryptojs) + ~43KB (lodash) + pm.js when unused,
+    // ~120KB/VU (~1.2 GB at 10k VUs). Bytecode for minimal bundles could be
+    // cached per-variant, but the source eval is cheap for small bundles and
+    // the memory win dominates.
+    let rendered = shim.render();
+    ctx.bootstrap_library(&rendered)
+        .await
+        .map_err(|e| TropelError::Js(format!("VU {vu_id}: minimal shim source eval failed: {e}")))
 }
 
 #[cfg(test)]
