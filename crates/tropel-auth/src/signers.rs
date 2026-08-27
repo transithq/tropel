@@ -290,7 +290,7 @@ impl AwsSigV4Auth {
         let mut headers = sigv4_canonical_headers(
             request,
             &payload_hash,
-            &amz_date,
+            amz_date,
             self.session_token.as_deref(),
         );
         headers.sort();
@@ -316,7 +316,7 @@ impl AwsSigV4Auth {
             hex_sha256(canonical_request.as_bytes())
         );
 
-        let signing_key = derive_signing_key(&self.secret_key, &date_stamp, &region, sn);
+        let signing_key = derive_signing_key(&self.secret_key, date_stamp, &region, sn);
         let signature = hex_hmac_sha256(&signing_key, string_to_sign.as_bytes());
 
         let authorization = format!(
@@ -324,7 +324,7 @@ impl AwsSigV4Auth {
             self.access_key, scope
         );
 
-        insert_header(request, "x-amz-date", &amz_date)?;
+        insert_header(request, "x-amz-date", amz_date)?;
         insert_header(request, "x-amz-content-sha256", &payload_hash)?;
         if let Some(token) = &self.session_token {
             insert_header(request, "x-amz-security-token", token)?;
