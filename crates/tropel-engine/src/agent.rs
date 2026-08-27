@@ -136,8 +136,86 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let out = execute_single(&state, &req).await;
             respond(sock, 200, &out.to_string()).await
         }
+        ("POST", "/run") => {
+            // TR-411: a load run — a collection (scenario JSON) plus a load
+            // block (iterations). Runs each item through the SAME engine HTTP
+            // client, bounded by `iterations`, and returns the aggregated
+            // raw samples. NO percentiles (TR-411 — the browser tier cannot
+            // report them; this endpoint matches that contract).
+            let mut body_buf = vec![0u8; content_length.min(4 * 1024 * 1024)];
+            if content_length > 0 {
+                sock.read_exact(&mut body_buf)
+                    .await
+                    .map_err(TropelError::Io)?;
+            }
+            let payload: serde_json::Value = match serde_json::from_slice(&body_buf) {
+                Ok(v) => v,
+                Err(_) => return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await,
+            };
+            let scenario_json = payload
+                .get("scenario")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let iterations = payload
+                .get("iterations")
+                .and_then(|i| i.as_u64())
+                .unwrap_or(1)
+                .min(1000); // bounded — a load run is not an unbounded loop
+            let scenario: tropel_sdk::scenario::Scenario = match serde_json::from_str(scenario_json)
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    return respond(sock, 400, &format!(r#"{{"error":"invalid scenario: {e}"}}"#))
+                        .await
+                }
+            };
+            let out = run_load(&state, &scenario, iterations).await;
+            respond(sock, 200, &out.to_string()).await
+        }
         _ => respond(sock, 404, r#"{"error":"not found"}"#).await,
     }
+}
+
+/// Run a load run: walk the scenario items `iterations` times, executing each
+/// request through the shared engine HTTP client with full sub-timings, and
+/// aggregate the raw samples. No percentiles (TR-411).
+async fn run_load(
+    state: &AgentState,
+    scenario: &tropel_sdk::scenario::Scenario,
+    iterations: u64,
+) -> serde_json::Value {
+    let mut samples: Vec<serde_json::Value> = Vec::new();
+    let mut total_failures = 0u64;
+    for it in 0..iterations {
+        for item in &scenario.items {
+            let Some(request) = item.request.as_ref() else { continue };
+            let start = Instant::now();
+            let result = state.client.execute(request, None).await;
+            let elapsed_ms = start.elapsed().as_millis() as f64;
+            let (status, ok) = match &result {
+                Ok(resp) => (resp.status_code, (200..400).contains(&resp.status_code)),
+                Err(_) => (0, false),
+            };
+            if !ok {
+                total_failures += 1;
+            }
+            samples.push(serde_json::json!({
+                "metric": "http_reqs",
+                "iteration": it,
+                "url": request.url,
+                "status": status,
+                "duration_ms": elapsed_ms,
+            }));
+        }
+    }
+    serde_json::json!({
+        "iterations": iterations,
+        "samples": samples,
+        "failures": total_failures,
+        // TR-411: thresholds are host-side, but a non-zero failure count is
+        // surfaced so the client can fail fast.
+        "has_failures": total_failures > 0,
+    })
 }
 
 async fn respond(sock: &mut TcpStream, status: u16, body: &str) -> tropel_sdk::Result<()> {
