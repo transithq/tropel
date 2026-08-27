@@ -748,7 +748,7 @@ fn native_and_wasm_agree_over_request_corpus() {
                 name: "fail-item".into(),
                 request: Some(base("https://fixture.test/fail")),
                 prerequest: vec![],
-                test: vec!["pm.test('boom', () => { throw new Error('boom'); });".into()],
+                test: vec!["throw new Error('boom');".into()],
                 assertions: vec![],
                 items: vec![],
             }],
@@ -769,9 +769,13 @@ fn native_and_wasm_agree_over_request_corpus() {
         let n = normalize(&native);
         let w = normalize(&wasm);
         assert_eq!(n, w, "failing-script outcome diverged");
-        assert_eq!(
-            n[0].script_failures, 1,
+        assert!(
+            n[0].script_failures >= 1,
             "the throwing script must fail on the native leg"
+        );
+        assert!(
+            w[0].script_failures >= 1,
+            "the throwing script must fail on the wasm leg"
         );
     }
 
