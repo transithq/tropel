@@ -546,6 +546,55 @@ impl Engine {
             "Starting Tropel load test: {} scenario(s)",
             scenario_configs.len()
         );
+
+        // TR-505: effective VU reporting — warn at startup when the 4096 cap
+        // or cgroup pids limit will reduce concurrency.
+        let peak_requested: u64 = {
+            fn peak_for_exec(exec: &ExecutionConfig) -> u64 {
+                match exec {
+                    ExecutionConfig::ConstantVus { vus, .. } => *vus as u64,
+                    ExecutionConfig::RampingVus { stages, start_vus, .. } => {
+                        let max_stage = stages.iter().map(|s| s.target as u64).max().unwrap_or(0);
+                        (*start_vus as u64).max(max_stage)
+                    }
+                    ExecutionConfig::ConstantArrivalRate { max_vus, .. } => *max_vus as u64,
+                    ExecutionConfig::RampingArrivalRate { max_vus, .. } => *max_vus as u64,
+                    ExecutionConfig::SharedIterations { vus, .. } => *vus as u64,
+                    ExecutionConfig::PerVUIterations { vus, .. } => *vus as u64,
+                    ExecutionConfig::ExternallyControlled { max_vus, .. } => *max_vus as u64,
+                }
+            }
+            // Concurrent scenarios run together — worst-case is sum of peaks.
+            // Sequential scenarios (staggered start_time) would over-estimate,
+            // but a startup warning that is slightly eager is safer than one
+            // that misses a real cap.
+            scenario_configs
+                .iter()
+                .map(|sc| peak_for_exec(&sc.execution))
+                .sum()
+        };
+        let effective = VUWorkerPool::effective_concurrency(peak_requested);
+        if peak_requested > effective {
+            let pids = VUWorkerPool::pids_limit();
+            let reason = if pids.is_some_and(|lim| lim < peak_requested && lim < VUWorkerPool::MAX_WORKERS as u64) {
+                format!("cgroup pids.max={} (Docker --pids-limit / Kubernetes pids.max)", pids.unwrap())
+            } else {
+                format!("MAX_WORKERS={}", VUWorkerPool::MAX_WORKERS)
+            };
+            tracing::warn!(
+                "TR-505: requested {} VUs but only {} effective ({}). Co-located VUs share a single-threaded runtime and block each other — throughput will be that of {} VUs.",
+                peak_requested, effective, reason, effective
+            );
+        } else if peak_requested > 0 {
+            tracing::info!(
+                "TR-505: requested {} VUs, effective {} (MAX_WORKERS={}, pids={})",
+                peak_requested,
+                effective,
+                VUWorkerPool::MAX_WORKERS,
+                VUWorkerPool::pids_limit().map(|v| v.to_string()).unwrap_or_else(|| "unlimited".to_string())
+            );
+        }
+
         let mut scenario_handles = Vec::new();
 
         for sc in &scenario_configs {
@@ -735,6 +784,12 @@ impl Engine {
         // runs that exited 1).
         results.vu_init_failures = total_vu_init_failures;
         results.script_failures = total_script_failures;
+        // TR-505: stamp requested vs effective so the summary can report the gap
+        // between what was asked and what the worker pool can deliver (4096 cap /
+        // pids.max). This is the cheapest honesty win — a run requesting 10k
+        // must not print "10 000 VUs" when it delivered 4 096.
+        results.requested_vus = peak_requested;
+        results.effective_vus = effective;
 
         // Distributed workers (`tropel-agent`) skip ALL end-of-run output —
         // the controller owns the summary, handleSummary, and reporters —

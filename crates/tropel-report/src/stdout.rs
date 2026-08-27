@@ -78,13 +78,31 @@ impl StdoutReporter {
 
         // Execution overview — aligned two-column block
         out.push_str("  ── Execution ─────────────────────────────────────────────\n");
-        let exec_rows = vec![
+        // TR-505: report effective vs requested when the 4096/pids cap bites.
+        let max_vus_label = if result.requested_vus > 0 && result.requested_vus != result.effective_vus {
+            format!("{} (effective {})", result.vus_max, result.effective_vus)
+        } else {
+            result.vus_max.to_string()
+        };
+        let mut exec_rows = vec![
             ("Iterations", result.iterations.to_string()),
-            ("Max VUs", result.vus_max.to_string()),
+            ("Max VUs", max_vus_label),
             ("Dropped", result.dropped_iterations.to_string()),
         ];
+        if result.requested_vus > 0 && result.requested_vus != result.effective_vus {
+            exec_rows.push((
+                "Requested VUs",
+                format!("{} → {} effective (MAX_WORKERS=4096, capped)", result.requested_vus, result.effective_vus),
+            ));
+        }
         for (label, value) in exec_rows {
             out.push_str(&format!("    {:<14}{}\n", label, value));
+        }
+        if result.requested_vus > result.effective_vus {
+            out.push_str(&format!(
+                "    {:<14}requested {} but only {} effective — co-located VUs share a single-threaded runtime and block each other\n",
+                "VU cap", result.requested_vus, result.effective_vus
+            ));
         }
         if result.is_unverified() {
             out.push_str("    Verification   UNVERIFIED: samples or iterations were dropped\n");

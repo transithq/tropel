@@ -1310,6 +1310,8 @@ impl Aggregator {
             },
             iterations,
             vus_max,
+            requested_vus: 0,
+            effective_vus: 0,
             // Backlog line 45 (P0): REAL mid-run elapsed — a ZERO here made
             // every rate/avg threshold compute 0.0 and abortOnFail killed
             // healthy runs (the engine stamps the final value post-run).
@@ -1755,6 +1757,14 @@ pub struct MetricsResult {
     pub iterations: u64,
     /// Maximum concurrent VUs observed.
     pub vus_max: u64,
+    /// Requested peak VUs (sum of configured `vus`/`maxVUs` across scenarios).
+    /// Stamped by the engine before the run so reporters can show the gap
+    /// between requested and effective when the 4096 cap bites (TR-505).
+    pub requested_vus: u64,
+    /// Effective peak VUs actually achievable — `min(requested, MAX_WORKERS,
+    /// pids.limit)`. When `requested > effective`, the run wrapped or was
+    /// pids-capped and throughput is that of `effective`.
+    pub effective_vus: u64,
     /// Wall-clock duration of the run (stamped by the engine after the run
     /// finishes). Reporters use it for k6-style per-second rates
     /// (`http_reqs: 136 13.56/s`) and `handleSummary` state.
@@ -1814,6 +1824,8 @@ impl Default for MetricsResult {
             http_req_failed: 0.0,
             iterations: 0,
             vus_max: 0,
+            requested_vus: 0,
+            effective_vus: 0,
             run_duration: Duration::ZERO,
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),

@@ -130,6 +130,8 @@ pub(crate) fn build_summary_data(
             "testRunDurationMs": test_start.elapsed().as_millis() as u64,
             "iterations": results.iterations,
             "vusMax": results.vus_max,
+            "vusRequested": results.requested_vus,
+            "vusEffective": results.effective_vus,
             "http_reqs": results.http_reqs,
             "checksTotal": results.checks_total,
             "checksPassed": results.checks_passed,
