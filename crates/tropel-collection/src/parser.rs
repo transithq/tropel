@@ -87,6 +87,7 @@ pub fn collection_to_scenario_with_file_reads(
         items: vec![],
         variables: HashMap::new(),
         auth: convert_auth(collection.auth.as_ref()),
+        conversion_notes: Vec::new(),
     };
 
     // Convert collection variables

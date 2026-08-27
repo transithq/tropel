@@ -388,6 +388,7 @@ impl InputAdapter for SubprocessAdapter {
             items,
             variables: HashMap::new(),
             auth: None,
+        conversion_notes: Vec::new(),
         })
     }
 

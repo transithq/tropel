@@ -249,7 +249,10 @@ impl InputAdapter for BruInputAdapter {
         let col: BruCollection = serde_json::from_slice(bytes)
             .map_err(|e| TropelError::Parse(format!("Failed to parse Bruno collection: {}", e)))?;
 
-        let items = build_items(&col.items);
+        // TR-410: collect conversion notes (skipped items, degraded requests)
+        // into a structured report the client can render, instead of eprintln.
+        let mut notes: Vec<String> = Vec::new();
+        let items = build_items(&col.items, &mut notes);
         if items.is_empty() {
             return Err(TropelError::Parse(
                 "Bruno collection contains no HTTP requests".into(),
@@ -280,13 +283,14 @@ impl InputAdapter for BruInputAdapter {
             items,
             variables,
             auth: None,
+            conversion_notes: notes,
         })
     }
 }
 
 /// Recurse Bruno items: folders become nested ScenarioItems, http-requests
 /// map to request items. Non-HTTP item types are skipped.
-fn build_items(items: &[BruItem]) -> Vec<ScenarioItem> {
+fn build_items(items: &[BruItem], notes: &mut Vec<String>) -> Vec<ScenarioItem> {
     let mut out = Vec::new();
     for item in items {
         match item.r#type.as_deref() {
@@ -297,22 +301,37 @@ fn build_items(items: &[BruItem]) -> Vec<ScenarioItem> {
                 prerequest: vec![],
                 test: vec![],
                 assertions: vec![],
-                items: build_items(&item.items),
+                items: build_items(&item.items, notes),
             }),
             Some("http-request") => {
                 match http_item_to_item(item) {
                     Ok(child) => out.push(child),
                     Err(e) => {
-                        // TR-005: report conversion errors instead of silently dropping
-                        eprintln!(
-                            "bru: skipping item {}: {}",
-                            item.name.as_deref().unwrap_or("?"),
-                            e
-                        );
+                        // TR-410: report conversion errors in the structured
+                        // notes instead of eprintln (which the client cannot
+                        // render).
+                        notes.push(format!(
+                            "Skipped '{}': {e}",
+                            item.name.as_deref().unwrap_or("(unnamed)")
+                        ));
                     }
                 }
             }
-            _ => {}
+            // TR-410: silently-skipped item types (ws-request, graphql-request)
+            // are now recorded so the client can show what was lost.
+            Some(other) => {
+                notes.push(format!(
+                    "Skipped '{}': unsupported Bruno item type '{}'",
+                    item.name.as_deref().unwrap_or("(unnamed)"),
+                    other
+                ));
+            }
+            None => {
+                notes.push(format!(
+                    "Skipped '{}': no item type",
+                    item.name.as_deref().unwrap_or("(unnamed)")
+                ));
+            }
         }
     }
     out
@@ -769,5 +788,30 @@ mod tests {
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
         assert_eq!(req.query_params.get("ids"), Some(&"1, 2".to_string()));
+    }
+
+    #[test]
+    fn conversion_notes_report_skipped_items() {
+        // TR-410: a ws-request item must be recorded in conversion_notes
+        // (not silently dropped), naming the item and the reason.
+        let adapter = BruInputAdapter;
+        let data = br#"{
+            "version": "1",
+            "name": "C",
+            "items": [
+                {"uid":"r","type":"http-request","name":"OK","request":{"url":"https://x.io/","method":"GET"}},
+                {"uid":"w","type":"ws-request","name":"Chat","request":{"url":"ws://x.io/chat"}}
+            ]
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        assert_eq!(scenario.items.len(), 1, "only the http-request converts");
+        assert!(
+            scenario
+                .conversion_notes
+                .iter()
+                .any(|n| n.contains("Chat") && n.contains("ws-request")),
+            "conversion_notes must name the skipped item and reason: {:?}",
+            scenario.conversion_notes
+        );
     }
 }
