@@ -560,6 +560,103 @@ pub fn parse_token_response(body: &str) -> Result<TokenResponse> {
     })
 }
 
+/// RFC 8628 §3.2 device authorization response — the server's answer to the
+/// INITIAL `grant_type=device_code` request. The user visits
+/// `verification_uri` and enters `user_code`; the client then POLLS the token
+/// endpoint with the `device_code` value (see `build_token_request`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceCodeResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    /// Seconds until the device_code expires.
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    /// Recommended poll interval in seconds.
+    #[serde(default)]
+    pub interval: Option<i64>,
+}
+
+/// RFC 8628 §3.5 device-code POLL result. The server answers the token
+/// endpoint with `authorization_pending` / `slow_down` while the user hasn't
+/// authorized, and a normal token response once they have.
+#[derive(Debug, Clone)]
+pub enum DeviceCodePoll {
+    /// Keep polling (optionally at a slower interval).
+    Pending { interval_seconds: i64 },
+    /// Keep polling, but slow down (RFC 8628 §3.5: interval +5 s).
+    SlowDown { interval_seconds: i64 },
+    /// The user authorized — the token response.
+    Authorized(TokenResponse),
+    /// The user denied or the code expired.
+    Denied { error: String, description: Option<String> },
+}
+
+/// Parse the INITIAL device-authorization response (RFC 8628 §3.2).
+pub fn parse_device_code_response(body: &str) -> Result<DeviceCodeResponse> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| OauthError::Invalid(format!("device response is not JSON: {e}")))?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(OauthError::TokenError {
+            error: err.into(),
+            error_description: v
+                .get("error_description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string),
+        });
+    }
+    let get = |k: &str| -> Result<String> {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| OauthError::TokenError {
+                error: "invalid_response".into(),
+                error_description: Some(format!("missing {k} in device authorization response")),
+            })
+    };
+    Ok(DeviceCodeResponse {
+        device_code: get("device_code")?,
+        user_code: get("user_code")?,
+        verification_uri: get("verification_uri")?,
+        verification_uri_complete: v
+            .get("verification_uri_complete")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        expires_in: v.get("expires_in").and_then(|x| x.as_i64()),
+        interval: v.get("interval").and_then(|x| x.as_i64()),
+    })
+}
+
+/// Parse a device-code POLL response (RFC 8628 §3.5). The token endpoint
+/// either returns `error=authorization_pending`/`slow_down` (keep polling) or
+/// a normal token response.
+pub fn parse_device_code_poll(body: &str) -> Result<DeviceCodePoll> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| OauthError::Invalid(format!("poll response is not JSON: {e}")))?;
+    let interval = v
+        .get("interval")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(5);
+    match v.get("error").and_then(|e| e.as_str()) {
+        Some("authorization_pending") => Ok(DeviceCodePoll::Pending {
+            interval_seconds: interval,
+        }),
+        Some("slow_down") => Ok(DeviceCodePoll::SlowDown {
+            interval_seconds: interval + 5,
+        }),
+        Some(err) => Ok(DeviceCodePoll::Denied {
+            error: err.into(),
+            description: v
+                .get("error_description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string),
+        }),
+        None => parse_token_response(body).map(DeviceCodePoll::Authorized),
+    }
+}
+
 /// Stored token + its computed absolute expiry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredToken {
@@ -974,6 +1071,51 @@ mod tests {
         assert!(poll
             .body
             .contains("device_code=GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS"));
+    }
+
+    #[test]
+    fn device_code_response_and_poll_parsing() {
+        // TR-409: RFC 8628 §3.2 initial response + §3.5 poll results.
+        let initial = parse_device_code_response(
+            r#"{"device_code":"GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS",
+                "user_code":"WDJB-MJHT",
+                "verification_uri":"https://example.com/device",
+                "verification_uri_complete":"https://example.com/device?user_code=WDJB-MJHT",
+                "expires_in":1800,"interval":5}"#,
+        )
+        .unwrap();
+        assert_eq!(initial.device_code, "GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS");
+        assert_eq!(initial.user_code, "WDJB-MJHT");
+        assert_eq!(initial.verification_uri, "https://example.com/device");
+        assert_eq!(initial.expires_in, Some(1800));
+        assert_eq!(initial.interval, Some(5));
+
+        // Poll: pending → keep polling; slow_down → +5 s interval.
+        let pending = parse_device_code_poll(r#"{"error":"authorization_pending"}"#).unwrap();
+        match pending {
+            DeviceCodePoll::Pending { interval_seconds } => assert_eq!(interval_seconds, 5),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        let slow = parse_device_code_poll(r#"{"error":"slow_down"}"#).unwrap();
+        match slow {
+            DeviceCodePoll::SlowDown { interval_seconds } => assert_eq!(interval_seconds, 10),
+            other => panic!("expected SlowDown, got {other:?}"),
+        }
+
+        // Poll: the user authorized → the token response.
+        let authorized =
+            parse_device_code_poll(r#"{"access_token":"tok","token_type":"Bearer"}"#).unwrap();
+        match authorized {
+            DeviceCodePoll::Authorized(t) => assert_eq!(t.access_token, "tok"),
+            other => panic!("expected Authorized, got {other:?}"),
+        }
+
+        // Poll: denied.
+        let denied = parse_device_code_poll(r#"{"error":"access_denied"}"#).unwrap();
+        match denied {
+            DeviceCodePoll::Denied { error, .. } => assert_eq!(error, "access_denied"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 
     #[test]
