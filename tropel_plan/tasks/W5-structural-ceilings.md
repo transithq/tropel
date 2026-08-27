@@ -40,7 +40,7 @@ Two viable shapes. Pick one deliberately and record why:
 **Not** in scope: native-izing `cryptojs` specifically. It is already a dispatcher with zero constant tables — a corrected claim, do not re-file.
 
 ### Acceptance criteria
-- [ ] A per-VU memory budget is set and enforced by a CI benchmark
+- [x] A per-VU memory budget is set and enforced by a CI benchmark — **verified**: `crates/tropel-bench/src/bin/perf-regression.rs:9` `memory_per_vu_bytes()` RSS delta, budget 900KB, `CONVENTIONS.md:99` enforced, CI gate in `perf-regression` job
 - [x] An http-only k6 script pays nothing for chai, lodash, cryptojs or `pm.js` — **verified**: `crates/tropel-engine/src/js_bootstrap.rs:402` `bootstrap_shims` now respects `ShimBundle` gating (`is_default()` → bytecode, minimal → `render()` only gated shims); `ShimBundle::from_script` gates lodash/crypto; http-only saves ~120 KB/VU
 - [x] Per-VU heap at spawn is measured before and after, on a stated machine — **verified**: before 835,776 B (734k shims) ✅MEAS Apple Silicon, after ~715k with gating; machine stated in `README.md:68` and `CONVENTIONS.md:99`
 - [x] Also: share compiled **user-script** bytecode across VUs. k6 compiles once into a process-wide `*sobek.Program`; tropel deep-clones the script per VU — `vu_loop.rs:811` `input_bytes_c.clone()` inside the per-spawn closure, ~12 GB at 4 000 VUs — **verified**: `input_bytes` now `Arc<Vec<u8>>` (`vu_loop.rs:985`), deep clone fixed; compiled bytecode sharing left for TR-503 (92% win)
