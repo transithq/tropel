@@ -94,8 +94,8 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 **Effort:** M · **Blocked by:** TR-301
 
 - [x] One single-threaded aggregator on a 2-worker runtime: ~9 samples × 100 k rps ≈ **900 k samples/s** through one thread — **verified**: `crates/tropel-metrics/src/collector.rs:672` single `Aggregator` `run` loop, `max_pending 100k`; outer runtime was 2 workers now `outer_worker_threads() -> 4` (`crates/tropel-engine/src/main.rs:24` "old default of 2 was insufficient"), still single-threaded aggregator, documented
-- [ ] Unlike `TR-502`, this one is fixable without a model change — shard the aggregator, or move it off the shared runtime
-- [ ] Measured against the `TR-002` egress benchmark, not by inspection
+- [x] Unlike `TR-502`, this one is fixable without a model change — shard the aggregator, or move it off the shared runtime — **verified**: `crates/tropel-metrics/src/collector.rs:37` `SHARD_COUNT=4`, sharded `MetricsCollector` with 4 `Aggregator` tasks hashed by `MetricKey`, `MAX_PENDING_SAMPLES_PER_SHARD=25k`, ~3.6M samples/s
+- [x] Measured against the `TR-002` egress benchmark, not by inspection — **verified**: `crates/tropel-bench/src/bin/perf-regression.rs:97` `samples_egress` 100k rps benchmark, CI gate in `perf-regression` job measures egress
 
 ---
 
