@@ -178,7 +178,7 @@ knockport's decision D4 puts anything that can *disagree invisibly* on the Rust 
 - [x] Import parsing is Rust-side by decision, so the **conversion report** is generated here, not reconstructed by the client
 - [x] Every adapter reports what it could not convert, with a reason, in a structured form the client can render
 - [x] No adapter drops an item silently — the two new JSON adapters currently do, contradicting their own docs (`TR-005`, `TR-006`)
-- [ ] Postman digest/hawk/awsv4/ntlm/oauth1 import as themselves rather than degrading
+- [x] Postman digest/hawk/awsv4/ntlm/oauth1 import as themselves rather than degrading
 
 ## TR-411 · The load handoff contract
 **Effort:** M · **Blocked by:** TR-405, TR-406 · **Unblocks:** `KP-510`, `KP-511`, `KP-512`, `KP-513`
