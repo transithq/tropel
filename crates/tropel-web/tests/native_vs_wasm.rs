@@ -686,7 +686,7 @@ fn native_and_wasm_agree_over_request_corpus() {
         response_type: ResponseType::Text,
     };
 
-    let mut corpus: Vec<Request> = vec![
+    let corpus: Vec<Request> = vec![
         base("https://fixture.test/get"),
         {
             let mut r = base("https://fixture.test/post");
@@ -702,7 +702,9 @@ fn native_and_wasm_agree_over_request_corpus() {
         },
         {
             let mut r = base("https://fixture.test/bearer");
-            r.auth = Some(AuthConfig::Bearer { token: "tok".into() });
+            r.auth = Some(AuthConfig::Bearer {
+                token: "tok".into(),
+            });
             r
         },
         {
