@@ -150,12 +150,12 @@ Verified: no `cargo tree` assertion and no out-of-workspace build anywhere in `.
 The thesis is *"one engine, with a differential harness proving they agree."* Without the harness it is a claim — and every competitor's runtime fork (Bruno GUI ≠ CLI, Hoppscotch app ≠ CLI) started as exactly the same claim. This repo already has four surfaces that can diverge: native, wasm, the web slice, and the agent.
 
 ### Acceptance criteria
-- [ ] `native_vs_wasm` over a request corpus: identical wire bytes, identical signing, identical script results
-- [ ] The corpus includes every fixture collection, and every auth scheme
-- [ ] Runs in CI on every PR and **blocks merge** on divergence
-- [ ] Divergences that are genuinely unavoidable are enumerated in a checked-in file; the suite fails on any divergence **not** on that list
+- [x] `native_vs_wasm` over a request corpus: identical wire bytes, identical signing, identical script results
+- [x] The corpus includes every fixture collection, and every auth scheme
+- [x] Runs in CI on every PR and **blocks merge** on divergence
+- [x] Divergences that are genuinely unavoidable are enumerated in a checked-in file; the suite fails on any divergence **not** on that list
 - [ ] Extends the conformance suite rather than forking it — a second harness is the bug this harness exists to catch
-- [ ] Published as a badge
+- [x] Published as a badge
 
 ---
 

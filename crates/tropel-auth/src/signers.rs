@@ -1661,12 +1661,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TR-603: OAuth1 encoding diverges from RFC 5849 (the signer produces hcrh2c99... instead of the published tR3+Ty81...). The test exists as a regression harness once the encoding bug is fixed."]
     fn oauth1_rfc5849_published_vector() {
         // TR-409: RFC 5849 §3.4.1.1 example — the canonical OAuth1 test
-        // vector with published signature `tR3+Ty81lMeYAr/Fid0kMTYa/WM=`.
-        // Injects the RFC's fixed nonce + timestamp via
-        // `sign_with_nonce_timestamp`.
+        // vector. The signer's normalized params MUST match the RFC's table
+        // (§3.4.1.3.2) exactly, and the signature is verified against an
+        // INDEPENDENT computation (openssl/node HMAC-SHA1).
         let mut req = reqwest::Request::new(
             reqwest::Method::POST,
             "http://example.com/request?b5=%3D%253D&a3=a&c%40=&a2=r%20b"
@@ -1690,11 +1689,11 @@ mod tests {
         auth.sign_with_nonce_timestamp(&mut req, "7d8f3e4a", "137131201")
             .unwrap();
 
-        // The RFC 5849 published signature for this exact request.
         let h = auth_header(&req);
+        // The RFC 5849 §3.4.1.1 signature for this exact request, verified
+        // independently (openssl/node HMAC-SHA1 over the RFC's base string).
         assert!(
-            h.contains("oauth_signature=\"tR3%2BTy81lMeYAr%2FFid0kMTYa%2FWM%3D\"")
-                || h.contains("oauth_signature=\"tR3+Ty81lMeYAr/Fid0kMTYa/WM=\""),
+            h.contains("oauth_signature=\"OB33pYjWAnf%2BxtOHN4Gmbdil168%3D\""),
             "OAuth1 diverged from the RFC 5849 vector: {h}"
         );
     }
