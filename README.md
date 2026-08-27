@@ -2,6 +2,8 @@
 
 > *Spanish: "a rushing throng; in droves"*
 
+[![CI](https://github.com/transithq/tropel/actions/workflows/ci.yml/badge.svg)](https://github.com/transithq/tropel/actions/workflows/ci.yml)
+
 **Tropel** is a high-performance, open-source load-testing framework built in
 Rust. It runs **Postman collections**, **HAR files**, **OpenAPI specs**, and
 **k6 scripts** as load tests — with a native Rust hot path and an embedded
