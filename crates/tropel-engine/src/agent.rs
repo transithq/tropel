@@ -169,11 +169,53 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                         .await
                 }
             };
-            let out = run_load(&state, &scenario, iterations).await;
+            // TR-411: optional thresholds map — evaluated against the run's
+            // http_reqs count + http_req_failed rate; the verdict is returned
+            // so the client can use it as the exit code.
+            let thresholds: std::collections::HashMap<String, String> =
+                payload.get("thresholds").and_then(|t| t.as_object()).map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                        .collect()
+                }).unwrap_or_default();
+            let out = run_load(&state, &scenario, iterations, &thresholds).await;
             respond(sock, 200, &out.to_string()).await
         }
         _ => respond(sock, 404, r#"{"error":"not found"}"#).await,
     }
+}
+
+/// Evaluate a simple `<metric> <op> <value>` threshold against a single
+/// number. Supported metrics: `http_reqs` (count), `http_req_failed` (rate).
+fn eval_threshold(expr: &str, reqs: u64, failed: u64) -> Result<bool, String> {
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() != 3 {
+        return Err(format!("invalid threshold '{expr}': expected '<metric> <op> <value>'"));
+    }
+    let actual = match parts[0] {
+        "http_reqs" => reqs as f64,
+        "http_req_failed" => {
+            if reqs == 0 {
+                0.0
+            } else {
+                failed as f64 / reqs as f64
+            }
+        }
+        other => return Err(format!("unsupported threshold metric '{other}'")),
+    };
+    let threshold: f64 = parts[2]
+        .parse()
+        .map_err(|_| format!("invalid threshold value '{}'", parts[2]))?;
+    let passed = match parts[1] {
+        "<" => actual < threshold,
+        "<=" => actual <= threshold,
+        ">" => actual > threshold,
+        ">=" => actual >= threshold,
+        "==" | "===" => (actual - threshold).abs() < f64::EPSILON,
+        "!=" => (actual - threshold).abs() > f64::EPSILON,
+        other => return Err(format!("unknown operator '{other}'")),
+    };
+    Ok(passed)
 }
 
 /// Run a load run: walk the scenario items `iterations` times, executing each
@@ -183,6 +225,7 @@ async fn run_load(
     state: &AgentState,
     scenario: &tropel_sdk::scenario::Scenario,
     iterations: u64,
+    thresholds: &std::collections::HashMap<String, String>,
 ) -> serde_json::Value {
     let mut samples: Vec<serde_json::Value> = Vec::new();
     let mut total_failures = 0u64;
@@ -212,9 +255,51 @@ async fn run_load(
         "iterations": iterations,
         "samples": samples,
         "failures": total_failures,
-        // TR-411: thresholds are host-side, but a non-zero failure count is
-        // surfaced so the client can fail fast.
+        // TR-411: thresholds are evaluated here; the verdict is the exit code
+        // the client should use.
         "has_failures": total_failures > 0,
+        "thresholds": threshold_verdict(thresholds, iterations, total_failures),
+    })
+}
+
+/// Evaluate the run's thresholds and produce the verdict (TR-411).
+fn threshold_verdict(
+    thresholds: &std::collections::HashMap<String, String>,
+    iterations: u64,
+    failures: u64,
+) -> serde_json::Value {
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut all_passed = true;
+    for (name, expr) in thresholds {
+        let passed = match eval_threshold(expr, iterations, failures) {
+            Ok(p) => p,
+            Err(e) => {
+                all_passed = false;
+                results.push(serde_json::json!({
+                    "name": name, "expression": expr, "passed": false,
+                    "error": e, "actual": null, "threshold": null,
+                }));
+                continue;
+            }
+        };
+        if !passed {
+            all_passed = false;
+        }
+        let actual = if expr.starts_with("http_req_failed") && iterations > 0 {
+            failures as f64 / iterations as f64
+        } else {
+            iterations as f64
+        };
+        results.push(serde_json::json!({
+            "name": name, "expression": expr, "passed": passed,
+            "actual": actual,
+            "threshold": expr.split_whitespace().nth(2).and_then(|v| v.parse::<f64>().ok()),
+        }));
+    }
+    results.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    serde_json::json!({
+        "results": results,
+        "passed": all_passed,
     })
 }
 
@@ -359,5 +444,42 @@ mod tests {
         assert!(!ip.is_loopback(), "0.0.0.0 must be rejected");
         let ip2: IpAddr = "127.0.0.1".parse().unwrap();
         assert!(ip2.is_loopback(), "127.0.0.1 must be accepted");
+    }
+
+    #[test]
+    fn threshold_verdict_evaluates_and_verdicts() {
+        // TR-411: http_reqs < N and http_req_failed <= rate thresholds.
+        use std::collections::HashMap;
+        let mut t = HashMap::new();
+        t.insert("reqs_ok".into(), "http_reqs < 100".into());
+        t.insert("fail_rate_ok".into(), "http_req_failed <= 0.1".into());
+
+        // 10 iterations, 1 failure → both pass.
+        let v = threshold_verdict(&t, 10, 1);
+        assert!(v["passed"].as_bool().unwrap(), "all must pass: {v}");
+        let results = v["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r["passed"].as_bool().unwrap()));
+
+        // 200 iterations, 1 failure → http_reqs < 100 fails.
+        let v2 = threshold_verdict(&t, 200, 1);
+        assert!(!v2["passed"].as_bool().unwrap(), "reqs threshold must fail");
+        let reqs = v2["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "reqs_ok")
+            .unwrap();
+        assert!(!reqs["passed"].as_bool().unwrap());
+
+        // A malformed threshold reports an error, not a silent pass.
+        let mut bad = HashMap::new();
+        bad.insert("bogus".into(), "http_reqs".into());
+        let v3 = threshold_verdict(&bad, 10, 0);
+        assert!(!v3["passed"].as_bool().unwrap(), "malformed must fail");
+        assert!(
+            v3["results"][0]["error"].as_str().is_some(),
+            "the malformed threshold must report its error"
+        );
     }
 }
