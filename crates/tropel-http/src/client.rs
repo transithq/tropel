@@ -846,9 +846,8 @@ impl HttpClient {
             // the captured headers as before. Cross-origin hops always strip.
             // Note: replay is done post-build via insert (replace) not append,
             // so a redirected request does not accumulate duplicate Authorization.
-            let replay_signed_headers = !strip_sensitive
-                && signer.is_none()
-                && !signed_headers.is_empty();
+            let replay_signed_headers =
+                !strip_sensitive && signer.is_none() && !signed_headers.is_empty();
 
             // ── Per-VU cookie jar: inject stored cookies for this hop ──
             // Skipped on cross-origin redirect hops (credentials must not
@@ -950,9 +949,7 @@ impl HttpClient {
             // header() is append, see request.rs:226).
             if replay_signed_headers {
                 for (key, value) in signed_headers.iter().filter(|(k, _)| k != "cookie") {
-                    if let Ok(name) =
-                        reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                    {
+                    if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
                         if let Ok(val) = value.parse() {
                             built_request.headers_mut().insert(name, val);
                         }
