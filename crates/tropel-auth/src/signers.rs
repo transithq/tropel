@@ -771,12 +771,23 @@ fn parse_form(bytes: &[u8]) -> Vec<(String, String)> {
         .filter(|p| !p.is_empty())
         .filter_map(|pair| {
             let (k, v) = pair.split_once('=')?;
+            // RFC 5849 §3.4.1.1: form-urlencoded bodies use `+` for space
+            // (the same decoding as `application/x-www-form-urlencoded`).
+            // The decoded value is then percent-encoded by `enc()` when the
+            // base string is built — so `+` must become space here, not
+            // survive as a literal `+` (which would re-encode as `%2B`).
             Some((
-                percent_decode(k).unwrap_or_else(|| k.to_string()),
-                percent_decode(v).unwrap_or_else(|| v.to_string()),
+                decode_form_value(k),
+                decode_form_value(v),
             ))
         })
         .collect()
+}
+
+/// Decode a form-urlencoded value: `+` → space, then percent-decode `%XX`.
+fn decode_form_value(s: &str) -> String {
+    let plus_to_space = s.replace('+', " ");
+    percent_decode(&plus_to_space).unwrap_or(plus_to_space)
 }
 
 fn percent_decode(s: &str) -> Option<String> {
