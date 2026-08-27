@@ -407,6 +407,13 @@ jobs:
       - name: P6 lockstep versioning gate
         run: bash scripts/version-lockstep.sh
 
+      # TR-407: the SDK inversion (contract at the bottom of the graph) rots
+      # if adapters start depending on tropel-core, or if the SDK needs a full
+      # checkout to use. Guard 1 asserts no in-tree adapter pulls tropel-core;
+      # Guard 2 compiles a sample extension from outside the workspace.
+      - name: TR-407 SDK inversion guards
+        run: bash scripts/sdk-guard.sh
+
   smoke:
     name: "e2e smoke (samples: k6, postman, openapi, har)"
     runs-on: ubuntu-latest
