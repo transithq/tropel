@@ -669,6 +669,7 @@ impl MetricsCollector {
     /// Merge sharded MetricsResults. Sharding by metric key guarantees no
     /// duplicate series across shards, so metrics vecs can be extended.
     /// Counters are summed, gauges take max, rates are merged via totals.
+    #[allow(clippy::field_reassign_with_default)]
     fn merge_results(mut shards: Vec<MetricsResult>) -> MetricsResult {
         if shards.is_empty() {
             return MetricsResult::default();
@@ -680,7 +681,11 @@ impl MetricsCollector {
         // Keep the config from the first shard (all shards share the same config via broadcast).
         out.summary_trend_stats = shards[0].summary_trend_stats.clone();
         out.effective_thresholds = shards[0].effective_thresholds.clone();
-        out.run_duration = shards.iter().map(|s| s.run_duration).max().unwrap_or_default();
+        out.run_duration = shards
+            .iter()
+            .map(|s| s.run_duration)
+            .max()
+            .unwrap_or_default();
         for r in shards {
             out.metrics.extend(r.metrics);
             out.per_url.extend(r.per_url);
@@ -693,19 +698,15 @@ impl MetricsCollector {
             out.http_reqs += r.http_reqs;
             match (&mut out.http_req_duration, r.http_req_duration) {
                 (None, Some(b)) => out.http_req_duration = Some(b),
-                (Some(a), Some(b)) => {
-                    if b.count > a.count {
-                        *a = b;
-                    }
+                (Some(a), Some(b)) if b.count > a.count => {
+                    *a = b;
                 }
                 _ => {}
             }
             match (&mut out.iteration_duration, r.iteration_duration) {
                 (None, Some(b)) => out.iteration_duration = Some(b),
-                (Some(a), Some(b)) => {
-                    if b.count > a.count {
-                        *a = b;
-                    }
+                (Some(a), Some(b)) if b.count > a.count => {
+                    *a = b;
                 }
                 _ => {}
             }

@@ -79,11 +79,12 @@ impl StdoutReporter {
         // Execution overview — aligned two-column block
         out.push_str("  ── Execution ─────────────────────────────────────────────\n");
         // TR-505: report effective vs requested when the 4096/pids cap bites.
-        let max_vus_label = if result.requested_vus > 0 && result.requested_vus != result.effective_vus {
-            format!("{} (effective {})", result.vus_max, result.effective_vus)
-        } else {
-            result.vus_max.to_string()
-        };
+        let max_vus_label =
+            if result.requested_vus > 0 && result.requested_vus != result.effective_vus {
+                format!("{} (effective {})", result.vus_max, result.effective_vus)
+            } else {
+                result.vus_max.to_string()
+            };
         let mut exec_rows = vec![
             ("Iterations", result.iterations.to_string()),
             ("Max VUs", max_vus_label),
@@ -92,7 +93,10 @@ impl StdoutReporter {
         if result.requested_vus > 0 && result.requested_vus != result.effective_vus {
             exec_rows.push((
                 "Requested VUs",
-                format!("{} → {} effective (MAX_WORKERS=4096, capped)", result.requested_vus, result.effective_vus),
+                format!(
+                    "{} → {} effective (MAX_WORKERS=4096, capped)",
+                    result.requested_vus, result.effective_vus
+                ),
             ));
         }
         for (label, value) in exec_rows {
