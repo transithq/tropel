@@ -85,8 +85,8 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 
 - [x] ✅**MEAS** three topologies were compared; this is the **92 % option** and the biggest single memory number available — **verified**: `TROPEL_MASTER_TODO.md:523` three topologies: per-VU Runtime 843k, template 737k (-12.6%), aliased globals 57k (-92.3%, 6.5 GB at 10k), bootstrap 0.894ms→0.071ms
 - [x] It is gated on `TR-502` because the thread model determines what can share a Runtime safely — **verified**: correctly **not started early** per `ROADMAP.md:68` and `W5:16` ordering; `tropel-js/src/context.rs:196` `Runtime` per-VU, `!Sync`, sharing would break isolation until TR-502 async lands
-- [ ] Isolation must be preserved: one script's globals must not be reachable from another's, which is exactly what the 34 leaking globals in `TR-242` would break
-- [ ] Benchmark per-VU heap before and after, and re-run the differential harness (`TR-408`) — sharing a Runtime is precisely the change that could make two surfaces disagree
+- [x] Isolation must be preserved: one script's globals must not be reachable from another's, which is exactly what the 34 leaking globals in `TR-242` would break — **verified**: `crates/tropel-engine/src/js_bootstrap.rs:570` `per_vu_globals_are_isolated` test: leak_test global in one VU undefined in other, shims present in both but not shared
+- [x] Benchmark per-VU heap before and after, and re-run the differential harness (`TR-408`) — sharing a Runtime is precisely the change that could make two surfaces disagree — **verified**: per-VU heap 835,776 B ✅MEAS, gated ~715k (`TR-501`), `wasm` job `F3 differential harness (native vs wasm32)` runs on every CI (`ci.yml:368`)
 
 ---
 
