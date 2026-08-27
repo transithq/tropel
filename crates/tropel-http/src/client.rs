@@ -844,11 +844,11 @@ impl HttpClient {
             // stale signed_headers — the signing block below will re-sign the
             // request for the new URL. Without a signer (or on hop 0), replay
             // the captured headers as before. Cross-origin hops always strip.
-            if !strip_sensitive && signer.is_none() {
-                for (key, value) in signed_headers.iter().filter(|(k, _)| k != "cookie") {
-                    req_builder = req_builder.header(key.as_str(), value.as_str());
-                }
-            }
+            // Note: replay is done post-build via insert (replace) not append,
+            // so a redirected request does not accumulate duplicate Authorization.
+            let replay_signed_headers = !strip_sensitive
+                && signer.is_none()
+                && !signed_headers.is_empty();
 
             // ── Per-VU cookie jar: inject stored cookies for this hop ──
             // Skipped on cross-origin redirect hops (credentials must not
@@ -944,6 +944,21 @@ impl HttpClient {
             let mut built_request = req_builder
                 .build()
                 .map_err(|e| TropelError::Http(format!("Failed to build request: {}", e)))?;
+            // Replay captured credential headers on same-origin, signer-less
+            // redirect hops via insert (replace) — not append — so stale
+            // Authorization/Cookie is not duplicated (reqwest's builder
+            // header() is append, see request.rs:226).
+            if replay_signed_headers {
+                for (key, value) in signed_headers.iter().filter(|(k, _)| k != "cookie") {
+                    if let Ok(name) =
+                        reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                    {
+                        if let Ok(val) = value.parse() {
+                            built_request.headers_mut().insert(name, val);
+                        }
+                    }
+                }
+            }
             // Backlog line 246: Sign on EVERY hop (not just hop 0) so the
             // Authorization signature is valid for the current method+URL.
             // Hop 0 captures what the signer added so the replay block above
