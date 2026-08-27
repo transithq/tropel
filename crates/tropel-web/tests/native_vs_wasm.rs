@@ -44,14 +44,32 @@ use tropel_web::wire::{RunOutcome, RunRequest};
 
 /// Deterministic response for ANY request — shared verbatim by the native
 /// seam handler and the wasm host function, so both legs see the same bytes.
+/// The response VARIES by URL path so the corpus can exercise error
+/// statuses, redirects, and different body types through both legs.
 fn fixture_response(req: &Request) -> Result<Response> {
+    let path = req.url.split('?').next().unwrap_or("");
+    let (status, status_text, body, extra_headers) = if path.ends_with("/404") {
+        (404, "Not Found".to_string(), br#"{"error":"not found"}"#.to_vec(), HashMap::new())
+    } else if path.ends_with("/500") {
+        (500, "Internal Server Error".to_string(), br#"{"error":"boom"}"#.to_vec(), HashMap::new())
+    } else if path.ends_with("/redirect") {
+        (301, "Moved Permanently".to_string(), b"".to_vec(), HashMap::from([("location".to_string(), "https://fixture.test/200".to_string())]))
+    } else if path.ends_with("/text") {
+        (200, "OK".to_string(), b"plain text body".to_vec(), HashMap::from([("content-type".to_string(), "text/plain".to_string())]))
+    } else if path.ends_with("/empty") {
+        (204, "No Content".to_string(), b"".to_vec(), HashMap::new())
+    } else {
+        (200, "OK".to_string(), br#"{"ok":true}"#.to_vec(), HashMap::from([("content-type".to_string(), "application/json".to_string())]))
+    };
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    headers.extend(extra_headers);
     Ok(Response {
         url: req.url.clone(),
-        status_code: 200,
-        status_text: "OK".into(),
+        status_code: status,
+        status_text,
         protocol: "HTTP/1.1".into(),
-        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
-        body: br#"{"ok":true}"#.to_vec(),
+        headers,
+        body,
         text_cache: std::sync::OnceLock::new(),
         json_cache: std::sync::OnceLock::new(),
         response_time: std::time::Duration::from_millis(5),
@@ -732,6 +750,13 @@ fn native_and_wasm_agree_over_request_corpus() {
             });
             r
         },
+        // Error statuses and redirects must produce IDENTICAL outcomes on
+        // both legs (the fixture varies by path).
+        base("https://fixture.test/404"),
+        base("https://fixture.test/500"),
+        base("https://fixture.test/redirect"),
+        base("https://fixture.test/text"),
+        base("https://fixture.test/empty"),
     ];
 
     // A failing script must ALSO agree (script_failures on both legs).
