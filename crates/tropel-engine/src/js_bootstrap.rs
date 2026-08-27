@@ -346,7 +346,7 @@ pub(crate) async fn create_vu_js_context(
         let _ = globals.set(
             "__tropel_native_sleep",
             rquickjs::function::Func::from(rquickjs::function::Async(
-                move |ctx: rquickjs::Ctx<'_>, ms: f64| {
+                move |_ctx: rquickjs::Ctx<'_>, ms: f64| {
                     let deadline_sleep = deadline_sleep.clone();
                     let force_stop_sleep = force_stop_sleep.clone();
                     async move {

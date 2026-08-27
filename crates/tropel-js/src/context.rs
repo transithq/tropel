@@ -12,11 +12,12 @@ use std::time::Duration;
 
 static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
 
-/// TR-503 proper fix: per-thread shared Runtime for 92% heap win.
-/// Each worker thread reuses one Runtime (heap + atom table) across its VUs,
-/// and template Context globals are aliased into per-VU Contexts (57k vs 843k).
 thread_local! {
-    static SHARED_RT: RefCell<Option<Runtime>> = RefCell::new(None);
+    /// TR-503 proper fix: per-thread shared Runtime for 92% heap win.
+    /// Each worker thread reuses one Runtime (heap + atom table) across its VUs,
+    /// and template Context globals are aliased into per-VU Contexts (57k vs 843k).
+    #[allow(clippy::missing_const_for_thread_local)]
+    static SHARED_RT: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
 /// A compiled script function persisted across `ctx.with()` calls.
@@ -277,7 +278,7 @@ impl JsContext {
         // per-VU heap significantly. Fall back to per-VU Runtime if thread-local
         // is unavailable (e.g., outside tokio).
         let rt = SHARED_RT.with(|cell| {
-            if let Some(rt) = cell.borrow().as_ref() {
+            if let Some(_rt) = cell.borrow().as_ref() {
                 // Clone the Runtime handle? Runtime is !Clone, so we can't clone.
                 // Instead, we return None to signal we need to create a new one
                 // but we can still share the heap via not dropping the old one.
