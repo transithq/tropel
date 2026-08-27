@@ -966,11 +966,14 @@ mod tests {
         })
         .unwrap();
         assert!(
-            poll.body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"),
+            poll.body
+                .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"),
             "poll must use the RFC 8628 URN grant type: {}",
             poll.body
         );
-        assert!(poll.body.contains("device_code=GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS"));
+        assert!(poll
+            .body
+            .contains("device_code=GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS"));
     }
 
     #[test]
