@@ -13,10 +13,14 @@ default = ["reqwest"]
 # The reqwest-coupled signers (signers.rs). Off for the browser core tier,
 # where reqwest cannot compile; `tropel-core-wasm` consumes the always-on
 # `oauth` module with `default-features = false`.
-reqwest = ["dep:reqwest", "dep:chrono"]
+reqwest = ["dep:reqwest", "dep:chrono", "dep:tropel-sdk"]
 
 [dependencies]
-tropel-sdk.workspace = true
+# TR-404: tropel-sdk is used ONLY by the reqwest-gated signers module (it
+# holds AuthConfig/Result); the always-on `oauth` module has ZERO tropel-sdk
+# references. Making it optional under `reqwest` drops simd-json + inventory
+# + rustc-hash out of the browser core tier at zero behavioural cost.
+tropel-sdk = { workspace = true, optional = true }
 # oauth module + signers module (pure hashing/encoding). sha1 is used by the
 # pure WSSE UsernameToken digest too, so it is NOT part of the reqwest feature.
 serde.workspace = true
