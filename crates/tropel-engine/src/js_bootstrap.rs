@@ -338,46 +338,50 @@ pub(crate) async fn create_vu_js_context(
     ctx.with_ctx(|rq_ctx| {
         let globals = rq_ctx.globals();
         let deadline_sleep = deadline.clone();
+        // TR-502 proper fix: sleep is now async (Promise-based) so the VU's
+        // thread yields and other VUs on the same worker can progress. The old
+        // sync std::thread::sleep parked the OS thread. With rquickjs
+        // full-async, host functions can be async and the job queue is pumped
+        // via finish_promise/pump_promise_queue.
         let _ = globals.set(
             "__tropel_native_sleep",
-            rquickjs::function::Func::from(move |ms: f64| {
-                if ms > 0.0 {
-                    // Interruptible sleep: poll the force-stop flag in small
-                    // slices. On force-stop, zero the JS interrupt deadline so
-                    // the eval is interrupted the moment control returns to JS
-                    // (the flag-aware handler unwinds it) — backlog: gracefulStop
-                    // force-stop was advisory only.
-                    // P2 line 174: use absolute deadline to avoid sleep
-                    // inflation from OS overshoot. The old code subtracted
-                    // the requested slice, not the actual elapsed time, so
-                    // OS overshoot compounds: ~+1-2% Linux, ~+10-20% macOS,
-                    // ~+56% Windows (15.6ms granularity).
-                    let total = Duration::from_secs_f64(ms / 1000.0);
-                    let deadline_sleep_inner = std::time::Instant::now() + total;
-                    let step = Duration::from_millis(10);
-                    loop {
-                        if force_stop_sleep.load(Ordering::Acquire) {
-                            deadline_sleep.store(0, Ordering::Relaxed);
-                            return;
+            rquickjs::function::Func::from(rquickjs::function::Async(
+                move |ctx: rquickjs::Ctx<'_>, ms: f64| {
+                    let deadline_sleep = deadline_sleep.clone();
+                    let force_stop_sleep = force_stop_sleep.clone();
+                    async move {
+                        if ms <= 0.0 {
+                            tropel_js::rearm_deadline(&deadline_sleep, max_exec);
+                            return Ok::<(), rquickjs::Error>(());
                         }
-                        let now = std::time::Instant::now();
-                        if now >= deadline_sleep_inner {
-                            break;
+                        let total = Duration::from_secs_f64(ms / 1000.0);
+                        let deadline_inner = std::time::Instant::now() + total;
+                        let step = Duration::from_millis(10);
+                        loop {
+                            if force_stop_sleep.load(Ordering::Acquire) {
+                                deadline_sleep.store(0, Ordering::Relaxed);
+                                return Err(rquickjs::Error::Exception);
+                            }
+                            let now = std::time::Instant::now();
+                            if now >= deadline_inner {
+                                break;
+                            }
+                            let remaining = deadline_inner - now;
+                            tokio::time::sleep(remaining.min(step)).await;
                         }
-                        let remaining = deadline_sleep_inner - now;
-                        std::thread::sleep(remaining.min(step));
+                        tropel_js::rearm_deadline(&deadline_sleep, max_exec);
+                        Ok::<(), rquickjs::Error>(())
                     }
-                }
-                tropel_js::rearm_deadline(&deadline_sleep, max_exec);
-            }),
+                },
+            )),
         );
     });
 
     let sleep_code = [
         "if (typeof sleep === 'undefined') {",
-        "  function sleep(seconds) {",
+        "  async function sleep(seconds) {",
         "    if (typeof __tropel_native_sleep === 'function') {",
-        "      __tropel_native_sleep(seconds * 1000);",
+        "      await __tropel_native_sleep(seconds * 1000);",
         "    }",
         "  }",
         "}",

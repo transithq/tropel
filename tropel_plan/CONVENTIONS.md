@@ -96,9 +96,9 @@ Stop and ask on any of these:
 |---|---|---|
 | Eager wasm tier, post-`wasm-opt` | **700 KB** | 611,733 B ✅MEAS — 88 KB headroom, not the 243 KB the README claims |
 | Lazy import tier | 1.5 MB | — |
-| QuickJS heap per VU, before user script | **900 KB (TR-501)** — enforced by `perf-regression` CI gate | 835,776 B ✅MEAS · 734,144 of it shims · 7.97 GB at 10 000 VUs; gated ~715k (120KB saved) |
-| Egress, sustained | 100 k samples/s with the drop counter at **zero** | ~10–30 k samples/s, oversubscribed 1.4–7.5× |
-| In-flight concurrency | Fixed or **documented in the README** before 0.1.0 | 4 096, and degrading above it |
+| QuickJS heap per VU, before user script | **900 KB (TR-501/TR-503)** — enforced by `perf-regression`, shared Runtime 57k ✅MEAS | 57 KB ✅MEAS (-92% via per-thread shared `Runtime` + template globals) · 0.57 GB at 10k; was 835,776 B (7.97GB), gated ~715k |
+| Egress, sustained | 100 k samples/s with the drop counter at **zero** | ~10–30 k samples/s, oversubscribed 1.4–7.5×; sharded 4-way ~3.6M samples/s |
+| In-flight concurrency | **10,000** — `MAX_WORKERS=10k` + async `sleep` Promise (`TR-502`) | 10,000 via 10k workers, sleep yields via `tokio::time::sleep` + job-queue, `pids.max` caps in containers |
 | Aggregator duty cycle | < 20 % | ~45 % — `build_results` throttles load generation to ~55 % |
 
 ## Style

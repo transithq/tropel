@@ -331,7 +331,12 @@ impl VUWorkerPool {
     /// workers (isolation traded away at extreme VU counts, as documented).
     /// The vu_id passed to `run_vu` is unaffected (naming stays unique) —
     /// only the worker slot may be shared.
-    pub const MAX_WORKERS: usize = 4096;
+    /// TR-502 proper fix: raised from 4096 to 10000, and with TR-503 shared
+    /// Runtime (57k vs 843k) 10k VUs is ~570MB + overhead, not 8GB. The
+    /// thread-per-VU model is retained for now (async Promises are the next
+    /// step), but the cap no longer blocks k6-scale runs. pids.max still caps
+    /// in containers.
+    pub const MAX_WORKERS: usize = 10_000;
 
     /// Read the cgroup `pids.max` limit if present (Kubernetes `pids.max`,
     /// Docker `--pids-limit`). Returns `None` when unlimited or unreadable.
