@@ -70,10 +70,25 @@ export function isCoreWasmReady() {
  * Resolve every predefined dynamic variable (`{{$guid}}`, `{{$timestamp}}`,
  * …) in the input — fresh value per occurrence, Tropel semantics. Plain
  * `{{var}}` refs are untouched. Returns the input unchanged if wasm is not
- * ready (never throws).
+ * ready.
+ *
+ * TR-403: THROWS on a total-output overflow (the wasm tier caps expansion at
+ * 16 MiB and returns a real `Error` naming the limit) — a consumer must
+ * catch it, never send a silently-truncated body. The old "never throws"
+ * claim was wrong: the uncapped path could grow a 460 kB input into 200 MB.
  */
 export function resolveDynamicVariables(template) {
-  return glue !== null ? glue.resolveVariables(template) : template;
+  if (glue === null) {
+    return template;
+  }
+  try {
+    return glue.resolveVariables(template);
+  } catch (err) {
+    throw new Error(
+      `resolveDynamicVariables failed (dynamic variable expansion exceeded the 16 MiB output cap)`,
+      { cause: err },
+    );
+  }
 }
 
 /**

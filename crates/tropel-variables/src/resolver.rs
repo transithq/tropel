@@ -91,7 +91,14 @@ impl VariableResolver {
         }
 
         // First resolve dynamic variables ({{$xxx}})
-        let after_dynamic = self.dynamic_catalog.resolve(input);
+        // TR-403: a total-output cap error means the input is too large to
+        // resolve safely — fall back to the ORIGINAL input (no partial
+        // substitution) and log loudly. The truncation warning was already
+        // emitted by the catalog.
+        let after_dynamic = self.dynamic_catalog.resolve(input).unwrap_or_else(|e| {
+            tracing::error!("dynamic variable resolution failed: {e}");
+            input.to_string()
+        });
 
         // Then resolve scoped variables ({{var_name}})
         let result = var_re().replace_all(&after_dynamic, |caps: &regex::Captures| {
