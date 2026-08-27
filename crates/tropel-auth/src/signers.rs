@@ -2314,10 +2314,7 @@ mod tests {
         // The cnonce is random in the signer, but `digest_response_value`
         // accepts it as a parameter — inject the RFC's cnonce to reproduce
         // the exact published response.
-        let base_ha1 = digest_with(
-            "Mufasa:http-auth@example.org:Circle of Life",
-            "SHA-256",
-        );
+        let base_ha1 = digest_with("Mufasa:http-auth@example.org:Circle of Life", "SHA-256");
         assert!(!base_ha1.is_empty(), "HA1 must compute");
 
         let ha2 = digest_with("GET:/dir/index.html", "SHA-256");
@@ -2325,21 +2322,18 @@ mod tests {
 
         let response = digest_response_value(
             &base_ha1,
-            false, // not -sess
-            "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",  // nonce
-            "00000001",                                          // nc
-            "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",    // cnonce (RFC's value)
-            Some("auth"),                                        // qop
+            false,
+            "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
+            "00000001",
+            "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+            Some("auth"),
             &ha2,
             "SHA-256",
         );
 
         // RFC 7616 A.2 published response value (SHA-256, qop=auth).
         let expected = "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1";
-        assert_eq!(
-            response, expected,
-            "RFC 7616 A.2 SHA-256 vector mismatch"
-        );
+        assert_eq!(response, expected, "RFC 7616 A.2 SHA-256 vector mismatch");
 
         // RFC 7616 A.2 also lists the MD5 response for the SAME inputs
         // (the server offered both SHA-256 and MD5 challenges).
