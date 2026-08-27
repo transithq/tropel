@@ -4504,21 +4504,28 @@ async fn bootstrap_js_libs(
                     // the eval is interrupted the moment control returns to JS
                     // (the flag-aware handler unwinds it) — backlog: gracefulStop
                     // force-stop was advisory only.
+                    // TR-502: use absolute deadline to avoid slice-loop inflation
+                    // (OS overshoot compounds with remaining-=slice; fixed in
+                    // engine js_bootstrap.rs:350, now fixed here too).
+                    let total = Duration::from_secs_f64(ms / 1000.0);
+                    let deadline_inner = Instant::now() + total;
                     let step = Duration::from_millis(10);
-                    let mut remaining = Duration::from_secs_f64(ms / 1000.0);
                     let link_set = || {
                         sched_link_sleep
                             .get()
                             .is_some_and(|f| f.load(Ordering::Acquire))
                     };
-                    while remaining > Duration::ZERO {
+                    loop {
                         if force_stop_sleep.load(Ordering::Acquire) || link_set() {
                             deadline_sleep.store(0, Ordering::Relaxed);
                             return;
                         }
-                        let slice = remaining.min(step);
-                        std::thread::sleep(slice);
-                        remaining -= slice;
+                        let now = Instant::now();
+                        if now >= deadline_inner {
+                            break;
+                        }
+                        let remaining = deadline_inner - now;
+                        std::thread::sleep(remaining.min(step));
                     }
                 }
                 tropel_js::rearm_deadline(&deadline_sleep, max_exec);
