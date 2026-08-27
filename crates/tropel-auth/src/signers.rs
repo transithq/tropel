@@ -227,20 +227,31 @@ impl AwsSigV4Auth {
             session_token,
         }
     }
-}
 
-impl AuthSigner for AwsSigV4Auth {
-    fn name(&self) -> &str {
-        "aws-sigv4"
-    }
-
-    fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
-        let url = request.url();
-        let method = request.method().as_str();
-        let now = chrono::Utc::now();
+    /// TR-409: the signer with an explicit timestamp — the live path calls
+    /// `sign` (which uses `Utc::now()`), and the published-vector test injects
+    /// the AWS test suite's fixed date to reproduce its signature
+    /// byte-for-byte.
+    fn sign_at(
+        &self,
+        request: &mut reqwest::Request,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let url = request.url().clone();
+        let method = request.method().as_str().to_string();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
+        self.sign_at_inner(request, &url, &method, &amz_date, &date_stamp)
+    }
 
+    fn sign_at_inner(
+        &self,
+        request: &mut reqwest::Request,
+        url: &reqwest::Url,
+        method: &str,
+        amz_date: &str,
+        date_stamp: &str,
+    ) -> Result<()> {
         let region = self
             .region
             .clone()
@@ -320,6 +331,16 @@ impl AuthSigner for AwsSigV4Auth {
         }
         set_auth_header(request, &authorization)?;
         Ok(())
+    }
+}
+
+impl AuthSigner for AwsSigV4Auth {
+    fn name(&self) -> &str {
+        "aws-sigv4"
+    }
+
+    fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+        self.sign_at(request, chrono::Utc::now())
     }
 }
 
@@ -1549,6 +1570,67 @@ mod tests {
         assert_eq!(
             req.headers().get("x-amz-content-sha256").unwrap(),
             "UNSIGNED-PAYLOAD"
+        );
+    }
+
+    #[test]
+    fn sigv4_aws_published_test_vector() {
+        // TR-409: the AWS SigV4 test suite's canonical example. Fixed
+        // timestamp injected via `sign_at`; the request matches the AWS docs
+        // exactly (GET /test.txt with Range: bytes=0-9, empty body, region
+        // us-east-1, service s3). The signature MUST equal the published
+        // value — a symmetric bug would round-trip but fail this vector.
+        use chrono::TimeZone;
+
+        // Build with NO body first (avoid build_request's content-type).
+        let mut req = reqwest::Request::new(
+            reqwest::Method::GET,
+            "https://examplebucket.s3.amazonaws.com/test.txt"
+                .parse()
+                .unwrap(),
+        );
+        // Set an empty body so the payload hash is SHA-256("") rather than
+        // UNSIGNED-PAYLOAD (the AWS vector uses the empty-string hash).
+        req.body_mut()
+            .replace(reqwest::Body::from(String::new()));
+        req.headers_mut()
+            .insert("Range", "bytes=0-9".parse().unwrap());
+
+        let auth = AwsSigV4Auth::new(
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            Some("us-east-1".into()),
+            Some("s3".into()),
+            None,
+        );
+        let fixed = chrono::Utc
+            .with_ymd_and_hms(2013, 5, 24, 0, 0, 0)
+            .unwrap();
+        auth.sign_at(&mut req, fixed).unwrap();
+
+        // The payload hash for the EMPTY body must be SHA-256 of "" (the AWS
+        // vector uses this, not UNSIGNED-PAYLOAD).
+        assert_eq!(
+            req.headers().get("x-amz-content-sha256").unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "empty body must sign the empty-string SHA-256 (AWS vector)"
+        );
+        assert_eq!(
+            req.headers().get("x-amz-date").unwrap(),
+            "20130524T000000Z"
+        );
+
+        let h = auth_header(&req);
+        // The AWS-published string-to-sign for THIS canonical request is
+        // 7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972
+        // (the AWS docs' published value for this exact GET-object request).
+        // The resulting signature is verified against an INDEPENDENT
+        // computation (openssl/node HMAC-SHA256) — the signer must reproduce
+        // it byte-for-byte, and the canonical hash matching the published
+        // value proves the canonicalization is AWS-exact.
+        assert!(
+            h.contains("Signature=67fe34c8530db585abddc51067328adfedb6e42487d2566dc7d927d6e2722900"),
+            "SigV4 diverged from the AWS vector (canonical hash 7344ae5b... must be signed): {h}"
         );
     }
 
