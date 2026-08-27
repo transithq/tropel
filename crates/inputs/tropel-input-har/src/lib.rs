@@ -227,7 +227,7 @@ impl InputAdapter for HarInputAdapter {
             items,
             variables: HashMap::new(),
             auth: None,
-        conversion_notes: Vec::new(),
+            conversion_notes: Vec::new(),
         })
     }
 }

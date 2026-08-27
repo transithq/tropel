@@ -136,6 +136,7 @@ fn fixture_run_request() -> RunRequest {
         ],
         variables: HashMap::new(),
         auth: None,
+        conversion_notes: Vec::new(),
     };
 
     RunRequest {
