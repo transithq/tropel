@@ -319,6 +319,12 @@ pub enum GrantType {
     ClientCredentials,
     Password,
     RefreshToken,
+    /// RFC 8628 device authorization grant. Two token-endpoint requests: the
+    /// initial one (`grant_type=device_code`) returns `device_code` +
+    /// `user_code` + `verification_uri`; the POLL request uses the URN grant
+    /// type (`urn:ietf:params:oauth:grant-type:device_code`) with the
+    /// `device_code` field (see `TokenRequestParams.device_code`).
+    DeviceCode,
 }
 
 impl GrantType {
@@ -328,6 +334,7 @@ impl GrantType {
             GrantType::ClientCredentials => "client_credentials",
             GrantType::Password => "password",
             GrantType::RefreshToken => "refresh_token",
+            GrantType::DeviceCode => "device_code",
         }
     }
 }
@@ -353,6 +360,9 @@ pub struct TokenRequestParams {
     pub password: Option<String>,
     // refresh_token
     pub refresh_token: Option<String>,
+    // device_code (RFC 8628): when set, the token request is the POLL phase
+    // (grant_type=urn:ietf:params:oauth:grant-type:device_code + device_code).
+    pub device_code: Option<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
 }
@@ -421,6 +431,18 @@ pub fn build_token_request(params: &TokenRequestParams) -> Result<TokenRequest> 
                     OauthError::Invalid("refresh_token grant requires refresh_token".into())
                 })?;
             form.push(("refresh_token".into(), rt.to_string()));
+        }
+        GrantType::DeviceCode => {
+            // RFC 8628 §3.4: the POLL request uses the URN grant type and
+            // carries `device_code`; the initial request uses
+            // `grant_type=device_code` with client_id + scope.
+            if let Some(dc) = params.device_code.as_deref().filter(|d| !d.is_empty()) {
+                form[0] = (
+                    "grant_type".into(),
+                    "urn:ietf:params:oauth:grant-type:device_code".into(),
+                );
+                form.push(("device_code".into(), dc.to_string()));
+            }
         }
     }
     if !params.scopes.is_empty() {
@@ -915,6 +937,40 @@ mod tests {
         assert!(req.body.contains("code=abc"));
         assert!(req.body.contains("code_verifier=vvv"));
         assert!(!req.body.contains("client_secret"));
+    }
+
+    #[test]
+    fn device_code_grant_two_phase_flow() {
+        // TR-409: RFC 8628 device grant. The initial request uses
+        // `grant_type=device_code` + client_id + scope; the POLL request uses
+        // the URN grant type + the device_code value.
+        let initial = build_token_request(&TokenRequestParams {
+            grant_type: GrantType::DeviceCode,
+            token_url: "https://idp/token".into(),
+            client_id: "cli".into(),
+            scopes: vec!["read".into(), "write".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(initial.body.contains("grant_type=device_code"));
+        assert!(initial.body.contains("client_id=cli"));
+        assert!(initial.body.contains("scope=read%20write"));
+
+        // The poll request carries the URN grant type and the device_code.
+        let poll = build_token_request(&TokenRequestParams {
+            grant_type: GrantType::DeviceCode,
+            token_url: "https://idp/token".into(),
+            client_id: "cli".into(),
+            device_code: Some("GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            poll.body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"),
+            "poll must use the RFC 8628 URN grant type: {}",
+            poll.body
+        );
+        assert!(poll.body.contains("device_code=GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS"));
     }
 
     #[test]
