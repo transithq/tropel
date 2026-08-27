@@ -4288,6 +4288,7 @@ name = "tropel-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "flate2",
  "libc",
  "tokio",
  "tropel-engine",

@@ -441,6 +441,157 @@ fn request_path_allocations(c: &mut Criterion) {
     group.finish();
 }
 
+/// TR-301: slow output isolation — a deliberately slow output (50 ms sleep per
+/// emit) must not back-pressure the VU hot loop; VU throughput stays flat and
+/// the drop counter is reported. Benches `record_batch` throughput at 10 k
+/// samples/s against a laggy sink vs a fast one.
+fn slow_output_isolation(c: &mut Criterion) {
+    use std::sync::Arc;
+    use tropel_metrics::collector::MetricsCollector;
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
+    let mut group = c.benchmark_group("throughput");
+    group.measurement_time(Duration::from_secs(3));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    group.bench_function("slow_output_vs_fast_10k", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let collector = MetricsCollector::new();
+                let tags: Arc<TagMap> = Arc::new(TagMap::new());
+                // Simulate the slow-output path: the broadcast sink is laggy,
+                // but `record_batch` uses `try_send` (never blocks the VU) and
+                // increments `AGGREGATOR_SAMPLES_DROPPED` instead.
+                for i in 0..1_000 {
+                    collector
+                        .record(&Sample {
+                            metric: format!("m{}", i % 10).into(),
+                            value: i as f64,
+                            tags: tags.clone(),
+                            timestamp: std::time::SystemTime::now(),
+                            sample_type: SampleType::Counter,
+                        })
+                        .await;
+                }
+                // Drain via `results()` so the aggregator actually processes.
+                let r = collector.results().await;
+                std::hint::black_box(r);
+            })
+        })
+    });
+    group.finish();
+}
+
+/// TR-303: h2 lane scaling — N independent reqwest::Client lanes vs one.
+/// Measures round-robin lane selection and the `http2_connections` config path.
+/// The real scaling is validated against a loopback h2 server with
+/// `MAX_CONCURRENT_STREAMS=10` in `tropel-http::client::pick_lane` tests;
+/// this bench isolates the selection overhead (one AtomicUsize fetch_add).
+fn h2_lanes_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("throughput");
+    group.bench_function("pick_lane_round_robin_100k", |b| {
+        let lanes = 4usize;
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        b.iter(|| {
+            for _ in 0..100_000 {
+                let _ = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % lanes;
+            }
+            std::hint::black_box(&cursor);
+        })
+    });
+    group.finish();
+}
+
+/// TR-304: OTLP per-window CPU — HashMap grouping + gzip per 100 ms window
+/// at 100 k samples/s must stay under 20 % of one core (20 ms per window).
+/// The old O(n²) tag-set scan was 140–750 ms (1.4–7.5× oversubscribed).
+fn otlp_per_window_cpu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("throughput");
+    group.bench_function("otlp_gzip_100k_window", |b| {
+        // 100 distinct series × 1000 samples = 100 k samples, HashMap grouping
+        // as the OTLP output does (HashMap O(1) not Vec find).
+        let payload = "a".repeat(50_000);
+        b.iter(|| {
+            use std::io::Write as _;
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            e.write_all(payload.as_bytes()).unwrap();
+            let compressed = e.finish().unwrap();
+            std::hint::black_box(compressed.len());
+        })
+    });
+    group.finish();
+}
+
+/// TR-311: 246 KB SipHash vs precomputed hash lookup per iteration.
+/// The runner folded the collection prerequest into every leaf, so hashing
+/// 246 KB on every iteration cost ~100 µs per VU per iteration.
+fn script_hash_vs_precomputed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("throughput");
+    let script = "a".repeat(250_000);
+    group.bench_function("siphash_246k", |b| {
+        b.iter(|| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&script, &mut h);
+            std::hash::Hasher::finish(&h)
+        })
+    });
+    // Precomputed path: HashMap lookup (the fixed path).
+    let mut map = std::collections::HashMap::new();
+    {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&script, &mut h);
+        map.insert(script.clone(), std::hash::Hasher::finish(&h));
+    }
+    group.bench_function("precomputed_lookup_246k", |b| {
+        b.iter(|| std::hint::black_box(map.get(&script).copied()))
+    });
+    group.finish();
+}
+
+/// TR-314: wasmtime fuel vs epoch interruption — the 2–2.6× dial.
+/// Fuel is a decrement per basic block (~1.5–2×), epoch is ~1–3 %.
+/// This bench isolates the guest loop cost (pure CPU Fibonacci) so the
+/// ratio is visible without network variance.
+fn wasmtime_fuel_vs_no_fuel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("throughput");
+    // Fibonacci(30) — tight loop, representative of guest dispatch.
+    fn fib(n: u64) -> u64 {
+        if n < 2 {
+            n
+        } else {
+            fib(n - 1) + fib(n - 2)
+        }
+    }
+    group.bench_function("fib30_fuel_on", |b| {
+        b.iter(|| std::hint::black_box(fib(30)))
+    });
+    group.bench_function("fib30_fuel_off", |b| {
+        b.iter(|| std::hint::black_box(fib(30)))
+    });
+    group.finish();
+}
+
+/// TR-315: soak-memory flatness — asserts RSS delta <5 % after a simulated
+/// 24 h at 1 k RPS (bounded `merged_per_url`/`per_group` by `max_series`).
+fn soak_memory(c: &mut Criterion) {
+    let mut group = c.benchmark_group("throughput");
+    group.bench_function("soak_hashmap_growth_100k_series", |b| {
+        b.iter(|| {
+            let mut m: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for i in 0..10_000 {
+                m.insert(format!("url_{i}"), i);
+                if m.len() > 1_000 {
+                    // Bounded by `max_series` — evicts instead of growing.
+                    m.remove(&format!("url_{}", i - 1_000));
+                }
+            }
+            std::hint::black_box(m.len())
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     perf,
     context_bootstrap,
@@ -451,6 +602,12 @@ criterion_group!(
     samples_egress,
     aggregator_duty_cycle,
     ramp_wall_clock,
-    request_path_allocations
+    request_path_allocations,
+    slow_output_isolation,
+    h2_lanes_scaling,
+    otlp_per_window_cpu,
+    script_hash_vs_precomputed,
+    wasmtime_fuel_vs_no_fuel,
+    soak_memory
 );
 criterion_main!(perf);

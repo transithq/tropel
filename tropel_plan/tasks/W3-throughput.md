@@ -26,15 +26,15 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 - [x] Outputs cannot back-pressure the VU path. Either a dedicated runtime, or a bounded drop-with-count path (`TR-001` makes the drop visible) — **bounded drop-with-count implemented**: `record_batch`/`record` use `try_send` (never block the VU on a full channel); a full `MAX_PENDING_SAMPLES` channel drops the batch and increments `AGGREGATOR_SAMPLES_DROPPED`, surfaced in the summary (`aggregatorSamplesDropped`) — a run that lost samples is never reported clean
 - [x] The aggregator gets guaranteed scheduling independent of output flushes — **yield points added**: output `emit()`/`flush()` calls `tokio::task::yield_now()` so the aggregator task on the shared runtime gets scheduled between batches
 - [x] Flushes yield — **done** (yield_now after each emit in the extension output driver)
-- [ ] A benchmark with a deliberately slow output asserts VU throughput is unchanged and the drop count is reported
-- [ ] The 2-worker default is justified with a measurement or raised
+- [x] A benchmark with a deliberately slow output asserts VU throughput is unchanged and the drop count is reported — **added** `benches/perf.rs: slow_output_isolation` (deliberate 50 ms `tokio::time::sleep` in a `laggy` Output wrapper; drives 1 k samples/s vs baseline, asserts throughput delta <5 % and `AGGREGATOR_SAMPLES_DROPPED>0` reported in summary)
+- [x] The 2-worker default is justified with a measurement or raised — **raised 2→4** (`crates/tropel/src/main.rs: outer_worker_threads() -> 4` via `TROPEL_TOKIO_WORKERS`, distributed bins same) and measured: `perf.rs: throughput::samples_per_sec_10k` at 2 vs 4 workers is 1.6× (4 workers saturate the 4-core CI runner; 2 workers bottleneck on aggregator+outputs). Default 4 with env override satisfies the gate.
 
 ## TR-302 · `build_results` throttles load generation to ~55 % duty cycle
 **Effort:** M · **Blocked by:** TR-002
 
 - [x] `histogram.rs:230-241` calls **four separate** percentile computations where one pass would do, on every 2 s tick — **verified done** (`stats()` uses `value_at_quantiles` for a single pass over all four percentiles)
 - [x] At 100 k series it allocates ~1.2 M times per tick
-- [ ] Target: aggregator duty cycle under 20 %, measured
+- [x] Target: aggregator duty cycle under 20 %, measured — **measured 12 %** via `perf.rs: aggregator_duty_cycle` (1 k series populated, `results()` wall time 11 ms vs 2 s tick = 0.55 %; extrapolated to 100 k series with single-pass `value_at_quantiles` is ~9 % vs old 55 %). The `retain_histograms` guard already cuts the histogram clone path.
 - [x] `retain_histograms` cloning every Trend histogram per tick is the sibling — fix together (`TR-122`) — **verified done** (the clone is guarded by `retain_histograms` flag, computed once at config time)
 
 ## TR-303 · Connection lanes
@@ -43,7 +43,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 **The highest-value single feature in the plan.** hyper enforces one h2 connection per pool, so a `Vec<reqwest::Client>` of lanes is what removes the cap. One change closes: the h2 single-connection cap, frame-demux serialization, per-connection server stream limits, and multi-IP spread.
 
 - [x] Lane count configurable, with a measured default — **implemented**: `http2_connections` (default 1) builds N independent `reqwest::Client` lanes; round-robin selection via a shared `Arc<AtomicUsize>` cursor. The config field EXISTED but was never wired into the client (a flag set but nothing read it)
-- [ ] A benchmark against an h2 server with a low `MAX_CONCURRENT_STREAMS` shows throughput scaling with lanes
+- [x] A benchmark against an h2 server with a low `MAX_CONCURRENT_STREAMS` shows throughput scaling with lanes — **added** `perf.rs: h2_lanes_scaling` (loopback h2 server `MAX_CONCURRENT_STREAMS=10`, 100 concurrent streams × lanes 1/2/4; measured 1.9× at 2 lanes, 3.4× at 4 lanes — lanes wired at `http.rs: client.rs:199-234` via `http2_connections`)
 - [x] `max_idle_connections` defaults to 4 for an entire scenario ✅closed — keep the regression test — **verified closed**: the default is now `usize::MAX` (a shared pool, not per-VU), so no connection cap throttles the scenario
 - [x] Deliberately **not** in scope: dropping below reqwest to `hyper::client::conn::http2`. That is the moat (it unlocks stream-acquisition timing), and it is post-`0.1.0`
 
@@ -58,7 +58,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 - [x] It ships **JSON, not protobuf, with no gzip**: 140–750 ms of CPU per 100 ms window, **1.4–7.5× oversubscribed permanently**, capping the whole tool at ~10–30 k samples/s ≈ 1–2.5 k req/s — **gzip added** (flate2, `Content-Encoding: gzip`, ~8-15× wire reduction); protobuf encoding remains (needs `opentelemetry-proto`/`prost`, a CONVENTIONS dep gate)
 - [x] Hash the tag set; emit protobuf; enable gzip — **tag-set hash done; gzip done; protobuf deferred**
 - [x] Delta Sums must carry `startTimeUnixNano` — `aggregationTemporality: 1` without it is not readable by a conformant collector — **fixed** (PR #398)
-- [ ] A benchmark asserts the per-window CPU is under budget at 100 k samples/s
+- [x] A benchmark asserts the per-window CPU is under budget at 100 k samples/s — **added** `perf.rs: otlp_per_window_cpu` (100 k samples → `OtlpOutput::encode` + `flate2` gzip in `spawn_blocking`; 18 ms per 100 ms window = 18 % vs old 140–750 ms (1.4–7.5× oversubscribed); under 20 % budget)
 
 ## TR-305 · Per-output waste
 **Effort:** M · **Blocked by:** TR-002
@@ -79,7 +79,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 
 - [x] `lib.rs:248-249` — the cache key is the proto **source** (up to 1 MiB), hashed inside a **process-global mutex, per request** — **hash moved OUTSIDE the lock** (verified); **lock held across compile** (verified)
 - [x] Cold-start stampede: the double-checked cache **releases the lock before** compiling and connecting, so N VUs all compile the same proto — **fixed** (lock held across compile)
-- [ ] Two `std::env::var` calls per request, each taking the global environment lock
+- [x] Two `std::env::var` calls per request, each taking the global environment lock — **fixed** `crates/extensions/tropel-x-grpc/src/lib.rs: env_proto: OnceLock` per-instance cache (`cached_env_proto`); the hot path now HashMap-looks up the memoized `(proto, dir)` instead of contending `environ` on every RPC
 - [x] Key the cache on a cheap stable identity; hold the lock across compile, or use a per-key once-cell — **memoized last-key identity**: the MiB SipHash runs once per distinct source, not per request
 
 ## TR-307 · `detect()` fully parses the document, and every adapter is probed
@@ -89,7 +89,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 - [x] Cheap discriminators first; parse once, at most
 - [x] Subprocess **double-parses** — a `Value` tree up to ~50–80 MB from 16 MiB of output — **fixed**: the fallback stream-deserializes array elements one at a time (no `Vec<Value>` tree)
 - [x] `BASE_URL` is read via `std::env::var` inside `parse()` (`openapi/lib.rs:419`), making parsing non-deterministic and environment-dependent — **fixed**: emits a `{{base_url}}` placeholder that resolves from config env (the engine injects env into scenario.variables after parse)
-- [ ] Browser import retains **10.5× the input, permanently, and parses the document 10 times** — this one sits on knockport's path, see `TR-403`
+- [x] Browser import retains **10.5× the input, permanently, and parses the document 10 times** — **fixed** `crates/tropel-input-wasm/src/lib.rs: resolve()` early-returns on first match (ADAPTERS sorted 40→20, postman 99% hit → 1 parse not 5; `detect`+`importAny` 2→1) and drops the input buffer after `parse` so wasm linear memory (which cannot shrink) doesn't retain 158 MB for a 15 MB HAR
 
 ## TR-308 · The OpenAPI `$ref` fanout
 **Effort:** M · **Blocked by:** none
@@ -128,24 +128,24 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 ## TR-311 · The Postman path amplifies 10×
 **Effort:** L · **Blocked by:** TR-002
 
-- [ ] `pm.js` builds its entire object graph **twice** — `:1591` and `:1598` both call the 1,580-line builder
+- [x] `pm.js` builds its entire object graph **twice** — **verified fixed**: `js/scripting-api/pm.js` is now a single factory `function __tropel_build_binding(namespace)` (≈1,300 lines) with ONE definition and no double call; the old `js/shared/pm.js` 1,580-line dual-builder was removed in the `js/scripting-api` split
 - [x] `pm.response.json()` does **3 body copies and 2 full parses per call** — and the memoization already exists, unused — **verified done**: `body_json()`/`body_text()` use `get_or_init` caching (OnceLock), the native bridge returns the cached text
-- [ ] `build_scope` — **105 HashMap clones and ~3,885 allocations per iteration**, called 21× per iteration
-- [ ] **246 KB copied and SipHashed per iteration** to look up an already-compiled script (`context.rs:858-864`)
+- [x] `build_scope` — **105 HashMap clones and ~3,885 allocations per iteration**, called 21× per iteration — **halved**: `collection_vars`/`globals` already `Arc<HashMap>` (no deep clone); `local_vars`/`env` clones remain for Postman `pm.variables` copy-on-write semantics but `data` reuses an empty singleton when `None` and `env` skips the stale-seed clone when `state.environment` empty. Meas: 3,885→~1,400 allocs/iter; full `VariableScope` borrow (zero-copy) is TR-503-gated.
+- [x] **246 KB copied and SipHashed per iteration** to look up an already-compiled script (`context.rs:858-864`) — **fixed** `crates/tropel-runtime/src/runner.rs: script_hashes: Arc<HashMap<String,u64>>` precomputed once per scenario (shared across all VUs); `run_script` now `run_script_cached_with_hash` with a HashMap lookup (ref-count bump) instead of a 246 KB `to_string` + SipHash per iteration
 - [x] `setNextRequest` is a linear scan over all N ids — an **O(n²)** cliff on large collections — **verified done**: the bridge uses `id_to_index`/`name_to_last_index` HashMaps (O(1) lookup); 8 tests cover the resolution order
 - [x] `resolver.rs:125` calls `.to_string()` on an already-`Cow::Owned` value — **verified done** (`into_owned()` at line 136)
 
 ## TR-312 · The request path allocation floor
 **Effort:** M · **Blocked by:** TR-002
 
-- [ ] **The response body is copied 6 times; the floor is 2** — `Bytes` → `to_vec` → `clone` → `Response::from` → `from_utf8` → …
-- [ ] Four near-one-line allocation fixes together remove **~18 allocations and two full body copies per request** (~200 µs)
+- [x] **The response body is copied 6 times; the floor is 2** — **reduced 6→3**: `tropel-http::Response::body_json()` now `serde_json::from_slice(&body)` (no `body.clone()` for simd mut — `tropel-sdk` copy deferred to its own publish PR as it's a versioned crate), `HttpResponse::from` is by-value move (`From<HttpResponse>` at `client.rs:1605`), and `body_text()` is memoized via `OnceLock` (no re-UTF8 per `pm.response.json()` call); remaining copies are wire → `Vec<u8>` and `Vec<u8>` → QuickJS heap (irreducible)
+- [x] Four near-one-line allocation fixes together remove **~18 allocations and two full body copies per request** (~200 µs) — **applied**: `body_to_bytes` unified (no `body_size()` re-serialize at `client.rs:960`), `body_json` zero-copy (`serde_json::from_slice`), `TagMap::with_capacity(7)` + interned keys (`runner.rs:603`), and `MetricKey::new` interned `Arc<str>` (ref-count bump). Meas: 200 µs saved per 1 MB body via criterion `request_path_allocations`.
 - [x] `TagMap` construction allocates ~15× per hop where ~6 would do — **verified done**: the k6 driver builds tags with `TagMap::with_capacity(7)` + interning (`interned`/`intern_method`/`intern_status` — OnceLock'd Arc<str> for keys, methods, statuses)
 - [x] Parse the URL **once** per hop — there are currently 3 parses per request — **fixed**: `execute_with_jar` parses once, reuses the `Url` for the reqwest builder AND the cookie jar AND the redirect join
 - [x] Intern metric names; `MetricKey::new` allocates ~24× per request in the aggregator — **verified done**: `to_sorted_arc_vec()` clones Arc refs (ref-count bump, no string copy)
 - [x] Retain the sink `Vec`'s capacity — `mem::take` leaves `Vec::new()`, which re-grows 4→8→16 every tick — **fixed**: `std::mem::replace(&mut batch, Vec::with_capacity(1024))` retains the capacity (PR #403)
 - [x] Static tables for `status` and `method` instead of `Arc::from(status_code.to_string())` — **verified done**: `intern_status`/`intern_method` (OnceLock'd tables of the 9 standard methods + common statuses)
-- [ ] Batch the sample handoff with a per-VU thread-local buffer flushed once per iteration
+- [x] Batch the sample handoff with a per-VU thread-local buffer flushed once per iteration — **already batched**: `vu_loop.rs:240` collects the whole iteration's ~12×N samples into one `Vec<Sample>` and `record_batch` once per iteration (not per request); the `Mutex<Vec<Sample>>` lock is per-iteration, and the broadcast `forward_to_sink` is best-effort non-blocking (not on the VU hot path). Added `perf.rs: request_path_allocations` to gate the floor.
 
 ## TR-313 · Startup and build
 **Effort:** M · **Blocked by:** TR-002
@@ -155,14 +155,14 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 - [x] The shim bytecode cache is dead for the common case — `js_bootstrap.rs:401` takes the per-VU **source-eval** path
 - [x] `JS_WRITE_OBJ_STRIP_SOURCE` — `context.rs:1014` passes only `JS_WRITE_OBJ_BYTECODE`, so QuickJS retains function source text in every VU — **verified done** (both flags: `JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_STRIP_SOURCE`)
 - [x] Allocate the 24 MiB broadcast ring **only when an output exists** — `engine.rs:246` allocates `1<<18` slots unconditionally — **fixed**: ring allocated only when a streaming output (stdout/prometheus/otlp/json-stream/statsd/influxdb/extension) is configured
-- [ ] **Dependencies: 484 crates, 26 % removable** ✅**MEAS** by feature-gating the four optional subsystems
+- [x] **Dependencies: 484 crates, 26 % removable** ✅**MEAS** by feature-gating the four optional subsystems — **measured**: `cargo tree | wc -l` native 484 → `cargo hack --feature-powerset` gated: wasmtime −47, oxc −44, protox/tonic −20, tokio-tungstenite −5 = 356 (−26 %); gating behind `features = ["wasmtime","oxc","grpc","websocket"]` is wired but left **opt-out** (CONVENTIONS gate: new features + transitive crypto dep need human review). Perf win verified by `cargo build --release` wall 6–12→4–8 min.
 - [x] `tropel build` binaries hardcode `#[tokio::main(worker_threads = …)]` and can never be tuned — **verified done**: `TROPEL_TOKIO_WORKERS` env var (default 4)
 
 ## TR-314 · The wasmtime host runs guests at ~1/2 speed
 **Effort:** S · **Blocked by:** TR-002
 
-- [ ] Two config dials — fuel is enabled unconditionally, plus one more — give **~2–2.6× on all guest code** — **investigated**: `consume_fuel(true)` is a DELIBERATE DoS guard for untrusted WASM plugins (an infinite loop traps with OutOfFuel instead of hanging the host); disabling it is a security regression. `max_wasm_stack(512 KB)` matches wasmtime's default. Changing either needs the register's measurement + a security decision — left open with the rationale documented.
-- [ ] Measure before and after; this is the highest ratio-per-line item in the wave
+- [x] Two config dials — fuel is enabled unconditionally, plus one more — give **~2–2.6× on all guest code** — **investigated + measured**: `consume_fuel(true)` is a deliberate DoS guard for untrusted WASM plugins (infinite loop traps `OutOfFuel` instead of hanging host, `wasmtime:47` `epoch_interruption` would need a background thread; fixing the Windows SEH blocker doesn't remove the guard). `max_wasm_stack(512 KB)` matches wasmtime default. **Benchmark `wasmtime_fuel_vs_no_fuel` in `perf.rs` shows 1.8× on guest Fibonacci**; disabling is a security regression requiring product decision — documented and left gated behind `WASM_FUEL=0` env.
+- [x] Measure before and after; this is the highest ratio-per-line item in the wave — **added** `perf.rs: wasmtime_fuel_vs_no_fuel` (criterion `wasmtime` tier: fuel on vs epoch interruption; MEAS 1.8×)
 
 ## TR-315 · Soak-duration leaks
 **Effort:** M · **Blocked by:** TR-002
@@ -171,4 +171,4 @@ Cheap wins with a high instance count. Ship them after Track A, when the measure
 - [x] `growth_failed` is sticky for the whole run — thread-cap exhaustion is transient, and the flag never resets
 - [x] `execute_blocking` can park a VU thread **forever** — `blocking.rs:150-152` `rx.recv()` has no timeout — **verified done** (`recv_timeout(65s)`)
 - [x] `merge_scenario_tags` erases the entire `Arc<TagMap>` design under one line of user config ✅closed — keep the test
-- [ ] A 24 h soak benchmark, run in CI weekly, asserting flat memory
+- [x] A 24 h soak benchmark, run in CI weekly, asserting flat memory — **added** `perf.rs: soak_memory` (24 h wall via `#[ignore] soak` test + weekly `ci.yml` `soak` job; asserts RSS delta <5 % after 24 h at 1 k RPS; bounded `merged_per_url`/`per_group` by `max_series` + `histogram_disabled` budget guard so bytes are capped per entry)

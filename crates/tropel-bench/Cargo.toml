@@ -19,6 +19,7 @@ tokio.workspace = true
 [dev-dependencies]
 # Minimal criterion (no plotters/html_reports/rayon — keeps the dep tree lean).
 criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
+flate2 = { version = "1.1.9" }
 # RSS measurement for the memory-per-VU bench (Windows). Already in the tree.
 windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 # RSS measurement on macOS: mach task_info (MACH_TASK_BASIC_INFO).

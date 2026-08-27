@@ -28,7 +28,7 @@ use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde::de::DeserializeSeed;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
@@ -87,6 +87,12 @@ pub struct GrpcProtocol {
     /// text on every request.
     last_key: Mutex<Option<PoolKey>>,
     last_hash: std::sync::atomic::AtomicU64,
+    /// TR-306: per-instance cache of the env-derived proto source. `std::env::var`
+    /// takes the global `environ` lock and scans the environment on every call;
+    /// resolving it on EVERY RPC contended that lock at ~1-2k RPC/s. The env is
+    /// immutable for the run, so cache it once per protocol instance (one per
+    /// scenario) instead of per request. `None` means "not set" (no proto in env).
+    env_proto: OnceLock<Option<(String, Option<String>)>>,
     /// Tonic channels pooled by authority (`scheme://host:port`).
     channels: Mutex<HashMap<String, Channel>>,
     /// Insertion order for the channel cache (FIFO eviction key).
@@ -278,7 +284,9 @@ impl Protocol for GrpcProtocol {
         }
 
         // ── Resolve the proto source (config → header → env) ──
-        let (proto_src, proto_dir) = resolve_proto(req, config)?;
+        // TR-306: env is per-instance cached to avoid `std::env::var`'s global
+        // `environ` lock on every RPC (the lock contended at ~1-2k RPC/s).
+        let (proto_src, proto_dir) = resolve_proto_inner(req, config, cached_env_proto(self))?;
 
         // ── Compile the proto ONCE per (source, dir) and cache the pool ──
         // Compilation (protox) is tens of ms — the dominant per-request cost
@@ -718,11 +726,25 @@ fn body_to_json(req: &Request) -> Option<serde_json::Value> {
     }
 }
 
+/// Resolve a per-protocol-instance cached env proto source. `std::env::var`
+/// takes the global `environ` lock; without caching, every RPC contended it.
+fn cached_env_proto(proto: &GrpcProtocol) -> Option<(String, Option<String>)> {
+    proto
+        .env_proto
+        .get_or_init(|| {
+            std::env::var("TROPEL_GRPC_PROTO")
+                .ok()
+                .map(|p| (p, std::env::var("TROPEL_GRPC_PROTO_DIR").ok()))
+        })
+        .clone()
+}
+
 /// Resolve the proto source from config → headers → env.
 /// Returns `(source_or_path, include_dir)`.
-fn resolve_proto(
+fn resolve_proto_inner(
     req: &Request,
     config: Option<&serde_json::Value>,
+    env: Option<(String, Option<String>)>,
 ) -> Result<(String, Option<String>)> {
     // 1. config
     if let Some(cfg) = config {
@@ -746,9 +768,8 @@ fn resolve_proto(
         let dir = get_header("x-grpc-proto-dir");
         return Ok((p, dir));
     }
-    // 3. env
-    if let Ok(p) = std::env::var("TROPEL_GRPC_PROTO") {
-        let dir = std::env::var("TROPEL_GRPC_PROTO_DIR").ok();
+    // 3. env (cached per instance — see `cached_env_proto`)
+    if let Some((p, dir)) = env {
         return Ok((p, dir));
     }
     Err(TropelError::Config(
@@ -756,6 +777,21 @@ fn resolve_proto(
          the x-grpc-proto request header, or set TROPEL_GRPC_PROTO"
             .into(),
     ))
+}
+
+#[allow(dead_code)]
+fn resolve_proto(
+    req: &Request,
+    config: Option<&serde_json::Value>,
+) -> Result<(String, Option<String>)> {
+    // Back-compat entry point for callers without a protocol instance (tests).
+    // Reads env directly — no caching. Production path is `resolve_proto_inner`
+    // with the per-instance cached env.
+    resolve_proto_inner(req, config, {
+        std::env::var("TROPEL_GRPC_PROTO")
+            .ok()
+            .map(|p| (p, std::env::var("TROPEL_GRPC_PROTO_DIR").ok()))
+    })
 }
 
 /// Compile proto source (path or inline text) into a `DescriptorPool`.
