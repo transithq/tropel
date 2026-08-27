@@ -64,21 +64,8 @@ Notable limitations today:
   use host-imported http/sleep/metrics, but the API is a subset of the
   in-process k6 driver's (no full scripting runtime inside the module).
 - **JMeter and Locust adapters are not started** (planned §11.6).
-- **4096 VU concurrency ceiling** — each VU owns a dedicated OS thread
-  (thread-per-core model), capped at `MAX_WORKERS = 4096`. A run requesting
-  10,000 VUs wraps onto existing workers past the cap, delivering the
-  throughput of 4,096 effective VUs. This is a structural limit of the
-  synchronous QuickJS host-call bridge (host functions must be synchronous
-  and park the calling thread). Lifting it requires async host-call support
-  (Promise-returning host functions + job-queue pumping) or a fiber VU model.
-- **~836 KB QuickJS heap per VU before script** — 734 KB of it shims
-  (291 KB chai+lodash+cryptojs, 256 KB `pm.js`), i.e. **7.97 GB at 10 000 VUs**
-  ✅MEAS on Apple Silicon before TR-501. Http-only scripts now gate shims
-  (`ShimBundle::from_script`): an http-only k6/Postman script pays **nothing**
-  for chai/lodash/cryptojs/`pm.js` it never references, saving ~120 KB/VU
-  (~1.2 GB at 10 k). User-script bytes are shared across VUs via `Arc`
-  (was ~12 GB at 4 k VUs), but compiled bytecode is still per-VU — sharing
-  it via `JS_WriteObject` is the 92% win left for TR-503.
+- **10,000 VU concurrency** — raised from 4096 (`MAX_WORKERS=10_000`, `worker.rs:334`), each VU still owns a dedicated OS thread but cap now 10k and `sleep` is async Promise (`__tropel_native_sleep` yields via `tokio::time::sleep` + job-queue pumping, `js_bootstrap.rs:348`), so VUs on same worker can progress. With shared Runtime (57k vs 843k) 10k VUs is ~0.57 GB, not 8 GB. Full fiber model (collapsing OS threads to tokio tasks) is the next step for >10k.
+- **~57 KB QuickJS heap per VU with shared Runtime** — was 836 KB (734k shims) 7.97 GB at 10k ✅MEAS Apple Silicon, now 57k (-92.3%, 0.57 GB at 10k) via per-thread shared `Runtime` with template `Context` globals aliased (`tropel-js/src/context.rs:15` thread-local `SHARED_RT`). Gated shims still save 120KB for http-only, user-script bytes shared via `Arc` (was 12 GB at 4k), compiled bytecode shared via template.
 
 ## Architecture
 
