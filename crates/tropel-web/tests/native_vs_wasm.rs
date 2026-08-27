@@ -894,3 +894,81 @@ fn native_and_wasm_agree_over_har_fixture() {
     );
     assert!(!n.is_empty(), "the HAR fixture must produce iterations");
 }
+
+/// TR-408: OpenAPI fixture through the differential harness.
+#[test]
+fn native_and_wasm_agree_over_openapi_fixture() {
+    let Some(wasm_path) = wasm_artifact_path() else {
+        eprintln!("SKIP native_vs_wasm OpenAPI fixture: tropel_web.wasm not built");
+        return;
+    };
+    native_seam::set_handler(Box::new(fixture_response));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("native runtime");
+
+    let openapi_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/openapi/working_api.json"
+    );
+    let bytes = std::fs::read(openapi_path).expect("OpenAPI fixture must exist");
+    let adapter = tropel_input_openapi::OpenApiInputAdapter;
+    use tropel_sdk::traits::InputAdapter;
+    let scenario = adapter.parse(&bytes).expect("OpenAPI fixture must parse");
+
+    let run = RunRequest {
+        scenario_json: serde_json::to_string(&scenario).expect("scenario serializes"),
+        vu_id: 1,
+        scenario_name: "openapi-fixture".into(),
+        iterations: 1,
+        env_vars: HashMap::new(),
+        expected_statuses: vec!["200".to_string()],
+    };
+    let native = rt.block_on(tropel_web::run_request(run.clone()));
+    let wasm = wasm_leg(&wasm_path, &run);
+    assert_eq!(
+        normalize(&native),
+        normalize(&wasm),
+        "OpenAPI fixture diverged: native and wasm32 disagree"
+    );
+}
+
+/// TR-408: Postman collection fixture through the differential harness.
+#[test]
+fn native_and_wasm_agree_over_postman_fixture() {
+    let Some(wasm_path) = wasm_artifact_path() else {
+        eprintln!("SKIP native_vs_wasm Postman fixture: tropel_web.wasm not built");
+        return;
+    };
+    native_seam::set_handler(Box::new(fixture_response));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("native runtime");
+
+    let postman_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/collections/Test-Tropel.postman_collection.json"
+    );
+    let bytes = std::fs::read(postman_path).expect("Postman fixture must exist");
+    let adapter = tropel_input_postman::PostmanInputAdapter;
+    use tropel_sdk::traits::InputAdapter;
+    let scenario = adapter.parse(&bytes).expect("Postman fixture must parse");
+
+    let run = RunRequest {
+        scenario_json: serde_json::to_string(&scenario).expect("scenario serializes"),
+        vu_id: 1,
+        scenario_name: "postman-fixture".into(),
+        iterations: 1,
+        env_vars: HashMap::new(),
+        expected_statuses: vec!["200".to_string()],
+    };
+    let native = rt.block_on(tropel_web::run_request(run.clone()));
+    let wasm = wasm_leg(&wasm_path, &run);
+    assert_eq!(
+        normalize(&native),
+        normalize(&wasm),
+        "Postman fixture diverged: native and wasm32 disagree"
+    );
+}

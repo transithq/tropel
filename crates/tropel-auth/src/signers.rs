@@ -822,22 +822,19 @@ impl HawkAuth {
             algorithm,
         }
     }
-}
 
-impl AuthSigner for HawkAuth {
-    fn name(&self) -> &str {
-        "hawk"
-    }
-
-    fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+    /// TR-409: the signer with an explicit timestamp + nonce — the live path
+    /// calls `sign` (random values), and the published-vector tests inject
+    /// the Hawk API.md reference values to reproduce its MAC exactly.
+    fn sign_with_ts_nonce(
+        &self,
+        request: &mut reqwest::Request,
+        ts: &str,
+        nonce: &str,
+        ext: &str,
+    ) -> Result<()> {
         let url = request.url();
         let method = request.method().as_str().to_uppercase();
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            .to_string();
-        let nonce = generate_nonce();
 
         // Resource = path + query.
         let resource = match url.query() {
@@ -852,12 +849,9 @@ impl AuthSigner for HawkAuth {
         // Normalized string per the Hawk spec (mozilla/hawk lib/crypto.js
         // generateNormalizedString): ts and nonce come FIRST, immediately
         // after the scheme line; method/resource/host/port follow; then hash
-        // and ext (empty here — this shim doesn't do payload validation). The
-        // previous ordering (method…port before ts/nonce) produced a MAC that
-        // mismatches a Hawk server (verified against the Hawk API.md
-        // reference vectors in the tests below).
+        // and ext (empty here — this shim doesn't do payload validation).
         let normalized =
-            hawk_normalized_string(&method, &ts, &nonce, &resource, &host, port, "", "");
+            hawk_normalized_string(&method, ts, nonce, &resource, &host, port, "", ext);
         let mac = hawk_mac(&normalized, &self.auth_key, self.algorithm.as_deref());
 
         let header = format!(
@@ -865,6 +859,22 @@ impl AuthSigner for HawkAuth {
             self.auth_id, ts, nonce, mac
         );
         set_auth_header(request, &header)
+    }
+}
+
+impl AuthSigner for HawkAuth {
+    fn name(&self) -> &str {
+        "hawk"
+    }
+
+    fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .to_string();
+        let nonce = generate_nonce();
+        self.sign_with_ts_nonce(request, &ts, &nonce, "")
     }
 }
 
@@ -1985,6 +1995,37 @@ mod tests {
             None,
         );
         assert_eq!(mac, "6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE=");
+    }
+
+    #[test]
+    fn hawk_full_signer_matches_api_reference_vector() {
+        // TR-409: the FULL Hawk signer (not just `hawk_mac`) must reproduce
+        // the Hawk API.md reference MAC. Injects the reference ts + nonce via
+        // `sign_with_ts_nonce` and extracts the MAC from the Authorization
+        // header — proving the normalized-string construction (scheme,
+        // resource, host, port) matches Hawk exactly.
+        let mut req = reqwest::Request::new(
+            reqwest::Method::GET,
+            "http://example.com:8000/resource/1?b=1&a=2"
+                .parse()
+                .unwrap(),
+        );
+        let auth = HawkAuth::new(
+            "dh37fgj492je",
+            "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn",
+            None,
+        );
+        auth.sign_with_ts_nonce(&mut req, "1353832234", "j4h3g2", "some-app-ext-data")
+            .unwrap();
+
+        let h = auth_header(&req);
+        assert!(
+            h.contains("mac=\"6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE=\""),
+            "Hawk signer diverged from the API.md reference MAC: {h}"
+        );
+        assert!(h.contains("id=\"dh37fgj492je\""));
+        assert!(h.contains("ts=\"1353832234\""));
+        assert!(h.contains("nonce=\"j4h3g2\""));
     }
 
     #[test]

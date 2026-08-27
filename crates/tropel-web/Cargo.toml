@@ -49,3 +49,4 @@ wasmtime-wasi = { version = "47.0.3", features = ["p1"] }
 # through the input adapters and runs them through both legs.
 tropel-input-har = { workspace = true }
 tropel-input-openapi = { workspace = true }
+tropel-input-postman = { workspace = true }
