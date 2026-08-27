@@ -273,6 +273,7 @@ mod tests {
             }],
             variables: HashMap::new(),
             auth: None,
+            conversion_notes: Vec::new(),
         }
     }
 

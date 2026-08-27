@@ -1504,8 +1504,9 @@ mod tests {
                 description: None,
                 schema: None,
             },
-            variables: HashMap::new(),
+variables: HashMap::new(),
             auth: None,
+            conversion_notes: Vec::new(),
             items: vec![ScenarioItem {
                 name: "resolved-item".into(),
                 id: None,
@@ -1573,6 +1574,7 @@ mod tests {
             },
             variables: HashMap::new(),
             auth: None,
+            conversion_notes: Vec::new(),
             items: vec![
                 ScenarioItem {
                     name: "item-a".into(),
@@ -2302,6 +2304,7 @@ mod tests {
             },
             variables: HashMap::new(),
             auth: None,
+            conversion_notes: Vec::new(),
             items: vec![leaf("ok-item"), leaf("dead-item")],
         });
         let execution_items: Arc<Vec<ScenarioItem>> =
