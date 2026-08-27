@@ -237,7 +237,11 @@ impl InputAdapter for InsomniaInputAdapter {
 /// Request groups become folders (nested `items`); requests map directly.
 /// Items are ordered by `metaSortKey` (ascending, default 0) — Insomnia
 /// exports resources in this order.
-fn build_items(resources: &[InsomniaResource], parent_id: &str, notes: &mut Vec<String>) -> Vec<ScenarioItem> {
+fn build_items(
+    resources: &[InsomniaResource],
+    parent_id: &str,
+    notes: &mut Vec<String>,
+) -> Vec<ScenarioItem> {
     let mut children: Vec<&InsomniaResource> = resources
         .iter()
         .filter(|r| r.parent_id.as_deref() == Some(parent_id))

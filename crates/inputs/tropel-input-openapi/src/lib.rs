@@ -591,7 +591,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
         items,
         variables: HashMap::new(),
         auth: None,
-    conversion_notes: Vec::new(),
+        conversion_notes: Vec::new(),
     })
 }
 

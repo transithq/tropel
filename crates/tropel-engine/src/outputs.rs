@@ -29,40 +29,40 @@ pub(crate) fn spawn_extension_output(
 
         loop {
             tokio::select! {
-                res = rx.recv() => match res {
-                    Ok(sample) => {
-                        batch.push(sample);
-                        if batch.len() >= MAX_BATCH {
-                            // TR-312: retain the Vec's capacity instead of
-                            // mem::take (which leaves Vec::new() → re-grows
-                            // 4→8→16→… every flush).
-                            let b = std::mem::replace(&mut batch, Vec::with_capacity(1024));
-                            if let Err(e) = output.emit(&b).await {
-                                tracing::warn!("extension output '{}' emit failed: {e}", output.name());
+                            res = rx.recv() => match res {
+                                Ok(sample) => {
+                                    batch.push(sample);
+                                    if batch.len() >= MAX_BATCH {
+                                        // TR-312: retain the Vec's capacity instead of
+                                        // mem::take (which leaves Vec::new() → re-grows
+                                        // 4→8→16→… every flush).
+                                        let b = std::mem::replace(&mut batch, Vec::with_capacity(1024));
+                                        if let Err(e) = output.emit(&b).await {
+                                            tracing::warn!("extension output '{}' emit failed: {e}", output.name());
+                                        }
+                                        // TR-301: flushes yield — a CPU-heavy emit (tag
+                                        // expansion, serialization) must not starve the
+                                        // aggregator task that shares this runtime.
+                                        tokio::task::yield_now().await;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!("extension output dropped {n} samples (consumer lag)");
+                                }
+                            },
+                            _ = tick.tick() => {
+                                if !batch.is_empty() {
+                                    let b = std::mem::replace(&mut batch, Vec::with_capacity(1024));
+                                    if let Err(e) = output.emit(&b).await {
+                                        tracing::warn!("extension output '{}' emit failed: {e}", output.name());
+                                    }
+            // TR-301: yield so the aggregator gets scheduled.
+                                    tokio::task::yield_now().await;
+                                }
                             }
-                            // TR-301: flushes yield — a CPU-heavy emit (tag
-                            // expansion, serialization) must not starve the
-                            // aggregator task that shares this runtime.
-                            tokio::task::yield_now().await;
                         }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tropel_metrics::OUTPUT_SAMPLES_DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!("extension output dropped {n} samples (consumer lag)");
-                    }
-                },
-                _ = tick.tick() => {
-                    if !batch.is_empty() {
-                        let b = std::mem::replace(&mut batch, Vec::with_capacity(1024));
-                        if let Err(e) = output.emit(&b).await {
-                            tracing::warn!("extension output '{}' emit failed: {e}", output.name());
-                        }
-// TR-301: yield so the aggregator gets scheduled.
-                        tokio::task::yield_now().await;
-                    }
-                }
-            }
         }
 
         // Final flush on stream close.

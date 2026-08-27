@@ -1402,7 +1402,7 @@ mod tests {
             items: vec![leaf("request-one"), leaf("request-two")],
             variables: HashMap::new(),
             auth: None,
-        conversion_notes: Vec::new(),
+            conversion_notes: Vec::new(),
         });
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
         let names: Arc<Vec<String>> =
@@ -1689,7 +1689,7 @@ mod tests {
             ],
             variables: HashMap::new(),
             auth: None,
-        conversion_notes: Vec::new(),
+            conversion_notes: Vec::new(),
         });
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
         let names: Arc<Vec<String>> =
@@ -1785,7 +1785,7 @@ mod tests {
             )],
             variables: HashMap::new(),
             auth: None,
-        conversion_notes: Vec::new(),
+            conversion_notes: Vec::new(),
         });
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
         assert_eq!(
@@ -1905,7 +1905,7 @@ mod tests {
             }],
             variables: HashMap::new(),
             auth: None,
-        conversion_notes: Vec::new(),
+            conversion_notes: Vec::new(),
         });
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
         let names: Arc<Vec<String>> =
@@ -1968,7 +1968,7 @@ mod tests {
             items,
             variables: HashMap::new(),
             auth: None,
-        conversion_notes: Vec::new(),
+            conversion_notes: Vec::new(),
         });
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
         let names: Arc<Vec<String>> =

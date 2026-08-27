@@ -127,7 +127,7 @@ impl InputAdapter for HttpFileAdapter {
             items,
             variables,
             auth: None,
-        conversion_notes: Vec::new(),
+            conversion_notes: Vec::new(),
         })
     }
 }

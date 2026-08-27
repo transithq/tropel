@@ -47,9 +47,7 @@ pub async fn run_agent(port: u16, bind: &str, token: Option<&str>) -> tropel_sdk
     }
 
     let addr = format!("{bind}:{port}");
-    let listener = TcpListener::bind(&addr)
-        .await
-        .map_err(TropelError::Io)?;
+    let listener = TcpListener::bind(&addr).await.map_err(TropelError::Io)?;
     tracing::info!(
         "tropel agent listening on http://{addr} (token auth {})",
         if token.is_some() { "on" } else { "off" }
@@ -127,7 +125,9 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
         ("POST", "/execute") => {
             let mut body_buf = vec![0u8; content_length.min(64 * 1024)];
             if content_length > 0 {
-                sock.read_exact(&mut body_buf).await.map_err(TropelError::Io)?;
+                sock.read_exact(&mut body_buf)
+                    .await
+                    .map_err(TropelError::Io)?;
             }
             let req: serde_json::Value = match serde_json::from_slice(&body_buf) {
                 Ok(v) => v,
@@ -153,7 +153,9 @@ async fn respond(sock: &mut TcpStream, status: u16, body: &str) -> tropel_sdk::R
         "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    sock.write_all(resp.as_bytes()).await.map_err(TropelError::Io)
+    sock.write_all(resp.as_bytes())
+        .await
+        .map_err(TropelError::Io)
 }
 
 /// Execute a single request with full sub-timings — the SAME engine code path
