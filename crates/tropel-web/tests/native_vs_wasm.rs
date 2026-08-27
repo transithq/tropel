@@ -28,7 +28,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_sdk::types::{Body, Cookie, Method, Request, Response, ResponseType, Sample, Timings};
+use tropel_sdk::types::{
+    ApiKeyLocation, AuthConfig, Body, Cookie, Method, Request, Response, ResponseType, Sample,
+    Timings,
+};
 use tropel_sdk::Result;
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
@@ -614,4 +617,174 @@ fn native_and_wasm_runtime_produce_identical_outcomes() {
     // tropel_alloc are reclaimed by the wasm module itself — http.rs's wasm
     // `bridge()` calls `tropel_free` after decoding (the F3 reviewer flagged
     // the leak; per-request growth would be unbounded on long web runs).
+}
+
+/// Build a single-item `RunRequest` from a raw `Request` — the corpus
+/// primitive for the differential.
+fn run_request_for(req: Request) -> RunRequest {
+    use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
+    let scenario = Scenario {
+        info: ScenarioInfo {
+            name: "corpus".into(),
+            description: None,
+            schema: None,
+        },
+        items: vec![ScenarioItem {
+            id: None,
+            name: "corpus-item".into(),
+            request: Some(req),
+            prerequest: vec![],
+            test: vec![],
+            assertions: vec![],
+            items: vec![],
+        }],
+        variables: HashMap::new(),
+        auth: None,
+        conversion_notes: vec![],
+    };
+    RunRequest {
+        scenario_json: serde_json::to_string(&scenario).expect("scenario serializes"),
+        vu_id: 1,
+        scenario_name: "corpus".into(),
+        iterations: 1,
+        env_vars: HashMap::new(),
+        expected_statuses: vec!["200".to_string()],
+    }
+}
+
+/// TR-408 (partial): the one-engine claim over a request CORPUS — different
+/// methods, bodies, query params, and every auth scheme — not just the single
+/// fixture. Same deterministic handler, both legs, identical outcomes.
+#[test]
+fn native_and_wasm_agree_over_request_corpus() {
+    let Some(wasm_path) = wasm_artifact_path() else {
+        if std::env::var("TROPEL_REQUIRE_WASM").as_deref() == Ok("1") {
+            panic!("F3 corpus: tropel_web.wasm not found but TROPEL_REQUIRE_WASM=1");
+        }
+        eprintln!("SKIP native_vs_wasm corpus: tropel_web.wasm not built");
+        return;
+    };
+
+    native_seam::set_handler(Box::new(fixture_response));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("native runtime");
+
+    let base = |url: &str| Request {
+        url: url.to_string(),
+        method: Method::GET,
+        headers: vec![],
+        query_params: HashMap::new(),
+        body: None,
+        auth: None,
+        certificate: None,
+        follow_redirects: true,
+        host: None,
+        cookies: vec![],
+        timeout: None,
+        response_type: ResponseType::Text,
+    };
+
+    let mut corpus: Vec<Request> = vec![
+        base("https://fixture.test/get"),
+        {
+            let mut r = base("https://fixture.test/post");
+            r.method = Method::POST;
+            r.body = Some(Body::Json(serde_json::json!({ "a": 1 })));
+            r.headers = vec![("Content-Type".into(), "application/json".into())];
+            r
+        },
+        {
+            let mut r = base("https://fixture.test/query");
+            r.query_params.insert("q".into(), "hello world".into());
+            r
+        },
+        {
+            let mut r = base("https://fixture.test/bearer");
+            r.auth = Some(AuthConfig::Bearer { token: "tok".into() });
+            r
+        },
+        {
+            let mut r = base("https://fixture.test/basic");
+            r.auth = Some(AuthConfig::Basic {
+                username: "u".into(),
+                password: "p".into(),
+            });
+            r
+        },
+        {
+            let mut r = base("https://fixture.test/apikey");
+            r.auth = Some(AuthConfig::ApiKey {
+                key: "X-Key".into(),
+                value: "k".into(),
+                location: ApiKeyLocation::Header,
+            });
+            r
+        },
+        {
+            let mut r = base("https://fixture.test/digest");
+            r.auth = Some(AuthConfig::Digest {
+                username: "u".into(),
+                password: "p".into(),
+            });
+            r
+        },
+    ];
+
+    // A failing script must ALSO agree (script_failures on both legs).
+    {
+        use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
+        let scenario = Scenario {
+            info: ScenarioInfo {
+                name: "corpus-fail".into(),
+                description: None,
+                schema: None,
+            },
+            items: vec![ScenarioItem {
+                id: None,
+                name: "fail-item".into(),
+                request: Some(base("https://fixture.test/fail")),
+                prerequest: vec![],
+                test: vec!["pm.test('boom', () => { throw new Error('boom'); });".into()],
+                assertions: vec![],
+                items: vec![],
+            }],
+            variables: HashMap::new(),
+            auth: None,
+            conversion_notes: vec![],
+        };
+        let run = RunRequest {
+            scenario_json: serde_json::to_string(&scenario).expect("scenario serializes"),
+            vu_id: 1,
+            scenario_name: "corpus-fail".into(),
+            iterations: 1,
+            env_vars: HashMap::new(),
+            expected_statuses: vec!["200".to_string()],
+        };
+        let native = rt.block_on(tropel_web::run_request(run.clone()));
+        let wasm = wasm_leg(&wasm_path, &run);
+        let n = normalize(&native);
+        let w = normalize(&wasm);
+        assert_eq!(n, w, "failing-script outcome diverged");
+        assert_eq!(
+            n[0].script_failures, 1,
+            "the throwing script must fail on the native leg"
+        );
+    }
+
+    for (i, req) in corpus.iter().enumerate() {
+        let run = run_request_for(req.clone());
+        let native = rt.block_on(tropel_web::run_request(run.clone()));
+        let wasm = wasm_leg(&wasm_path, &run);
+        let n = normalize(&native);
+        let w = normalize(&wasm);
+        assert_eq!(
+            n, w,
+            "corpus item {i} diverged ({}): native and wasm32 disagree",
+            req.url
+        );
+        assert_eq!(n.len(), 1, "corpus item {i} must produce one iteration");
+        assert_eq!(n[0].script_failures, 0, "corpus item {i} scripts must pass");
+    }
 }
