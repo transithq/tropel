@@ -185,6 +185,15 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                         .collect()
                 })
                 .unwrap_or_default();
+            // TR-411: `stream: true` streams each iteration's samples as a
+            // chunked response (live metrics) instead of one batched JSON.
+            let stream = payload
+                .get("stream")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
+            if stream {
+                return run_load_streaming(sock, &state, &scenario, iterations, &thresholds).await;
+            }
             let out = run_load(&state, &scenario, iterations, &thresholds).await;
             respond(sock, 200, &out.to_string()).await
         }
@@ -271,6 +280,72 @@ async fn run_load(
         "has_failures": total_failures > 0,
         "thresholds": threshold_verdict(thresholds, iterations, total_failures),
     })
+}
+
+/// TR-411: STREAMING load run — writes a chunked HTTP response and emits
+/// each iteration's samples as a chunk, so the client sees live metrics
+/// during the run instead of a single batched JSON at the end.
+async fn run_load_streaming(
+    sock: &mut TcpStream,
+    state: &AgentState,
+    scenario: &tropel_sdk::scenario::Scenario,
+    iterations: u64,
+    thresholds: &std::collections::HashMap<String, String>,
+) -> tropel_sdk::Result<()> {
+    // Chunked HTTP head.
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    sock.write_all(head.as_bytes()).await.map_err(TropelError::Io)?;
+
+    let mut total_failures = 0u64;
+    for it in 0..iterations {
+        let mut batch: Vec<serde_json::Value> = Vec::new();
+        for item in &scenario.items {
+            let Some(request) = item.request.as_ref() else { continue };
+            let start = Instant::now();
+            let result = state.client.execute(request, None).await;
+            let elapsed_ms = start.elapsed().as_millis() as f64;
+            let (status, ok) = match &result {
+                Ok(resp) => (resp.status_code, (200..400).contains(&resp.status_code)),
+                Err(_) => (0, false),
+            };
+            if !ok {
+                total_failures += 1;
+            }
+            batch.push(serde_json::json!({
+                "metric": "http_reqs",
+                "iteration": it,
+                "url": request.url,
+                "status": status,
+                "duration_ms": elapsed_ms,
+            }));
+        }
+        let chunk = serde_json::json!({
+            "iteration": it,
+            "samples": batch,
+            "failures": total_failures,
+        })
+        .to_string();
+        write_chunk(sock, &chunk).await?;
+    }
+    // Final verdict chunk + the terminating chunk.
+    let verdict = serde_json::json!({
+        "done": true,
+        "iterations": iterations,
+        "failures": total_failures,
+        "has_failures": total_failures > 0,
+        "thresholds": threshold_verdict(thresholds, iterations, total_failures),
+    })
+    .to_string();
+    write_chunk(sock, &verdict).await?;
+    sock.write_all(b"0\r\n\r\n").await.map_err(TropelError::Io)
+}
+
+/// Write one HTTP/1.1 chunk: `<hex-size>\r\n<data>\r\n`.
+async fn write_chunk(sock: &mut TcpStream, data: &str) -> tropel_sdk::Result<()> {
+    let size = format!("{:x}\r\n", data.len());
+    sock.write_all(size.as_bytes()).await.map_err(TropelError::Io)?;
+    sock.write_all(data.as_bytes()).await.map_err(TropelError::Io)?;
+    sock.write_all(b"\r\n").await.map_err(TropelError::Io)
 }
 
 /// Evaluate the run's thresholds and produce the verdict (TR-411).
