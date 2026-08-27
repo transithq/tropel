@@ -4,12 +4,21 @@
 //! gate), while the bulky collection parsers live HERE, loaded only when the
 //! import UI opens.
 //!
-//! Exports mirror the engine's `ExtensionRegistry::resolve_input` dispatch:
-//! iterate the registered input adapters in priority order and pick the
-//! HIGHEST-priority one whose `detect()` claims the bytes (ties → listed
-//! order). The adapter set is enumerated explicitly (not via `inventory`)
-//! so the dispatch is deterministic and independent of link order — same
-//! guarantee the engine's explicit-priority design provides natively.
+//! Exports use the same explicit-priority dispatch as the engine's
+//! `ExtensionRegistry::resolve_input`: iterate the input adapters in
+//! priority order and pick the HIGHEST-priority one whose `detect()` claims
+//! the bytes (ties → listed order). The adapter set is enumerated
+//! explicitly (not via `inventory`) so the dispatch is deterministic and
+//! independent of link order — same guarantee the engine's explicit-priority
+//! design provides natively.
+//!
+//! NOTE (TR-404): this is NOT a full mirror of the resolver. `k6`, `http`
+//! and `subprocess` are deliberately omitted — `k6` needs the QuickJS
+//! scripting runtime (a separate, heavy tier), `http` is a plain file
+//! adapter that only makes sense for local files (the browser talks HTTP
+//! through a relay), and `subprocess` shells out to a binary (impossible in
+//! the browser). The collection-import adapters (postman/insomnia/har/bru/
+//! openapi) are what a browser embedder can meaningfully import.
 //!
 //! The output is a protocol-agnostic `Scenario` JSON (the `tropel-sdk`
 //! shape: `info` / `items` / `variables` / `auth`); the embedder maps it to

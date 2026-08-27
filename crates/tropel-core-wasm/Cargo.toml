@@ -22,7 +22,10 @@ wasm-opt = false
 
 [dependencies]
 tropel-variables.workspace = true
-tropel-auth.workspace = true
+# TR-404: the browser oauth module needs ZERO tropel-sdk deps; disable
+# tropel-auth's default reqwest feature (signers + tropel-sdk) so simd-json,
+# inventory and rustc-hash drop out of the gated tier.
+tropel-auth = { workspace = true, default-features = false }
 wasm-bindgen = "0.2"
 serde.workspace = true
 serde_json.workspace = true
