@@ -41,43 +41,48 @@ edition = "2021"
 tropel-sdk = { path = "$(realpath "$SDK_DIR")" }
 EOF
 cat > "$TMPDIR/src/lib.rs" <<EOF
-use tropel_sdk::traits::{Driver, DriverInstance, DriverDeclaredOptions, VuContext};
-use tropel_sdk::types::{Request, Method, AuthConfig};
-use tropel_sdk::Result;
+use tropel_sdk::types::{Request, Method, AuthConfig, Body, ResponseType};
+use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
 
-pub struct MyDriver;
-impl Driver for MyDriver {
-    fn id(&self) -> &str { "test" }
-    fn detect(&self, _bytes: &[u8]) -> bool { false }
-    async fn init(
-        &self,
-        _bytes: &[u8],
-        _path: Option<&std::path::Path>,
-        _exec: Option<&str>,
-    ) -> Result<Box<dyn DriverInstance>> {
-        Ok(Box::new(MyInstance))
-    }
-    async fn declared_options(
-        &self,
-        _bytes: &[u8],
-        _path: Option<&std::path::Path>,
-        _env: &std::collections::HashMap<String, String>,
-    ) -> Result<Option<DriverDeclaredOptions>> {
-        Ok(None)
+// Guard 2 is about proving the CONTRACT types resolve from the SDK alone
+// (no full checkout, no tropel-core). Constructing the core types is enough;
+// implementing Driver would couple the sample to trait lifetime details that
+// are not the point of the guard.
+pub fn build_scenario() -> Scenario {
+    Scenario {
+        info: ScenarioInfo { name: "sample".into(), description: None, schema: None },
+        items: vec![ScenarioItem {
+            id: None,
+            name: "GET /ping".into(),
+            request: Some(Request {
+                url: "https://example.com/ping".into(),
+                method: Method::GET,
+                headers: vec![],
+                query_params: std::collections::HashMap::new(),
+                body: None,
+                auth: None,
+                certificate: None,
+                follow_redirects: true,
+                host: None,
+                cookies: vec![],
+                timeout: None,
+                response_type: ResponseType::Text,
+            }),
+            prerequest: vec![],
+            test: vec![],
+            assertions: vec![],
+            items: vec![],
+        }],
+        variables: std::collections::HashMap::new(),
+        auth: None,
+        conversion_notes: vec![],
     }
 }
 
-pub struct MyInstance;
-impl DriverInstance for MyInstance {
-    async fn run_iteration(&mut self, _ctx: &mut VuContext) -> Result<()> {
-        Ok(())
-    }
-}
-
-// Touch a few contract types so the build proves they resolve from the SDK.
+// Touch the auth contract too.
 #[allow(dead_code)]
-fn touch(req: &Request, method: &Method, auth: &AuthConfig) {
-    let _ = (req, method, auth);
+fn touch_auth(auth: &AuthConfig, body: &Body) {
+    let _ = (auth, body);
 }
 EOF
 if cargo build --manifest-path "$TMPDIR/Cargo.toml" 2>&1; then
