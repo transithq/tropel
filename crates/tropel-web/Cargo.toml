@@ -45,3 +45,7 @@ rquickjs = { version = "0.12.2", default-features = false, features = ["std", "c
 [dev-dependencies]
 wasmtime = { version = "47.0.3", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] }
 wasmtime-wasi = { version = "47.0.3", features = ["p1"] }
+# TR-408: the differential corpus parses REAL fixture collections (HAR etc.)
+# through the input adapters and runs them through both legs.
+tropel-input-har = { workspace = true }
+tropel-input-openapi = { workspace = true }

@@ -847,3 +847,47 @@ fn native_and_wasm_agree_over_request_corpus() {
         assert_eq!(n[0].script_failures, 0, "corpus item {i} scripts must pass");
     }
 }
+
+/// TR-408: the corpus must include REAL fixture collections (not hand-built
+/// scenarios) — parse a checked-in HAR through the input adapter, then run
+/// the resulting scenario through BOTH legs and assert byte-identical
+/// outcomes. The seam fixture keeps the requests off the network, so the
+/// run is deterministic and the two legs must agree.
+#[test]
+fn native_and_wasm_agree_over_har_fixture() {
+    let Some(wasm_path) = wasm_artifact_path() else {
+        eprintln!("SKIP native_vs_wasm HAR fixture: tropel_web.wasm not built");
+        return;
+    };
+
+    native_seam::set_handler(Box::new(fixture_response));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("native runtime");
+
+    // Parse the checked-in HAR fixture through the real input adapter.
+    let har_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/har/01_get_posts.har");
+    let bytes = std::fs::read(har_path).expect("HAR fixture must exist");
+    let adapter = tropel_input_har::HarInputAdapter;
+    use tropel_sdk::traits::InputAdapter;
+    let scenario = adapter.parse(&bytes).expect("HAR fixture must parse");
+
+    let run = RunRequest {
+        scenario_json: serde_json::to_string(&scenario).expect("scenario serializes"),
+        vu_id: 1,
+        scenario_name: "har-fixture".into(),
+        iterations: 1,
+        env_vars: HashMap::new(),
+        expected_statuses: vec!["200".to_string()],
+    };
+    let native = rt.block_on(tropel_web::run_request(run.clone()));
+    let wasm = wasm_leg(&wasm_path, &run);
+    let n = normalize(&native);
+    let w = normalize(&wasm);
+    assert_eq!(
+        n, w,
+        "HAR fixture diverged: native and wasm32 disagree on the parsed collection"
+    );
+    assert!(!n.is_empty(), "the HAR fixture must produce iterations");
+}
