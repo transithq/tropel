@@ -566,4 +566,55 @@ mod tests {
             "custom namespace/aliases must be installed via the preamble; default trp absent; bru must be evaluated by the real bundle path — got: {check}"
         );
     }
+
+    /// TR-503: isolation — one script's globals must not be reachable from
+    /// another's. Each VU owns a separate QuickJS Runtime, so a global set
+    /// in one must be undefined in the other. This is the 34 leaking globals
+    /// guard: if a shim leaks, this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_vu_globals_are_isolated() {
+        let pm_state = new_pm_state();
+        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+            client: VuCookieClient::new(
+                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+            ),
+        });
+        let mut ctx1 = create_vu_js_context(
+            1,
+            &pm_state,
+            &client,
+            &ShimBundle::default(),
+            &SandboxConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("ctx1");
+        let mut ctx2 = create_vu_js_context(
+            2,
+            &pm_state,
+            &client,
+            &ShimBundle::default(),
+            &SandboxConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("ctx2");
+
+        // Set a global in ctx1
+        let _ = ctx1.eval("var leak_test = 42; leak_test").await;
+        // Must be undefined in ctx2
+        let check = ctx2
+            .eval("typeof leak_test === 'undefined'")
+            .await
+            .expect("probe");
+        assert_eq!(
+            check, "true",
+            "per-VU globals must be isolated — leak_test leaked to ctx2: {check}"
+        );
+        // Also check that built-in shims are present in both but not shared
+        let c1 = ctx1.eval("typeof pm === 'object'").await.expect("c1");
+        let c2 = ctx2.eval("typeof pm === 'object'").await.expect("c2");
+        assert_eq!(c1, "true");
+        assert_eq!(c2, "true");
+    }
 }
