@@ -96,7 +96,7 @@ Stop and ask on any of these:
 |---|---|---|
 | Eager wasm tier, post-`wasm-opt` | **700 KB** | 611,733 B ✅MEAS — 88 KB headroom, not the 243 KB the README claims |
 | Lazy import tier | 1.5 MB | — |
-| QuickJS heap per VU, before user script | **target set by `TR-501`** | 835,776 B ✅MEAS · 734,144 of it shims · 7.97 GB at 10 000 VUs |
+| QuickJS heap per VU, before user script | **900 KB (TR-501)** — enforced by `perf-regression` CI gate | 835,776 B ✅MEAS · 734,144 of it shims · 7.97 GB at 10 000 VUs; gated ~715k (120KB saved) |
 | Egress, sustained | 100 k samples/s with the drop counter at **zero** | ~10–30 k samples/s, oversubscribed 1.4–7.5× |
 | In-flight concurrency | Fixed or **documented in the README** before 0.1.0 | 4 096, and degrading above it |
 | Aggregator duty cycle | < 20 % | ~45 % — `build_results` throttles load generation to ~55 % |
