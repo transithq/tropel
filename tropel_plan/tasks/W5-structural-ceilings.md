@@ -71,20 +71,20 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 - [ ] `http.*` and `sleep` return Promises driven on the IO runtime; the QuickJS job queue is pumped so the VU yields
 - [ ] `execute_blocking` is deleted from the VU path
 - [ ] In-flight concurrency scales past 4 096, demonstrated by benchmark
-- [ ] **Until this lands, the summary must report *effective* VUs, not spawned** — a run that delivers 4 096 must not print 10 000. That reporting fix is cheap and ships first, independent of the rewrite
-- [ ] `execute_blocking`'s unbounded `rx.recv()` (`blocking.rs:150-152`) is gone with the path — or timed out (`TR-315`) if this task is deferred
-- [ ] `sleep()` pacing is no longer inflated by the slice loop (`js_bootstrap.rs:350-360`)
+- [x] **Until this lands, the summary must report *effective* VUs, not spawned** — a run that delivers 4 096 must not print 10 000. That reporting fix is cheap and ships first, independent of the rewrite — **verified**: done in TR-505 (`engine.rs` peak/effective, `summary.rs` `vusRequested`/`vusEffective`, `stdout.rs`)
+- [x] `execute_blocking`'s unbounded `rx.recv()` (`blocking.rs:150-152`) is gone with the path — or timed out (`TR-315`) if this task is deferred — **verified**: `crates/tropel-http/src/blocking.rs:150` `recv_timeout(65s)` with `TropelError::Http` on timeout/disconnect, mitigated while deferred
+- [x] `sleep()` pacing is no longer inflated by the slice loop (`js_bootstrap.rs:350-360`) — **verified**: `crates/tropel-engine/src/js_bootstrap.rs:351` absolute deadline fix, `crates/inputs/tropel-input-k6/src/driver.rs:4508` same fix for K6 driver
 
 ### If this is deferred
-- [ ] The README states the ceiling, the degradation above it, and the throughput implication in numbers — this is an explicit `0.1.0` release-gate item
+- [x] The README states the ceiling, the degradation above it, and the throughput implication in numbers — this is an explicit `0.1.0` release-gate item — **verified**: `README.md:67` documents 4096 cap, wrapping, `Slot::Wrapped` degradation, 41k req/s at 100ms (either fixed or documented gate satisfied)
 
 ---
 
 ## TR-503 · Shared QuickJS `Runtime` with aliased globals
 **Effort:** L · **Blocked by:** TR-502 · **Do not start early**
 
-- [ ] ✅**MEAS** three topologies were compared; this is the **92 % option** and the biggest single memory number available
-- [ ] It is gated on `TR-502` because the thread model determines what can share a Runtime safely
+- [x] ✅**MEAS** three topologies were compared; this is the **92 % option** and the biggest single memory number available — **verified**: `TROPEL_MASTER_TODO.md:523` three topologies: per-VU Runtime 843k, template 737k (-12.6%), aliased globals 57k (-92.3%, 6.5 GB at 10k), bootstrap 0.894ms→0.071ms
+- [x] It is gated on `TR-502` because the thread model determines what can share a Runtime safely — **verified**: correctly **not started early** per `ROADMAP.md:68` and `W5:16` ordering; `tropel-js/src/context.rs:196` `Runtime` per-VU, `!Sync`, sharing would break isolation until TR-502 async lands
 - [ ] Isolation must be preserved: one script's globals must not be reachable from another's, which is exactly what the 34 leaking globals in `TR-242` would break
 - [ ] Benchmark per-VU heap before and after, and re-run the differential harness (`TR-408`) — sharing a Runtime is precisely the change that could make two surfaces disagree
 
@@ -93,7 +93,7 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 ## TR-504 · The second, fixable cap: a single-threaded aggregator
 **Effort:** M · **Blocked by:** TR-301
 
-- [ ] One single-threaded aggregator on a 2-worker runtime: ~9 samples × 100 k rps ≈ **900 k samples/s** through one thread
+- [x] One single-threaded aggregator on a 2-worker runtime: ~9 samples × 100 k rps ≈ **900 k samples/s** through one thread — **verified**: `crates/tropel-metrics/src/collector.rs:672` single `Aggregator` `run` loop, `max_pending 100k`; outer runtime was 2 workers now `outer_worker_threads() -> 4` (`crates/tropel-engine/src/main.rs:24` "old default of 2 was insufficient"), still single-threaded aggregator, documented
 - [ ] Unlike `TR-502`, this one is fixable without a model change — shard the aggregator, or move it off the shared runtime
 - [ ] Measured against the `TR-002` egress benchmark, not by inspection
 
