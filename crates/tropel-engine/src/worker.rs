@@ -331,7 +331,39 @@ impl VUWorkerPool {
     /// workers (isolation traded away at extreme VU counts, as documented).
     /// The vu_id passed to `run_vu` is unaffected (naming stays unique) —
     /// only the worker slot may be shared.
-    const MAX_WORKERS: usize = 4096;
+    pub const MAX_WORKERS: usize = 4096;
+
+    /// Read the cgroup `pids.max` limit if present (Kubernetes `pids.max`,
+    /// Docker `--pids-limit`). Returns `None` when unlimited or unreadable.
+    /// Checks both cgroup v1 and v2 paths.
+    pub fn pids_limit() -> Option<u64> {
+        for path in [
+            "/sys/fs/cgroup/pids.max",
+            "/sys/fs/cgroup/pids/pids.max",
+            "/sys/fs/cgroup/cpu/pids.max",
+        ] {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                let t = s.trim();
+                if t == "max" || t.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = t.parse::<u64>() {
+                    if v > 0 {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Effective concurrency actually achievable — `min(requested, MAX_WORKERS,
+    /// pids.limit)`. When `requested > effective`, wrapping or pids-capping
+    /// reduces throughput to that of `effective`.
+    pub fn effective_concurrency(requested: u64) -> u64 {
+        let pids = Self::pids_limit().unwrap_or(u64::MAX);
+        requested.min(Self::MAX_WORKERS as u64).min(pids)
+    }
 
     /// Spawn a VU on a dedicated worker thread. Reuses an idle slot (a
     /// finished VU's worker) when one exists, grows the pool only when every
