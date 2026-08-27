@@ -294,13 +294,17 @@ async fn run_load_streaming(
 ) -> tropel_sdk::Result<()> {
     // Chunked HTTP head.
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-    sock.write_all(head.as_bytes()).await.map_err(TropelError::Io)?;
+    sock.write_all(head.as_bytes())
+        .await
+        .map_err(TropelError::Io)?;
 
     let mut total_failures = 0u64;
     for it in 0..iterations {
         let mut batch: Vec<serde_json::Value> = Vec::new();
         for item in &scenario.items {
-            let Some(request) = item.request.as_ref() else { continue };
+            let Some(request) = item.request.as_ref() else {
+                continue;
+            };
             let start = Instant::now();
             let result = state.client.execute(request, None).await;
             let elapsed_ms = start.elapsed().as_millis() as f64;
@@ -343,8 +347,12 @@ async fn run_load_streaming(
 /// Write one HTTP/1.1 chunk: `<hex-size>\r\n<data>\r\n`.
 async fn write_chunk(sock: &mut TcpStream, data: &str) -> tropel_sdk::Result<()> {
     let size = format!("{:x}\r\n", data.len());
-    sock.write_all(size.as_bytes()).await.map_err(TropelError::Io)?;
-    sock.write_all(data.as_bytes()).await.map_err(TropelError::Io)?;
+    sock.write_all(size.as_bytes())
+        .await
+        .map_err(TropelError::Io)?;
+    sock.write_all(data.as_bytes())
+        .await
+        .map_err(TropelError::Io)?;
     sock.write_all(b"\r\n").await.map_err(TropelError::Io)
 }
 
