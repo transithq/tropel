@@ -140,6 +140,7 @@ fn fixture() -> MetricsResult {
         run_duration: std::time::Duration::from_secs(30),
         vu_init_failures: 0,
         script_failures: 0,
+        ..Default::default()
     };
     result.metrics.extend(result.per_url.clone());
     result
