@@ -450,10 +450,14 @@ pub fn build_token_request(params: &TokenRequestParams) -> Result<TokenRequest> 
     }
 
     let auth_method = params.auth_method.unwrap_or(ClientAuthMethod::Basic);
+    // RFC 6749 §2.3.1: client_id + client_secret are application/x-www-form-urlencoded
+    // encoded before the "id:secret" concatenation and base64.
     let basic = |id: &str, secret: &str| {
+        let enc_id = utf8_percent_encode(id, &UNRESERVED).to_string();
+        let enc_secret = utf8_percent_encode(secret, &UNRESERVED).to_string();
         format!(
             "Basic {}",
-            STANDARD.encode(format!("{id}:{secret}").as_bytes())
+            STANDARD.encode(format!("{enc_id}:{enc_secret}").as_bytes())
         )
     };
     let mut basic_auth_header = None;
