@@ -1006,6 +1006,7 @@ fn convert_scenario(ws: WasmScenario) -> Result<Scenario> {
         items,
         variables,
         auth: ws.auth.as_ref().and_then(convert_auth),
+        conversion_notes: Vec::new(),
     })
 }
 

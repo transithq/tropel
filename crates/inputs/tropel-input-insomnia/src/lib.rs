@@ -205,8 +205,10 @@ impl InputAdapter for InsomniaInputAdapter {
             .cloned()
             .unwrap_or_default();
 
+        // TR-410: collect conversion notes instead of eprintln.
+        let mut notes: Vec<String> = Vec::new();
         // Rebuild the tree: request groups + requests nested by parentId.
-        let items = build_items(&root.resources, &workspace_id);
+        let items = build_items(&root.resources, &workspace_id, &mut notes);
 
         if items.is_empty() {
             return Err(TropelError::Parse(
@@ -226,6 +228,7 @@ impl InputAdapter for InsomniaInputAdapter {
             items,
             variables: base_env,
             auth: None,
+            conversion_notes: notes,
         })
     }
 }
@@ -234,7 +237,7 @@ impl InputAdapter for InsomniaInputAdapter {
 /// Request groups become folders (nested `items`); requests map directly.
 /// Items are ordered by `metaSortKey` (ascending, default 0) — Insomnia
 /// exports resources in this order.
-fn build_items(resources: &[InsomniaResource], parent_id: &str) -> Vec<ScenarioItem> {
+fn build_items(resources: &[InsomniaResource], parent_id: &str, notes: &mut Vec<String>) -> Vec<ScenarioItem> {
     let mut children: Vec<&InsomniaResource> = resources
         .iter()
         .filter(|r| r.parent_id.as_deref() == Some(parent_id))
@@ -258,23 +261,32 @@ fn build_items(resources: &[InsomniaResource], parent_id: &str) -> Vec<ScenarioI
                     prerequest: vec![],
                     test: vec![],
                     assertions: vec![],
-                    items: build_items(resources, &id),
+                    items: build_items(resources, &id, notes),
                 });
             }
             "request" => {
                 match request_to_item(r) {
                     Ok(item) => out.push(item),
                     Err(e) => {
-                        // TR-006: report conversion errors instead of silently dropping
-                        eprintln!(
-                            "insomnia: skipping request {}: {}",
-                            r.name.as_deref().unwrap_or("?"),
-                            e
-                        );
+                        // TR-410: report conversion errors in the structured
+                        // notes instead of eprintln (which the client cannot
+                        // render).
+                        notes.push(format!(
+                            "Skipped '{}': {e}",
+                            r.name.as_deref().unwrap_or("(unnamed)")
+                        ));
                     }
                 }
             }
-            _ => {}
+            // TR-410: silently-skipped resource types (grpc, websocket, etc.)
+            // are now recorded so the client can show what was lost.
+            other => {
+                notes.push(format!(
+                    "Skipped '{}': unsupported Insomnia resource type '{}'",
+                    r.name.as_deref().unwrap_or("(unnamed)"),
+                    other
+                ));
+            }
         }
     }
     out

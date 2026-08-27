@@ -146,6 +146,7 @@ fn build_scenario_from_source(js_code: &str, name: &str) -> Result<Scenario> {
         }],
         variables: std::collections::HashMap::new(),
         auth: None,
+    conversion_notes: Vec::new(),
     })
 }
 
