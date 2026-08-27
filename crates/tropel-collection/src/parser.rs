@@ -87,7 +87,30 @@ pub fn collection_to_scenario_with_file_reads(
         items: vec![],
         variables: HashMap::new(),
         auth: convert_auth(collection.auth.as_ref()),
-        conversion_notes: Vec::new(),
+        conversion_notes: {
+            // TR-409: an unsupported collection-level auth scheme is reported
+            // in the conversion notes (never silently degraded to a different
+            // scheme). The known-unsupported set maps to NoAuth (no header).
+            let mut notes = Vec::new();
+            if let Some(a) = &collection.auth {
+                match a.auth_type.as_str() {
+                    "ntlm" | "edgegrid" | "digest" | "hawk" | "awsv4" | "oauth1" | "oauth2" => {
+                        // These ARE supported in tropel (digest/hawk/awsv4/
+                        // oauth1/oauth2 map to the matching AuthConfig);
+                        // only truly-unknown types degrade.
+                    }
+                    "bearer" | "basic" | "apikey" | "noauth" => {}
+                    other => {
+                        notes.push(format!(
+                            "Collection auth type '{}' is not supported by tropel — \
+                             requests are sent without auth (conversion degrades)",
+                            other
+                        ));
+                    }
+                }
+            }
+            notes
+        },
     };
 
     // Convert collection variables
@@ -1554,6 +1577,24 @@ mod tests {
             Some(AuthConfig::Bearer { token }) => assert_eq!(token, "tok123"),
             other => panic!("expected Bearer auth, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_unsupported_collection_auth_is_reported_in_notes() {
+        // TR-409: an unknown collection-level auth type must be recorded in
+        // conversion_notes (the client renders it), never silently degraded.
+        let json = r#"{
+            "info": { "name": "C", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+            "auth": { "type": "akamai-edgegrid" },
+            "item": [ { "name": "r", "request": { "url": "https://x.io/", "method": "GET" } } ]
+        }"#;
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        assert!(
+            scenario.conversion_notes.iter().any(|n| n.contains("akamai-edgegrid")),
+            "unsupported auth must be reported: {:?}",
+            scenario.conversion_notes
+        );
     }
 
     #[test]
