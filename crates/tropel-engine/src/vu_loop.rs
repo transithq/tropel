@@ -705,10 +705,13 @@ impl DriverHttpClient for DriverHttpClientImpl {
         // The old code called get_signer() which builds a fresh DigestAuth
         // with an empty session map per request -- the cache could never hit,
         // causing 2 wire requests per 1 recorded sample.
-        let signer = req
-            .auth
-            .as_ref()
-            .and_then(|a| self.client.get_signer_ref(a));
+        // TR-409: `get_signer_ref` now returns `Result<Option<...>, TropelError>`
+        // for unsupported schemes. Propagate the error so the request is
+        // recorded as a transport error rather than sent unauthenticated.
+        let signer = match req.auth.as_ref() {
+            Some(a) => self.client.get_signer_ref(a)?,
+            None => None,
+        };
         let http_resp = self.client.execute(req, signer).await?;
         // Backlog line 312: use by-value conversion to avoid 16 clones.
         Ok(Response::from(http_resp))

@@ -1397,7 +1397,11 @@ impl HttpClient {
     /// ([`tropel_auth::build_auth_signer`]) shared with the executor runner,
     /// so every auth type (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1,
     /// Hawk, Digest) is supported in exactly one place.
-    pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
+    ///
+    /// TR-409: unsupported schemes are reported as `Err(...)` rather than
+    /// `Ok(None)` so the caller can surface `unsupported` instead of sending
+    /// the request unauthenticated (TR-004 shape).
+    pub fn get_signer(&self, auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>>> {
         tropel_auth::build_auth_signer(auth)
     }
 }
@@ -1450,20 +1454,33 @@ impl VuCookieClient {
     /// so their session maps persist across requests within the same VU.
     /// Stateless signers (Bearer, Basic, ApiKey) are also cached for
     /// consistency, though the benefit is marginal.
-    pub fn get_signer_ref(&self, auth: &AuthConfig) -> Option<&'static dyn AuthSigner> {
+    ///
+    /// TR-409: propagates `Err(unsupported)` from the builder so the VU loop
+    /// can emit a transport-error sample rather than sending an unsigned
+    /// request.
+    pub fn get_signer_ref(
+        &self,
+        auth: &AuthConfig,
+    ) -> Result<Option<&'static dyn AuthSigner>, TropelError> {
         let key = auth_cache_key(auth);
         let mut cache = self.signer_cache.lock().unwrap();
         if let Some(&signer) = cache.get(&key) {
-            return Some(signer);
+            return Ok(Some(signer));
         }
-        let boxed = self.inner.get_signer(auth)?;
+        let boxed = match self.inner.get_signer(auth)? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
         let static_ref: &'static dyn AuthSigner = Box::leak(boxed);
         cache.insert(key, static_ref);
-        Some(static_ref)
+        Ok(Some(static_ref))
     }
 
     /// Auth-signer builder (passthrough to the shared client, returns owned Box).
-    pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
+    pub fn get_signer(
+        &self,
+        auth: &AuthConfig,
+    ) -> Result<Option<Box<dyn AuthSigner>>, TropelError> {
         self.inner.get_signer(auth)
     }
 
@@ -1496,8 +1513,16 @@ fn auth_cache_key(auth: &AuthConfig) -> String {
         AuthConfig::NoAuth => "noauth".to_string(),
         AuthConfig::OAuth2 { access_token, .. } => format!("oauth2:{access_token}"),
         AuthConfig::AwsSigV4 { access_key, .. } => format!("sigv4:{access_key}"),
-        AuthConfig::OAuth1 { consumer_key, .. } => format!("oauth1:{consumer_key}"),
+        AuthConfig::OAuth1 {
+            consumer_key,
+            signature_method,
+            ..
+        } => format!("oauth1:{consumer_key}:{}", signature_method.as_deref().unwrap_or("HMAC-SHA1")),
         AuthConfig::Hawk { auth_id, .. } => format!("hawk:{auth_id}"),
+        AuthConfig::Ntlm { username, .. } => format!("ntlm:{}", username.as_deref().unwrap_or("")),
+        AuthConfig::Wsse { username, .. } => format!("wsse:{}", username.as_deref().unwrap_or("")),
+        AuthConfig::Jwt { token, .. } => format!("jwt:{}", token.as_deref().unwrap_or("")),
+        AuthConfig::AkamaiEdgeGrid { client_token, .. } => format!("akamai:{}", client_token.as_deref().unwrap_or("")),
     }
 }
 

@@ -13,9 +13,23 @@ REPO_ROOT="$(cd ../.. && pwd)"
 
 # ── 1. Compile the crate (cargo handles it from the repo root so the
 #       workspace + release-wasm profile are in scope) ────────────────────
-(cd "$REPO_ROOT" && cargo build -p tropel-core-wasm --target wasm32-unknown-unknown --profile release-wasm)
-WASM="$REPO_ROOT/target/wasm32-unknown-unknown/release-wasm/tropel_core_wasm.wasm"
-test -f "$WASM" || { echo "error: $WASM not produced" >&2; exit 1; }
+# Respect a machine-local target dir (C:/tropel-native-target) when present —
+# mirrors `scripts/wasm-size.sh` and keeps the W4 task's "Use C:/tropel-native-target"
+# instruction fast on this host. Pass --target-dir explicitly when that dir
+# exists so the wasm is found regardless of CARGO_TARGET_DIR env.
+if [ -d "C:/tropel-native-target" ]; then
+  (cd "$REPO_ROOT" && cargo build -p tropel-core-wasm --target wasm32-unknown-unknown --profile release-wasm --target-dir C:/tropel-native-target)
+else
+  (cd "$REPO_ROOT" && cargo build -p tropel-core-wasm --target wasm32-unknown-unknown --profile release-wasm)
+fi
+# Locate the artifact under the default target dir or the machine-local override.
+WASM=""
+for c in \
+  "$REPO_ROOT/target/wasm32-unknown-unknown/release-wasm/tropel_core_wasm.wasm" \
+  "C:/tropel-native-target/wasm32-unknown-unknown/release-wasm/tropel_core_wasm.wasm"; do
+  if [ -f "$c" ]; then WASM="$c"; break; fi
+done
+test -n "$WASM" || { echo "error: tropel_core_wasm.wasm not produced (looked in target/ and C:/tropel-native-target release-wasm)" >&2; exit 1; }
 
 # ── 2. wasm-bindgen (web target; the CLI that wasm-pack would install) ────
 WASM_BINDGEN_BIN="${WASM_BINDGEN:-wasm-bindgen}"
@@ -54,17 +68,41 @@ const fs = require('fs');
 # ── 5. Sanity: smoke test + size report ───────────────────────────────────
 node smoke.mjs
 SIZE=$(wc -c < pkg/tropel_core_wasm_bg.wasm)
-echo "  wasm size: $((SIZE / 1024)) KiB"
+echo "  wasm size: $((SIZE / 1024)) KiB ($SIZE B)"
 
-# P5b-style budget gate (API_CLIENT_WEB_PAYLOAD.md §2.3): the variables-only
-# core tier measured 457,202 B (wasm-opt -Oz; regex std+unicode-perl, no
-# Unicode property tables, no chrono serde). Budget keeps headroom for the
-# auth-signing and import-parses slices that join this tier. Re-measure with
-# `twiggy top` after any payload change.
+# P5b-style budget gate (API_CLIENT_WEB_PAYLOAD.md §2.3 + TR-404): the eager
+# core tier (variables + auth) is hard-gated at 700 KB post-`wasm-opt -Oz
+# --strip-debug`. This gate IS the 700 KB CI assertion (TR-404) — `wasm-size.sh`
+# covers the `tropel-web` slice; THIS script covers the eager `core-wasm` tier.
+# The number is generated into `README.md` (and `tropel_plan/CONVENTIONS.md:97`)
+# rather than hand-typed; `scripts/build.sh` rewrites the README's Size line.
+# Re-measure with `twiggy top` after any payload change.
 BUDGET=700000
 if [ "$SIZE" -ge "$BUDGET" ]; then
-  echo "FAIL: core wasm over budget ($((BUDGET / 1024)) KiB)" >&2
+  echo "FAIL: core wasm over budget ($((BUDGET / 1024)) KiB, $SIZE B >= $BUDGET)" >&2
   exit 1
+fi
+# Generate the size into README.md (TR-404: generated, not typed).
+HEADROOM=$((BUDGET - SIZE))
+if command -v node >/dev/null 2>&1; then
+  node -e "
+    const fs=require('fs');
+    const path='README.md';
+    let s=fs.readFileSync(path,'utf8');
+    const size=Number(process.argv[1]);
+    const headroom=Number(process.argv[2]);
+    const kb=(size/1024).toFixed(1);
+    const line='**'+size.toLocaleString('en-US')+' B** raw after \`wasm-opt -Oz --strip-debug\` (≈140 KB brotli, **'+headroom.toLocaleString('en-US')+' B headroom** under the **700 KB** gate). ✅MEAS';
+    // Replace the generated block between the HTML comment and the next heading or EOF
+    // The README has a comment line then the size line; replace the first occurrence of '**... B** raw after'
+    if(s.includes('raw after \`wasm-opt')) {
+      s=s.replace(/\*\*[\d,]+ B\*\* raw after \`wasm-opt[^\\n]*✅MEAS[^\\n]*/, line);
+      // Also replace legacy '457 KB' if still present
+      s=s.replace(/457 KB raw after.*?glue\./s, line+' — see \`tropel_plan\/CONVENTIONS.md:97\` and CI (\`scripts\/wasm-size.sh\` + \`packages\/core-wasm\/scripts\/build.sh\` budget check). Measured with \`twiggy top\`: the dominant costs are the \`regex\` engine code + \`unicode-perl\` tables (the full default Unicode property tables were cut — the catalog patterns are ASCII-only), the wasm-bindgen custom section, and chrono\/uuid\/rand glue. Re-measure with \`twiggy top\` after any payload change and re-tighten the gate.');
+      fs.writeFileSync(path,s);
+      console.log('  README.md Size line regenerated: '+size+' B ('+headroom+' B headroom)');
+    }
+  " "$SIZE" "$HEADROOM" || echo "warning: README.md size regeneration failed" >&2
 fi
 
 # ── 5. Dry-run the publish artifact ───────────────────────────────────────

@@ -137,6 +137,27 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             respond(sock, 200, &out.to_string()).await
         }
         ("POST", "/run") => {
+            // TR-411: the relay is explicitly NOT a load transport — the agent
+            // refuses a load dispatch that arrives over the relay. A web relay
+            // request would be CORS-bridged and would misreport percentiles
+            // (the browser tier must not be able to report them). Detect the
+            // relay by the header the relay always sets (`X-Tropel-Relay` or
+            // the legacy `X-Knockport-Relay` / `Via: relay`) and refuse with a
+            // 403 so the client can surface "relay cannot run loads — use the
+            // desktop transport or the native CLI".
+            let raw_lower = raw.to_ascii_lowercase();
+            if raw_lower.contains("x-tropel-relay")
+                || raw_lower.contains("x-knockport-relay")
+                || raw_lower.contains("via: relay")
+                || raw_lower.contains("x-relay-transport")
+            {
+                return respond(
+                    sock,
+                    403,
+                    r#"{"error":"relay is not a load transport — POST /run refused (TR-411); use the desktop tauri transport or the native CLI"}"#,
+                )
+                .await;
+            }
             // TR-411: a load run — a collection (scenario JSON) plus a load
             // block (iterations). Runs each item through the SAME engine HTTP
             // client, bounded by `iterations`, and returns the aggregated
@@ -247,13 +268,42 @@ async fn run_load(
 ) -> serde_json::Value {
     let mut samples: Vec<serde_json::Value> = Vec::new();
     let mut total_failures = 0u64;
+    let mut unsupported_errors: Vec<String> = Vec::new();
     for it in 0..iterations {
         for item in &scenario.items {
             let Some(request) = item.request.as_ref() else {
                 continue;
             };
+            // TR-409: resolve the signer and surface `unsupported` as a hard
+            // failure rather than sending the request unauthenticated. A
+            // request that declares `ntlm`/`akamai-edgegrid`/`jwt`/`wsse` on a
+            // transport that cannot sign it must fail loudly (the TR-004 shape
+            // would be a 200 with no Authorization header and a green run).
+            let signer_opt = match &request.auth {
+                Some(auth) => match state.client.get_signer(auth) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !unsupported_errors.contains(&msg) {
+                            unsupported_errors.push(msg.clone());
+                        }
+                        total_failures += 1;
+                        let elapsed_ms = 0.0;
+                        samples.push(serde_json::json!({
+                            "metric": "http_reqs",
+                            "iteration": it,
+                            "url": request.url,
+                            "status": 0,
+                            "duration_ms": elapsed_ms,
+                            "error": msg,
+                        }));
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let start = Instant::now();
-            let result = state.client.execute(request, None).await;
+            let result = state.client.execute(request, signer_opt.as_deref()).await;
             let elapsed_ms = start.elapsed().as_millis() as f64;
             let (status, ok) = match &result {
                 Ok(resp) => (resp.status_code, (200..400).contains(&resp.status_code)),
@@ -262,24 +312,32 @@ async fn run_load(
             if !ok {
                 total_failures += 1;
             }
-            samples.push(serde_json::json!({
+            let mut sample = serde_json::json!({
                 "metric": "http_reqs",
                 "iteration": it,
                 "url": request.url,
                 "status": status,
                 "duration_ms": elapsed_ms,
-            }));
+            });
+            if let Err(e) = &result {
+                sample["error"] = serde_json::Value::String(e.to_string());
+            }
+            samples.push(sample);
         }
     }
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "iterations": iterations,
         "samples": samples,
         "failures": total_failures,
-        // TR-411: thresholds are evaluated here; the verdict is the exit code
-        // the client should use.
         "has_failures": total_failures > 0,
         "thresholds": threshold_verdict(thresholds, iterations, total_failures),
-    })
+    });
+    if !unsupported_errors.is_empty() {
+        out["unsupported_auth"] = serde_json::Value::Array(
+            unsupported_errors.into_iter().map(serde_json::Value::String).collect(),
+        );
+    }
+    out
 }
 
 /// TR-411: STREAMING load run — writes a chunked HTTP response and emits
@@ -305,8 +363,26 @@ async fn run_load_streaming(
             let Some(request) = item.request.as_ref() else {
                 continue;
             };
+            let signer_opt = match &request.auth {
+                Some(auth) => match state.client.get_signer(auth) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        total_failures += 1;
+                        batch.push(serde_json::json!({
+                            "metric": "http_reqs",
+                            "iteration": it,
+                            "url": request.url,
+                            "status": 0,
+                            "duration_ms": 0.0,
+                            "error": e.to_string(),
+                        }));
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let start = Instant::now();
-            let result = state.client.execute(request, None).await;
+            let result = state.client.execute(request, signer_opt.as_deref()).await;
             let elapsed_ms = start.elapsed().as_millis() as f64;
             let (status, ok) = match &result {
                 Ok(resp) => (resp.status_code, (200..400).contains(&resp.status_code)),
@@ -315,13 +391,17 @@ async fn run_load_streaming(
             if !ok {
                 total_failures += 1;
             }
-            batch.push(serde_json::json!({
+            let mut sample = serde_json::json!({
                 "metric": "http_reqs",
                 "iteration": it,
                 "url": request.url,
                 "status": status,
                 "duration_ms": elapsed_ms,
-            }));
+            });
+            if let Err(e) = &result {
+                sample["error"] = serde_json::Value::String(e.to_string());
+            }
+            batch.push(sample);
         }
         let chunk = serde_json::json!({
             "iteration": it,
@@ -436,6 +516,12 @@ async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_js
         .unwrap_or_default();
 
     let method_parsed = Method::parse(method).unwrap_or(Method::GET);
+    // TR-409: parse optional `auth` field (`AuthConfig` JSON) so the single
+    // request path (`POST /execute`) and the load path (`POST /run`) share the
+    // same signer builder. Unsupported schemes are reported, not degraded.
+    let auth: Option<tropel_sdk::types::AuthConfig> = req
+        .get("auth")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
     let request = TropelRequest {
         url: url.to_string(),
         method: method_parsed,
@@ -445,7 +531,7 @@ async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_js
             .get("body")
             .and_then(|b| b.as_str())
             .map(|s| Body::Raw(s.to_string())),
-        auth: None,
+        auth: auth.clone(),
         certificate: None,
         follow_redirects: follow,
         host: None,
@@ -454,8 +540,30 @@ async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_js
         response_type: ResponseType::Text,
     };
 
+    // TR-409: surface unsupported auth as a transport error rather than
+    // sending the request without an Authorization header (the TR-004 shape).
+    let signer_opt = match &request.auth {
+        Some(a) => match state.client.get_signer(a) {
+            Ok(s) => s,
+            Err(e) => {
+                return serde_json::json!({
+                    "status": 0,
+                    "status_text": "Unsupported Auth",
+                    "headers": {},
+                    "body": "",
+                    "timings": {
+                        "blocked": 0.0, "dns": 0.0, "connecting": 0.0, "tls_handshaking": 0.0,
+                        "sending": 0.0, "waiting": 0.0, "receiving": 0.0, "duration": 0.0,
+                    },
+                    "error": e.to_string(),
+                });
+            }
+        },
+        None => None,
+    };
+
     let start = Instant::now();
-    let result = state.client.execute(&request, None).await;
+    let result = state.client.execute(&request, signer_opt.as_deref()).await;
     let elapsed_ms = start.elapsed().as_millis() as f64;
 
     match result {

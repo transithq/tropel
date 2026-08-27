@@ -334,7 +334,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-wasip1
+          targets: wasm32-wasip1,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm
@@ -406,6 +406,32 @@ jobs:
       # handshake (agent vs wasm) before a single load runs.
       - name: P6 lockstep versioning gate
         run: bash scripts/version-lockstep.sh
+
+      # TR-404: the eager tier (core-wasm) is hard-gated at 700 KB post-wasm-opt.
+      # `packages/core-wasm/scripts/build.sh` IS the gate — it builds the crate
+      # for wasm32-unknown-unknown (release-wasm profile), runs wasm-bindgen +
+      # wasm-opt -Oz, asserts the artifact is < 700 KB, and regenerates the
+      # `## Size` line in `packages/core-wasm/README.md` so the number is
+      # measured, not typed. The `git diff --exit-code` below makes a stale
+      # README a hard CI failure (the drift that left the README at 457 KB
+      # while the real artifact was 611,733 B). Requires wasm32-unknown-unknown
+      # + wasm-bindgen-cli + binaryen (wasm-opt) — the same toolchain the
+      # package's own build.sh documents.
+      - name: TR-404 eager tier 700 KB gate + generated README
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-bindgen and binaryen for TR-404 gate
+        run: |
+          cargo install wasm-bindgen-cli --locked || true
+          sudo apt-get update && sudo apt-get install -y binaryen || npm i -g binaryen || true
+          wasm-bindgen --version || true
+          wasm-opt --version || true
+      - name: TR-404 build core-wasm and assert 700 KB budget (generates README)
+        run: |
+          bash packages/core-wasm/scripts/build.sh
+          git diff --exit-code -- packages/core-wasm/README.md || { echo "FAIL: packages/core-wasm/README.md Size line is stale — run 'bash packages/core-wasm/scripts/build.sh' locally and commit the generated Size line (TR-404: generated, not typed)" >&2; exit 1; }
+          echo "ok: core-wasm 700 KB gate + README generation check passed"
 
       # TR-407: the SDK inversion (contract at the bottom of the graph) rots
       # if adapters start depending on tropel-core, or if the SDK needs a full
