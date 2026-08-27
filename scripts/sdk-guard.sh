@@ -41,14 +41,22 @@ edition = "2021"
 tropel-sdk = { path = "$(realpath "$SDK_DIR")" }
 EOF
 cat > "$TMPDIR/src/lib.rs" <<EOF
-use tropel_sdk::traits::{Driver, DriverDeclaredOptions};
+use tropel_sdk::traits::{Driver, DriverInstance, DriverDeclaredOptions, VuContext};
 use tropel_sdk::types::{Request, Method, AuthConfig};
 use tropel_sdk::Result;
 
 pub struct MyDriver;
 impl Driver for MyDriver {
-    fn name(&self) -> &str { "test" }
+    fn id(&self) -> &str { "test" }
     fn detect(&self, _bytes: &[u8]) -> bool { false }
+    async fn init(
+        &self,
+        _bytes: &[u8],
+        _path: Option<&std::path::Path>,
+        _exec: Option<&str>,
+    ) -> Result<Box<dyn DriverInstance>> {
+        Ok(Box::new(MyInstance))
+    }
     async fn declared_options(
         &self,
         _bytes: &[u8],
@@ -56,6 +64,13 @@ impl Driver for MyDriver {
         _env: &std::collections::HashMap<String, String>,
     ) -> Result<Option<DriverDeclaredOptions>> {
         Ok(None)
+    }
+}
+
+pub struct MyInstance;
+impl DriverInstance for MyInstance {
+    async fn run_iteration(&mut self, _ctx: &mut VuContext) -> Result<()> {
+        Ok(())
     }
 }
 
