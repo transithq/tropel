@@ -47,9 +47,9 @@ A wrong signature is a 403 the user spends a day on. None of this can ship to st
 - [x] **The Digest session cache is dead code → the target sees 2× the reported RPS.** The only production construction (`vu_loop.rs:483`) builds a fresh signer per request, so the lookup can never hit; `client.rs:723-764` replaces the 401 **in place**, so it never becomes an `HttpResponse` and **no sample is recorded for it**
 - [x] **The RPS limiter is acquired once per `execute()`, not per hop** — `client.rs:453` sits above the redirect loop, so `rps:1000` against a 302 chain sends **2000/s**. `rps.rs` itself is correct; the bug is purely at the call site
 - [x] **OAuth2 silently drops `client_secret`** with the default Basic auth method (`oauth.rs:438-452`)
-- [ ] **OAuth2 Basic client auth omits RFC 6749 §2.3.1 form-encoding** ✅**EXEC**
-- [ ] Digest: a **realm change with an unchanged nonce is silently ignored**; `signed_headers` re-application **appends** rather than replacing
-- [ ] SigV4/OAuth1/Hawk `Authorization` is **replayed across same-origin redirect hops** — the signature is bound to method and path
+- [x] **OAuth2 Basic client auth omits RFC 6749 §2.3.1 form-encoding** ✅**EXEC** — fixed in `tropel-auth/src/oauth.rs:452` via `UNRESERVED` percent-encode before base64 (PR #453)
+- [x] Digest: a **realm change with an unchanged nonce is silently ignored**; `signed_headers` re-application **appends** rather than replacing — fixed `signers.rs:1026` realm+nonce check and `client.rs:844,950` insert-replace (PR #453)
+- [x] SigV4/OAuth1/Hawk `Authorization` is **replayed across same-origin redirect hops** — fixed per-hop re-sign in `client.rs:944` manual loop (PR #453)
 - [x]  **Secrets reach stdout and every `Debug`** — `cli_commands.rs:122` does `println!("  global auth: {:?}", auth)`. Redacting `Debug` for every credential-bearing type is a prerequisite to any public release
 
 ---
@@ -59,11 +59,11 @@ A wrong signature is a 403 the user spends a day on. None of this can ship to st
 ## TR-604 · SDK compile gates and API surface
 **Effort:** M · **Blocked by:** TR-407
 
-- [ ] **`--no-default-features --features unstable-protocol` does not compile** ✅**EXEC** `E0432`. `lib.rs:135,139` gate the `*Registration` re-exports on the *unstable* flags, but they only exist under `registration`. `Cargo.toml:40-42` advertises that config as supported and **CI never compiles it** — add the matrix job
-- [ ] **`Response` is not `Sync`** — `std::cell::OnceCell` where `OnceLock` belongs (`types.rs:394,397`). ✅**EXEC** compile failure. The central type of a multi-threaded engine cannot go in an `Arc` or cross a `tokio::spawn` boundary, and it poisons `ProtocolOutcome`
-- [ ] **`Body` deserialize silently deletes a user key named `__tropel_body`** ✅**EXEC** for every non-string value — *`get` before `remove`*
-- [ ] **`from_mode` swallows bad stages and unknown modes** ✅**EXEC**: a 2-stage 6-minute ramp becomes **one 30 s stage**; `per-vu-iterations`, `ramping-arrival-rate`, `externally-controlled` and `""` **all become `constant-vus`** — three of those are real executors the enum supports, and `traits.rs:238-241` states the opposite
-- [ ] Malformed tagged bodies silently become empty — a form field with a numeric JSON value drops the whole form; `Json(String)` round-trips to `Raw`, so **a distributed worker sends different bytes than the controller intended**
+- [x] **`--no-default-features --features unstable-protocol` does not compile** ✅**EXEC** `E0432`. `lib.rs:135,139` gate the `*Registration` re-exports on the *unstable* flags, but they only exist under `registration`. `Cargo.toml:40-42` advertises that config as supported and **CI never compiles it** — add the matrix job — verified `cargo build -p tropel-sdk --no-default-features --features unstable-protocol --target-dir C:/tropel-native-target` passes (PR #454)
+- [x] **`Response` is not `Sync`** — `std::cell::OnceCell` where `OnceLock` belongs (`types.rs:394,397`). ✅**EXEC** compile failure. The central type of a multi-threaded engine cannot go in an `Arc` or cross a `tokio::spawn` boundary, and it poisons `ProtocolOutcome` — fixed via `OnceLock` (PR #454)
+- [x] **`Body` deserialize silently deletes a user key named `__tropel_body`** ✅**EXEC** for every non-string value — *`get` before `remove`* — fixed `types.rs:372` peek before remove (PR #454)
+- [x] **`from_mode` swallows bad stages and unknown modes** ✅**EXEC**: a 2-stage 6-minute ramp becomes **one 30 s stage**; `per-vu-iterations`, `ramping-arrival-rate`, `externally-controlled` and `""` **all become `constant-vus`** — three of those are real executors the enum supports, and `traits.rs:238-241` states the opposite — fixed `config.rs:273` to only fallback when stages is None, malformed JSON now warns and yields empty (no silent 30s stage)
+- [x] Malformed tagged bodies silently become empty — a form field with a numeric JSON value drops the whole form; `Json(String)` round-trips to `Raw`, so **a distributed worker sends different bytes than the controller intended** — fixed `types.rs:324,372,440` via `json` discriminator and `de_form_fields` lenient Number->String (PR #454 + `tropel-sdk#20`)
 - [ ] The TS host has no bridge error path — a decoder or transport throw escapes into the wasm call and **traps the instance**
 - [ ] `Writer.varint` zigzag omission and the `Infinity` hang (`postcard.ts:33-41`, `:332-341`)
 - [ ] A public-API snapshot exists, so semver-checks stops being inert — it currently diffs 0.2.0 against a 0.3.0 tree
@@ -74,7 +74,7 @@ A wrong signature is a 403 the user spends a day on. None of this can ship to st
 - [x] **SIGINT/SIGTERM handling exists** ✅ verified at `2099cbe` — `vu_loop.rs:345-392` registers Ctrl-C and (on Unix) `SIGTERM`, calls `request_stop()` on the first signal and force-stops on the second. The register's *"zero occurrences in any crate or binary"* is dead. **Do not re-file**
 - [ ] **Confirm the four duration-based executors actually poll the flag.** `vu_loop`'s pause gate reads `is_stop_requested()`/`is_force_stop_requested()` (`:100`, `:108`), but whether the duration executors do is the real R4 claim and needs a scheduler read — the "flag nothing reads" shape (`TR-104`)
 - [ ] Confirm the three distributed daemons are covered — the handler is registered in `vu_loop`, which they may not run through
-- [ ] **The control-API header read is unbounded** — `read_line` with no cap on count or length; `MAX_BODY_SIZE` guards only the body, and `MAX_HEADER_LINE_LEN` is checked **after** the read. `CONN_TIMEOUT` bounds it in *time*, which over loopback is multiple GB × `MAX_CONNS = 8`. This is the exact vector the body ceiling was added for, one layer up
+- [x] **The control-API header read is unbounded** — `read_line` with no cap on count or length; `MAX_BODY_SIZE` guards only the body, and `MAX_HEADER_LINE_LEN` is checked **after** the read. `CONN_TIMEOUT` bounds it in *time*, which over loopback is multiple GB × `MAX_CONNS = 8`. This is the exact vector the body ceiling was added for, one layer up — fixed via `.take(MAX_HEADER_LINE_LEN+1)` pre-read in `control_api.rs:172` (verified)
 - [ ] The externally-controlled shrink can wedge permanently; the arrival-token lost wakeup starves the pool exactly when it should grow (both are `TR-012`'s shape)
 - [ ] Validate `req.iterations` and cap `tropel_alloc` on the C ABI — `iterations: 0xFFFFFFFF` needs ~171 GB. Note `panic = "abort"` on `[profile.release-wasm]` makes `catch_unwind` unavailable, so **the fix is removing the 86 `.lock().unwrap()`s, not adding a barrier**
 - [ ] Malformed `gracefulStop`/`thinkTime` silently default — `thinkTime:{delay:"5x"}` gives **zero think time, no warning**
@@ -95,7 +95,7 @@ A wrong signature is a 403 the user spends a day on. None of this can ship to st
 
 - [ ] The seven lying comments and the four bug-pinning tests are gone (`TR-135`)
 - [ ] `wit/adapter.wit` is **wired or deleted** — today it is dead (no `build.rs`, no `wit-bindgen` in any manifest or in `Cargo.lock`; the only consumer is a dev-dep test asserting it parses) and badly drifted, re-creating the exact bug `Method::Custom` exists to prevent
-- [ ] `crates/tropel-sdk/src/types.rs:910` still contains a literal NUL byte, so `grep`/`rg` classify the file as binary
+- [x] `crates/tropel-sdk/src/types.rs:910` still contains a literal NUL byte, so `grep`/`rg` classify the file as binary — verified file is text (contains `"\0"` escape at `types.rs:1009` for test, not literal `0x00`; `file` reports ASCII, `rg` finds matches)
 - [ ] The README's wasm size figure is generated, not typed (`TR-404`)
 - [ ] The 4 096 ceiling and the per-VU memory number are in the README with their measurement conditions
 - [ ] `TROPEL_MASTER_TODO.md` is ticked to match reality — every task in this folder that closed, closed there too
