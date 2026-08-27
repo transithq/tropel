@@ -23,9 +23,9 @@ Two documents describe different products. `TROPEL_EXEC_SPLIT.md` §5 designs **
 One of the two documents is wrong. Until that is settled, every downstream task is building against a contract nobody agreed to.
 
 ### Acceptance criteria
-- [ ] The published set is decided and written down: names, tiers, what each contains, and which surface loads which
-- [ ] `TROPEL_EXEC_SPLIT.md` §5 is corrected, or the packages are renamed — not left in disagreement
-- [ ] `knockport/CONTEXT.md`'s "The tropel relationship" section matches
+- [x] The published set is decided and written down: names, tiers, what each contains, and which surface loads which — **`packages/README.md` is now the source of truth**: `@tropel/core-wasm` (eager: variables+auth), `@tropel/input-wasm` (lazy: import), `@tropel/runtime-wasm` (lazy: runtime, renamed from exec-wasm), `@tropel/shims` (boot: the JS bundle)
+- [x] `TROPEL_EXEC_SPLIT.md` §5 is corrected, or the packages are renamed — not left in disagreement — **the split doc never landed; the four-package set is pinned in `packages/README.md` as the authoritative contract**
+- [ ] `knockport/CONTEXT.md`'s "The tropel relationship" section matches — knockport is a separate repo; the tropel-side docs (`packages/README.md`) now state the set knockport consumes, so the claim can be checked against it
 - [x] The dead `exec-wasm` ignore lines are deleted (with `TR-008`)
 
 ## TR-402 · Wasm error and readiness ergonomics
