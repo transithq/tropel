@@ -104,8 +104,8 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 
 Independent of every task above, and the cheapest honesty win in the wave.
 
-- [ ] The summary reports **effective** in-flight concurrency alongside spawned VUs
-- [ ] Exceeding the worker cap is a **visible warning at startup**, naming the number you will actually get
+- [x] The summary reports **effective** in-flight concurrency alongside spawned VUs — **verified**: `crates/tropel-metrics/src/collector.rs:1758` `requested_vus`/`effective_vus`, `crates/tropel-engine/src/engine.rs:peak_requested`+`effective`, `crates/tropel-engine/src/summary.rs:132` `vusRequested`/`vusEffective`, `crates/tropel-report/src/stdout.rs:82` `Max VUs (effective ...)` + `Requested VUs` line
+- [x] Exceeding the worker cap is a **visible warning at startup**, naming the number you will actually get — **verified**: `crates/tropel-engine/src/engine.rs:peak_requested`+`VUWorkerPool::effective_concurrency` `tracing::warn` at startup with reason `MAX_WORKERS=4096` or `pids.max`
 - [x]  `growth_failed` stops being sticky for the whole run — thread-cap exhaustion is transient (`TR-315`)
-- [ ] `make_worker` failure is memoized ✅closed — but the flag is never reset, which is the sticky bug above. Fix both together
-- [ ] Kubernetes `pids.max` and Docker `--pids-limit` are commonly ≤ 4 096, so this fires on ordinary deployments, not exotic ones
+- [x] `make_worker` failure is memoized ✅closed — but the flag is never reset, which is the sticky bug above. Fix both together — **verified**: `crates/tropel-engine/src/worker.rs:245` reset `growth_failed` on `find_idle_slot` success, `258` memoize on failure; sticky no longer
+- [x] Kubernetes `pids.max` and Docker `--pids-limit` are commonly ≤ 4 096, so this fires on ordinary deployments, not exotic ones — **verified**: `crates/tropel-engine/src/worker.rs:340` `pids_limit()` reads cgroup v1/v2, `effective_concurrency` includes pids
