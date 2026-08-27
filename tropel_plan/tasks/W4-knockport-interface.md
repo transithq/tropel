@@ -40,11 +40,11 @@ Four defects that together make a failed wasm load indistinguishable from a work
 - `isTropelCoreReady` / `isTropelInputReady` have **zero call sites** — so a 404, a MIME mismatch, or a CSP block means `{{$guid}}` and `{{$timestamp}}` go out **literally on the wire**.
 
 ### Acceptance criteria
-- [ ] Errors are real `Error` instances carrying a code, a message, and the parser diagnostic
-- [ ] `detect()` distinguishes not-loaded from not-recognised — different values, both checkable
-- [ ] Init failure is a rejected promise or a thrown error, not a discarded boolean
-- [ ] The readiness predicates are load-bearing: a documented, tested path where the consumer must await readiness before sending
-- [ ] A test loads the package with the wasm asset 404ing and asserts the consumer gets a loud failure, **not** unresolved variables on the wire
+- [x] Errors are real `Error` instances carrying a code, a message, and the parser diagnostic
+- [x] `detect()` distinguishes not-loaded from not-recognised — different values, both checkable
+- [x] Init failure is a rejected promise or a thrown error, not a discarded boolean
+- [x] The readiness predicates are load-bearing: a documented, tested path where the consumer must await readiness before sending
+- [x] A test loads the package with the wasm asset 404ing and asserts the consumer gets a loud failure, **not** unresolved variables on the wire
 
 ## TR-403 · Cap `resolveDynamicVariables` before it takes the browser down
 **Effort:** M · **Blocked by:** none · **Blocks:** knockport's send path
@@ -56,10 +56,10 @@ Documented as "never throws". It throws. ✅**MEAS**: 460 k chars in → **200 M
 
 ### Acceptance criteria
 - [x] Total output is capped in `DynamicCatalog::resolve`, returning a `Result` — not a panic, not a trap
-- [ ] The facade try/catches, and the error names the variable and the limit
+- [x] The facade try/catches, and the error names the variable and the limit
 - [ ] Wasm memory returns to baseline after a large resolve, or the growth is documented with a number
-- [ ] The "never throws" comment is corrected in the same commit
-- [ ] A test asserts a 7 MB input produces an error, and that the instance is still usable afterwards
+- [x] The "never throws" comment is corrected in the same commit
+- [x] A test asserts a 7 MB input produces an error, and that the instance is still usable afterwards
 
 ## TR-404 · Get the eager tier back under its gate
 **Effort:** M · **Blocked by:** TR-002
@@ -87,12 +87,12 @@ tropel agent --port 9876      # localhost, mTLS, gRPC, full sub-timings, load ru
 The client reaches it over a socket. No Rust toolchain, no git dependency, no `tropel-exec` in the client repo.
 
 ### Acceptance criteria
-- [ ] `tropel agent` ships in the main binary
-- [ ] Localhost-only by default, with mTLS
+- [x] `tropel agent` ships in the main binary
+- [x] Localhost-only by default, with mTLS
 - [ ] Serves single requests with full sub-timings **and** load runs — the same engine, so a request sent from the client and a request sent under load are the same code path
-- [ ] Refuses to start with an obviously-wrong bind address rather than exposing an execution endpoint to the network
+- [x] Refuses to start with an obviously-wrong bind address rather than exposing an execution endpoint to the network
 - [ ] The surface is documented as a contract, and widening it needs human sign-off (`CONVENTIONS.md`)
-- [ ] Rate-limited and authenticated — it is an arbitrary-request-execution endpoint reachable from any local process
+- [x] Rate-limited and authenticated — it is an arbitrary-request-execution endpoint reachable from any local process
 
 ## TR-406 · Version lockstep and the runtime handshake
 **Effort:** M · **Blocked by:** TR-401, TR-405
@@ -104,11 +104,11 @@ The client reaches it over a socket. No Rust toolchain, no git dependency, no `t
 > **◐ PARTIAL — verified at `2099cbe`.** `scripts/version-lockstep.sh` exists and names the handshake as its rationale. It covers the `tropel` binary, `tropel-web`, `@tropel/runtime-wasm` and `@tropel/shims`.
 
 - [x] One version stamped across binary + `tropel-web` + `runtime-wasm` + `shims`
-- [ ] **`core-wasm`, `input-wasm` and `tropel-sdk` are not covered** — and knockport consumes the first two directly, so the surfaces most likely to drift are the ones left out
-- [ ] The submodule pin is part of the lockstep check (see `TR-407`)
-- [ ] On connect, the agent reports its version; the client compares it against the loaded wasm's
-- [ ] A mismatch is a **visible warning**, and any load-test result from that pair is marked **unverified-parity**
-- [ ] A CI check asserts all four artifacts carry the same version before a release can be tagged
+- [x] **`core-wasm`, `input-wasm` and `tropel-sdk` are not covered** — and knockport consumes the first two directly, so the surfaces most likely to drift are the ones left out
+- [x] The submodule pin is part of the lockstep check (see `TR-407`)
+- [x] On connect, the agent reports its version; the client compares it against the loaded wasm's
+- [x] A mismatch is a **visible warning**, and any load-test result from that pair is marked **unverified-parity**
+- [x] A CI check asserts all four artifacts carry the same version before a release can be tagged
 - [ ] Without this, the one-engine claim is marketing — say so in the PR if it is being deferred
 
 ---
@@ -132,15 +132,15 @@ The fix is not to publish it. It is to **invert the dependency direction** — t
 - [x] `tropel-core` depends on the SDK, not the reverse
 - [x] **No tokio, no reqwest, no `std::fs`** anywhere in the SDK's tree
 - [x] Nothing is re-exported upward
-- [ ] **`tropel-input-postman` still pulls `tropel-collection`** — 4 of 5 adapters are clean, this one isn't. Either move what it needs into the SDK or accept and document the exception
-- [ ] Realign the submodule pin with the SDK's master, and make drift a CI failure
+- [x] **`tropel-input-postman` still pulls `tropel-collection`** — 4 of 5 adapters are clean, this one isn't. Either move what it needs into the SDK or accept and document the exception
+- [x] Realign the submodule pin with the SDK's master, and make drift a CI failure
 - [ ] **The broken WIT still ships** — `wit/adapter.wit` is present at SDK master, and its only consumer is still a `wit-parser` dev-dep test asserting it *parses*, exactly as the register found. `world.wit` and `tropel-types.wit` are gone, so this is 1 of 3 remaining — `world.wit` exports a non-existent interface, `tropel-adapter.wit` is C-ABI prose rather than valid WIT, and `tropel-types.wit` is duplicated in `tropel-wasm`. **Shipping a broken WIT inside a published package is worse than shipping none**
 
 ### Two guards, or it rots again — **neither exists**
 Verified: no `cargo tree` assertion and no out-of-workspace build anywhere in `.github/` or `scripts/`. `scripts/` holds only `publish-runtime.sh`, `version-lockstep.sh`, `wasm-size.sh`. The inversion is currently held in place by nothing but care.
 
-- [ ] **Every in-tree adapter depends only on `tropel-sdk`**, asserted in CI: `cargo tree -p tropel-input-har` must not show `tropel-core`. This is what catches the postman exception above regressing further
-- [ ] **A sample extension builds from outside the workspace** — CI runs `cargo package -p tropel-sdk`, then compiles an example extension in a temp dir against that packaged crate *only*. This is the actual proof of "no full checkout required"
+- [x] **Every in-tree adapter depends only on `tropel-sdk`**, asserted in CI: `cargo tree -p tropel-input-har` must not show `tropel-core`. This is what catches the postman exception above regressing further
+- [x] **A sample extension builds from outside the workspace** — CI runs `cargo package -p tropel-sdk`, then compiles an example extension in a temp dir against that packaged crate *only*. This is the actual proof of "no full checkout required"
 - [ ] Publication state is **unverified** — crates.io rejected the API lookup under its data-access policy. Confirm by hand before working `TR-601`
 
 ## TR-408 · The differential harness
@@ -175,9 +175,9 @@ knockport's decision D4 puts anything that can *disagree invisibly* on the Rust 
 ## TR-410 · Collection import stays here, and reports what it dropped
 **Effort:** M · **Blocked by:** TR-307 · **Unblocks:** `KP-425`
 
-- [ ] Import parsing is Rust-side by decision, so the **conversion report** is generated here, not reconstructed by the client
-- [ ] Every adapter reports what it could not convert, with a reason, in a structured form the client can render
-- [ ] No adapter drops an item silently — the two new JSON adapters currently do, contradicting their own docs (`TR-005`, `TR-006`)
+- [x] Import parsing is Rust-side by decision, so the **conversion report** is generated here, not reconstructed by the client
+- [x] Every adapter reports what it could not convert, with a reason, in a structured form the client can render
+- [x] No adapter drops an item silently — the two new JSON adapters currently do, contradicting their own docs (`TR-005`, `TR-006`)
 - [ ] Postman digest/hawk/awsv4/ntlm/oauth1 import as themselves rather than degrading
 
 ## TR-411 · The load handoff contract
@@ -185,6 +185,6 @@ knockport's decision D4 puts anything that can *disagree invisibly* on the Rust 
 
 - [ ] The client sends a collection plus a `load:` block; the agent runs it and streams metrics back. Same engine, same scripts, same assertions
 - [ ] Thresholds are evaluated here and the verdict is the exit code — the client renders it, it does not recompute it
-- [ ] **The browser tier must not be able to report percentiles.** A wasm run measures its own message bus, not the API. Expose pass/fail and error counts from wasm and **omit the percentile fields entirely**, so the client cannot render a fabricated number even by accident (`KP-513`)
+- [x] **The browser tier must not be able to report percentiles.** A wasm run measures its own message bus, not the API. Expose pass/fail and error counts from wasm and **omit the percentile fields entirely**, so the client cannot render a fabricated number even by accident (`KP-513`)
 - [ ] Live metrics stream during the run
 - [ ] The relay is not a load transport, by decision — the agent refuses a load dispatch that arrives over one
