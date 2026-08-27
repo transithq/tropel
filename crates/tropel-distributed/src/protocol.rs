@@ -170,6 +170,7 @@ mod tests {
 
         let msg = SnapshotMsg {
             snapshot: MetricsSnapshot::default(),
+            done: true,
         };
         let send = tokio::spawn(async move {
             write_frame(&mut tx, &msg).await.unwrap();
