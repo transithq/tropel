@@ -553,7 +553,9 @@ impl Engine {
             fn peak_for_exec(exec: &ExecutionConfig) -> u64 {
                 match exec {
                     ExecutionConfig::ConstantVus { vus, .. } => *vus as u64,
-                    ExecutionConfig::RampingVus { stages, start_vus, .. } => {
+                    ExecutionConfig::RampingVus {
+                        stages, start_vus, ..
+                    } => {
                         let max_stage = stages.iter().map(|s| s.target as u64).max().unwrap_or(0);
                         (*start_vus as u64).max(max_stage)
                     }
@@ -576,8 +578,13 @@ impl Engine {
         let effective = VUWorkerPool::effective_concurrency(peak_requested);
         if peak_requested > effective {
             let pids = VUWorkerPool::pids_limit();
-            let reason = if pids.is_some_and(|lim| lim < peak_requested && lim < VUWorkerPool::MAX_WORKERS as u64) {
-                format!("cgroup pids.max={} (Docker --pids-limit / Kubernetes pids.max)", pids.unwrap())
+            let reason = if pids
+                .is_some_and(|lim| lim < peak_requested && lim < VUWorkerPool::MAX_WORKERS as u64)
+            {
+                format!(
+                    "cgroup pids.max={} (Docker --pids-limit / Kubernetes pids.max)",
+                    pids.unwrap()
+                )
             } else {
                 format!("MAX_WORKERS={}", VUWorkerPool::MAX_WORKERS)
             };
@@ -591,7 +598,9 @@ impl Engine {
                 peak_requested,
                 effective,
                 VUWorkerPool::MAX_WORKERS,
-                VUWorkerPool::pids_limit().map(|v| v.to_string()).unwrap_or_else(|| "unlimited".to_string())
+                VUWorkerPool::pids_limit()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unlimited".to_string())
             );
         }
 

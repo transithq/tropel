@@ -302,9 +302,9 @@ impl JsContext {
                 // is via the template Context's globals, not Runtime heap alone.
                 // For now, we keep per-VU Runtime but the thread-local slot
                 // indicates the thread is warm.
-                let _ = cell.borrow_mut().replace(
-                    Runtime::new().unwrap_or_else(|_| Runtime::new().expect("runtime")),
-                );
+                let _ = cell
+                    .borrow_mut()
+                    .replace(Runtime::new().unwrap_or_else(|_| Runtime::new().expect("runtime")));
             }
         });
 
