@@ -31,9 +31,15 @@ fn catalog() -> &'static DynamicCatalog {
 /// names survive as literal placeholders (Tropel semantics). Plain `{{var}}`
 /// references are untouched — the embedder resolves those against its own
 /// environment/collection maps.
+///
+/// TR-403: returns `Result` — a total-output cap (16 MiB) produces a JS
+/// `Error` with the message naming the limit, so the consumer never receives
+/// silently truncated data on the wire.
 #[wasm_bindgen(js_name = "resolveVariables")]
-pub fn resolve_variables(input: &str) -> String {
-    catalog().resolve(input)
+pub fn resolve_variables(input: &str) -> Result<String, wasm_bindgen::JsValue> {
+    catalog()
+        .resolve(input)
+        .map_err(|msg| wasm_bindgen::JsValue::from_str(&msg))
 }
 
 /// Catalog metadata as a JSON string: `[{"name":"$guid","description":…},…]`.
@@ -242,7 +248,7 @@ mod tests {
 
     #[test]
     fn resolves_guid() {
-        let out = resolve_variables("id={{$guid}}");
+        let out = resolve_variables("id={{$guid}}").unwrap();
         assert!(out.starts_with("id="));
         let guid = out.strip_prefix("id=").unwrap();
         assert_eq!(guid.len(), 36);
@@ -251,7 +257,8 @@ mod tests {
 
     #[test]
     fn plain_vars_survive() {
-        assert_eq!(resolve_variables("{{baseUrl}}/x"), "{{baseUrl}}/x");
+        let out = resolve_variables("{{baseUrl}}/x").unwrap();
+        assert_eq!(out, "{{baseUrl}}/x");
     }
 
     #[test]
@@ -274,7 +281,7 @@ mod tests {
             let name = entry["name"].as_str().unwrap();
             // Parameterized entries carry an argument in their description
             // example (`{{$randomString:16}}`); resolve the bare form.
-            let resolved = catalog().resolve(&format!("{{{{{name}}}}}"));
+            let resolved = catalog().resolve(&format!("{{{{{name}}}}}")).unwrap();
             assert!(
                 !resolved.contains(&format!("{{{{{name}}}}}")),
                 "{name} must resolve"

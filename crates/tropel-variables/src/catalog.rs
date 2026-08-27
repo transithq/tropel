@@ -223,6 +223,10 @@ fn capped_len(raw: Option<&str>, default: usize) -> usize {
 /// Dynamic variable catalog.
 /// Generates values for built-in Postman dynamic variables like {{$guid}}, {{$timestamp}}, etc.
 pub struct DynamicCatalog {
+    /// TR-403: set when the total-output cap is hit during a `resolve` call.
+    /// Reset at the start of each `resolve`; checked at the end to return
+    /// `Err` instead of a silently-truncated result.
+    capped: std::sync::atomic::AtomicBool,
     // Uses direct string replacement and regex-based replacement internally
     // All patterns are matched by their literal strings
 }
@@ -246,25 +250,36 @@ fn chrono_now() -> chrono::DateTime<chrono::Utc> {
 
 impl DynamicCatalog {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            capped: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// Resolve all dynamic variables in a string.
     /// Each occurrence of a dynamic variable generates a fresh value.
-    pub fn resolve(&self, s: &str) -> String {
+    ///
+    /// TR-403: returns `Result` — a total-output cap (16 MiB) stops unbounded
+    /// expansion, and an overflow is an ERROR naming the limit, not a silent
+    /// truncation. The old behaviour silently truncated, so a hostile/large
+    /// collection produced a corrupt wire body while the run looked clean.
+    pub fn resolve(&self, s: &str) -> Result<String, String> {
+        // Reset the cap flag for this call (the catalog is a shared
+        // process-global; the flag must not leak between calls).
+        self.capped
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // Fast path: no `$` means no dynamic variable anywhere — return
         // unchanged. This is the common case (plain URLs, headers, bodies
         // with scoped `{{var}}` refs only) and it skips the ~30 marker
         // `contains` scans and all regex work entirely.
         if !s.contains('$') {
-            return s.to_string();
+            return Ok(s.to_string());
         }
         // Second fast path: a bare `$` without `{{` cannot be a dynamic
         // variable (all Postman dynamic vars use `{{$...}}` syntax), so
         // skip the 44 marker scans. Common in URLs with prices, JSONPath
         // refs, and Stripe/GitHub-style query params.
         if !s.contains("{{") {
-            return s.to_string();
+            return Ok(s.to_string());
         }
         let mut result = s.to_string();
         let mut rng = rand::rng();
@@ -584,7 +599,14 @@ impl DynamicCatalog {
             }
         }
 
-        result
+        if self.capped.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(format!(
+                "dynamic variable expansion exceeded max output ({} bytes)",
+                MAX_TOTAL_OUTPUT
+            ))
+        } else {
+            Ok(result)
+        }
     }
 
     /// Replace regex matches using a closure with proper lifetime handling.
@@ -603,6 +625,8 @@ impl DynamicCatalog {
             let replacement = f(&caps);
             // P1 line 151: stop expanding if total output exceeds cap
             if result.len() + replacement.len() > MAX_TOTAL_OUTPUT {
+                self.capped
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
                     "dynamic variable expansion capped at {} bytes (input: {} bytes)",
                     MAX_TOTAL_OUTPUT,
@@ -1043,7 +1067,7 @@ mod tests {
     #[test]
     fn test_guid() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("prefix-{{$guid}}-suffix");
+        let result = catalog.resolve("prefix-{{$guid}}-suffix").unwrap();
         assert!(result.starts_with("prefix-"));
         assert!(result.ends_with("-suffix"));
         let guid = result
@@ -1055,7 +1079,7 @@ mod tests {
     #[test]
     fn test_timestamp() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("ts={{$timestamp}}");
+        let result = catalog.resolve("ts={{$timestamp}}").unwrap();
         assert!(result.starts_with("ts="));
         let ts: u64 = result[3..].parse().expect("Should be a number");
         assert!(ts > 1700000000); // Should be a reasonable recent timestamp
@@ -1064,7 +1088,7 @@ mod tests {
     #[test]
     fn test_random_int() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("n={{$randomInt}}");
+        let result = catalog.resolve("n={{$randomInt}}").unwrap();
         assert!(result.starts_with("n="));
         let n: u32 = result[2..].parse().expect("Should be a number");
         assert!(n < 1000);
@@ -1073,7 +1097,7 @@ mod tests {
     #[test]
     fn test_no_vars() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("just a string");
+        let result = catalog.resolve("just a string").unwrap();
         assert_eq!(result, "just a string");
     }
 
@@ -1081,7 +1105,7 @@ mod tests {
     fn test_multiple_same_var_fresh_values() {
         let catalog = DynamicCatalog::new();
         // Use | as separator since neither UUIDs nor the placeholder contain it
-        let result = catalog.resolve("{{$guid}}|{{$guid}}");
+        let result = catalog.resolve("{{$guid}}|{{$guid}}").unwrap();
         assert!(!result.contains("{{$guid}}"));
         let parts: Vec<&str> = result.split('|').collect();
         assert_eq!(parts.len(), 2);
@@ -1097,7 +1121,7 @@ mod tests {
     #[test]
     fn test_repeated_timestamp_fresh_values() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("{{$timestamp}}-{{$timestamp}}");
+        let result = catalog.resolve("{{$timestamp}}-{{$timestamp}}").unwrap();
         assert!(!result.contains("{{$timestamp}}"));
         let parts: Vec<&str> = result.split('-').collect();
         assert_eq!(parts.len(), 2);
@@ -1111,7 +1135,7 @@ mod tests {
     #[test]
     fn test_repeated_random_int_fresh_values() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("{{$randomInt}}-{{$randomInt}}");
+        let result = catalog.resolve("{{$randomInt}}-{{$randomInt}}").unwrap();
         assert!(!result.contains("{{$randomInt}}"));
         let parts: Vec<&str> = result.split('-').collect();
         assert_eq!(parts.len(), 2);
@@ -1127,7 +1151,7 @@ mod tests {
     #[test]
     fn test_random_hex() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("hex={{$randomHex:16}}");
+        let result = catalog.resolve("hex={{$randomHex:16}}").unwrap();
         assert!(result.starts_with("hex="));
         assert_eq!(result.len(), "hex=".len() + 16);
     }
@@ -1141,23 +1165,27 @@ mod tests {
         // killing the process.
         let catalog = DynamicCatalog::new();
 
-        let s = catalog.resolve("x={{$randomString:9999999999}}");
+        let s = catalog.resolve("x={{$randomString:9999999999}}").unwrap();
         assert_eq!(s.len(), "x=".len() + MAX_DYNAMIC_LENGTH);
         assert!(!s.contains("{{$"));
 
-        let hex = catalog.resolve("h={{$randomHex:9999999999}}");
+        let hex = catalog.resolve("h={{$randomHex:9999999999}}").unwrap();
         assert_eq!(hex.len(), "h=".len() + MAX_DYNAMIC_LENGTH);
 
-        let pwd = catalog.resolve("p={{$randomPassword:9999999999}}");
+        let pwd = catalog.resolve("p={{$randomPassword:9999999999}}").unwrap();
         assert_eq!(pwd.len(), "p=".len() + MAX_DYNAMIC_LENGTH);
 
-        let alpha = catalog.resolve("a={{$randomAlphabetic:9999999999}}");
+        let alpha = catalog
+            .resolve("a={{$randomAlphabetic:9999999999}}")
+            .unwrap();
         assert_eq!(alpha.len(), "a=".len() + MAX_DYNAMIC_LENGTH);
 
-        let alnum = catalog.resolve("n={{$randomAlphanumeric:9999999999}}");
+        let alnum = catalog
+            .resolve("n={{$randomAlphanumeric:9999999999}}")
+            .unwrap();
         assert_eq!(alnum.len(), "n=".len() + MAX_DYNAMIC_LENGTH);
 
-        let words = catalog.resolve("w={{$randomWords:9999999999}}");
+        let words = catalog.resolve("w={{$randomWords:9999999999}}").unwrap();
         // 10k words (each >= 5 chars + spaces) — bounded, no abort; the
         // count itself is what is clamped.
         assert!(words.starts_with("w="));
@@ -1169,10 +1197,10 @@ mod tests {
     fn test_moderate_length_still_honored() {
         // The cap must NOT change legitimate sizes below the limit.
         let catalog = DynamicCatalog::new();
-        let s = catalog.resolve("x={{$randomString:64}}");
+        let s = catalog.resolve("x={{$randomString:64}}").unwrap();
         assert_eq!(s.len(), "x=".len() + 64);
         // "w=" + 7 words joined by spaces → 7 space-separated tokens.
-        let words = catalog.resolve("w={{$randomWords:7}}");
+        let words = catalog.resolve("w={{$randomWords:7}}").unwrap();
         assert_eq!(words.split(' ').count(), 7);
     }
 
@@ -1196,7 +1224,7 @@ mod tests {
     #[test]
     fn test_random_phone_number() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("tel={{$randomPhoneNumber}}");
+        let result = catalog.resolve("tel={{$randomPhoneNumber}}").unwrap();
         assert!(!result.contains("{{$randomPhoneNumber}}"));
         assert!(result.starts_with("tel=("));
     }
@@ -1204,7 +1232,7 @@ mod tests {
     #[test]
     fn test_random_company_name() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("company={{$randomCompany}}");
+        let result = catalog.resolve("company={{$randomCompany}}").unwrap();
         assert!(!result.contains("{{$randomCompany}}"));
         // Some catalog entries are single-word names (e.g. "Initech"), so assert
         // the placeholder was replaced with a known company rather than that the
@@ -1216,7 +1244,7 @@ mod tests {
     #[test]
     fn test_random_lorem_paragraph() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("text={{$randomLorem}}");
+        let result = catalog.resolve("text={{$randomLorem}}").unwrap();
         assert!(!result.contains("{{$randomLorem}}"));
         assert!(result.ends_with('.'));
         assert!(result.contains(' '));
@@ -1225,10 +1253,10 @@ mod tests {
     #[test]
     fn test_random_date_variants() {
         let catalog = DynamicCatalog::new();
-        let past = catalog.resolve("past={{$randomDatePast}}");
-        let future = catalog.resolve("future={{$randomDateFuture}}");
-        let date = catalog.resolve("date={{$randomDate}}");
-        let time = catalog.resolve("time={{$randomTime}}");
+        let past = catalog.resolve("past={{$randomDatePast}}").unwrap();
+        let future = catalog.resolve("future={{$randomDateFuture}}").unwrap();
+        let date = catalog.resolve("date={{$randomDate}}").unwrap();
+        let time = catalog.resolve("time={{$randomTime}}").unwrap();
 
         assert!(!past.contains("{{$randomDatePast}}"));
         assert!(!future.contains("{{$randomDateFuture}}"));
@@ -1268,7 +1296,7 @@ mod tests {
         // (`1a2b3c`) instead of a colour WORD. Must be one of COLOR_NAMES.
         let catalog = DynamicCatalog::new();
         for _ in 0..50 {
-            let c = catalog.resolve("{{$randomColor}}");
+            let c = catalog.resolve("{{$randomColor}}").unwrap();
             assert!(
                 COLOR_NAMES.contains(&c.as_str()),
                 "randomColor must be a colour word, got {:?}",
@@ -1287,7 +1315,7 @@ mod tests {
         // verbatim). Postman's faker.internet.color emits `#rrggbb`.
         let catalog = DynamicCatalog::new();
         for _ in 0..50 {
-            let c = catalog.resolve("{{$randomHexColor}}");
+            let c = catalog.resolve("{{$randomHexColor}}").unwrap();
             assert_eq!(c.len(), 7, "hex color is #rrggbb, got {c}");
             assert!(c.starts_with('#'), "hex color must start with #, got {c}");
             assert!(c[1..].chars().all(|ch| ch.is_ascii_hexdigit()));
@@ -1301,13 +1329,15 @@ mod tests {
         // the literal placeholder, and the resolver warns once per name (the
         // warn itself is fire-and-forget; the literal is the observable part).
         let catalog = DynamicCatalog::new();
-        let out = catalog.resolve("user={{$randomUserName}}");
+        let out = catalog.resolve("user={{$randomUserName}}").unwrap();
         assert_eq!(out, "user={{$randomUserName}}", "unknown var stays literal");
         // Resolving twice must be idempotent and not panic.
-        let out2 = catalog.resolve("user={{$randomUserName}}");
+        let out2 = catalog.resolve("user={{$randomUserName}}").unwrap();
         assert_eq!(out2, "user={{$randomUserName}}");
         // A known var in the same string still resolves.
-        let mixed = catalog.resolve("u={{$randomUserName}} id={{$randomInt}}");
+        let mixed = catalog
+            .resolve("u={{$randomUserName}} id={{$randomInt}}")
+            .unwrap();
         assert!(
             mixed.contains("id="),
             "known var resolves beside unknown: {mixed}"
@@ -1316,5 +1346,31 @@ mod tests {
             mixed.contains("{{$randomUserName}}"),
             "unknown stays literal: {mixed}"
         );
+    }
+
+    #[test]
+    fn test_total_output_cap_produces_error_not_truncation() {
+        // TR-403: a 7 MB input of `{{$randomString:100}}` (each occurrence
+        // expands ×4.3) should produce an ERROR at the 16 MiB total-output
+        // cap — not a silent truncation, not a panic. The instance must
+        // still be usable after the error.
+        let catalog = DynamicCatalog::new();
+        // 7 MB of `{{$randomString:100}}` (23 bytes each) → ~304k
+        // occurrences → ~30 MB if fully expanded (past the 16 MiB cap).
+        let unit = "{{$randomString:100}}";
+        let repeats = 7_000_000 / unit.len() + 1;
+        let input = unit.repeat(repeats);
+        let result = catalog.resolve(&input);
+        assert!(
+            result.is_err(),
+            "7 MB input must exceed the total output cap: got Ok with len {}",
+            result.as_ref().map(|s| s.len()).unwrap_or(0)
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("16"), "error must name the limit: {err}");
+
+        // Instance is still usable after the error.
+        let ok = catalog.resolve("hello={{$guid}}");
+        assert!(ok.is_ok(), "instance must still be usable after cap error");
     }
 }
