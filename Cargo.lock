@@ -4784,6 +4784,7 @@ dependencies = [
  "tracing",
  "tropel-input-har",
  "tropel-input-openapi",
+ "tropel-input-postman",
  "tropel-js",
  "tropel-native",
  "tropel-runtime",
