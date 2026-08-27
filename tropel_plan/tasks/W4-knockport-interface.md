@@ -166,9 +166,9 @@ knockport's decision D4 puts anything that can *disagree invisibly* on the Rust 
 ## TR-409 · Signing correctness, because the client cannot check it
 **Effort:** M · **Blocked by:** none · **Unblocks:** `KP-401`, `KP-402`
 
-- [ ] A signing byte-difference is a 403 that takes a day to find — this is precisely why signing is Rust-side and must not be reimplemented in TypeScript
+- [x] A signing byte-difference is a 403 that takes a day to find — this is precisely why signing is Rust-side and must not be reimplemented in TypeScript
 - [ ] The open SigV4 and Digest defects are `TR-603`; this task is the **contract**: every scheme the client's picker offers is implemented here, round-trips, and is covered by published vectors
-- [ ] Schemes the client needs: basic, bearer, apikey, digest (**including SHA-256 and `-sess`**), ntlm, oauth1 (all signature methods), awsv4, wsse, akamai-edgegrid, jwt
+- [x] Schemes the client needs: basic, bearer, apikey, digest (**including SHA-256 and `-sess`**), ntlm, oauth1 (all signature methods), awsv4, wsse, akamai-edgegrid, jwt
 - [ ] OAuth2 grants including `device_code`, which neither competitor has
 - [ ] Any scheme the Rust side cannot do is reported to the client as unsupported — never silently degraded to `none`, which is the `TR-004` failure shape in a different costume
 
