@@ -776,10 +776,7 @@ fn parse_form(bytes: &[u8]) -> Vec<(String, String)> {
             // The decoded value is then percent-encoded by `enc()` when the
             // base string is built — so `+` must become space here, not
             // survive as a literal `+` (which would re-encode as `%2B`).
-            Some((
-                decode_form_value(k),
-                decode_form_value(v),
-            ))
+            Some((decode_form_value(k), decode_form_value(v)))
         })
         .collect()
 }
