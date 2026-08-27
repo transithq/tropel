@@ -867,7 +867,10 @@ fn native_and_wasm_agree_over_har_fixture() {
         .expect("native runtime");
 
     // Parse the checked-in HAR fixture through the real input adapter.
-    let har_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/har/01_get_posts.har");
+    let har_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/har/01_get_posts.har"
+    );
     let bytes = std::fs::read(har_path).expect("HAR fixture must exist");
     let adapter = tropel_input_har::HarInputAdapter;
     use tropel_sdk::traits::InputAdapter;
