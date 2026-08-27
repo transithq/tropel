@@ -21,14 +21,17 @@ let wasmInstance = null;
 let glue = null;
 
 /**
- * Initialize the input wasm. Resolves `true` when ready.
+ * Initialize the input wasm. Resolves when ready.
+ * THROWS on init failure (wasm fetch, compilation, or instantiation error)
+ * with a real `Error` carrying the parser diagnostic — never silently
+ * disables import detection (TR-402).
  * Options:
  *   - `wasmUrl`:   explicit URL/path for tropel_input_wasm_bg.wasm
  *                  (default: resolved relative to this module)
  *   - `wasmBytes`: ArrayBuffer/Uint8Array with the wasm (node/tests)
  */
 export async function initInputWasm(options = {}) {
-  if (wasmInstance) return true;
+  if (wasmInstance) return;
   try {
     const g = await import("../pkg/tropel_input_wasm.js");
     let source = options.wasmBytes;
@@ -38,10 +41,11 @@ export async function initInputWasm(options = {}) {
     }
     wasmInstance = await g.default({ module_or_path: source });
     glue = g;
-    return true;
   } catch (err) {
-    console.warn("[tropel-input] input wasm unavailable — collection import disabled:", err);
-    return false;
+    throw new Error(
+      `[tropel-input] input wasm init failed — collection import, detection and parsing are unavailable`,
+      { cause: err },
+    );
   }
 }
 
@@ -50,10 +54,16 @@ export function isInputWasmReady() {
   return wasmInstance !== null;
 }
 
-/** Detect the import format: "openapi" | "postman" | "har", or "" when the
- * bytes are not recognized. Requires the wasm (init first). */
+/**
+ * Detect the import format: `"openapi"` | `"postman"` | `"har"`, or `""` when
+ * the bytes are not recognised. THROWS when the wasm has not been inited
+ * (TR-402: distinguishes "not loaded" from "not recognised").
+ */
 export function detect(bytes) {
-  return glue !== null ? glue.detect(bytes) : "";
+  if (glue === null) {
+    throw new Error("[tropel-input] detect() requires the input wasm (initInputWasm)");
+  }
+  return glue.detect(bytes);
 }
 
 /** Auto-detect and parse arbitrary import bytes → Scenario JSON. Throws when

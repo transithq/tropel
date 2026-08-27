@@ -37,14 +37,17 @@ let wasmInstance = null;
 let glue = null;
 
 /**
- * Initialize the core wasm. Resolves `true` when ready.
+ * Initialize the core wasm. Resolves when ready.
+ * THROWS on init failure (wasm fetch, compilation, or instantiation error)
+ * with a real `Error` — never silently disables `{{$dynamic}}` resolution
+ * (TR-402).
  * Options:
  *   - `wasmUrl`:   explicit URL/path for tropel_core_wasm_bg.wasm
  *                  (default: resolved relative to this module)
  *   - `wasmBytes`: ArrayBuffer/Uint8Array with the wasm (node/tests)
  */
 export async function initCoreWasm(options = {}) {
-  if (wasmInstance) return true;
+  if (wasmInstance) return;
   try {
     const g = await import("../pkg/tropel_core_wasm.js");
     let source = options.wasmBytes;
@@ -54,10 +57,11 @@ export async function initCoreWasm(options = {}) {
     }
     wasmInstance = await g.default({ module_or_path: source });
     glue = g;
-    return true;
   } catch (err) {
-    console.warn("[tropel-core] core wasm unavailable — {{$dynamic}} resolution disabled:", err);
-    return false;
+    throw new Error(
+      `[tropel-core] core wasm init failed — dynamic-variable resolution is unavailable`,
+      { cause: err },
+    );
   }
 }
 

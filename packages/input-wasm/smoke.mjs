@@ -5,6 +5,34 @@ import { initInputWasm, detect, importAny, importById } from "./src/index.js";
 
 const text = (s) => new TextEncoder().encode(s);
 
+let failures = 0;
+const check = (cond, label) => {
+  if (!cond) { console.error(`FAIL: ${label}`); failures++; }
+  else console.log(`ok: ${label}`);
+};
+
+// TR-402: init must reject on a failing wasm fetch (404/missing asset), so a
+// consumer gets a loud failure instead of silently-disabled detection.
+// Tested BEFORE the real init (the module-level instance guard short-circuits
+// a second init call).
+let initFailed = false;
+try {
+  await initInputWasm({ wasmUrl: "file:///nonexistent/tropel_input_wasm_bg.wasm" });
+} catch (err) {
+  initFailed = err instanceof Error;
+}
+check(initFailed, "initInputWasm rejects on missing wasm asset");
+
+// TR-402: detect() before init throws (distinguishes "not loaded" from
+// "not recognised") — the old code returned "" for both.
+let detectBeforeInit = false;
+try {
+  detect(text("{}"));
+} catch (err) {
+  detectBeforeInit = err instanceof Error;
+}
+check(detectBeforeInit, "detect() before init throws");
+
 await initInputWasm({ wasmBytes: readFileSync("./pkg/tropel_input_wasm_bg.wasm") });
 
 const postman = text(JSON.stringify({
@@ -48,12 +76,6 @@ const bru = text(JSON.stringify({
     { uid: "r1", type: "http-request", name: "List pets", request: { url: "https://api.example.com/pets", method: "GET" } },
   ],
 }));
-
-let failures = 0;
-const check = (cond, label) => {
-  if (!cond) { console.error(`FAIL: ${label}`); failures++; }
-  else console.log(`ok: ${label}`);
-};
 
 check(detect(postman) === "postman", "detect postman");
 check(detect(openapi) === "openapi", "detect openapi");
