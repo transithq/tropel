@@ -591,7 +591,10 @@ pub enum DeviceCodePoll {
     /// The user authorized — the token response.
     Authorized(TokenResponse),
     /// The user denied or the code expired.
-    Denied { error: String, description: Option<String> },
+    Denied {
+        error: String,
+        description: Option<String>,
+    },
 }
 
 /// Parse the INITIAL device-authorization response (RFC 8628 §3.2).
@@ -635,10 +638,7 @@ pub fn parse_device_code_response(body: &str) -> Result<DeviceCodeResponse> {
 pub fn parse_device_code_poll(body: &str) -> Result<DeviceCodePoll> {
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| OauthError::Invalid(format!("poll response is not JSON: {e}")))?;
-    let interval = v
-        .get("interval")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(5);
+    let interval = v.get("interval").and_then(|x| x.as_i64()).unwrap_or(5);
     match v.get("error").and_then(|e| e.as_str()) {
         Some("authorization_pending") => Ok(DeviceCodePoll::Pending {
             interval_seconds: interval,
@@ -1084,7 +1084,10 @@ mod tests {
                 "expires_in":1800,"interval":5}"#,
         )
         .unwrap();
-        assert_eq!(initial.device_code, "GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS");
+        assert_eq!(
+            initial.device_code,
+            "GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS"
+        );
         assert_eq!(initial.user_code, "WDJB-MJHT");
         assert_eq!(initial.verification_uri, "https://example.com/device");
         assert_eq!(initial.expires_in, Some(1800));

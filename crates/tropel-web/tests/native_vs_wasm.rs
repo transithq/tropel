@@ -49,17 +49,45 @@ use tropel_web::wire::{RunOutcome, RunRequest};
 fn fixture_response(req: &Request) -> Result<Response> {
     let path = req.url.split('?').next().unwrap_or("");
     let (status, status_text, body, extra_headers) = if path.ends_with("/404") {
-        (404, "Not Found".to_string(), br#"{"error":"not found"}"#.to_vec(), HashMap::new())
+        (
+            404,
+            "Not Found".to_string(),
+            br#"{"error":"not found"}"#.to_vec(),
+            HashMap::new(),
+        )
     } else if path.ends_with("/500") {
-        (500, "Internal Server Error".to_string(), br#"{"error":"boom"}"#.to_vec(), HashMap::new())
+        (
+            500,
+            "Internal Server Error".to_string(),
+            br#"{"error":"boom"}"#.to_vec(),
+            HashMap::new(),
+        )
     } else if path.ends_with("/redirect") {
-        (301, "Moved Permanently".to_string(), b"".to_vec(), HashMap::from([("location".to_string(), "https://fixture.test/200".to_string())]))
+        (
+            301,
+            "Moved Permanently".to_string(),
+            b"".to_vec(),
+            HashMap::from([(
+                "location".to_string(),
+                "https://fixture.test/200".to_string(),
+            )]),
+        )
     } else if path.ends_with("/text") {
-        (200, "OK".to_string(), b"plain text body".to_vec(), HashMap::from([("content-type".to_string(), "text/plain".to_string())]))
+        (
+            200,
+            "OK".to_string(),
+            b"plain text body".to_vec(),
+            HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+        )
     } else if path.ends_with("/empty") {
         (204, "No Content".to_string(), b"".to_vec(), HashMap::new())
     } else {
-        (200, "OK".to_string(), br#"{"ok":true}"#.to_vec(), HashMap::from([("content-type".to_string(), "application/json".to_string())]))
+        (
+            200,
+            "OK".to_string(),
+            br#"{"ok":true}"#.to_vec(),
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        )
     };
     let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     headers.extend(extra_headers);

@@ -165,19 +165,26 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             {
                 Ok(s) => s,
                 Err(e) => {
-                    return respond(sock, 400, &format!(r#"{{"error":"invalid scenario: {e}"}}"#))
-                        .await
+                    return respond(
+                        sock,
+                        400,
+                        &format!(r#"{{"error":"invalid scenario: {e}"}}"#),
+                    )
+                    .await
                 }
             };
             // TR-411: optional thresholds map — evaluated against the run's
             // http_reqs count + http_req_failed rate; the verdict is returned
             // so the client can use it as the exit code.
-            let thresholds: std::collections::HashMap<String, String> =
-                payload.get("thresholds").and_then(|t| t.as_object()).map(|o| {
+            let thresholds: std::collections::HashMap<String, String> = payload
+                .get("thresholds")
+                .and_then(|t| t.as_object())
+                .map(|o| {
                     o.iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect()
-                }).unwrap_or_default();
+                })
+                .unwrap_or_default();
             let out = run_load(&state, &scenario, iterations, &thresholds).await;
             respond(sock, 200, &out.to_string()).await
         }
@@ -190,7 +197,9 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
 fn eval_threshold(expr: &str, reqs: u64, failed: u64) -> Result<bool, String> {
     let parts: Vec<&str> = expr.split_whitespace().collect();
     if parts.len() != 3 {
-        return Err(format!("invalid threshold '{expr}': expected '<metric> <op> <value>'"));
+        return Err(format!(
+            "invalid threshold '{expr}': expected '<metric> <op> <value>'"
+        ));
     }
     let actual = match parts[0] {
         "http_reqs" => reqs as f64,
@@ -231,7 +240,9 @@ async fn run_load(
     let mut total_failures = 0u64;
     for it in 0..iterations {
         for item in &scenario.items {
-            let Some(request) = item.request.as_ref() else { continue };
+            let Some(request) = item.request.as_ref() else {
+                continue;
+            };
             let start = Instant::now();
             let result = state.client.execute(request, None).await;
             let elapsed_ms = start.elapsed().as_millis() as f64;

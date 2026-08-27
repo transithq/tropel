@@ -1591,7 +1591,10 @@ mod tests {
         let collection = parse_collection_str(json).unwrap();
         let scenario = collection_to_scenario(collection, HashMap::new());
         assert!(
-            scenario.conversion_notes.iter().any(|n| n.contains("akamai-edgegrid")),
+            scenario
+                .conversion_notes
+                .iter()
+                .any(|n| n.contains("akamai-edgegrid")),
             "unsupported auth must be reported: {:?}",
             scenario.conversion_notes
         );

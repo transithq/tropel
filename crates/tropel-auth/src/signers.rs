@@ -1603,8 +1603,7 @@ mod tests {
         );
         // Set an empty body so the payload hash is SHA-256("") rather than
         // UNSIGNED-PAYLOAD (the AWS vector uses the empty-string hash).
-        req.body_mut()
-            .replace(reqwest::Body::from(String::new()));
+        req.body_mut().replace(reqwest::Body::from(String::new()));
         req.headers_mut()
             .insert("Range", "bytes=0-9".parse().unwrap());
 
@@ -1615,9 +1614,7 @@ mod tests {
             Some("s3".into()),
             None,
         );
-        let fixed = chrono::Utc
-            .with_ymd_and_hms(2013, 5, 24, 0, 0, 0)
-            .unwrap();
+        let fixed = chrono::Utc.with_ymd_and_hms(2013, 5, 24, 0, 0, 0).unwrap();
         auth.sign_at(&mut req, fixed).unwrap();
 
         // The payload hash for the EMPTY body must be SHA-256 of "" (the AWS
@@ -1627,10 +1624,7 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "empty body must sign the empty-string SHA-256 (AWS vector)"
         );
-        assert_eq!(
-            req.headers().get("x-amz-date").unwrap(),
-            "20130524T000000Z"
-        );
+        assert_eq!(req.headers().get("x-amz-date").unwrap(), "20130524T000000Z");
 
         let h = auth_header(&req);
         // The AWS-published string-to-sign for THIS canonical request is
@@ -1641,7 +1635,9 @@ mod tests {
         // it byte-for-byte, and the canonical hash matching the published
         // value proves the canonicalization is AWS-exact.
         assert!(
-            h.contains("Signature=67fe34c8530db585abddc51067328adfedb6e42487d2566dc7d927d6e2722900"),
+            h.contains(
+                "Signature=67fe34c8530db585abddc51067328adfedb6e42487d2566dc7d927d6e2722900"
+            ),
             "SigV4 diverged from the AWS vector (canonical hash 7344ae5b... must be signed): {h}"
         );
     }
@@ -1660,8 +1656,10 @@ mod tests {
                 .unwrap(),
         );
         // Form-urlencoded body: c2=  &  a3=2+q
-        req.headers_mut()
-            .insert("content-type", "application/x-www-form-urlencoded".parse().unwrap());
+        req.headers_mut().insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
         req.body_mut()
             .replace(reqwest::Body::from("c2=&a3=2+q".to_string()));
 
