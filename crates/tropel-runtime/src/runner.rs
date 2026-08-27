@@ -1504,7 +1504,7 @@ mod tests {
                 description: None,
                 schema: None,
             },
-variables: HashMap::new(),
+            variables: HashMap::new(),
             auth: None,
             conversion_notes: Vec::new(),
             items: vec![ScenarioItem {
