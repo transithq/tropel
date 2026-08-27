@@ -4782,6 +4782,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tropel-input-har",
+ "tropel-input-openapi",
  "tropel-js",
  "tropel-native",
  "tropel-runtime",
