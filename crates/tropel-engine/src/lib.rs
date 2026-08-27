@@ -3,6 +3,7 @@
 //! Orchestration facade: wires adapters → executor → protocols/pm → metrics → reporters.
 
 pub mod builtins;
+pub mod agent;
 pub mod cli;
 mod cli_commands;
 mod cli_overlay;

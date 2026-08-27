@@ -273,6 +273,23 @@ pub enum Commands {
         #[arg(default_value = "script.js")]
         output: PathBuf,
     },
+
+    /// Run the localhost agent server (TR-405). knockport's desktop transport
+    /// reaches the same engine over this socket — one engine from Send to
+    /// 10 000 VU. Localhost-only by default; refuses a non-loopback bind.
+    Agent {
+        /// Bind port (default 9876). Only loopback addresses are accepted.
+        #[arg(short = 'p', long = "port", default_value_t = 9876)]
+        port: u16,
+
+        /// Auth token required on every request (rate-limited too).
+        #[arg(long = "token")]
+        token: Option<String>,
+
+        /// Bind address (default 127.0.0.1). Anything non-loopback is refused.
+        #[arg(long = "bind", default_value = "127.0.0.1")]
+        bind: String,
+    },
 }
 
 impl Cli {
@@ -358,6 +375,9 @@ pub async fn run_cli() -> Result<()> {
         }
         Commands::Version => print_version(),
         Commands::New { output } => crate::cli_commands::new_command(&output),
+        Commands::Agent { port, token, bind } => {
+            crate::agent::run_agent(port, bind.as_str(), token.as_deref()).await
+        }
     }
 }
 
