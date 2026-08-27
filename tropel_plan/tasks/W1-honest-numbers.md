@@ -4,6 +4,8 @@
 
 Two asymmetric failure classes, and the duplicate implementations that keep regenerating both. Source: `TROPEL_MASTER_TODO.md` §W1-A/B/C, §W2, §W-R4.
 
+> **Verification 2026-08-28 — 0 open (58/58 checked) — green after `bb77c0e` (`d55dd96`).** Re-counted all checkboxes in this file: 58 × `[x]`, 0 × `[ ]`. No hidden unchecked items. `TROPEL_MASTER_TODO.md` §W1-A/B/C and §Release gate both ticked; `W6-release.md` gate is green and explicitly covers **W1-A empty** and **W1-B empty** via `bb77c0e` (`W6-merge-all` #457). No additional W1 fix required — this PR is verification-only and documents the W6 coverage.
+
 ---
 
 # Track A — Always-green: a broken thing reports success
