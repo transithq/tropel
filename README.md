@@ -64,8 +64,26 @@ Notable limitations today:
   use host-imported http/sleep/metrics, but the API is a subset of the
   in-process k6 driver's (no full scripting runtime inside the module).
 - **JMeter and Locust adapters are not started** (planned §11.6).
-- **10,000 VU concurrency** — raised from 4096 (`MAX_WORKERS=10_000`, `worker.rs:334`), each VU still owns a dedicated OS thread but cap now 10k and `sleep` is async Promise (`__tropel_native_sleep` yields via `tokio::time::sleep` + job-queue pumping, `js_bootstrap.rs:348`), so VUs on same worker can progress. With shared Runtime (57k vs 843k) 10k VUs is ~0.57 GB, not 8 GB. Full fiber model (collapsing OS threads to tokio tasks) is the next step for >10k.
-- **~57 KB QuickJS heap per VU with shared Runtime** — was 836 KB (734k shims) 7.97 GB at 10k ✅MEAS Apple Silicon, now 57k (-92.3%, 0.57 GB at 10k) via per-thread shared `Runtime` with template `Context` globals aliased (`tropel-js/src/context.rs:15` thread-local `SHARED_RT`). Gated shims still save 120KB for http-only, user-script bytes shared via `Arc` (was 12 GB at 4k), compiled bytecode shared via template.
+- **10,000 VU concurrency, one OS thread per VU** — `MAX_WORKERS = 10_000`
+  (`worker.rs:339`), raised from 4 096. `sleep` yields rather than parking its
+  thread (`__tropel_native_sleep` is a Promise driven by `tokio::time::sleep`
+  with job-queue pumping, `js_bootstrap.rs:348`), so co-located VUs no longer
+  freeze each other. **`http.*` still parks the calling thread** via
+  `execute_blocking`, so in-flight concurrency is still bounded by threads, not
+  by tasks — the fiber model that removes that bound is TR-502's remaining
+  half. Kubernetes `pids.max` and Docker `--pids-limit` cap this further, and
+  the summary reports the effective number.
+- **~486 KB of QuickJS heap per VU before a line of user script runs**
+  ✅MEAS — `malloc_size` from `JS_ComputeMemoryUsage`, release build, Apple
+  Silicon (M-series), rquickjs 0.12.2. Reproduce with
+  `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored`.
+  Breakdown: a bare context is 104,768 B; the full shim bundle takes it to
+  497,584 B. At 10 000 VUs that is **~4.6 GB of QuickJS heap alone**.
+  User-script bytes are shared across VUs via `Arc` (that one is fixed — it was
+  a per-VU deep clone). Sharing a `Runtime` per worker thread and aliasing
+  template globals — the change that would make this number small — is
+  **designed but not implemented**; see TR-503. Do not quote a per-VU figure
+  that this command does not print.
 
 ## Architecture
 
