@@ -91,11 +91,18 @@ impl StdoutReporter {
             ("Dropped", result.dropped_iterations.to_string()),
         ];
         if result.requested_vus > 0 && result.requested_vus != result.effective_vus {
+            // Render the engine's reason verbatim. Naming a cap here would be a
+            // SECOND copy of a constant this crate cannot see — that copy read
+            // `MAX_WORKERS=4096` for the whole life of the 10 000 worker pool.
+            let reason = result
+                .effective_vus_reason
+                .as_deref()
+                .unwrap_or("worker pool capped");
             exec_rows.push((
                 "Requested VUs",
                 format!(
-                    "{} → {} effective (MAX_WORKERS=4096, capped)",
-                    result.requested_vus, result.effective_vus
+                    "{} → {} effective ({}, capped)",
+                    result.requested_vus, result.effective_vus, reason
                 ),
             ));
         }
@@ -673,6 +680,43 @@ mod tests {
         assert!(
             out.contains("NO DATA"),
             "no-data threshold renders distinctly: {out}"
+        );
+    }
+
+    /// The cap named in the summary must be the pool's REAL ceiling, carried
+    /// from the engine — not a constant re-typed in this crate.
+    ///
+    /// Fails on the pre-fix code: `stdout.rs` hardcoded
+    /// `"MAX_WORKERS=4096, capped"`, so a run capped by the 10 000 worker pool
+    /// (or by a cgroup `pids.max`) printed a number that had not been true
+    /// since the pool was raised. This asserts the printed line, not the field.
+    #[test]
+    fn requested_vu_line_names_the_engines_cap_not_a_hardcoded_one() {
+        let mut capped = result_with();
+        capped.requested_vus = 15_000;
+        capped.effective_vus = 10_000;
+        capped.effective_vus_reason = Some("MAX_WORKERS=10000".to_string());
+        let out = StdoutReporter.render(&capped);
+        assert!(
+            out.contains("15000 → 10000 effective (MAX_WORKERS=10000, capped)"),
+            "summary must print the engine's cap verbatim, got:\n{out}"
+        );
+        assert!(
+            !out.contains("4096"),
+            "summary must not name a cap this crate cannot see:\n{out}"
+        );
+
+        // A cgroup limit is a different reason for the same gap; the reporter
+        // must render whichever the engine determined, with no cap logic here.
+        let mut pids = result_with();
+        pids.requested_vus = 8_000;
+        pids.effective_vus = 4_096;
+        pids.effective_vus_reason =
+            Some("cgroup pids.max=4096 (Docker --pids-limit / Kubernetes pids.max)".to_string());
+        let out = StdoutReporter.render(&pids);
+        assert!(
+            out.contains("cgroup pids.max=4096"),
+            "a pids-capped run must say so, not blame MAX_WORKERS:\n{out}"
         );
     }
 }
