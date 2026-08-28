@@ -334,7 +334,10 @@ async fn run_load(
     });
     if !unsupported_errors.is_empty() {
         out["unsupported_auth"] = serde_json::Value::Array(
-            unsupported_errors.into_iter().map(serde_json::Value::String).collect(),
+            unsupported_errors
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
         );
     }
     out

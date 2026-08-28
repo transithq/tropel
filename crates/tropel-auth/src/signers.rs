@@ -704,10 +704,7 @@ impl OAuth1Auth {
         let mut oauth: Vec<(String, String)> = vec![
             ("oauth_consumer_key".to_string(), self.consumer_key.clone()),
             ("oauth_nonce".to_string(), nonce.to_string()),
-            (
-                "oauth_signature_method".to_string(),
-                method_str.clone(),
-            ),
+            ("oauth_signature_method".to_string(), method_str.clone()),
             ("oauth_timestamp".to_string(), timestamp.to_string()),
             ("oauth_version".to_string(), "1.0".to_string()),
         ];

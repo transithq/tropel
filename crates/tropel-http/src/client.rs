@@ -1517,12 +1517,17 @@ fn auth_cache_key(auth: &AuthConfig) -> String {
             consumer_key,
             signature_method,
             ..
-        } => format!("oauth1:{consumer_key}:{}", signature_method.as_deref().unwrap_or("HMAC-SHA1")),
+        } => format!(
+            "oauth1:{consumer_key}:{}",
+            signature_method.as_deref().unwrap_or("HMAC-SHA1")
+        ),
         AuthConfig::Hawk { auth_id, .. } => format!("hawk:{auth_id}"),
         AuthConfig::Ntlm { username, .. } => format!("ntlm:{}", username.as_deref().unwrap_or("")),
         AuthConfig::Wsse { username, .. } => format!("wsse:{}", username.as_deref().unwrap_or("")),
         AuthConfig::Jwt { token, .. } => format!("jwt:{}", token.as_deref().unwrap_or("")),
-        AuthConfig::AkamaiEdgeGrid { client_token, .. } => format!("akamai:{}", client_token.as_deref().unwrap_or("")),
+        AuthConfig::AkamaiEdgeGrid { client_token, .. } => {
+            format!("akamai:{}", client_token.as_deref().unwrap_or(""))
+        }
     }
 }
 
