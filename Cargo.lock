@@ -4291,6 +4291,7 @@ dependencies = [
  "libc",
  "tokio",
  "tropel-engine",
+ "tropel-http",
  "tropel-js",
  "tropel-metrics",
  "tropel-native",
