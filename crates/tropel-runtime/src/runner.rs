@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -86,6 +88,13 @@ pub struct ScenarioRunner {
     /// when the Arc is shared across ~12 per-request samples (backlog line
     //  450).
     scenario_tags: Arc<HashMap<String, String>>,
+    /// TR-311: precomputed SipHash of every distinct prerequest/test script.
+    /// The runner hashed each script's full source (246 KB per iteration due
+    /// to the folded collection prerequest) on EVERY iteration to look up the
+    /// compiled `CachedScript`. Precomputing once per scenario (shared via Arc
+    /// across all VUs) makes the hot path a HashMap lookup (ref-count bump)
+    /// instead of a 246 KB memcpy + SipHash per iteration per VU.
+    script_hashes: Arc<HashMap<String, u64>>,
     // ── Execution context (k6 exec.* API) ──
     /// Unique VU identifier.
     pub vu_id: u32,
@@ -127,6 +136,19 @@ impl ScenarioRunner {
             // scenario.variables by the engine before this point.
             Arc::make_mut(&mut state.collection_vars).extend(scenario.variables.clone());
         }
+        // TR-311: pre-hash every distinct script once per scenario so the hot
+        // path avoids the 246 KB memcpy + SipHash per iteration. Shared via Arc
+        // across all VUs (the hash is stable per script text).
+        let mut hashes = HashMap::new();
+        for item in execution_items.iter() {
+            for s in item.prerequest.iter().chain(item.test.iter()) {
+                if !hashes.contains_key(s) {
+                    let mut h = DefaultHasher::new();
+                    s.hash(&mut h);
+                    hashes.insert(s.clone(), h.finish());
+                }
+            }
+        }
         Self {
             scenario,
             execution_items,
@@ -139,6 +161,7 @@ impl ScenarioRunner {
             expected_statuses: vec![ExpectedStatus::Range("200-399".to_string())],
             force_stop: Arc::new(AtomicBool::new(false)),
             scenario_tags: Arc::new(HashMap::new()),
+            script_hashes: Arc::new(hashes),
             vu_id,
             scenario_name,
         }
@@ -323,7 +346,10 @@ impl ScenarioRunner {
                 }
                 for (script_idx, script) in item.prerequest.iter().enumerate() {
                     let source_url = Some(format!("{}.prerequest#{}.js", item.name, script_idx));
-                    if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await {
+                    let pre_hash = self.script_hashes.get(script).copied();
+                    if let Err(e) =
+                        Self::run_script(&mut self.js_ctx, script, source_url, pre_hash).await
+                    {
                         if self.force_stop.load(Ordering::Acquire) {
                             // A deliberate force-stop interrupted the eval —
                             // not a script failure; k6 ends such runs neutrally
@@ -823,7 +849,9 @@ impl ScenarioRunner {
                     }
                     for (script_idx, script) in item.test.iter().enumerate() {
                         let source_url = Some(format!("{}.test#{}.js", item.name, script_idx));
-                        if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await
+                        let pre_hash = self.script_hashes.get(script).copied();
+                        if let Err(e) =
+                            Self::run_script(&mut self.js_ctx, script, source_url, pre_hash).await
                         {
                             if self.force_stop.load(Ordering::Acquire) {
                                 // Deliberate force-stop interrupted the eval —
@@ -938,14 +966,18 @@ impl ScenarioRunner {
     /// Run a script in the VU's JS context. Takes the context by itself (not
     /// `&mut self`) so callers holding an immutable borrow of another field
     /// (e.g. `&self.execution_items[i]`) don't trip the borrow checker — the
-    /// js_ctx field is disjoint from the execution list.
+    /// js_ctx field is disjoint from the execution list. TR-311: `pre_hash` is
+    /// the precomputed SipHash of `code` (246 KB per iteration avoided) looked
+    /// up from `self.script_hashes` at the call site so the hot path is a
+    /// HashMap lookup instead of a memcpy+SipHash.
     async fn run_script(
         js_ctx: &mut Option<Box<JsContext>>,
         code: &str,
         source_url: Option<String>,
+        pre_hash: Option<u64>,
     ) -> Result<()> {
         if let Some(ctx) = js_ctx {
-            ctx.run_script_cached(code, source_url)
+            ctx.run_script_cached_with_hash(code, source_url, pre_hash)
                 .await
                 .map_err(|e| tropel_sdk::TropelError::Other(format!("Script error: {}", e)))?;
         } else {

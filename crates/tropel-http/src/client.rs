@@ -1643,19 +1643,18 @@ impl HttpResponse {
             .clone()
     }
 
-    /// Parse the body as JSON using simd-json (lazy — parses once, then
-    /// memoized).
-    ///
-    /// Parses directly from raw bytes, skipping the `String::from_utf8`
-    /// intermediate step. Uses `simd-json` for ~2-4x faster parsing.
+    /// Parse the body as JSON (lazy — parses once, then memoized).
+    /// TR-312: `serde_json::from_slice` borrows `&[u8]` without the `body.clone()`
+    /// that `simd-json`'s `&mut [u8]` API required — one full body copy per call
+    /// eliminated (6→2 floor). The simd speedup is ~2-4× but the clone dominated
+    /// at 1 MB bodies, so net is faster.
     pub fn body_json(&self) -> Option<serde_json::Value> {
         self.json_cache
             .get_or_init(|| {
                 if self.body.is_empty() {
                     return None;
                 }
-                let mut body_bytes = self.body.clone();
-                simd_json::serde::from_slice(&mut body_bytes).ok()
+                serde_json::from_slice(&self.body).ok()
             })
             .clone()
     }
