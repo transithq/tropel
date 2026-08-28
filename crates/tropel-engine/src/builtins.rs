@@ -65,6 +65,71 @@ mod tests {
     /// `link_builtins`) registers in `inventory` but gets dead-stripped from
     /// the binary, so `tropel run file` reports "no input adapter recognized".
     /// This test walks the real `collect_inventory()` path the CLI uses.
+    /// TR-102: no host bridge may carry its own reserved-metric list.
+    ///
+    /// The guard existed in four places and the four copies drifted:
+    /// `http_req_dns` was guarded on the k6 path only, `iteration_duration`
+    /// and `dropped_iterations` on the pm/trp path only, `ws_*`/`browser_*`
+    /// on two of three. A k6 script could therefore forge
+    /// `dropped_iterations` — the counter that decides whether a run reports
+    /// itself verified.
+    ///
+    /// Fails on the pre-fix code: it greps the shipped sources for a local
+    /// list literal, and pre-fix there were four. Source-level because the
+    /// failure mode is a *new copy* appearing, which no runtime assertion on
+    /// the current call sites can see.
+    #[test]
+    fn no_crate_carries_a_private_reserved_metric_list() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .join("crates");
+
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // The SDK is where the one canonical list lives.
+                    if path.file_name().is_some_and(|n| n == "tropel-sdk") {
+                        continue;
+                    }
+                    walk(&path, hits);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let Ok(src) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    // The shape all four copies had: a `const RESERVED:
+                    // &[&str]` slice literal.
+                    //
+                    // Both needles are assembled with `concat!` so this
+                    // detector does not match its own source. Spelling them
+                    // literally here makes the test fail on itself, which is
+                    // a decorative failure that teaches the next person to
+                    // add an exclusion rather than fix a real hit.
+                    let name_needle = concat!("const ", "RESERVED");
+                    let type_needle = concat!("&[&", "str]");
+                    for (i, line) in src.lines().enumerate() {
+                        if line.contains(name_needle) && line.contains(type_needle) {
+                            hits.push(format!("{}:{}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut hits = Vec::new();
+        walk(&root, &mut hits);
+        assert!(
+            hits.is_empty(),
+            "these files carry a private reserved-metric list; call \
+             tropel_sdk::is_reserved_builtin_metric instead (TR-102): {hits:#?}"
+        );
+    }
+
     #[test]
     fn every_builtin_adapter_is_reachable_from_the_cli() {
         register_builtins();
