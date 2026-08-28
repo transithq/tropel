@@ -1468,7 +1468,7 @@ fn generate_crypto_nonce() -> String {
 /// as `NoAuth` and send the request unauthenticated — the TR-004 failure shape
 /// in a different costume). Callers must surface the error to the client as
 /// `unsupported` so the UI can disable the picker entry.
-pub fn build_auth_signer(auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>>, TropelError> {
+pub fn build_auth_signer(auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>>> {
     match auth {
         // Explicit noauth: no signer — and crucially the RUNNER must not
         // fall back to scenario auth. The runner's `.or(scenario.auth)`
@@ -2479,7 +2479,10 @@ mod tests {
             },
         ];
         for cfg in unsupported {
-            let err = build_auth_signer(&cfg).expect_err("unsupported scheme must be Err");
+            let err = match build_auth_signer(&cfg) {
+                Ok(_) => panic!("unsupported scheme must be Err"),
+                Err(e) => e,
+            };
             assert!(
                 err.to_string().contains("unsupported"),
                 "error must mention unsupported: {err}"

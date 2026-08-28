@@ -1461,7 +1461,7 @@ impl VuCookieClient {
     pub fn get_signer_ref(
         &self,
         auth: &AuthConfig,
-    ) -> Result<Option<&'static dyn AuthSigner>, TropelError> {
+    ) -> Result<Option<&'static dyn AuthSigner>> {
         let key = auth_cache_key(auth);
         let mut cache = self.signer_cache.lock().unwrap();
         if let Some(&signer) = cache.get(&key) {
@@ -1480,7 +1480,7 @@ impl VuCookieClient {
     pub fn get_signer(
         &self,
         auth: &AuthConfig,
-    ) -> Result<Option<Box<dyn AuthSigner>>, TropelError> {
+    ) -> Result<Option<Box<dyn AuthSigner>>> {
         self.inner.get_signer(auth)
     }
 
