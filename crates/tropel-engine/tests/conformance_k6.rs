@@ -220,7 +220,24 @@ async fn run_tropel_and_get_durations(script: &str) -> Result<(f64, f64)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn k6_and_tropel_http_req_duration_agree_within_tolerance() -> Result<()> {
     if find_k6().is_none() {
+        // TROPEL_REQUIRE_K6=1 turns "no k6" into a hard failure. CI sets it,
+        // so this comparison is a gate rather than decoration; locally it
+        // still skips so `cargo test` needs no k6 install.
+        //
+        // Without that env var this test skipped in EVERY environment,
+        // including CI, which never installed k6 — so the single
+        // highest-impact parity claim in the plan ("k6 avg 33.65ms vs tropel
+        // 32.19ms") was a one-off local run that no job could ever
+        // re-check. CONVENTIONS: "Smoke tests must be able to fail."
+        if std::env::var("TROPEL_REQUIRE_K6").as_deref() == Ok("1") {
+            panic!(
+                "TROPEL_REQUIRE_K6=1 but no k6 binary was found on PATH — the k6 \
+                 conformance comparison cannot run, and a silent skip here is what \
+                 made TR-202's parity number unverifiable"
+            );
+        }
         eprintln!("SKIP: k6 binary not found on PATH — conformance comparison not run");
+        eprintln!("      (set TROPEL_REQUIRE_K6=1 to make this a failure, as CI does)");
         return Ok(());
     }
     let srv = start_delayed_server().await;
