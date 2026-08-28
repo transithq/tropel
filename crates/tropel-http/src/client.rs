@@ -1458,10 +1458,7 @@ impl VuCookieClient {
     /// TR-409: propagates `Err(unsupported)` from the builder so the VU loop
     /// can emit a transport-error sample rather than sending an unsigned
     /// request.
-    pub fn get_signer_ref(
-        &self,
-        auth: &AuthConfig,
-    ) -> Result<Option<&'static dyn AuthSigner>> {
+    pub fn get_signer_ref(&self, auth: &AuthConfig) -> Result<Option<&'static dyn AuthSigner>> {
         let key = auth_cache_key(auth);
         let mut cache = self.signer_cache.lock().unwrap();
         if let Some(&signer) = cache.get(&key) {
@@ -1477,10 +1474,7 @@ impl VuCookieClient {
     }
 
     /// Auth-signer builder (passthrough to the shared client, returns owned Box).
-    pub fn get_signer(
-        &self,
-        auth: &AuthConfig,
-    ) -> Result<Option<Box<dyn AuthSigner>>> {
+    pub fn get_signer(&self, auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>>> {
         self.inner.get_signer(auth)
     }
 
