@@ -621,4 +621,108 @@ mod tests {
         assert_eq!(c1, "true");
         assert_eq!(c2, "true");
     }
+
+    /// TR-503: the per-VU heap number printed in `README.md` and
+    /// `tropel_plan/CONVENTIONS.md` must track the code.
+    ///
+    /// This is the gate that the 57 KB "shared Runtime" claim needed and did
+    /// not have. That figure sat in the README, the budget table, the W5
+    /// verification footer and the W6 release gate for as long as it took to
+    /// read `context.rs` — the `SHARED_RT` it cited shared nothing. Nothing
+    /// compared the documented number against a running context, so nothing
+    /// objected.
+    ///
+    /// A wide band on purpose: this catches an order-of-magnitude divergence
+    /// (57 KB vs ~486 KB is 9x) and tolerates allocator and platform variance.
+    /// It is a drift alarm, not a precision budget — `perf-regression` owns
+    /// the budget.
+    ///
+    /// If this fails, re-run `measure_per_vu_quickjs_heap` and update BOTH
+    /// documents. Do not widen the band to make it pass.
+    #[tokio::test]
+    async fn documented_per_vu_heap_matches_reality() {
+        const DOCUMENTED_BYTES: u64 = 497_584;
+        const TOLERANCE: f64 = 0.25;
+
+        let pm_state = new_pm_state();
+        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+            client: VuCookieClient::new(
+                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+            ),
+        });
+        let ctx = create_vu_js_context(
+            1,
+            &pm_state,
+            &client,
+            &ShimBundle::default(),
+            &SandboxConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("full VU context");
+
+        let actual = ctx.quickjs_heap_bytes();
+        let low = (DOCUMENTED_BYTES as f64 * (1.0 - TOLERANCE)) as u64;
+        let high = (DOCUMENTED_BYTES as f64 * (1.0 + TOLERANCE)) as u64;
+        assert!(
+            (low..=high).contains(&actual),
+            "per-VU QuickJS heap is {actual} B but README/CONVENTIONS document \
+             {DOCUMENTED_BYTES} B (band {low}..={high}). Re-run \
+             `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap \
+             -- --nocapture --ignored` and update both documents."
+        );
+    }
+
+    /// TR-503 / TR-501: print the ACTUAL per-VU QuickJS heap so the README
+    /// number is derived, not asserted. Run with:
+    /// `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored`
+    #[tokio::test]
+    #[ignore = "measurement, not an assertion — run explicitly with --nocapture"]
+    async fn measure_per_vu_quickjs_heap() {
+        let pm_state = new_pm_state();
+        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+            client: VuCookieClient::new(
+                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+            ),
+        });
+        let bare = tropel_js::JsContext::new(None, None)
+            .await
+            .expect("bare context");
+        println!(
+            "bare JsContext (no shims)      = {} B",
+            bare.quickjs_heap_bytes()
+        );
+
+        let full = create_vu_js_context(
+            1,
+            &pm_state,
+            &client,
+            &ShimBundle::default(),
+            &SandboxConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("full VU context");
+        println!(
+            "full VU context (all shims)    = {} B",
+            full.quickjs_heap_bytes()
+        );
+
+        let gated = create_vu_js_context(
+            2,
+            &pm_state,
+            &client,
+            &ShimBundle::from_script(
+                b"import http from 'k6/http'; export default () => http.get('http://x');",
+            ),
+            &SandboxConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("gated VU context");
+        println!(
+            "http-only gated VU context     = {} B",
+            gated.quickjs_heap_bytes()
+        );
+    }
 }
