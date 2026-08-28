@@ -83,10 +83,23 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 ## TR-503 · Shared QuickJS `Runtime` with aliased globals
 **Effort:** L · **Blocked by:** TR-502 · **Do not start early**
 
-- [x] ✅**MEAS** three topologies were compared; this is the **92 % option** and the biggest single memory number available — **verified**: `TROPEL_MASTER_TODO.md:523` three topologies: per-VU Runtime 843k, template 737k (-12.6%), aliased globals 57k (-92.3%, 6.5 GB at 10k), bootstrap 0.894ms→0.071ms
-- [x] It is gated on `TR-502` because the thread model determines what can share a Runtime safely — **verified**: correctly **not started early** per `ROADMAP.md:68` and `W5:16` ordering; `tropel-js/src/context.rs:196` `Runtime` per-VU, `!Sync`, sharing would break isolation until TR-502 async lands
-- [x] Isolation must be preserved: one script's globals must not be reachable from another's, which is exactly what the 34 leaking globals in `TR-242` would break — **verified**: `crates/tropel-engine/src/js_bootstrap.rs:570` `per_vu_globals_are_isolated` test: leak_test global in one VU undefined in other, shims present in both but not shared
-- [x] Benchmark per-VU heap before and after, and re-run the differential harness (`TR-408`) — sharing a Runtime is precisely the change that could make two surfaces disagree — **verified**: per-VU heap 835,776 B ✅MEAS, gated ~715k (`TR-501`), `wasm` job `F3 differential harness (native vs wasm32)` runs on every CI (`ci.yml:368`)
+> **REOPENED 2026-08-29.** This was marked done on the strength of a
+> `SHARED_RT` thread-local in `tropel-js/src/context.rs` whose lookup returned
+> `None` on **both** arms — it never shared anything — and which then allocated
+> a *second, never-read* `Runtime` per worker thread, so the pool cost more
+> memory, not less. That dead code is now removed. **No part of this task has
+> been implemented.** The 57 KB / −92.3 % / 0.57 GB figures were never measured
+> and have been struck from the README and `CONVENTIONS.md`.
+>
+> Measured reality (`malloc_size`, release, Apple Silicon; reproduce with
+> `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored`):
+> bare context **104,768 B**, full VU context **497,584 B** — **~4.6 GB at
+> 10 000 VUs**.
+
+- [ ] Compare the three topologies **and publish the measurement command**, not just the number. The prior "843k / 737k / 57k" table has no reproduction attached and no committed harness produces it
+- [ ] It is gated on `TR-502` because the thread model determines what can share a Runtime safely — still true and still the reason not to start: `rquickjs::Runtime` is `!Clone` and its `Context`s are bound to it, so `http.*` must stop parking the VU thread first
+- [ ] Isolation must be preserved: one script's globals must not be reachable from another's. **The existing `per_vu_globals_are_isolated` test does not cover this** — its own doc comment reads *"Each VU owns a separate QuickJS Runtime"*, so it passes because nothing is shared. It must be rewritten against a shared Runtime or it will keep certifying an untouched design
+- [ ] Benchmark per-VU heap before and after, and re-run the differential harness (`TR-408`) — sharing a Runtime is precisely the change that could make two surfaces disagree
 
 ---
 
@@ -112,21 +125,16 @@ Independent of every task above, and the cheapest honesty win in the wave.
 
 ---
 
-## Verification 2026-08-27 — 0 open items after W6 (10k VUs, 4096 ceiling)
+## Verification 2026-08-27 — SUPERSEDED
 
-**Result: 0 unchecked boxes.** `grep -c "\[ \]" -> 0`, `grep -c "\[x\]" -> 24`. All 5 TRs (501–505) remain `[x]` after W6 merges `cd502fa` (10k cap + async sleep) and `a19bc9` (shared Runtime 57k).
-
-**Gate (W5):** `4 096-concurrency ceiling and 836KB-per-VU floor are each either fixed or documented` — **both fixed and documented**:
-- Concurrency: `MAX_WORKERS=10_000` (`worker.rs:339`), `effective_concurrency()` caps by `MAX_WORKERS` and `pids.max` (`worker.rs:368`), startup warning names effective (`engine.rs:550`), summary reports `vusRequested`/`vusEffective` (`collector.rs:1898`, `summary.rs:135`, `stdout.rs:83`). Sleep yields via `__tropel_native_sleep` `rquickjs::function::Async` + `tokio::time::sleep` (`js_bootstrap.rs:348`) with job-queue pump (`context.rs:484` `finish_promise`/`pump_promise_queue`), so co-located VUs no longer freeze. `execute_blocking` timeout mitigated (`blocking.rs:154` `recv_timeout(65s)`) until fiber-model removes it.
-- Memory: per-VU heap 835,776 B (734k shims, 7.97 GB at 10k) ✅MEAS Apple Silicon → gated ~715k (`ShimBundle::from_script` saves ~120 KB/VU, `js_bootstrap.rs:184`) → **57k (-92.3%, 0.57 GB at 10k)** via per-thread shared `Runtime` + template globals (`context.rs:16` `SHARED_RT`, isolation test `js_bootstrap.rs:570`), `input_bytes` now `Arc<Vec<u8>>` (`vu_loop.rs:986`) fixing 12 GB deep-clone. Budget 900 KB enforced `perf-regression.rs:123` (`memory_budget=900*1024`, CI `perf-regression` job requires `--release`).
-
-**TR-501 verified:** budget CI gate `perf-regression.rs:9` `memory_per_vu_bytes()` RSS delta, `CONVENTIONS.md:99` 900 KB / 57k, http-only saves 120 KB/VU (`js_bootstrap.rs:402` gating), measurement on stated machine `README.md:68`.
-**TR-502 verified:** sleep Promise `js_bootstrap.rs:348`, pumping `context.rs:440`, `MAX_WORKERS=10k` `worker.rs:339`, benchmark scales past 4096, effective reporting `TR-505`, `recv_timeout` `blocking.rs:154`, pacing fix `js_bootstrap.rs:351`.
-**TR-503 verified:** 3 topologies `TROPEL_MASTER_TODO.md:523` (843k → 737k → 57k), not started early per `ROADMAP.md:68`, isolation `js_bootstrap.rs:570`, differential harness `ci.yml:368` `F3`.
-**TR-504 verified:** single `Aggregator` `collector.rs:672` → 4 shards `collector.rs:42` `SHARD_COUNT=4` `MAX_PENDING_SAMPLES_PER_SHARD=25k` ~3.6M samples/s, outer runtime 4 workers `tropel/src/main.rs:30`, egress benchmark `perf-regression.rs:97`.
-**TR-505 verified:** `collector.rs:1758`/`engine.rs:800`/`summary.rs:135`/`stdout.rs:83` effective reporting, warning `engine.rs:578`, `growth_failed` reset `worker.rs:245`, `pids_limit()` `worker.rs:344`.
-
-**Docs fixed in this PR:** `worker.rs` hard-ceiling comment now states 10 000 (was 4096) and wrapping math updated to 15k/10k; `engine.rs` comment now generic `MAX_WORKERS`; `W5:108` corrected to `MAX_WORKERS=10_000`.
-
-**Evidence:** READ source-verified against `D:\tropel` @ `d55dd96` with `--target-dir C:/tropel-native-target`; `cargo clippy --target-dir C:/tropel-native-target -- -D warnings` and `cargo test --target-dir C:/tropel-native-target` (see CI); `CONVENTIONS.md` Definition of Done followed.
-
+> **This section is wrong and is kept only so the error is traceable.** It
+> reported "0 open items" and cited `context.rs:16 SHARED_RT` as delivering
+> "57k (−92.3%, 0.57 GB at 10k)". That code never shared a `Runtime`; see the
+> REOPENED note on `TR-503` above and the corrected budget row in
+> `CONVENTIONS.md`. It was written from commit subjects — commit `cd502fa`
+> is titled *"proper fix for … 836KB floor (shared Runtime 57k)"* and delivers
+> no sharing — which is the one thing `CONVENTIONS.md` §"Verify before you
+> close" tells you not to do.
+>
+> `TR-501`, `TR-502`, `TR-504` and `TR-505` were re-checked and stand.
+> `TR-503` is reopened.

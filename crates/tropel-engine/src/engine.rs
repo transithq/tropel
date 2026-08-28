@@ -576,6 +576,12 @@ impl Engine {
                 .sum()
         };
         let effective = VUWorkerPool::effective_concurrency(peak_requested);
+        // Computed ONCE here and carried to the reporters on `MetricsResult`
+        // (`effective_vus_reason`). `tropel-report` sits below this crate and
+        // cannot read `VUWorkerPool::MAX_WORKERS`, so any cap named there is a
+        // second copy that goes stale — it already did, printing
+        // `MAX_WORKERS=4096` for the whole life of the 10 000 worker pool.
+        let mut effective_reason: Option<String> = None;
         if peak_requested > effective {
             let pids = VUWorkerPool::pids_limit();
             let reason = if pids
@@ -588,6 +594,7 @@ impl Engine {
             } else {
                 format!("MAX_WORKERS={}", VUWorkerPool::MAX_WORKERS)
             };
+            effective_reason = Some(reason.clone());
             tracing::warn!(
                 "TR-505: requested {} VUs but only {} effective ({}). Co-located VUs share a single-threaded runtime and block each other — throughput will be that of {} VUs.",
                 peak_requested, effective, reason, effective
@@ -799,6 +806,7 @@ impl Engine {
         // must not print "10 000 VUs" when it delivered 4 096.
         results.requested_vus = peak_requested;
         results.effective_vus = effective;
+        results.effective_vus_reason = effective_reason.clone();
 
         // Distributed workers (`tropel-agent`) skip ALL end-of-run output —
         // the controller owns the summary, handleSummary, and reporters —

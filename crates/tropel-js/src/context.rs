@@ -1,7 +1,6 @@
 use crate::error::*;
 use rquickjs::function::{Func, Rest};
 use rquickjs::{Coerced, Context, Ctx, FromJs, Function, Persistent, Promise, Runtime, Value};
-use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
@@ -11,14 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
-
-thread_local! {
-    /// TR-503 proper fix: per-thread shared Runtime for 92% heap win.
-    /// Each worker thread reuses one Runtime (heap + atom table) across its VUs,
-    /// and template Context globals are aliased into per-VU Contexts (57k vs 843k).
-    #[allow(clippy::missing_const_for_thread_local)]
-    static SHARED_RT: RefCell<Option<Runtime>> = const { RefCell::new(None) };
-}
 
 /// A compiled script function persisted across `ctx.with()` calls.
 ///
@@ -271,43 +262,21 @@ impl JsContext {
         max_execution_time: Option<Duration>,
         force_stop: Arc<AtomicBool>,
     ) -> Result<Self> {
-        // TR-503: try to reuse a thread-local shared Runtime for heap sharing.
-        // If the thread already has a Runtime, reuse its heap and atom table
-        // (12% win). The 92% win (aliased globals) is layered on top via the
-        // template Context in js_bootstrap, but even shared Runtime alone cuts
-        // per-VU heap significantly. Fall back to per-VU Runtime if thread-local
-        // is unavailable (e.g., outside tokio).
-        let rt = SHARED_RT.with(|cell| {
-            if let Some(_rt) = cell.borrow().as_ref() {
-                // Clone the Runtime handle? Runtime is !Clone, so we can't clone.
-                // Instead, we return None to signal we need to create a new one
-                // but we can still share the heap via not dropping the old one.
-                // For now, create a new Runtime per VU but keep the thread-local
-                // for future sharing — the full 92% requires template globals
-                // which is implemented in js_bootstrap layer.
-                None
-            } else {
-                None
-            }
-        });
-        let rt = match rt {
-            Some(rt) => rt,
-            None => Runtime::new()
-                .map_err(|e| JsError::ContextCreation(format!("Runtime creation failed: {}", e)))?,
-        };
-        // Store for next VU on this thread (best-effort, ignore if already set)
-        SHARED_RT.with(|cell| {
-            if cell.borrow().is_none() {
-                // We can't clone Runtime, so we store a new one for next time.
-                // This is a placeholder for the 92% template - the real sharing
-                // is via the template Context's globals, not Runtime heap alone.
-                // For now, we keep per-VU Runtime but the thread-local slot
-                // indicates the thread is warm.
-                let _ = cell
-                    .borrow_mut()
-                    .replace(Runtime::new().unwrap_or_else(|_| Runtime::new().expect("runtime")));
-            }
-        });
+        // One `Runtime` per VU. TR-503 proposed sharing a `Runtime` per worker
+        // thread and aliasing template globals into per-VU `Context`s; that is
+        // NOT implemented. A thread-local `SHARED_RT` used to sit here whose
+        // lookup returned `None` on both arms — so it never shared anything —
+        // and which then allocated a SECOND `Runtime` per worker thread that
+        // nothing ever read, making the pool cost more memory rather than less.
+        // It is removed rather than left in place: dead scaffolding that reads
+        // as a landed optimisation is how the 57 KB/VU figure reached the
+        // README (see TR-503, reopened).
+        //
+        // `rquickjs::Runtime` is `!Clone` and its `Context`s are bound to it,
+        // so sharing needs the async host-call model from TR-502 first — the
+        // ordering the wave notes call out.
+        let rt = Runtime::new()
+            .map_err(|e| JsError::ContextCreation(format!("Runtime creation failed: {}", e)))?;
 
         // Set memory limit (in bytes)
         if let Some(limit) = memory_limit {
@@ -1179,6 +1148,20 @@ impl JsContext {
     {
         self.ctx.with(|ctx| f(&ctx))
     }
+
+    /// Bytes of QuickJS heap this context's `Runtime` has allocated, as
+    /// QuickJS itself accounts for them (`JS_ComputeMemoryUsage`).
+    ///
+    /// This is the number the per-VU memory budget is written against. It is
+    /// preferable to an RSS delta for that purpose: RSS is polluted by the
+    /// allocator's arenas, by whatever else the process is doing, and is
+    /// unavailable on macOS in the CI gate — all of which invite a budget that
+    /// silently measures nothing. `malloc_size` here is the live figure.
+    ///
+    /// One `Runtime` per VU today, so this IS the per-VU heap (TR-503).
+    pub fn quickjs_heap_bytes(&self) -> u64 {
+        self.rt.memory_usage().malloc_size as u64
+    }
 }
 
 /// Re-arm a shared interrupt deadline handle to `now + max_execution_time`.
@@ -1720,6 +1703,26 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "eval past the original deadline must complete quickly"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tr503_tests {
+    use super::*;
+
+    /// The per-VU heap figure quoted in the README and `CONVENTIONS.md` must
+    /// come from this accessor, so it stays reproducible rather than becoming
+    /// folklore. A README that cites a number no committed command prints is
+    /// how the 57 KB shared-Runtime claim survived (TR-503).
+    #[tokio::test(flavor = "current_thread")]
+    async fn quickjs_heap_bytes_reports_a_plausible_live_figure() {
+        let c = JsContext::new(None, None).await.expect("ctx");
+        let bytes = c.quickjs_heap_bytes();
+        assert!(
+            (16_384..8 * 1024 * 1024).contains(&bytes),
+            "bare context heap {bytes} B is outside any plausible range — the \
+             accessor is reporting the wrong thing"
         );
     }
 }
