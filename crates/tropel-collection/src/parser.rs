@@ -757,11 +757,13 @@ fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
             let consumer_secret = get_auth_attr(&auth.oauth1, "consumerSecret").unwrap_or_default();
             let token = get_auth_attr(&auth.oauth1, "token");
             let token_secret = get_auth_attr(&auth.oauth1, "tokenSecret");
+            let signature_method = get_auth_attr(&auth.oauth1, "signatureMethod");
             Some(AuthConfig::OAuth1 {
                 consumer_key,
                 consumer_secret,
                 token,
                 token_secret,
+                signature_method,
             })
         }
         "oauth2" => {
