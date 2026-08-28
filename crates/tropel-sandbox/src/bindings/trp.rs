@@ -1171,15 +1171,11 @@ impl TrpBridge {
                     // names; `pm.metrics.add('checks', 1)` must be rejected
                     // the same way, or a script forges the checks headline
                     // through the Postman-style bridge.
-                    const RESERVED: &[&str] = &[
-                        "http_reqs", "http_req_duration", "http_req_failed",
-                        "http_req_blocked", "http_req_connecting", "http_req_tls_handshaking",
-                        "http_req_receiving", "http_req_sending", "http_req_waiting",
-                        "iterations", "iteration_duration", "dropped_iterations",
-                        "checks", "group_duration", "vus", "vus_max",
-                        "data_received", "data_sent",
-                    ];
-                    if RESERVED.iter().any(|&r| name == r) {
+                    // The list lives in tropel-sdk. This copy used to omit
+                    // `http_req_dns` and the whole ws_*/browser_* family, so
+                    // a Postman script could emit into a sub-timing series a
+                    // threshold then read.
+                    if tropel_sdk::is_reserved_builtin_metric(&name) {
                         tracing::warn!(
                             "Custom metric '{}' clashes with built-in metric name — ignoring",
                             name
@@ -1246,15 +1242,9 @@ impl TrpBridge {
                         // must not be overwritten by script-defined custom
                         // metrics. A new Counter('http_reqs') would mint a
                         // Gauge whose p50..p99 are hardcoded 0.
-                        const RESERVED: &[&str] = &[
-                            "http_reqs", "http_req_duration", "http_req_failed",
-                            "http_req_blocked", "http_req_connecting", "http_req_tls_handshaking",
-                            "http_req_receiving", "http_req_sending", "http_req_waiting",
-                            "iterations", "iteration_duration", "dropped_iterations",
-                            "checks", "group_duration", "vus", "vus_max",
-                            "data_received", "data_sent",
-                        ];
-                        if RESERVED.iter().any(|&r| name == r) {
+                        // The list lives in tropel-sdk — see the sibling
+                        // guard above and TR-102 for why it is not local.
+                        if tropel_sdk::is_reserved_builtin_metric(&name) {
                             tracing::warn!(
                                 "Custom metric '{}' clashes with built-in metric name — ignoring",
                                 name

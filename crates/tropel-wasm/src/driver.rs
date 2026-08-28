@@ -922,31 +922,10 @@ fn metric_add_host(
     // TR-102: reserved-name guard — the wasm tier must reject builtin
     // metric names the same way the k6 driver and sandbox do, or a guest
     // module can forge the checks headline through the wasm bridge.
-    const RESERVED: &[&str] = &[
-        "http_reqs",
-        "http_req_duration",
-        "http_req_failed",
-        "http_req_blocked",
-        "http_req_connecting",
-        "http_req_tls_handshaking",
-        "http_req_receiving",
-        "http_req_sending",
-        "http_req_waiting",
-        "data_sent",
-        "data_received",
-        "iterations",
-        "vus",
-        "vus_max",
-        "checks",
-        "group_duration",
-        "ws_connecting",
-        "ws_sending",
-        "ws_receiving",
-        "ws_msgs_sent",
-        "ws_msgs_received",
-        "ws_session_duration",
-    ];
-    if RESERVED.iter().any(|r| *r == name) {
+    //
+    // The list lives in tropel-sdk. This copy used to omit `http_req_dns`,
+    // `iteration_duration` and `dropped_iterations`.
+    if tropel_sdk::is_reserved_builtin_metric(&name) {
         tracing::warn!(
             "wasm metric '{}' clashes with built-in metric name — ignoring",
             name

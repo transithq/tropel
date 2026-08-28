@@ -2805,37 +2805,16 @@ let _ = globals.set(
                         // emit into builtin metrics. A script that writes
                         // `new Rate('http_req_failed').add(0)` makes a CI
                         // gate read whatever it likes.
-                        const RESERVED: &[&str] = &[
-                            "http_reqs",
-                            "http_req_duration",
-                            "http_req_failed",
-                            "http_req_blocked",
-                            "http_req_dns",
-                            "http_req_connecting",
-                            "http_req_tls_handshaking",
-                            "http_req_sending",
-                            "http_req_waiting",
-                            "http_req_receiving",
-                            "data_sent",
-                            "data_received",
-                            "iterations",
-                            "vus",
-                            "vus_max",
-                            "checks",
-                            "group_duration",
-                            "ws_connecting",
-                            "ws_sending",
-                            "ws_receiving",
-                            "ws_msgs_sent",
-                            "ws_msgs_received",
-                            "ws_session_duration",
-                            "browser_http_req_duration",
-                            "browser_http_req_failed",
-                        ];
-                        if RESERVED.iter().any(|r| *r == name) {
-                            // Drop silently — k6's own guard rejects at
-                            // construction time; tropel emits a warning and
-                            // drops the sample to stay safe.
+                        //
+                        // The list lives in tropel-sdk. It used to be a local
+                        // copy here, and the four copies across the host
+                        // bridges drifted: this one never guarded
+                        // `dropped_iterations`, so a k6 script could zero the
+                        // counter that decides whether a run is reported as
+                        // verified.
+                        if tropel_sdk::is_reserved_builtin_metric(&name) {
+                            // Drop with a warning — k6 rejects at construction
+                            // time; tropel drops the sample to stay safe.
                             eprintln!(
                                 "warning: custom metric '{}' shadows a builtin — dropped",
                                 name
