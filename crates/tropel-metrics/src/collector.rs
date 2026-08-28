@@ -725,6 +725,9 @@ impl MetricsCollector {
             out.vus_max = out.vus_max.max(r.vus_max);
             out.requested_vus = out.requested_vus.max(r.requested_vus);
             out.effective_vus = out.effective_vus.max(r.effective_vus);
+            if out.effective_vus_reason.is_none() {
+                out.effective_vus_reason = r.effective_vus_reason.clone();
+            }
         }
         // Recompute http_req_failed as weighted average if we have http_reqs
         // (each shard's http_req_failed is failed/total for that shard).
@@ -1450,6 +1453,7 @@ impl Aggregator {
             vus_max,
             requested_vus: 0,
             effective_vus: 0,
+            effective_vus_reason: None,
             // Backlog line 45 (P0): REAL mid-run elapsed — a ZERO here made
             // every rate/avg threshold compute 0.0 and abortOnFail killed
             // healthy runs (the engine stamps the final value post-run).
@@ -1903,6 +1907,17 @@ pub struct MetricsResult {
     /// pids.limit)`. When `requested > effective`, the run wrapped or was
     /// pids-capped and throughput is that of `effective`.
     pub effective_vus: u64,
+    /// Why `effective_vus < requested_vus` — e.g. `MAX_WORKERS=10000` or
+    /// `cgroup pids.max=4096`. Stamped by the engine, which is the only place
+    /// that knows the pool's real ceiling.
+    ///
+    /// Reporters MUST render this string rather than naming a cap themselves:
+    /// `tropel-report` sits below `tropel-engine` and cannot read
+    /// `VUWorkerPool::MAX_WORKERS`, so a hand-written constant there silently
+    /// goes stale the next time the ceiling moves. It already did — the
+    /// summary printed `MAX_WORKERS=4096` for the whole life of the 10 000
+    /// worker pool.
+    pub effective_vus_reason: Option<String>,
     /// Wall-clock duration of the run (stamped by the engine after the run
     /// finishes). Reporters use it for k6-style per-second rates
     /// (`http_reqs: 136 13.56/s`) and `handleSummary` state.
@@ -1964,6 +1979,7 @@ impl Default for MetricsResult {
             vus_max: 0,
             requested_vus: 0,
             effective_vus: 0,
+            effective_vus_reason: None,
             run_duration: Duration::ZERO,
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),

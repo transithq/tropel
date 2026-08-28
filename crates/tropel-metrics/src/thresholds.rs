@@ -1099,6 +1099,7 @@ mod tests {
             run_duration: Duration::from_secs(10),
             requested_vus: 0,
             effective_vus: 0,
+            effective_vus_reason: None,
             metrics: vec![
                 trend_series_with_hist(
                     "http_req_waiting{url=/fast}",
