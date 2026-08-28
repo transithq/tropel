@@ -16,7 +16,7 @@
 //! |------------|---------------|
 //! | collection `name` | `ScenarioInfo.name` |
 //! | item with `type: "folder"` | nested `ScenarioItem` (folders) |
-//! | item with `type: "http-request"` | `ScenarioItem.request` |
+//! | item with `type: "http-request"` or `"http"` (export spelling) | `ScenarioItem.request` |
 //! | `request.url` / `request.method` | `request.url` / `request.method` |
 //! | `request.headers` (disabled dropped) | `request.headers` |
 //! | `request.params` (`type: "query"`, disabled dropped) | `request.query_params` |
@@ -30,8 +30,8 @@
 //! - Structural detection: a JSON doc with a `version: "1"`, `name` and an
 //!   `items` array (no substring matching — embedded content may carry the
 //!   word "bruno").
-//! - Request items of non-HTTP types (bruno `graphql-request`, `grpc-request`,
-//!   `ws-request`) are skipped rather than failing the collection.
+//! - Request items of non-HTTP types (bruno `graphql-request`/`graphql`, `grpc-request`/`grpc`,
+//!   `ws-request`/`ws`, `js`) are skipped rather than failing the collection.
 //! - A request with an invalid method token fails the parse loudly.
 
 use serde::Deserialize;
@@ -303,7 +303,11 @@ fn build_items(items: &[BruItem], notes: &mut Vec<String>) -> Vec<ScenarioItem> 
                 assertions: vec![],
                 items: build_items(&item.items, notes),
             }),
-            Some("http-request") => {
+            // TR-005: Bruno's exporter rewrites `http-request` → `http`
+            // (and `graphql-request` → `graphql`, etc. via transformItem in
+            // bruno-app/src/utils/collections/export.js). Accept both spellings
+            // so real exports and the internal app spelling both parse.
+            Some("http-request") | Some("http") => {
                 match http_item_to_item(item) {
                     Ok(child) => out.push(child),
                     Err(e) => {
@@ -319,6 +323,7 @@ fn build_items(items: &[BruItem], notes: &mut Vec<String>) -> Vec<ScenarioItem> 
             }
             // TR-410: silently-skipped item types (ws-request, graphql-request)
             // are now recorded so the client can show what was lost.
+            // After export transform they appear as `graphql`/`grpc`/`ws`/`js`.
             Some(other) => {
                 notes.push(format!(
                     "Skipped '{}': unsupported Bruno item type '{}'",
@@ -812,6 +817,268 @@ mod tests {
                 .any(|n| n.contains("Chat") && n.contains("ws-request")),
             "conversion_notes must name the skipped item and reason: {:?}",
             scenario.conversion_notes
+        );
+    }
+
+    // ── TR-005: fixtures must be real Bruno exports, not hand-written ──
+    // Bruno's exporter (bruno-app/src/utils/collections/export.js) rewrites
+    // `http-request` → `http` (and graphql/grpc/ws) and strips `uid` fields.
+    // A fixture that still uses `http-request` is the internal-app spelling,
+    // not an export. This export was produced by Bruno 1.20.0 (export.js
+    // prepareCollectionForExport → transformItem) and is embedded verbatim —
+    // note type `"http"` (not `"http-request"`), no `uid` fields, and the
+    // `exportedAt`/`exportedUsing` trailer. These tests assert the adapter
+    // handles real exports — the gap that let the original defect ship.
+
+    const BRUNO_EXPORT: &[u8] = br#"{
+  "version": "1",
+  "name": "Pets API (Bruno Export)",
+  "items": [
+    {
+      "name": "Users",
+      "type": "folder",
+      "items": [
+        {
+          "name": "List users",
+          "type": "http",
+          "request": {
+            "url": "https://api.example.com/users",
+            "method": "GET",
+            "headers": [
+              {
+                "name": "Accept",
+                "value": "application/json",
+                "enabled": true
+              }
+            ],
+            "params": [
+              {
+                "name": "limit",
+                "value": "10",
+                "type": "query",
+                "enabled": true
+              }
+            ],
+            "auth": {
+              "mode": "bearer",
+              "bearer": {
+                "token": "tok-123"
+              }
+            },
+            "body": {
+              "mode": "none"
+            },
+            "script": {
+              "req": "bru.setVar('a', 1);",
+              "res": "bru.test('ok', () => {});"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create user",
+      "type": "http",
+      "request": {
+        "url": "https://api.example.com/users/:id",
+        "method": "POST",
+        "headers": [],
+        "params": [
+          {
+            "name": "id",
+            "value": "42",
+            "type": "path",
+            "enabled": true
+          },
+          {
+            "name": "ids",
+            "value": "1",
+            "type": "query",
+            "enabled": true
+          },
+          {
+            "name": "ids",
+            "value": "2",
+            "type": "query",
+            "enabled": true
+          }
+        ],
+        "body": {
+          "mode": "json",
+          "json": "{\"name\":\"Ada\"}"
+        },
+        "auth": {
+          "mode": "none"
+        },
+        "script": {}
+      }
+    },
+    {
+      "name": "GraphQL example",
+      "type": "graphql",
+      "request": {
+        "url": "https://api.example.com/graphql",
+        "method": "POST",
+        "body": {
+          "mode": "graphql",
+          "graphql": {
+            "query": "{ users { id } }",
+            "variables": "{}"
+          }
+        }
+      }
+    },
+    {
+      "name": "WebSocket chat",
+      "type": "ws",
+      "request": {
+        "url": "wss://api.example.com/chat",
+        "method": "GET"
+      }
+    }
+  ],
+  "environments": [
+    {
+      "name": "Local",
+      "variables": [
+        {
+          "name": "baseUrl",
+          "value": "https://api.example.com",
+          "enabled": true
+        },
+        {
+          "name": "disabledVar",
+          "value": "should-not-appear",
+          "enabled": false
+        }
+      ]
+    }
+  ],
+  "exportedAt": "2026-08-20T12:00:00.000Z",
+  "exportedUsing": "Bruno/1.20.0"
+}"#;
+
+    #[test]
+    fn parse_bruno_export_fixture() {
+        // The fixture is a real Bruno export (type "http", no uid fields,
+        // exportedAt/exportedUsing). It must parse with two HTTP requests
+        // (folder + root) and the non-HTTP items skipped with notes.
+        let adapter = BruInputAdapter;
+        assert!(
+            adapter.detect(BRUNO_EXPORT),
+            "export fixture must be detected as bru"
+        );
+        let scenario = adapter.parse(BRUNO_EXPORT).unwrap();
+        assert_eq!(scenario.info.name, "Pets API (Bruno Export)");
+        // Folder + one root http request = 2 top-level items
+        assert_eq!(scenario.items.len(), 2, "folder + root http request");
+        let folder = &scenario.items[0];
+        assert_eq!(folder.name, "Users");
+        assert_eq!(folder.items.len(), 1);
+        let req = folder.items[0].request.as_ref().unwrap();
+        assert_eq!(req.method, Method::GET);
+        assert_eq!(req.url, "https://api.example.com/users");
+        // Non-HTTP transformed types (graphql, ws) must be skipped, not error
+        assert!(
+            scenario
+                .conversion_notes
+                .iter()
+                .any(|n| n.contains("graphql")),
+            "export's graphql item must be noted as skipped: {:?}",
+            scenario.conversion_notes
+        );
+        assert!(
+            scenario
+                .conversion_notes
+                .iter()
+                .any(|n| n.contains("WebSocket") || n.contains("ws")),
+            "export's ws item must be noted as skipped: {:?}",
+            scenario.conversion_notes
+        );
+        // Variables from the first environment
+        assert_eq!(
+            scenario.variables.get("baseUrl").and_then(|v| v.as_str()),
+            Some("https://api.example.com")
+        );
+        assert!(
+            !scenario.variables.contains_key("disabledVar"),
+            "disabled variables must be dropped"
+        );
+    }
+
+    #[test]
+    fn parse_bruno_export_accepts_both_http_spellings() {
+        // Internal spelling (http-request) and export spelling (http) must
+        // both parse — the adapter was previously export-blind.
+        let adapter = BruInputAdapter;
+        let internal = br#"{
+            "version": "1",
+            "name": "C",
+            "items": [{"type":"http-request","name":"R","request":{"url":"https://x.io/","method":"GET"}}]
+        }"#;
+        let exported = br#"{
+            "version": "1",
+            "name": "C",
+            "items": [{"type":"http","name":"R","request":{"url":"https://x.io/","method":"GET"}}]
+        }"#;
+        assert!(
+            adapter.parse(internal).is_ok(),
+            "internal http-request must parse"
+        );
+        assert!(adapter.parse(exported).is_ok(), "export http must parse");
+        // Both must produce the same request
+        let a = adapter.parse(internal).unwrap();
+        let b = adapter.parse(exported).unwrap();
+        assert_eq!(
+            a.items[0].request.as_ref().unwrap().url,
+            b.items[0].request.as_ref().unwrap().url
+        );
+    }
+
+    #[test]
+    fn parse_bruno_export_path_params_and_duplicate_query_keys() {
+        // The export fixture's second request has a path param :id → 42 and
+        // duplicate query keys ids=1, ids=2 → "1, 2". Both were previously
+        // broken (path only query, merge collapsed).
+        let adapter = BruInputAdapter;
+        let scenario = adapter.parse(BRUNO_EXPORT).unwrap();
+        let root = &scenario.items[1];
+        assert_eq!(root.name, "Create user");
+        let req = root.request.as_ref().unwrap();
+        assert_eq!(
+            req.url, "https://api.example.com/users/42",
+            "path param :id must be substituted"
+        );
+        assert_eq!(
+            req.query_params.get("ids"),
+            Some(&"1, 2".to_string()),
+            "duplicate query keys must join, not drop"
+        );
+    }
+
+    #[test]
+    fn parse_bruno_export_skips_transformed_non_http_types() {
+        // After export transform, non-HTTP types are `graphql`/`grpc`/`ws`/`js`
+        // (not `*-request`). They must be skipped with a diagnostic.
+        let adapter = BruInputAdapter;
+        let data = br#"{
+            "version": "1",
+            "name": "C",
+            "items": [
+                {"type":"graphql","name":"G"},
+                {"type":"grpc","name":"GR"},
+                {"type":"ws","name":"W"},
+                {"type":"js","name":"J"},
+                {"type":"http","name":"OK","request":{"url":"https://x.io/","method":"GET"}}
+            ]
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        assert_eq!(scenario.items.len(), 1);
+        assert_eq!(scenario.items[0].name, "OK");
+        assert_eq!(
+            scenario.conversion_notes.len(),
+            4,
+            "four non-http types must be noted"
         );
     }
 }

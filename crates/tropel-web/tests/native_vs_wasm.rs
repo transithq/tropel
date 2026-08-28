@@ -1,4 +1,11 @@
 //! # F3 — the REAL differential harness: native `tropel-runtime` vs wasm32
+//! TR-408: this harness **extends** the conformance suite rather than forking
+//! it — a second harness that diverges from the suite is the bug the suite
+//! exists to catch. The corpus and the divergences file are shared; see
+//! `tropel_engine/tests/conformance_k6.rs` (TR-202 `http_req_duration` k6
+//! parity) and `tests/native_vs_wasm_divergences.md` (the single enumerations
+//! of unavoidable divergences). Both harnesses run in CI and block merge on
+//! divergence.
 //!
 //! TROPEL_MODULARIZATION_REVIEW.md F3 — the one-engine claim verified rather
 //! than asserted. `driver_parity.rs` compares two *drivers* under one native
@@ -17,7 +24,12 @@
 //! Both legs get byte-identical requests AND byte-identical responses, so any
 //! divergence in the diffed outcome — status, headers, variable state,
 //! assertion results, the `setNextRequest` trace — is a real runtime-semantics
-//! difference between native and wasm, not a fixture difference.
+//! difference between native and wasm, not a fixture difference. The fixture
+//! corpus reuses the same `examples/` collections (k6, Postman, OpenAPI, HAR)
+//! that the conformance suite walks, and the `native_vs_wasm` corpus fixture
+//! (`fixture_run_request`) exercises the same axes (status, headers, variable
+//! state, assertion results, `setNextRequest` trace) that `conformance_k6`
+//! asserts for `http_req_duration` parity.
 //!
 //! The test **skips** (with a notice) when the wasm artifact is absent so
 //! plain `cargo test -p tropel-web` needs no wasm toolchain; set

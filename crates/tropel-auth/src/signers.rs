@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512_256};
+use sha2::{Digest, Sha256, Sha512, Sha512_256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -45,6 +45,7 @@ const UNRESERVED: AsciiSet = NON_ALPHANUMERIC
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
+type HmacSha512 = Hmac<Sha512>;
 
 /// Auth signer trait — signs/modifies a request before sending.
 ///
@@ -612,16 +613,20 @@ fn sigv4_canonical_headers(
 
 // ─────────────────────────── OAuth1 (RFC 5849) ───────────────────────────
 
-/// OAuth1 HMAC-SHA1 request signing (RFC 5849).
+/// OAuth1 request signing (RFC 5849) — HMAC-SHA1 and HMAC-SHA256.
 ///
 /// Builds the signature base string from method, base URL, query + form body
 /// params and the OAuth params, signs with the consumer/token secrets, and
-/// emits the `Authorization: OAuth ...` header.
+/// emits the `Authorization: OAuth ...` header. The signature method is taken
+/// from `AuthConfig::OAuth1.signature_method` (TR-409: all picker methods must
+/// round-trip; unsupported methods are reported as an error, never silently
+/// degraded to HMAC-SHA1).
 pub struct OAuth1Auth {
     consumer_key: String,
     consumer_secret: String,
     token: Option<String>,
     token_secret: Option<String>,
+    signature_method: Option<String>,
 }
 
 impl OAuth1Auth {
@@ -636,6 +641,23 @@ impl OAuth1Auth {
             consumer_secret: consumer_secret.to_string(),
             token,
             token_secret,
+            signature_method: None,
+        }
+    }
+
+    pub fn new_with_method(
+        consumer_key: &str,
+        consumer_secret: &str,
+        token: Option<String>,
+        token_secret: Option<String>,
+        signature_method: Option<String>,
+    ) -> Self {
+        Self {
+            consumer_key: consumer_key.to_string(),
+            consumer_secret: consumer_secret.to_string(),
+            token,
+            token_secret,
+            signature_method,
         }
     }
 
@@ -661,13 +683,28 @@ impl OAuth1Auth {
                 params.extend(parse_form(bytes));
             }
         }
+        let method_str = self
+            .signature_method
+            .as_deref()
+            .unwrap_or("HMAC-SHA1")
+            .to_ascii_uppercase();
+        // TR-409: only HMAC-SHA1 and HMAC-SHA256 are implemented; every other
+        // picker value (RSA-SHA1/256/512, PLAINTEXT, HMAC-SHA512, etc.) is
+        // reported as unsupported rather than silently downgraded to HMAC-SHA1
+        // (the TR-004 / TR-409 failure shape).
+        if !matches!(
+            method_str.as_str(),
+            "HMAC-SHA1" | "HMAC-SHA256" | "HMAC-SHA512"
+        ) {
+            return Err(TropelError::Other(format!(
+                "unsupported OAuth1 signature_method '{}' — supported: HMAC-SHA1, HMAC-SHA256, HMAC-SHA512",
+                method_str
+            )));
+        }
         let mut oauth: Vec<(String, String)> = vec![
             ("oauth_consumer_key".to_string(), self.consumer_key.clone()),
             ("oauth_nonce".to_string(), nonce.to_string()),
-            (
-                "oauth_signature_method".to_string(),
-                "HMAC-SHA1".to_string(),
-            ),
+            ("oauth_signature_method".to_string(), method_str.clone()),
             ("oauth_timestamp".to_string(), timestamp.to_string()),
             ("oauth_version".to_string(), "1.0".to_string()),
         ];
@@ -682,11 +719,24 @@ impl OAuth1Auth {
         // canonical test vector (see tests).
         let base_uri = base_url(url);
         let base_string = oauth1_base_string(method, &base_uri, &params);
-        let signature = oauth1_hmac_sha1(
-            &base_string,
-            &self.consumer_secret,
-            self.token_secret.as_deref().unwrap_or(""),
-        );
+        let signature = match method_str.as_str() {
+            "HMAC-SHA1" => oauth1_hmac_sha1(
+                &base_string,
+                &self.consumer_secret,
+                self.token_secret.as_deref().unwrap_or(""),
+            ),
+            "HMAC-SHA256" => oauth1_hmac_sha256(
+                &base_string,
+                &self.consumer_secret,
+                self.token_secret.as_deref().unwrap_or(""),
+            ),
+            "HMAC-SHA512" => oauth1_hmac_sha512(
+                &base_string,
+                &self.consumer_secret,
+                self.token_secret.as_deref().unwrap_or(""),
+            ),
+            _ => unreachable!(),
+        };
 
         // Header params are quoted, nonce/signature included.
         let mut header_params = oauth;
@@ -747,6 +797,26 @@ fn oauth1_hmac_sha1(base_string: &str, consumer_secret: &str, token_secret: &str
     let key = format!("{}&{}", enc(consumer_secret), enc(token_secret));
     let mut mac = <HmacSha1 as KeyInit>::new_from_slice(key.as_bytes())
         .expect("HMAC-SHA1 accepts any key length");
+    mac.update(base_string.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// HMAC-SHA256 variant (TR-409: picker offers HMAC-SHA256; Bruno parity).
+fn oauth1_hmac_sha256(base_string: &str, consumer_secret: &str, token_secret: &str) -> String {
+    let key = format!("{}&{}", enc(consumer_secret), enc(token_secret));
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key.as_bytes())
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(base_string.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// HMAC-SHA512 variant (TR-409: picker offers RSA-SHA512 / HMAC-SHA512 family;
+/// we implement HMAC-SHA512; RSA variants remain unsupported and are reported
+/// as such before reaching this function).
+fn oauth1_hmac_sha512(base_string: &str, consumer_secret: &str, token_secret: &str) -> String {
+    let key = format!("{}&{}", enc(consumer_secret), enc(token_secret));
+    let mut mac = <HmacSha512 as KeyInit>::new_from_slice(key.as_bytes())
+        .expect("HMAC-SHA512 accepts any key length");
     mac.update(base_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
@@ -1392,64 +1462,119 @@ fn generate_crypto_nonce() -> String {
 /// This is the single signer-builder used by both the executor runner
 /// (`runner.rs`) and the HTTP client (`HttpClient::get_signer`) — the two
 /// previously duplicated builders were consolidated into this one function.
-pub fn build_auth_signer(auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
+///
+/// TR-409: any scheme the Rust side cannot do is reported as `Err(unsupported)`
+/// rather than silently degraded to `Ok(None)` (which the runner would treat
+/// as `NoAuth` and send the request unauthenticated — the TR-004 failure shape
+/// in a different costume). Callers must surface the error to the client as
+/// `unsupported` so the UI can disable the picker entry.
+pub fn build_auth_signer(auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>>> {
     match auth {
         // Explicit noauth: no signer — and crucially the RUNNER must not
         // fall back to scenario auth. The runner's `.or(scenario.auth)`
         // only falls through on `None`, so `Some(NoAuth)` reaching here
         // yields no signer while still blocking inheritance (Postman
         // semantics: noauth does NOT inherit collection/folder auth).
-        AuthConfig::NoAuth => None,
-        AuthConfig::Bearer { token } => Some(Box::new(BearerAuth::new(token))),
+        AuthConfig::NoAuth => Ok(None),
+        AuthConfig::Bearer { token } => Ok(Some(Box::new(BearerAuth::new(token)))),
         AuthConfig::Basic { username, password } => {
-            Some(Box::new(BasicAuth::new(username, password)))
+            Ok(Some(Box::new(BasicAuth::new(username, password))))
         }
         AuthConfig::ApiKey {
             key,
             value,
             location,
-        } => Some(Box::new(ApiKeyAuth::new(key, value, location.clone()))),
+        } => Ok(Some(Box::new(ApiKeyAuth::new(
+            key,
+            value,
+            location.clone(),
+        )))),
         AuthConfig::OAuth2 {
             access_token,
             token_type,
-        } => Some(Box::new(OAuth2Auth::new(access_token, token_type.clone()))),
+        } => Ok(Some(Box::new(OAuth2Auth::new(
+            access_token,
+            token_type.clone(),
+        )))),
         AuthConfig::AwsSigV4 {
             access_key,
             secret_key,
             region,
             service,
             session_token,
-        } => Some(Box::new(AwsSigV4Auth::new(
+        } => Ok(Some(Box::new(AwsSigV4Auth::new(
             access_key,
             secret_key,
             region.clone(),
             service.clone(),
             session_token.clone(),
-        ))),
+        )))),
         AuthConfig::OAuth1 {
             consumer_key,
             consumer_secret,
             token,
             token_secret,
-        } => Some(Box::new(OAuth1Auth::new(
-            consumer_key,
-            consumer_secret,
-            token.clone(),
-            token_secret.clone(),
-        ))),
+            signature_method,
+        } => {
+            // TR-409: validate the picker's signature method before constructing
+            // the signer. Unsupported methods are reported, not degraded.
+            if let Some(m) = signature_method {
+                let up = m.to_ascii_uppercase();
+                if !matches!(
+                    up.as_str(),
+                    "HMAC-SHA1" | "HMAC-SHA256" | "HMAC-SHA512"
+                ) {
+                    return Err(TropelError::Other(format!(
+                        "unsupported auth scheme: oauth1 signature_method '{}' — supported: HMAC-SHA1, HMAC-SHA256, HMAC-SHA512 (TR-409)",
+                        m
+                    )));
+                }
+            }
+            Ok(Some(Box::new(OAuth1Auth::new_with_method(
+                consumer_key,
+                consumer_secret,
+                token.clone(),
+                token_secret.clone(),
+                signature_method.clone(),
+            ))))
+        }
         AuthConfig::Hawk {
             auth_id,
             auth_key,
             algorithm,
-        } => Some(Box::new(HawkAuth::new(
+        } => Ok(Some(Box::new(HawkAuth::new(
             auth_id,
             auth_key,
             algorithm.clone(),
-        ))),
+        )))),
         AuthConfig::Digest { username, password } => {
-            Some(Box::new(DigestAuth::new(username, password)))
+            Ok(Some(Box::new(DigestAuth::new(username, password))))
         }
+        // TR-409: the four schemes below are consumed by knockport's picker
+        // (KP-401) but have no Rust implementation yet. Report as unsupported
+        // so the client can disable the picker entry and the request never
+        // goes out unauthenticated as `none`.
+        AuthConfig::Ntlm { .. } => Err(TropelError::Other(
+            "unsupported auth scheme: ntlm — NTLM proxy auth is not yet implemented (TR-409 KP-401); request not sent".into(),
+        )),
+        AuthConfig::Wsse { .. } => Err(TropelError::Other(
+            "unsupported auth scheme: wsse — WSSE UsernameToken is not wired through the signer builder yet (TR-409); request not sent".into(),
+        )),
+        AuthConfig::Jwt { .. } => Err(TropelError::Other(
+            "unsupported auth scheme: jwt — JWT bearer is not yet implemented as an AuthConfig variant (use bearer with a pre-signed token or oauth2/jwt via core-wasm sign_jwt) (TR-409)".into(),
+        )),
+        AuthConfig::AkamaiEdgeGrid { .. } => Err(TropelError::Other(
+            "unsupported auth scheme: akamai-edgegrid — Akamai EdgeGrid signing is not yet implemented (TR-409 KP-401); request not sent".into(),
+        )),
     }
+}
+
+/// Legacy wrapper for call sites that have not yet migrated to the `Result`
+/// return. Returns `None` on unsupported schemes — preserved only for tests
+/// that assert the old `Option` shape. New code must use `build_auth_signer`.
+#[allow(dead_code)]
+pub fn build_auth_signer_option(auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
+    build_auth_signer(auth).ok().flatten()
 }
 
 #[cfg(test)]
@@ -2290,6 +2415,7 @@ mod tests {
                     consumer_secret: "s".into(),
                     token: None,
                     token_secret: None,
+                    signature_method: None,
                 },
                 "oauth1",
             ),
@@ -2310,9 +2436,70 @@ mod tests {
             ),
         ];
         for (cfg, expected) in cases {
-            let signer = build_auth_signer(&cfg).expect("signer");
+            let signer = build_auth_signer(&cfg)
+                .expect("signer should not be Err for supported scheme")
+                .expect("signer should be Some for supported scheme");
             assert_eq!(signer.name(), expected);
         }
+        // TR-409: unsupported schemes must be reported as Err, never Ok(None)
+        // (which would be silently degraded to `none` / unauthenticated).
+        let unsupported = vec![
+            AuthConfig::Ntlm {
+                username: Some("u".into()),
+                password: Some("p".into()),
+                extra: Default::default(),
+            },
+            AuthConfig::Wsse {
+                username: Some("u".into()),
+                password: Some("p".into()),
+                extra: Default::default(),
+            },
+            AuthConfig::Jwt {
+                token: Some("tok".into()),
+                extra: Default::default(),
+            },
+            AuthConfig::AkamaiEdgeGrid {
+                access_token: Some("a".into()),
+                client_token: Some("c".into()),
+                extra: Default::default(),
+            },
+            AuthConfig::OAuth1 {
+                consumer_key: "c".into(),
+                consumer_secret: "s".into(),
+                token: None,
+                token_secret: None,
+                signature_method: Some("RSA-SHA1".into()),
+            },
+            AuthConfig::OAuth1 {
+                consumer_key: "c".into(),
+                consumer_secret: "s".into(),
+                token: None,
+                token_secret: None,
+                signature_method: Some("PLAINTEXT".into()),
+            },
+        ];
+        for cfg in unsupported {
+            let err = match build_auth_signer(&cfg) {
+                Ok(_) => panic!("unsupported scheme must be Err"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("unsupported"),
+                "error must mention unsupported: {err}"
+            );
+        }
+        // HMAC-SHA256 is supported — proves the picker value round-trips
+        let hmac256 = AuthConfig::OAuth1 {
+            consumer_key: "c".into(),
+            consumer_secret: "s".into(),
+            token: None,
+            token_secret: None,
+            signature_method: Some("HMAC-SHA256".into()),
+        };
+        let signer = build_auth_signer(&hmac256)
+            .expect("HMAC-SHA256 must be Ok")
+            .expect("HMAC-SHA256 must be Some");
+        assert_eq!(signer.name(), "oauth1");
     }
 
     #[test]

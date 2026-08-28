@@ -547,8 +547,8 @@ impl Engine {
             scenario_configs.len()
         );
 
-        // TR-505: effective VU reporting — warn at startup when the 4096 cap
-        // or cgroup pids limit will reduce concurrency.
+        // TR-505: effective VU reporting — warn at startup when the MAX_WORKERS cap
+        // (10 000) or cgroup pids limit will reduce concurrency.
         let peak_requested: u64 = {
             fn peak_for_exec(exec: &ExecutionConfig) -> u64 {
                 match exec {

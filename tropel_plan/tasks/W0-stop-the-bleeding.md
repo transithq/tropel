@@ -91,7 +91,7 @@ These are one story: the newest adapters do not work, and the npm side does not 
 **Effort:** M · **Blocked by:** none
 
 - [x] `lib.rs:302` matches `Some("http-request")`; Bruno's exporter rewrites the type, so no real export matches
-- [ ] Test fixtures are **exports produced by Bruno**, not hand-written JSON — this is exactly the gap that let it ship
+- [x] Test fixtures are **exports produced by Bruno**, not hand-written JSON — this is exactly the gap that let it ship
 - [x] Bruno path params are preserved (`:345` currently keeps only `param_type == "query"`)
 - [x] Duplicate query keys survive — `merge_pairs` joins with `", "`, collapsing `[{ids,1},{ids,2}]` into one
 - [x] A request that fails to convert is **reported**, not skipped: `if let Ok(child)` currently drops bad requests silently, contradicting the adapter's own docs
@@ -154,7 +154,7 @@ Emitting the two zero samples was correct and cheap.
 
 ### Acceptance criteria
 - [x] Both samples emitted again, **or** `aggregate_series` grows arms that return 0 for a metric with no observations — pick one and say why
-- [ ] A missing series never renders as `FAIL`; "no data" and "failed" are distinct verdicts (see `TR-111`)
+- [x] A missing series never renders as `FAIL`; "no data" and "failed" are distinct verdicts (see `TR-111`)
 - [x] `res.timings` and the emitted metrics agree — a test asserts it
 - [x] k6 also declares `looking_up` and never assigns it; emit it as 0 for byte-compat
 
@@ -192,7 +192,7 @@ It is undetectable from inside the tool. On a multiplexed stream the connector n
 - [x] h2 stream-queueing time is **not** reported as server latency — either its own timing or an explicit documented divergence
 - [x] Typed h2 error classification, replacing the substring match on error text at `driver.rs:1022`
 - [x] h2 keep-alive tuning: interval 10 s ✅landed, plus `timeout=5s` and `while_idle=true`
-- [ ] A benchmark against an h2 server with a low `MAX_CONCURRENT_STREAMS` proves the cap is gone or is documented
+- [x] A benchmark against an h2 server with a low `MAX_CONCURRENT_STREAMS` proves the cap is gone or is documented
 
 ### Do not re-file
 h2 is **on by default** — that is the problem, not the gap. hyper already overrides the h2 windows to 5 MiB / 2 MiB; at 10 k streams you want the stream window *smaller*, not larger.

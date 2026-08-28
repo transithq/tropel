@@ -47,7 +47,7 @@ let glue = null;
  *   - `wasmBytes`: ArrayBuffer/Uint8Array with the wasm (node/tests)
  */
 export async function initCoreWasm(options = {}) {
-  if (wasmInstance) return;
+  if (wasmInstance) return true;
   try {
     const g = await import("../pkg/tropel_core_wasm.js");
     let source = options.wasmBytes;
@@ -57,6 +57,7 @@ export async function initCoreWasm(options = {}) {
     }
     wasmInstance = await g.default({ module_or_path: source });
     glue = g;
+    return true;
   } catch (err) {
     throw new Error(
       `[tropel-core] core wasm init failed — dynamic-variable resolution is unavailable`,
