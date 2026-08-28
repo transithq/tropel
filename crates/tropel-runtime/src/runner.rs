@@ -1076,11 +1076,13 @@ fn resolve_auth(
             consumer_secret,
             token,
             token_secret,
+            signature_method,
         } => AuthConfig::OAuth1 {
             consumer_key: r(consumer_key),
             consumer_secret: r(consumer_secret),
             token: token.as_deref().map(r),
             token_secret: token_secret.as_deref().map(r),
+            signature_method: signature_method.as_deref().map(r),
         },
         AuthConfig::OAuth2 {
             access_token,
@@ -1110,6 +1112,73 @@ fn resolve_auth(
             auth_id: r(auth_id),
             auth_key: r(auth_key),
             algorithm: algorithm.as_deref().map(r),
+        },
+        AuthConfig::Ntlm {
+            username,
+            password,
+            extra,
+        } => AuthConfig::Ntlm {
+            username: username.as_deref().map(r),
+            password: password.as_deref().map(r),
+            extra: extra
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => serde_json::Value::String(r(s)),
+                        other => other.clone(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect(),
+        },
+        AuthConfig::Wsse {
+            username,
+            password,
+            extra,
+        } => AuthConfig::Wsse {
+            username: username.as_deref().map(r),
+            password: password.as_deref().map(r),
+            extra: extra
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => serde_json::Value::String(r(s)),
+                        other => other.clone(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect(),
+        },
+        AuthConfig::Jwt { token, extra } => AuthConfig::Jwt {
+            token: token.as_deref().map(r),
+            extra: extra
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => serde_json::Value::String(r(s)),
+                        other => other.clone(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect(),
+        },
+        AuthConfig::AkamaiEdgeGrid {
+            access_token,
+            client_token,
+            extra,
+        } => AuthConfig::AkamaiEdgeGrid {
+            access_token: access_token.as_deref().map(r),
+            client_token: client_token.as_deref().map(r),
+            extra: extra
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => serde_json::Value::String(r(s)),
+                        other => other.clone(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect(),
         },
     }
 }
@@ -1244,7 +1313,10 @@ mod tests {
             &self,
             req: &tropel_sdk::types::Request,
         ) -> Result<tropel_sdk::types::Response> {
-            let signer = req.auth.as_ref().and_then(|a| self.0.get_signer(a));
+            let signer = match req.auth.as_ref() {
+                Some(a) => self.0.get_signer(a)?,
+                None => None,
+            };
             let resp = self.0.execute(req, signer.as_deref()).await?;
             // Backlog line 312: use by-value conversion to avoid 16 clones.
             Ok(tropel_sdk::types::Response::from(resp))
