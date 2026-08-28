@@ -21,9 +21,9 @@
 //! the 1-VU-per-task design; a future refinement could cap growth when a
 //! script never calls `sleep()`.
 //!
-//! **Hard ceiling:** the pool never grows past `MAX_WORKERS` (4096). For a
-//! bounded executor with `vus > 4096` (an extreme 10k-VU constant test), VU
-//! `n` and VU `n+4096` would silently share a worker, so a blocking
+//! **Hard ceiling:** the pool never grows past `MAX_WORKERS` (10 000). For a
+//! bounded executor with `vus > 10 000` (an extreme 15k-VU constant test), VU
+//! `n` and VU `n+10_000` would silently share a worker, so a blocking
 //! `sleep()` in one could freeze the other — the cap trades strict isolation
 //! away at extreme VU counts to avoid exhausting the OS with one thread per
 //! VU. Realistic tests stay far below the cap, where isolation is exact.
@@ -327,7 +327,7 @@ impl VUWorkerPool {
     /// growing, so for any realistic test the pool sizes to PEAK CONCURRENCY
     /// and stays far below this cap — strict 1-VU-per-thread isolation is
     /// preserved. The cap only bites when a single run is concurrently busy
-    /// beyond 4096 VUs; once reached, additional VUs wrap onto existing
+    /// beyond 10 000 VUs; once reached, additional VUs wrap onto existing
     /// workers (isolation traded away at extreme VU counts, as documented).
     /// The vu_id passed to `run_vu` is unaffected (naming stays unique) —
     /// only the worker slot may be shared.
@@ -396,9 +396,9 @@ impl VUWorkerPool {
             }),
             Slot::Wrapped(idx) => {
                 // Line 387: warn once when wrapping begins so the user knows
-                // the reported VU count exceeds the pool capacity. At 10,000
-                // VUs with MAX_WORKERS=4096, workers 0–1,807 host 3 VUs each
-                // and 1,808–4,095 host 2, tripling iteration periods for
+                // the reported VU count exceeds the pool capacity. At 15,000
+                // VUs with MAX_WORKERS=10_000, workers 0–4,999 host 2 VUs each
+                // and 5,000–9,999 host 1, doubling iteration periods for
                 // co-located VUs.
                 use std::sync::Once;
                 static WRAP_WARNED: Once = Once::new();

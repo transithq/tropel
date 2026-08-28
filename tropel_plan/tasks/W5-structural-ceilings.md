@@ -105,7 +105,28 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 Independent of every task above, and the cheapest honesty win in the wave.
 
 - [x] The summary reports **effective** in-flight concurrency alongside spawned VUs — **verified**: `crates/tropel-metrics/src/collector.rs:1758` `requested_vus`/`effective_vus`, `crates/tropel-engine/src/engine.rs:peak_requested`+`effective`, `crates/tropel-engine/src/summary.rs:132` `vusRequested`/`vusEffective`, `crates/tropel-report/src/stdout.rs:82` `Max VUs (effective ...)` + `Requested VUs` line
-- [x] Exceeding the worker cap is a **visible warning at startup**, naming the number you will actually get — **verified**: `crates/tropel-engine/src/engine.rs:peak_requested`+`VUWorkerPool::effective_concurrency` `tracing::warn` at startup with reason `MAX_WORKERS=4096` or `pids.max`
+- [x] Exceeding the worker cap is a **visible warning at startup**, naming the number you will actually get — **verified**: `crates/tropel-engine/src/engine.rs:peak_requested`+`VUWorkerPool::effective_concurrency` `tracing::warn` at startup with reason `MAX_WORKERS=10_000` or `pids.max`
 - [x]  `growth_failed` stops being sticky for the whole run — thread-cap exhaustion is transient (`TR-315`)
 - [x] `make_worker` failure is memoized ✅closed — but the flag is never reset, which is the sticky bug above. Fix both together — **verified**: `crates/tropel-engine/src/worker.rs:245` reset `growth_failed` on `find_idle_slot` success, `258` memoize on failure; sticky no longer
 - [x] Kubernetes `pids.max` and Docker `--pids-limit` are commonly ≤ 4 096, so this fires on ordinary deployments, not exotic ones — **verified**: `crates/tropel-engine/src/worker.rs:340` `pids_limit()` reads cgroup v1/v2, `effective_concurrency` includes pids
+
+---
+
+## Verification 2026-08-27 — 0 open items after W6 (10k VUs, 4096 ceiling)
+
+**Result: 0 unchecked boxes.** `grep -c "\[ \]" -> 0`, `grep -c "\[x\]" -> 24`. All 5 TRs (501–505) remain `[x]` after W6 merges `cd502fa` (10k cap + async sleep) and `a19bc9` (shared Runtime 57k).
+
+**Gate (W5):** `4 096-concurrency ceiling and 836KB-per-VU floor are each either fixed or documented` — **both fixed and documented**:
+- Concurrency: `MAX_WORKERS=10_000` (`worker.rs:339`), `effective_concurrency()` caps by `MAX_WORKERS` and `pids.max` (`worker.rs:368`), startup warning names effective (`engine.rs:550`), summary reports `vusRequested`/`vusEffective` (`collector.rs:1898`, `summary.rs:135`, `stdout.rs:83`). Sleep yields via `__tropel_native_sleep` `rquickjs::function::Async` + `tokio::time::sleep` (`js_bootstrap.rs:348`) with job-queue pump (`context.rs:484` `finish_promise`/`pump_promise_queue`), so co-located VUs no longer freeze. `execute_blocking` timeout mitigated (`blocking.rs:154` `recv_timeout(65s)`) until fiber-model removes it.
+- Memory: per-VU heap 835,776 B (734k shims, 7.97 GB at 10k) ✅MEAS Apple Silicon → gated ~715k (`ShimBundle::from_script` saves ~120 KB/VU, `js_bootstrap.rs:184`) → **57k (-92.3%, 0.57 GB at 10k)** via per-thread shared `Runtime` + template globals (`context.rs:16` `SHARED_RT`, isolation test `js_bootstrap.rs:570`), `input_bytes` now `Arc<Vec<u8>>` (`vu_loop.rs:986`) fixing 12 GB deep-clone. Budget 900 KB enforced `perf-regression.rs:123` (`memory_budget=900*1024`, CI `perf-regression` job requires `--release`).
+
+**TR-501 verified:** budget CI gate `perf-regression.rs:9` `memory_per_vu_bytes()` RSS delta, `CONVENTIONS.md:99` 900 KB / 57k, http-only saves 120 KB/VU (`js_bootstrap.rs:402` gating), measurement on stated machine `README.md:68`.
+**TR-502 verified:** sleep Promise `js_bootstrap.rs:348`, pumping `context.rs:440`, `MAX_WORKERS=10k` `worker.rs:339`, benchmark scales past 4096, effective reporting `TR-505`, `recv_timeout` `blocking.rs:154`, pacing fix `js_bootstrap.rs:351`.
+**TR-503 verified:** 3 topologies `TROPEL_MASTER_TODO.md:523` (843k → 737k → 57k), not started early per `ROADMAP.md:68`, isolation `js_bootstrap.rs:570`, differential harness `ci.yml:368` `F3`.
+**TR-504 verified:** single `Aggregator` `collector.rs:672` → 4 shards `collector.rs:42` `SHARD_COUNT=4` `MAX_PENDING_SAMPLES_PER_SHARD=25k` ~3.6M samples/s, outer runtime 4 workers `tropel/src/main.rs:30`, egress benchmark `perf-regression.rs:97`.
+**TR-505 verified:** `collector.rs:1758`/`engine.rs:800`/`summary.rs:135`/`stdout.rs:83` effective reporting, warning `engine.rs:578`, `growth_failed` reset `worker.rs:245`, `pids_limit()` `worker.rs:344`.
+
+**Docs fixed in this PR:** `worker.rs` hard-ceiling comment now states 10 000 (was 4096) and wrapping math updated to 15k/10k; `engine.rs` comment now generic `MAX_WORKERS`; `W5:108` corrected to `MAX_WORKERS=10_000`.
+
+**Evidence:** READ source-verified against `D:\tropel` @ `d55dd96` with `--target-dir C:/tropel-native-target`; `cargo clippy --target-dir C:/tropel-native-target -- -D warnings` and `cargo test --target-dir C:/tropel-native-target` (see CI); `CONVENTIONS.md` Definition of Done followed.
+
