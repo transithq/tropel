@@ -16,8 +16,39 @@
 //!    INSIDE the timed body (a fresh batch per iteration) so the number is a
 //!    real per-context allocation, not a constant captured once.
 //!
-//! 6. **samples_egress** and **aggregator_duty_cycle** — output and aggregation.
-//! 7. **ramp_wall_clock** and **request_path_allocations** — W3 regression floors.
+//! 6. **samples_egress** and **aggregator_duty_cycle** — the metrics pipeline,
+//!    driven through the real `MetricsCollector`.
+//! 7. **request_path_allocations** — the twelve-sample set one HTTP hop emits,
+//!    sharing one `Arc<TagMap>` (TR-312).
+//! 8. **otlp_per_window_cpu** — the real `build_export_request` + gzip at
+//!    100 k samples per 100 ms window (TR-304).
+//! 9. **h2_lanes** and **script_hash_vs_precomputed** — client-side lane
+//!    selection cost, and the 246 KB per-iteration hash TR-311 removed.
+//!
+//! # What is deliberately NOT here
+//!
+//! Five benches were removed rather than left in place, because each measured
+//! something other than its name and each had a MEAS number in the wave docs
+//! attributed to it (TR-002):
+//!
+//! * `wasmtime_fuel_vs_no_fuel` — both arms ran the SAME native `fib(30)`.
+//!   No wasmtime, no fuel, no guest; the ratio was 1.0 by construction, and
+//!   "1.8x" was quoted from it.
+//! * `h2_lanes_scaling` — an `AtomicUsize::fetch_add` loop, quoted as
+//!   "1.9x at 2 lanes, 3.4x at 4 lanes" against a loopback h2 server that
+//!   does not exist in this tree.
+//! * `otlp_per_window_cpu` (old form) — gzipped `"a".repeat(50_000)`, never
+//!   touching the OTLP encoder. Rewritten above rather than deleted.
+//! * `ramp_wall_clock` — added integers in a loop. There is no public
+//!   step-table API to benchmark; see TR-220.
+//! * `soak_memory` — a 10 k-iteration HashMap insert/remove, quoted as
+//!   "RSS delta <5 % after 24 h at 1 k RPS". A real soak needs a long-running
+//!   harness, not a criterion bench; see TR-315.
+//! * `slow_output_isolation` — nothing in it was slow and it asserted
+//!   nothing. criterion cannot assert; the isolation claim needs a test.
+//!
+//! A benchmark whose two arms are the same function is worse than no
+//! benchmark: it launders a fabricated ratio into a MEAS number.
 //!
 //! Run in release mode: `cargo bench -p tropel-bench --release`.
 
@@ -74,16 +105,26 @@ fn process_rss_bytes() -> Option<u64> {
         // mach_task_basic_info { resident_size, virtual_size, ... }.
         // The struct embeds time_value_t fields (nested structs), so it is
         // zero-initialized rather than spelled out field-by-field.
+        // `mach_task_self` is deprecated in `libc` in favour of the `mach2`
+        // crate, and deprecation is an error under `-D warnings` — so on macOS
+        // this file did not lint. CI only runs clippy on ubuntu, and
+        // `cargo test` skips `harness = false` benches, so nothing caught it:
+        // the whole bench crate went uncompiled on the platform its own
+        // MEAS numbers were measured on (TR-002).
+        //
+        // `mach2` is already in the tree (wasmtime pulls it), so this adds no
+        // dependency weight.
         use libc::{
-            mach_task_basic_info, mach_task_self, task_info, KERN_SUCCESS, MACH_TASK_BASIC_INFO,
+            mach_task_basic_info, task_info, KERN_SUCCESS, MACH_TASK_BASIC_INFO,
             MACH_TASK_BASIC_INFO_COUNT,
         };
+        use mach2::traps::mach_task_self;
         let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
         // task_info writes the count back, so it must be a mutable binding.
         let mut count = MACH_TASK_BASIC_INFO_COUNT;
         let kr = unsafe {
             task_info(
-                mach_task_self(),
+                mach_task_self() as libc::mach_port_t,
                 MACH_TASK_BASIC_INFO,
                 &mut info as *mut mach_task_basic_info as *mut libc::integer_t,
                 &mut count,
@@ -400,42 +441,64 @@ fn aggregator_duty_cycle(c: &mut Criterion) {
     group.finish();
 }
 
-/// TR-002: wall-clock cost of the scheduler's ramp pacing calculation.
-fn ramp_wall_clock(c: &mut Criterion) {
-    let mut group = c.benchmark_group("throughput");
-    group.bench_function("ramp_10000_vus_10_stages", |b| {
-        b.iter(|| {
-            let mut target = 0u32;
-            for stage in 0..10u32 {
-                target = std::hint::black_box(target.saturating_add(1000 + stage));
-                std::hint::black_box(std::time::Duration::from_millis(100));
-            }
-            target
-        });
-    });
-    group.finish();
-}
-
-/// TR-002: request-path allocation floor using the same metric/tag shape as
-/// the runner. This intentionally excludes network I/O and isolates request
-/// bookkeeping allocations from server variance.
+/// TR-312: the per-request bookkeeping floor — the FULL sample set one HTTP
+/// hop emits, not a single sample.
+///
+/// The previous version built one `Sample` with two tags and called that the
+/// "request path", then a 200 us/1 MB-body figure was attributed to it. A hop
+/// emits twelve samples sharing one `Arc<TagMap>` of seven tags: that sharing
+/// is the optimisation TR-312 is about, so the bench has to build the whole
+/// set or it measures nothing about it.
+///
+/// Network I/O is excluded deliberately — this isolates bookkeeping from
+/// server variance. It does NOT measure body copies; nothing here has a body.
 fn request_path_allocations(c: &mut Criterion) {
     use std::sync::Arc;
     use tropel_sdk::types::{Sample, SampleType, TagMap};
+
+    const HOP_METRICS: [(&str, SampleType); 12] = [
+        ("http_req_duration", SampleType::Trend),
+        ("http_reqs", SampleType::Counter),
+        ("http_req_failed", SampleType::Rate),
+        ("http_req_blocked", SampleType::Trend),
+        ("http_req_dns", SampleType::Trend),
+        ("http_req_connecting", SampleType::Trend),
+        ("http_req_tls_handshaking", SampleType::Trend),
+        ("http_req_sending", SampleType::Trend),
+        ("http_req_waiting", SampleType::Trend),
+        ("http_req_receiving", SampleType::Trend),
+        ("data_sent", SampleType::Counter),
+        ("data_received", SampleType::Counter),
+    ];
+
     let mut group = c.benchmark_group("throughput");
-    group.bench_function("record_http_sample", |b| {
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("per_hop_sample_set_12_samples_7_tags", |b| {
         b.iter(|| {
-            let mut tags = TagMap::new();
-            tags.insert("url", "https://example.test/api");
+            let mut tags = TagMap::with_capacity(7);
+            tags.insert("url", "https://example.test/api/resource/42");
+            tags.insert("method", "GET");
             tags.insert("status", "200");
-            let sample = Sample {
-                metric: "http_req_duration".into(),
-                value: 12.5,
-                tags: Arc::new(tags),
-                timestamp: std::time::SystemTime::now(),
-                sample_type: SampleType::Trend,
-            };
-            std::hint::black_box(sample)
+            tags.insert("name", "getResource");
+            tags.insert("group", "::checkout");
+            tags.insert("scenario", "default");
+            tags.insert("expected_response", "true");
+            // One Arc shared by all twelve samples — the whole point of
+            // TR-312's tag work is that this is a refcount bump per sample,
+            // not a map copy.
+            let tags = Arc::new(tags);
+            let now = std::time::SystemTime::now();
+            let mut samples = Vec::with_capacity(HOP_METRICS.len());
+            for (name, sample_type) in HOP_METRICS {
+                samples.push(Sample {
+                    metric: name.into(),
+                    value: 12.5,
+                    tags: tags.clone(),
+                    timestamp: now,
+                    sample_type,
+                });
+            }
+            std::hint::black_box(samples)
         });
     });
     group.finish();
@@ -540,79 +603,70 @@ fn h2_lanes(c: &mut Criterion) {
 /// emit) must not back-pressure the VU hot loop; VU throughput stays flat and
 /// the drop counter is reported. Benches `record_batch` throughput at 10 k
 /// samples/s against a laggy sink vs a fast one.
-fn slow_output_isolation(c: &mut Criterion) {
-    use std::sync::Arc;
-    use tropel_metrics::collector::MetricsCollector;
-    use tropel_sdk::types::{Sample, SampleType, TagMap};
-    let mut group = c.benchmark_group("throughput");
-    group.measurement_time(Duration::from_secs(3));
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    group.bench_function("slow_output_vs_fast_10k", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let collector = MetricsCollector::new();
-                let tags: Arc<TagMap> = Arc::new(TagMap::new());
-                // Simulate the slow-output path: the broadcast sink is laggy,
-                // but `record_batch` uses `try_send` (never blocks the VU) and
-                // increments `AGGREGATOR_SAMPLES_DROPPED` instead.
-                for i in 0..1_000 {
-                    collector
-                        .record(&Sample {
-                            metric: format!("m{}", i % 10).into(),
-                            value: i as f64,
-                            tags: tags.clone(),
-                            timestamp: std::time::SystemTime::now(),
-                            sample_type: SampleType::Counter,
-                        })
-                        .await;
-                }
-                // Drain via `results()` so the aggregator actually processes.
-                let r = collector.results().await;
-                std::hint::black_box(r);
-            })
-        })
-    });
-    group.finish();
-}
-
-/// TR-303: h2 lane scaling — N independent reqwest::Client lanes vs one.
-/// Measures round-robin lane selection and the `http2_connections` config path.
-/// The real scaling is validated against a loopback h2 server with
-/// `MAX_CONCURRENT_STREAMS=10` in `tropel-http::client::pick_lane` tests;
-/// this bench isolates the selection overhead (one AtomicUsize fetch_add).
-fn h2_lanes_scaling(c: &mut Criterion) {
-    let mut group = c.benchmark_group("throughput");
-    group.bench_function("pick_lane_round_robin_100k", |b| {
-        let lanes = 4usize;
-        let cursor = std::sync::atomic::AtomicUsize::new(0);
-        b.iter(|| {
-            for _ in 0..100_000 {
-                let _ = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % lanes;
-            }
-            std::hint::black_box(&cursor);
-        })
-    });
-    group.finish();
-}
-
-/// TR-304: OTLP per-window CPU — HashMap grouping + gzip per 100 ms window
-/// at 100 k samples/s must stay under 20 % of one core (20 ms per window).
-/// The old O(n²) tag-set scan was 140–750 ms (1.4–7.5× oversubscribed).
+/// TR-304: OTLP per-window CPU — the REAL encode path plus gzip, at the
+/// egress rate the budget is written for.
+///
+/// The previous version of this bench gzipped `"a".repeat(50_000)` and never
+/// called `OtlpOutput`'s encoder at all, so its "18 ms per 100 ms window"
+/// number described nothing in the product (TR-002). It also compressed 50 KB
+/// of one repeated byte, which is the best case gzip has — real OTLP JSON is
+/// nothing like it.
+///
+/// This builds one REAL 100 ms window at the budgeted egress rate: 100 k
+/// samples/s means 10 000 samples per window, spread over 100 tagged series.
+/// It runs `build_export_request` (the O(1) HashMap grouping that replaced the
+/// O(n^2) tag-set scan), serializes, and gzips.
+///
+/// Read the reported time against **20 ms** — that is 20 % of one core per
+/// 100 ms window, the `CONVENTIONS.md` aggregator budget. Above 100 ms the
+/// output cannot keep up with its own window at all and the drop counter
+/// starts moving.
 fn otlp_per_window_cpu(c: &mut Criterion) {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tropel_sdk::types::{Sample, SampleType, TagMap};
+
     let mut group = c.benchmark_group("throughput");
-    group.bench_function("otlp_gzip_100k_window", |b| {
-        // 100 distinct series × 1000 samples = 100 k samples, HashMap grouping
-        // as the OTLP output does (HashMap O(1) not Vec find).
-        let payload = "a".repeat(50_000);
+    group.throughput(Throughput::Elements(10_000));
+    group.measurement_time(Duration::from_secs(10));
+
+    // 100 series x 100 samples = 10 000, one 100 ms window at 100 k samples/s.
+    // Tags are realistic: the set an HTTP sample
+    // actually carries, with a varying url so the grouping does real work
+    // rather than collapsing to one bucket.
+    let mut metrics: HashMap<String, Vec<Sample>> = HashMap::new();
+    for series in 0..100u32 {
+        let mut tags = TagMap::with_capacity(7);
+        tags.insert("url", format!("https://example.test/api/resource/{series}"));
+        tags.insert("method", "GET");
+        tags.insert("status", "200");
+        tags.insert("name", format!("resource_{series}"));
+        tags.insert("group", "::checkout");
+        tags.insert("scenario", "default");
+        tags.insert("expected_response", "true");
+        let tags = Arc::new(tags);
+        let entry = metrics
+            .entry("http_req_duration".to_string())
+            .or_insert_with(|| Vec::with_capacity(10_000));
+        for i in 0..100u32 {
+            entry.push(Sample {
+                metric: "http_req_duration".into(),
+                value: f64::from(i % 250) + 0.5,
+                tags: tags.clone(),
+                timestamp: std::time::SystemTime::now(),
+                sample_type: SampleType::Trend,
+            });
+        }
+    }
+
+    group.bench_function("otlp_encode_and_gzip_one_100ms_window", |b| {
         b.iter(|| {
             use std::io::Write as _;
-            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            e.write_all(payload.as_bytes()).unwrap();
-            let compressed = e.finish().unwrap();
-            std::hint::black_box(compressed.len());
+            let payload = tropel_report::otlp::build_export_request(&metrics);
+            let json = serde_json::to_vec(&payload).expect("export request serializes");
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&json).expect("gzip write");
+            std::hint::black_box(enc.finish().expect("gzip finish").len())
         })
     });
     group.finish();
@@ -644,49 +698,6 @@ fn script_hash_vs_precomputed(c: &mut Criterion) {
     group.finish();
 }
 
-/// TR-314: wasmtime fuel vs epoch interruption — the 2–2.6× dial.
-/// Fuel is a decrement per basic block (~1.5–2×), epoch is ~1–3 %.
-/// This bench isolates the guest loop cost (pure CPU Fibonacci) so the
-/// ratio is visible without network variance.
-fn wasmtime_fuel_vs_no_fuel(c: &mut Criterion) {
-    let mut group = c.benchmark_group("throughput");
-    // Fibonacci(30) — tight loop, representative of guest dispatch.
-    fn fib(n: u64) -> u64 {
-        if n < 2 {
-            n
-        } else {
-            fib(n - 1) + fib(n - 2)
-        }
-    }
-    group.bench_function("fib30_fuel_on", |b| {
-        b.iter(|| std::hint::black_box(fib(30)))
-    });
-    group.bench_function("fib30_fuel_off", |b| {
-        b.iter(|| std::hint::black_box(fib(30)))
-    });
-    group.finish();
-}
-
-/// TR-315: soak-memory flatness — asserts RSS delta <5 % after a simulated
-/// 24 h at 1 k RPS (bounded `merged_per_url`/`per_group` by `max_series`).
-fn soak_memory(c: &mut Criterion) {
-    let mut group = c.benchmark_group("throughput");
-    group.bench_function("soak_hashmap_growth_100k_series", |b| {
-        b.iter(|| {
-            let mut m: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-            for i in 0..10_000 {
-                m.insert(format!("url_{i}"), i);
-                if m.len() > 1_000 {
-                    // Bounded by `max_series` — evicts instead of growing.
-                    m.remove(&format!("url_{}", i - 1_000));
-                }
-            }
-            std::hint::black_box(m.len())
-        })
-    });
-    group.finish();
-}
-
 criterion_group!(
     perf,
     context_bootstrap,
@@ -696,14 +707,9 @@ criterion_group!(
     memory_per_vu,
     samples_egress,
     aggregator_duty_cycle,
-    ramp_wall_clock,
     request_path_allocations,
     h2_lanes,
-    slow_output_isolation,
-    h2_lanes_scaling,
     otlp_per_window_cpu,
-    script_hash_vs_precomputed,
-    wasmtime_fuel_vs_no_fuel,
-    soak_memory
+    script_hash_vs_precomputed
 );
 criterion_main!(perf);

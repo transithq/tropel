@@ -97,7 +97,7 @@ Stop and ask on any of these:
 | Eager wasm tier, post-`wasm-opt` | **700 KB** | 611,733 B ✅MEAS — 88 KB headroom, not the 243 KB the README claims |
 | Lazy import tier | 1.5 MB | — |
 | QuickJS heap per VU, before user script | **900 KB (TR-501/TR-503)** | **497,584 B** ✅MEAS (`malloc_size`, release, Apple Silicon; bare context 104,768 B) · ~4.6 GB at 10k. `TR-503`'s shared `Runtime` is **NOT implemented** — the 57 KB figure was never measured, see `TR-503`. Reproduce: `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored` |
-| Egress, sustained | 100 k samples/s with the drop counter at **zero** | ~10–30 k samples/s, oversubscribed 1.4–7.5×; sharded 4-way ~3.6M samples/s |
+| Egress, sustained | 100 k samples/s with the drop counter at **zero** | **OTLP: 123.76 ms per 100 ms window ✅MEAS** (6.2× the 20 ms budget; max ~80.8 k samples/s) — gzip fixed the wire, not the CPU; protobuf still open (TR-304). The 4-way aggregator shard is real, but the aggregator is not the binding constraint — the output encoder is |
 | In-flight concurrency | **10,000** — `MAX_WORKERS=10k` + async `sleep` Promise (`TR-502`) | 10,000 via 10k workers, sleep yields via `tokio::time::sleep` + job-queue, `pids.max` caps in containers |
 | Aggregator duty cycle | < 20 % | ~45 % — `build_results` throttles load generation to ~55 % |
 

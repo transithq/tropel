@@ -25,6 +25,20 @@ flate2 = { version = "1.1.9" }
 windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 # RSS measurement on macOS: mach task_info (MACH_TASK_BASIC_INFO).
 libc = "0.2"
+# TR-002/TR-304: the OTLP window bench measures the REAL encoder, so it needs
+# the reporter crate and a JSON serializer. The bench it replaced gzipped a
+# synthetic string and its CPU number described nothing in the product.
+tropel-report.workspace = true
+serde_json.workspace = true
+
+# `libc::mach_task_self` is deprecated in favour of `mach2`, and a deprecation
+# is an error under `-D warnings` — so this crate did not lint on macOS. CI runs
+# clippy on ubuntu only, and `cargo test` skips `harness = false` benches, so
+# nothing caught it: the bench crate went uncompiled on the very platform its
+# MEAS numbers were taken on (TR-002). `mach2` is already in the tree via
+# wasmtime, so this adds no dependency weight.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+mach2 = "0.5"
 
 [[bin]]
 name = "perf-regression"

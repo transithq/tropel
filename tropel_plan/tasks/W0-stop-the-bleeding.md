@@ -42,7 +42,7 @@ What remains is narrow, and it is the part that makes the counter trustworthy ra
 
 ### Acceptance criteria
 - [x] Per-iteration CPU, per-VU memory at spawn
-- [x] Benchmarks for: **samples/s egress per output**, **aggregator duty cycle**, **ramp wall-clock**, **request-path allocations**
+- [ ] Benchmarks for: **samples/s egress per output**, **aggregator duty cycle**, **ramp wall-clock**, **request-path allocations** — **PARTIALLY REOPENED 2026-08-29.** Egress, duty cycle and request-path allocations are real and drive production code. **Ramp wall-clock is not measured at all** — the bench with that name added integers in a loop, and there is no public step-table API to benchmark (see TR-220). Five benches in this suite measured something other than their name, each with a MEAS number quoted from it in W3/W5; they are deleted or rewritten and the claims withdrawn. See the `perf.rs` module header for the list
 - [x] Each emits a machine-readable number CI can compare against a committed baseline
 - [x] Release profile only — a debug measurement is not a measurement (see `TROPEL_PERF_VS_K6.md` §1: debug runs the serde/alloc/QuickJS path 3–10× slower, and the original 22 % gap was measured debug-vs-release)
 - [x] The harness records the machine, so ✅MEAS claims are reproducible

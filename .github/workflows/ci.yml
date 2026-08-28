@@ -118,6 +118,14 @@ jobs:
           key: ${{ matrix.os }}
       - name: Build tests
         run: cargo test --workspace --no-run --locked
+      # `cargo test` does NOT build `harness = false` bench targets, and clippy
+      # runs on ubuntu only — so `tropel-bench` was compiled by no job on macOS
+      # or Windows. It had been failing to lint on macOS (deprecated
+      # `libc::mach_task_self`) while its MEAS numbers were quoted as measured
+      # there. Benches are the measurement floor for all of W3/W5; they have to
+      # at least compile everywhere (TR-002).
+      - name: Build benches
+        run: cargo bench --workspace --no-run --locked
       - name: Run tests
         run: cargo test --workspace -- --nocapture
 
