@@ -120,8 +120,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
+      # The wasm-target crates are excluded from the THREE-OS matrix and run
+      # once on ubuntu below.
+      #
+      # `tropel-input-wasm` pulls five input adapters plus wasm-bindgen, and
+      # building it natively on Windows was timing the job out at 45 min. It
+      # is a wasm-bindgen crate: its reason to exist is `wasm32-unknown-unknown`,
+      # which the dedicated `wasm` job builds properly via
+      # `packages/*/scripts/build.sh`. Compiling it three more times natively
+      # bought nothing.
+      #
+      # Their ~8 native tests are pure Rust (adapter dispatch, the variable
+      # catalog) with no platform-specific code, so running them once is real
+      # coverage, not a coverage cut. Excluding them from macOS/Windows only
+      # removes duplicate work.
       - name: Build tests
-        run: cargo test --workspace --no-run --locked
+        run: cargo test --workspace --exclude tropel-input-wasm --exclude tropel-core-wasm --no-run --locked
       # `cargo test` does NOT build `harness = false` bench targets, and clippy
       # runs on ubuntu only — so `tropel-bench` was compiled by no job on macOS
       # or Windows. It had been failing to lint on macOS (deprecated
@@ -129,9 +143,14 @@ jobs:
       # there. Benches are the measurement floor for all of W3/W5; they have to
       # at least compile everywhere (TR-002).
       - name: Build benches
-        run: cargo bench --workspace --no-run --locked
+        run: cargo bench --workspace --exclude tropel-input-wasm --exclude tropel-core-wasm --no-run --locked
       - name: Run tests
-        run: cargo test --workspace -- --nocapture
+        run: cargo test --workspace --exclude tropel-input-wasm --exclude tropel-core-wasm -- --nocapture
+      # Run the excluded pair exactly once, so the exclusion above trades
+      # duplicate work for wall-clock without trading away coverage.
+      - name: Test the wasm-target crates (ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p tropel-input-wasm -p tropel-core-wasm -- --nocapture
 
   msrv:
     name: MSRV 1.94
