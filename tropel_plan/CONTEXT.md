@@ -45,6 +45,9 @@ A fix that trades one of these away is a regression even if it closes its ticket
 - **`SharedArray`** — native copy with no per-element `JSON.parse`; k6's re-parses *and* recursively freezes on every element access.
 - **`discardResponseBodies`** implemented correctly — it *drains* the body so the pooled connection survives.
 - **Executors and outputs are a k6 v2 superset** — `externally-controlled` and StatsD were both deleted in k6 v2 and tropel kept them.
+- **Transport failures keep their timing.** k6 records a genuine `0` for every phase on a transport error, which is honest per-phase but throws the signal away: a connection refused in 2 ms and a 30 s timeout are indistinguishable in k6's output. Tropel matches k6 on `http_req_duration` (a ported threshold must get k6's answer) and keeps the elapsed time in its own `http_req_time_to_failure` series, so parity costs nothing (TR-203).
+
+> **The rule these follow.** Match k6 exactly on any series a k6 script can read — that is what makes a ported threshold correct. Where k6 is simply *deficient*, add rather than diverge: a new series, a better algorithm, a cap k6 lacks. Tropel should never be worse than k6 at anything, and "parity" is never a reason to reproduce a k6 shortcoming — `CONVENTIONS.md`'s D4 says it outright: *parity means "a k6 script gets k6's answer", not "copy k6's bugs"*.
 
 ## The settled decisions
 

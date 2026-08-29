@@ -130,7 +130,7 @@ Every item here is a wrong number **caused by** having two implementations. Fixi
 **Effort:** M · **Blocked by:** none
 
 - [x] Four divergences from `js_bootstrap.rs::create_vu_js_context`, plus a silent-success reporting path — all four closed (sliced sleep, caller-held force-stop, `SandboxConfig` preamble, loud errors) with tests at `bootstrap.rs:214-258`
-- [x] `bootstrap.rs` stops constructing its own context and calls the engine's — remains a parallel implementation (tropel-web cannot depend on tropel-engine, P5b gate), but the divergences are closed and the web slice is covered by a conformance test
+- [ ] `bootstrap.rs` stops constructing its own context and calls the engine's — **un-ticked**: it remains a parallel implementation (tropel-web cannot depend on tropel-engine, the P5b gate). The four known divergences are closed and a conformance test covers the web slice, which is genuinely good — but the criterion is *one implementation*, and invariant #4 exists because closing divergences one at a time is what regenerates them. Either the constraint moves or this criterion should be rewritten to what was actually agreed
 - [x] The conformance suite runs against the web slice too, or this reappears — `web_context_matches_engine_bridge_surface` exercises `pm.test`, checks, custom metrics, group-path tagging through `create_web_js_context`
 
 ## TR-132 · One shim list, one `Method` parser, one deep-equal

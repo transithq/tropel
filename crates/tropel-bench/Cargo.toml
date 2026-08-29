@@ -41,9 +41,30 @@ serde_json.workspace = true
 mach2 = "0.5"
 
 [[bin]]
+name = "soak"
+path = "src/bin/soak.rs"
+
+[[bin]]
 name = "perf-regression"
 path = "src/bin/perf-regression.rs"
 
 [[bench]]
 name = "perf"
 harness = false
+
+# RSS sampling for the soak harness. Scoped per-target so adding it does not
+# perturb the dependency graph on the other two platforms — declaring
+# windows-sys unconditionally re-unified it from 0.52 to 0.61 for unrelated
+# crates, which is a bigger change than a soak harness should make.
+#
+# `libc::mach_task_self` is deprecated in favour of `mach2`, and a deprecation
+# is an error under `-D warnings`. mach2 is already in the tree via wasmtime.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+mach2 = "0.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }

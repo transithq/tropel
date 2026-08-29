@@ -808,8 +808,25 @@ impl ScenarioRunner {
                                 // where every request failed. Mirrors the k6
                                 // driver's push_http_failure (same names,
                                 // same zero values — one contract).
+                                // TR-203: a genuine ZERO, matching k6. The
+                                // seven sub-timings below are 0, so emitting
+                                // elapsed here made
+                                // `duration != sending + waiting + receiving`
+                                // in tropel's own data — on exactly the
+                                // samples a saturated run produces most of.
                                 result.samples.push(tropel_sdk::types::Sample {
                                     metric: "http_req_duration".into(),
+                                    value: 0.0,
+                                    tags: err_tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Trend,
+                                });
+                                // Time-to-failure keeps its own series (a
+                                // tropel superset, not a k6 metric) so the
+                                // "fast refusal vs 30 s timeout" signal is
+                                // not lost to the parity fix.
+                                result.samples.push(tropel_sdk::types::Sample {
+                                    metric: "http_req_time_to_failure".into(),
                                     value: duration.as_secs_f64() * 1000.0,
                                     tags: err_tags.clone(),
                                     timestamp: now,
@@ -2443,9 +2460,28 @@ mod tests {
             .filter(|s| s.metric == "http_req_duration")
             .collect();
         assert_eq!(durations.len(), 2, "two failure durations");
+        // INVERTED (TR-203). This previously asserted `value > 0.0` —
+        // "failure duration must carry the time-to-failure" — which pinned a
+        // k6 divergence as correct and contradicted TR-202's own formula:
+        // the seven sub-timings are emitted as 0, so the duration must be 0
+        // too or `duration != sending + waiting + receiving` in our own data.
+        // k6's measureAndEmitMetrics has no error branch; every timing
+        // records a genuine zero.
         assert!(
-            durations.iter().all(|s| s.value > 0.0),
-            "failure duration must carry the time-to-failure"
+            durations.iter().all(|s| s.value == 0.0),
+            "failure duration must be a genuine zero (k6 parity), got {:?}",
+            durations.iter().map(|s| s.value).collect::<Vec<_>>()
+        );
+        // The time-to-failure signal is preserved in its own series.
+        let ttf: Vec<_> = samples
+            .iter()
+            .filter(|s| s.metric == "http_req_time_to_failure")
+            .collect();
+        assert_eq!(ttf.len(), 2, "each failure emits http_req_time_to_failure");
+        assert!(
+            ttf.iter().all(|s| s.value > 0.0),
+            "time-to-failure must carry the real elapsed time, got {:?}",
+            ttf.iter().map(|s| s.value).collect::<Vec<_>>()
         );
         let failed: Vec<_> = samples
             .iter()
@@ -2471,5 +2507,27 @@ mod tests {
                 "failure path must emit {sub}"
             );
         }
+
+        // TR-202/TR-203: the identity must hold on the failure path too.
+        // `http_req_duration` is DEFINED as sending + waiting + receiving; the
+        // failure path emitted `elapsed` while those three were 0, so tropel's
+        // own data contradicted its own formula on exactly the samples a
+        // saturated run produces most of. Nothing asserted it, which is why it
+        // survived both TR-202 and TR-121.
+        let sum_of = |metric: &str| -> f64 {
+            samples
+                .iter()
+                .filter(|s| s.metric == metric)
+                .map(|s| s.value)
+                .sum()
+        };
+        let duration_total = sum_of("http_req_duration");
+        let phases_total =
+            sum_of("http_req_sending") + sum_of("http_req_waiting") + sum_of("http_req_receiving");
+        assert!(
+            (duration_total - phases_total).abs() < f64::EPSILON,
+            "http_req_duration ({duration_total}) must equal sending + waiting + receiving \
+             ({phases_total}) on the failure path — that identity is the whole of TR-202"
+        );
     }
 }

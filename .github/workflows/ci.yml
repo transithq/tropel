@@ -25,6 +25,10 @@ name: CI
 on:
   push:
     branches: [master]
+  # TR-315: the long soak. GitHub-hosted runners hard-cap a job at 6 h, so a
+  # literal 24 h run needs a self-hosted runner — see the `soak` job below.
+  schedule:
+    - cron: "0 3 * * 0"   # Sundays 03:00 UTC
   pull_request:
     # P4a (TROPEL_MODULARIZATION_TODO.md): docs-only PRs skip the full matrix.
     # Everything that can affect a build is covered: crates, the shim bundle,
@@ -261,6 +265,16 @@ jobs:
           set -euo pipefail
           npm install --no-audit --no-fund
           echo "ok: root npm install resolved the workspace"
+      # TR-013: `packages/shims/deep-equal.test.mjs` is the test TR-013's
+      # acceptance criteria require ("property test over generated object
+      # pairs, asserting agreement with a reference implementation"). It
+      # exists, it passes, and no CI job ran it — so the shared deep-equal
+      # that pm.expect(...).to.eql, chai's deepEqual and the k6 shim all
+      # delegate to had no gate. It needs no Rust toolchain and no wasm
+      # artifact, so it belongs here rather than in the wasm job.
+      - name: Run the JS unit tests that need no build (TR-013)
+        run: node packages/shims/deep-equal.test.mjs
+
       # TR-009: @tropel/core-wasm must load from a clean clone with NO Rust
       # toolchain present. `src/index.js` used a static top-level import of
       # build-generated pkg/meta.js, which failed at module load with ENOENT.
@@ -282,6 +296,44 @@ jobs:
               console.log("ok: @tropel/core-wasm loads from clean clone without a Rust build");
             });
           '
+
+  k6-conformance:
+    name: k6 conformance (TR-202 http_req_duration parity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # TR-202 is the highest-impact parity item in the plan: k6 defines
+    # http_req_duration as sending + waiting + receiving, deliberately
+    # excluding blocked/connecting/tls_handshaking. Get it wrong and every
+    # duration threshold ported from a k6 script is off by one connection
+    # setup — in the direction that HIDES regressions on a warm pool.
+    #
+    # The conformance test runs the SAME script through both engines against
+    # one server. It has always existed; it has also always skipped, because
+    # no job installed k6. The number quoted as evidence for TR-202 ("k6 avg
+    # 33.65ms vs tropel 32.19ms") was therefore a one-off local run that no
+    # CI job could ever re-check. TROPEL_REQUIRE_K6=1 turns a missing binary
+    # into a failure, the same way the wasm job treats a missing artifact.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: k6-conformance
+      - name: Install k6
+        run: |
+          set -euo pipefail
+          # Pinned: parity is measured against a stated k6 version, and a
+          # floating "latest" would silently move the reference mid-review.
+          K6_VERSION=v1.3.0
+          curl -fsSL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local/bin "k6-${K6_VERSION}-linux-amd64/k6"
+          k6 version
+      - name: Run the k6 conformance comparison
+        env:
+          TROPEL_REQUIRE_K6: "1"
+        run: cargo test -p tropel-engine --test conformance_k6 -- --nocapture
 
   semver:
     name: semver-checks (tropel-sdk API breaks)
@@ -305,6 +357,100 @@ jobs:
         with:
           tool: cargo-semver-checks
       - run: cargo semver-checks check-release -p tropel-sdk
+
+  publish-dry-run:
+    name: publish dry-run (TR-601 release-gate readiness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Reports whether the 0.1.0 release gate line "cargo publish --dry-run
+    # succeeds for every publishable crate" is actually met. It was ticked
+    # while four of seven crates failed.
+    #
+    # Deliberately NOT in ci-ok's needs: the blocker is that tropel-sdk 0.3.0
+    # is not on crates.io yet, publishing needs a human (versions are
+    # permanent), and wedging every PR on a release-readiness fact helps
+    # nobody. Set TROPEL_PUBLISH_GATE=1 in the release job to make it block.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-dry-run
+      - run: bash scripts/publish-dry-run.sh
+
+  soak:
+    name: soak (TR-315 flat-memory under sustained load)
+    runs-on: ubuntu-latest
+    # 5 h: the longest a GitHub-hosted runner allows with headroom (the hard
+    # cap is 6 h). See the honesty note in the job summary below.
+    timeout-minutes: 330
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: soak
+      - name: Build soak harness
+        run: cargo build --release --locked -p tropel-bench --bin soak
+      - name: Long soak
+        env:
+          TROPEL_SOAK_SECS: "18000"          # 5 h
+          TROPEL_SOAK_SAMPLES_PER_SEC: "20000"
+          TROPEL_SOAK_SERIES: "5000"
+        run: ./target/release/soak
+      - name: Note the 24 h gap
+        if: always()
+        run: |
+          echo "TR-315 asks for 24 h. GitHub-hosted runners hard-cap a job at 6 h," >> $GITHUB_STEP_SUMMARY
+          echo "so this runs 5 h. A literal 24 h soak needs a self-hosted runner;" >> $GITHUB_STEP_SUMMARY
+          echo "the harness takes TROPEL_SOAK_SECS=86400 unchanged." >> $GITHUB_STEP_SUMMARY
+
+  soak-smoke:
+    name: soak harness self-check (both directions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Runs on EVERY PR. Not the soak itself — a check that the soak harness
+    # still works, in both directions:
+    #
+    #   clean run  -> must PASS
+    #   leak run   -> must FAIL
+    #
+    # The previous `soak_memory` "soak" was a HashMap insert/remove loop that
+    # could not fail, and nobody noticed for as long as it existed. A detector
+    # that has never been shown to fail is decoration; this makes that
+    # impossible to regress silently.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: soak-smoke
+      - name: Build soak harness
+        run: cargo build --release --locked -p tropel-bench --bin soak
+      - name: Clean run must PASS
+        env:
+          TROPEL_SOAK_SECS: "45"
+          TROPEL_SOAK_SAMPLES_PER_SEC: "20000"
+        run: ./target/release/soak
+      - name: Injected leak must FAIL
+        env:
+          TROPEL_SOAK_SECS: "30"
+          TROPEL_SOAK_SAMPLES_PER_SEC: "20000"
+          TROPEL_SOAK_INJECT_LEAK: "1"
+        run: |
+          if ./target/release/soak; then
+            echo "FAIL: the soak harness reported PASS on a deliberately leaking run." >&2
+            echo "      The leak detector is broken — it cannot fail, so it gates nothing." >&2
+            exit 1
+          fi
+          echo "ok: the harness correctly detected the injected leak"
 
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
@@ -613,7 +759,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages]
+    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages, k6-conformance, soak-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

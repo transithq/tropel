@@ -1562,10 +1562,29 @@ fn push_http_failure(
     let tags = Arc::new(tags);
 
     let mut v = sink.lock().unwrap();
-    // Time-to-failure in ms (same Trend series the success path feeds), so
-    // duration thresholds see the outage.
+    // TR-203: k6 emits a GENUINE ZERO here. `measureAndEmitMetrics` has no
+    // error branch — a DNS failure never fires GotConn/WroteRequest, so every
+    // timing records 0 and `http_req_duration` is the sum of three zeros.
+    //
+    // This used to emit the elapsed time-to-failure, which broke TR-202's
+    // formula in tropel's own data: the seven sub-timings below are 0, so
+    // `duration != sending + waiting + receiving` on exactly the samples a
+    // saturated run produces most of. It also silently shifted every ported
+    // k6 duration threshold — a 30 s timeout fed 30000 into the Trend where
+    // k6 feeds 0.
     v.push(Sample {
         metric: "http_req_duration".into(),
+        value: 0.0,
+        tags: tags.clone(),
+        timestamp: now,
+        sample_type: SampleType::Trend,
+    });
+    // The time-to-failure signal is real and worth keeping — it is how you
+    // tell a fast connection-refused from a 30 s timeout — so it moves to its
+    // own series instead of being folded into a k6-defined one. Documented as
+    // a tropel superset, not a parity claim.
+    v.push(Sample {
+        metric: "http_req_time_to_failure".into(),
         value: elapsed.as_secs_f64() * 1000.0,
         tags: tags.clone(),
         timestamp: now,
@@ -9024,7 +9043,7 @@ mod tests {
     }
 
     #[test]
-    fn test_push_http_failure_emits_duration_and_data_sent() {
+    fn test_push_http_failure_emits_zero_duration_and_data_sent() {
         // W1-B line 161: transport failures emitted ONLY http_reqs +
         // http_req_failed — no http_req_duration (time-to-failure) or
         // data_sent, so a fully-down target let p(95)<500 pass on the
@@ -9062,15 +9081,44 @@ mod tests {
         let duration = samples
             .iter()
             .find(|s| s.metric == "http_req_duration")
-            .expect("failure must emit http_req_duration (time-to-failure)");
+            .expect("failure must emit http_req_duration");
+        // INVERTED (TR-203). This asserted `1500.0` — "http_req_duration must
+        // carry the elapsed ms" — pinning a k6 divergence as correct. k6's
+        // measureAndEmitMetrics has no error branch, so a failed request
+        // records a genuine zero for every timing, and TR-202 defines
+        // duration as sending + waiting + receiving: all three are emitted as
+        // 0 below, so anything but 0 here contradicts our own formula.
         assert_eq!(
-            duration.value, 1500.0,
-            "http_req_duration must carry the elapsed ms"
+            duration.value, 0.0,
+            "http_req_duration must be a genuine zero on transport failure (k6 parity)"
         );
         assert_eq!(
             duration.sample_type,
             SampleType::Trend,
             "same Trend series as the success path"
+        );
+        // The elapsed time is preserved in its own series so the "fast
+        // refusal vs slow timeout" signal survives the parity fix.
+        let ttf = samples
+            .iter()
+            .find(|s| s.metric == "http_req_time_to_failure")
+            .expect("failure must emit http_req_time_to_failure");
+        assert_eq!(
+            ttf.value, 1500.0,
+            "http_req_time_to_failure carries the elapsed ms"
+        );
+        // The identity TR-202 defines must hold here too.
+        let phase = |m: &str| -> f64 {
+            samples
+                .iter()
+                .filter(|s| s.metric == m)
+                .map(|s| s.value)
+                .sum()
+        };
+        assert_eq!(
+            duration.value,
+            phase("http_req_sending") + phase("http_req_waiting") + phase("http_req_receiving"),
+            "http_req_duration must equal sending + waiting + receiving on the failure path"
         );
         let reqs = samples
             .iter()
@@ -9117,7 +9165,13 @@ mod tests {
                 "{sub} must be the same Trend series as the success path"
             );
         }
-        assert_eq!(samples.len(), 11, "4 base + 7 sub-timing samples");
+        // 4 base (duration, http_reqs, http_req_failed, data_sent)
+        // + 7 sub-timings + http_req_time_to_failure (TR-203).
+        assert_eq!(
+            samples.len(),
+            12,
+            "4 base + 7 sub-timings + http_req_time_to_failure"
+        );
     }
 
     #[test]
