@@ -91,7 +91,7 @@ These are one story: the newest adapters do not work, and the npm side does not 
 **Effort:** M · **Blocked by:** none
 
 - [x] `lib.rs:302` matches `Some("http-request")`; Bruno's exporter rewrites the type, so no real export matches
-- [x] Test fixtures are **exports produced by Bruno**, not hand-written JSON — this is exactly the gap that let it ship
+- [ ] Test fixtures are **exports produced by Bruno**, not hand-written JSON — this is exactly the gap that let it ship — **NOT DONE.** `crates/inputs/tropel-input-bru/` contains only `Cargo.toml` and `src/lib.rs`; every test uses inline JSON. Two things were in the way and one is now cleared: the root `.gitignore` carried a blanket `*.json`, so a fixture dropped in the crate was silently untracked (fixed in TR-008). `tests/fixtures/` now exists with the requirement recorded — **someone with Bruno installed still has to export one and commit it verbatim**
 - [x] Bruno path params are preserved (`:345` currently keeps only `param_type == "query"`)
 - [x] Duplicate query keys survive — `merge_pairs` joins with `", "`, collapsing `[{ids,1},{ids,2}]` into one
 - [x] A request that fails to convert is **reported**, not skipped: `if let Ok(child)` currently drops bad requests silently, contradicting the adapter's own docs
@@ -100,7 +100,7 @@ These are one story: the newest adapters do not work, and the npm side does not 
 **Effort:** S · **Blocked by:** none
 
 - [x] `lib.rs:71` types `metaSortKey` as `Option<i64>`; Insomnia assigns sort keys by **midpoint averaging**, so they go fractional the first time a user drags anything. Type it as a float
-- [x] Fixture: a workspace exported *after* reordering
+- [ ] Fixture: a workspace exported *after* reordering — **NOT DONE**, same story as TR-005. A hand-written fixture with integer `metaSortKey`s cannot catch this: the bug only appears once Insomnia's midpoint averaging makes them fractional, which only a genuinely drag-reordered export produces. `tests/fixtures/` now exists and is no longer gitignored
 - [x] Same silent-drop and duplicate-query-key fixes as `TR-005`
 
 ## TR-007 · Bruno and Insomnia are compiled out of the CLI entirely
@@ -118,9 +118,9 @@ These are one story: the newest adapters do not work, and the npm side does not 
 Root `.gitignore:33` is a blanket `*.json`. This is its **third** victim — the file's own comments record the prior two. Four reproduced consequences: the directory is not a workspace member (npm silently skips manifest-less dirs); its own `scripts/build.sh:50` fails `npm pack --dry-run` with `ENOENT` *after* producing `pkg/`; the README's `npm run build` reports `Missing script`; and **knockport's `file:` dep cannot resolve**, so `pnpm install` fails there.
 
 ### Acceptance criteria
-- [x] **Scope the ignore rule** — do not add a fifth exception
+- [x] **Scope the ignore rule** — do not add a fifth exception — **now actually done.** The blanket `*.json` survived the original fix and the exception count had grown to **eight**; the criterion said not to add a fifth. The rule is now scoped to where run output lands (`/results/`, `/output/`, named report files) and every negation is gone
 - [x] Delete the two dead `!packages/exec-wasm/*` lines left from the rename to `runtime-wasm`
-- [x] A CI check asserts every `packages/*` directory has a committed manifest and is a workspace member
+- [x] A CI check asserts every `packages/*` directory has a committed manifest and is a workspace member — plus a check that `.gitignore` carries no blanket source-extension rule, since the manifest check passes right up until someone adds a new package
 - [x] A clean clone runs `npm install` at the root with no missing-manifest error
 
 ## TR-009 · `@tropel/core-wasm` cannot be imported without a prior Rust build
