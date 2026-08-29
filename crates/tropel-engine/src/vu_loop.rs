@@ -776,6 +776,7 @@ pub(crate) async fn run_scenario_vus(
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
     input_path: &str,
+    input_format: Option<String>,
 ) -> (u32, u64, Option<String>) {
     // Expected statuses are read by every VU's ScenarioRunner — snapshot them once
     // and share (the closure no longer captures the whole HttpConfig, which
@@ -832,9 +833,19 @@ pub(crate) async fn run_scenario_vus(
     // P-B: source-gated bundle split — scan the script once per scenario
     // and build a minimal shim bundle (skipping cryptojs/lodash when unused).
     // This is shared across all VUs — one scan, one bundle, ~120KB/VU saved.
-    let shim = Arc::new(ShimBundle::from_script_path(std::path::Path::new(
-        input_path,
-    )));
+    // TR-501: prefer the FORMAT the adapter reported over scanning the file.
+    // A HAR or OpenAPI input has no scripting surface at all, so it cannot
+    // need pm/chai/lodash/cryptojs regardless of what strings appear inside
+    // it — content scanning can only ever guess that. Falls back to the scan
+    // when the format is unknown, which keeps the safe direction (full
+    // bundle) for any adapter not yet listed.
+    let shim = Arc::new(match input_format.as_deref() {
+        Some(fmt) => match std::fs::read(input_path) {
+            Ok(bytes) => ShimBundle::for_format(fmt, &bytes),
+            Err(_) => ShimBundle::default(),
+        },
+        None => ShimBundle::from_script_path(std::path::Path::new(input_path)),
+    });
 
     // Backlog line 426: pre-warm connections during the serial startup
     // window. Extract every distinct URL from the flattened scenario items

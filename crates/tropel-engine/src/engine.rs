@@ -448,6 +448,10 @@ impl Engine {
         // Build scenario configs. Script-declared scenarios/execution (from a
         // k6 `export const options`) take precedence over the default profile
         // but not over explicit user config (execution_explicit check above).
+        // TR-501: the user-declared input format, snapshotted before the
+        // per-scenario loop so each VU-loop can pick a shim bundle the
+        // format can actually use instead of scanning the file.
+        let config_input_type: Option<String> = config.input_type.clone();
         let scenario_configs: Vec<ScenarioConfigEntry> = if let Some(scs) = declared_scenarios {
             scs.iter()
                 .map(|(name, sc)| {
@@ -662,6 +666,7 @@ impl Engine {
                 // share the scheme-keyed map across VUs so ANY non-HTTP URL
                 // scheme (`grpc://`, `ws://`, or a third-party one) dispatches
                 // to its registered protocol (the runner's scheme lookup).
+                let input_type_sc = config_input_type.clone();
                 let protocols: Arc<HashMap<String, Arc<dyn Protocol>>> =
                     Arc::new(registry_sc.instantiate_protocols());
                 let (init_failures, script_failures, abort_message) = match resolved {
@@ -685,6 +690,12 @@ impl Engine {
                             control_port,
                             rps_limiter_sc,
                             &input_path,
+                            // TR-501: when the user names the format
+                            // (`--input-type`), trust it over scanning the
+                            // file — a HAR input cannot need pm/chai/lodash
+                            // whatever strings it contains. `None` falls back
+                            // to the content scan, which is the safe default.
+                            input_type_sc.clone(),
                         )
                         .await
                     }
