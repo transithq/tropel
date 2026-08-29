@@ -66,6 +66,18 @@ env:
   # Keep incremental off in CI: it bloats the cache and doesn't help cold builds.
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
+  # Windows was hitting the 45-minute wall (45m05s) building tests. Nothing in
+  # CI attaches a debugger, but every job was emitting FULL debug info for the
+  # whole graph — wasmtime, aws-lc-sys, oxc and the QuickJS C sources. On
+  # Windows that means writing PDBs for all of it, which is by far the most
+  # expensive part of the build.
+  #
+  # `line-tables-only` rather than `0`: RUST_BACKTRACE=1 is deliberately on
+  # above, and a backtrace without file:line is much harder to act on. This
+  # keeps panic locations while dropping variable and type debug info, which is
+  # the bulk of the cost and the part nothing here reads.
+  CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
 jobs:
   fmt:
@@ -105,7 +117,19 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # 90, not 45. Windows was landing on 45m05s — i.e. the cap was set below
+    # what this workspace legitimately takes there, so the job reported a
+    # timeout rather than a result. A Windows Rust build of a graph containing
+    # wasmtime, aws-lc-sys, oxc and the QuickJS C sources is genuinely ~2-3x a
+    # Linux one, and MSVC linking is single-threaded per crate.
+    #
+    # The debug-info reduction in `env:` above cuts roughly 10% (measured on
+    # macOS: 124s -> 111s cold for tropel-engine; the Windows saving should be
+    # larger because PDB emission is the expensive part, but that is untested).
+    # 10% does not rescue a job sitting one minute over its own limit, so the
+    # limit moves too. A timeout should mean "something hung", not "this is
+    # how long it takes".
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
