@@ -389,7 +389,7 @@ pub fn build_export_request_protobuf(metrics: &HashMap<String, Vec<Sample>>) -> 
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
     use tropel_sdk::types::TagMap;
 
     fn sample_at(
