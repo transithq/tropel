@@ -74,10 +74,129 @@ pub struct K6Options {
     /// config. Previously unmodelled, so it was silently dropped.
     #[serde(alias = "insecureSkipTLSVerify")]
     pub insecure_skip_tls_verify: Option<bool>,
+    /// Max concurrent requests inside ONE `http.batch()` call (k6
+    /// `options.batch`, default 20). TR-233: this used to fall into
+    /// `unknown` — warned and dropped — so a script that lowered `batch`
+    /// to throttle a fragile endpoint still hammered it at the default.
+    pub batch: Option<i64>,
+    /// Max concurrent requests to any ONE host inside a batch (k6
+    /// `options.batchPerHost`, default 6). Applied under `batch`.
+    #[serde(alias = "batchPerHost")]
+    pub batch_per_host: Option<i64>,
     // TR-201: catch unrecognized options — ~20 k6 root options are currently
     // silently dropped. This field collects them so we can warn per-key.
     #[serde(flatten)]
     pub unknown: HashMap<String, serde_json::Value>,
+}
+
+/// k6's two-level cap on concurrency inside one `http.batch()` call.
+///
+/// k6 defaults: `batch` 20 global, `batchPerHost` 6 per host
+/// (`lib/options.go`). The per-host limiter runs *under* the global one, so
+/// the effective ceiling for a single-host batch is `min(batch, per_host)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct K6BatchLimits {
+    pub batch: usize,
+    pub per_host: usize,
+}
+
+/// k6 `lib/options.go` defaults.
+pub const DEFAULT_BATCH: usize = 20;
+pub const DEFAULT_BATCH_PER_HOST: usize = 6;
+
+impl Default for K6BatchLimits {
+    fn default() -> Self {
+        Self {
+            batch: DEFAULT_BATCH,
+            per_host: DEFAULT_BATCH_PER_HOST,
+        }
+    }
+}
+
+/// A [`K6BatchLimits`] the HTTP bridges read at `http.batch()` **call** time.
+///
+/// The bridges are registered before the script's module is evaluated in the
+/// `setup()`/`teardown()` contexts, so the limits cannot be baked into the
+/// closure there. Late binding keeps ONE mechanism for both paths, and it is
+/// also what k6 does: `MakeBatchRequests` builds its limiters per batch call,
+/// not once per VU.
+#[derive(Debug)]
+pub struct BatchLimitsCell {
+    batch: std::sync::atomic::AtomicUsize,
+    per_host: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for BatchLimitsCell {
+    fn default() -> Self {
+        Self::new(K6BatchLimits::default())
+    }
+}
+
+impl BatchLimitsCell {
+    pub fn new(limits: K6BatchLimits) -> Self {
+        Self {
+            batch: std::sync::atomic::AtomicUsize::new(limits.batch),
+            per_host: std::sync::atomic::AtomicUsize::new(limits.per_host),
+        }
+    }
+
+    pub fn set(&self, limits: K6BatchLimits) {
+        use std::sync::atomic::Ordering;
+        self.batch.store(limits.batch, Ordering::Relaxed);
+        self.per_host.store(limits.per_host, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> K6BatchLimits {
+        use std::sync::atomic::Ordering;
+        K6BatchLimits {
+            batch: self.batch.load(Ordering::Relaxed),
+            per_host: self.per_host.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Coerce one declared limit. A non-positive value cannot mean "no
+/// concurrency" — a zero-permit semaphore parks the whole batch forever — so
+/// it is clamped to 1 and said out loud rather than silently reinterpreted
+/// (CONVENTIONS: no `unwrap_or` that turns a bad value into a plausible one).
+fn coerce_limit(name: &str, declared: Option<i64>, default: usize) -> usize {
+    match declared {
+        None => default,
+        Some(v) if v >= 1 => usize::try_from(v).unwrap_or(usize::MAX),
+        Some(v) => {
+            tracing::warn!(
+                "k6 option '{name}' = {v} is not a usable concurrency limit — \
+                 using 1 (serial). k6's default is {default}."
+            );
+            1
+        }
+    }
+}
+
+impl K6Options {
+    /// The batch limits this script declares, with k6's defaults filled in.
+    ///
+    /// TR-233: the ONLY place `batch`/`batchPerHost` are interpreted. The
+    /// engine's `DriverDeclaredOptions` cannot carry them (it is the pinned,
+    /// published SDK contract), so the k6 driver reads them from the script's
+    /// own `options` export through this one function — parsed by the same
+    /// serde model that parses every other k6 option.
+    pub fn batch_limits(&self) -> K6BatchLimits {
+        K6BatchLimits {
+            batch: coerce_limit("batch", self.batch, DEFAULT_BATCH),
+            per_host: coerce_limit("batchPerHost", self.batch_per_host, DEFAULT_BATCH_PER_HOST),
+        }
+    }
+
+    /// Parse batch limits straight out of a stringified `options` export.
+    /// Returns k6's defaults when the JSON is absent or unparseable — the
+    /// load profile path already reports a malformed `options` fatally, so
+    /// this must not raise a second, competing error.
+    pub fn batch_limits_from_options_json(json: Option<&str>) -> K6BatchLimits {
+        json.and_then(|s| serde_json::from_str::<K6Options>(s).ok())
+            .map(|o| o.batch_limits())
+            .unwrap_or_default()
+    }
 }
 
 /// k6 `options.dns` — DNS cache TTL, address selection and family policy.

@@ -766,11 +766,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_vu_js_context_honors_custom_sandbox_config() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(
+        let client: Arc<dyn DriverHttpClient> =
+            DriverHttpClientImpl::new_arc(VuCookieClient::new(
                 HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ),
-        });
+            ));
         let config = SandboxConfig {
             namespace: "acme".into(),
             aliases: vec!["product".into(), "wire".into()],
@@ -808,11 +807,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn per_vu_globals_are_isolated() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(
+        let client: Arc<dyn DriverHttpClient> =
+            DriverHttpClientImpl::new_arc(VuCookieClient::new(
                 HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ),
-        });
+            ));
         let mut ctx1 = create_vu_js_context(
             1,
             &pm_state,
@@ -875,11 +873,10 @@ mod tests {
         const TOLERANCE: f64 = 0.25;
 
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(
+        let client: Arc<dyn DriverHttpClient> =
+            DriverHttpClientImpl::new_arc(VuCookieClient::new(
                 HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ),
-        });
+            ));
         let ctx = create_vu_js_context(
             1,
             &pm_state,
@@ -981,11 +978,10 @@ mod tests {
     #[ignore = "measurement, not an assertion — run explicitly with --nocapture"]
     async fn measure_per_vu_quickjs_heap() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(
+        let client: Arc<dyn DriverHttpClient> =
+            DriverHttpClientImpl::new_arc(VuCookieClient::new(
                 HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ),
-        });
+            ));
         let bare = tropel_js::JsContext::new(None, None)
             .await
             .expect("bare context");
