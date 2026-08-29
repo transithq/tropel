@@ -748,8 +748,8 @@ pub struct K6DriverInstance {
     /// `batch: 50` gets 50 — previously the value was warned as an unknown
     /// option and the hardcoded k6 defaults were used regardless.
     batch_limits: Arc<BatchLimitsCell>,
-    /// Whether the script-state bridges (__tropel_pm_test,
-    /// __tropel_pm_custom_metric_add, __tropel_exec_*, __tropel_test_abort)
+    /// Whether the script-state bridges (__tropel_trp_test,
+    /// __tropel_trp_custom_metric_add, __tropel_exec_*, __tropel_test_abort)
     /// have been registered. Same lazy pattern as the HTTP bridge; these
     /// read the per-VU exec_state / abort flag.
     script_bridges_registered: bool,
@@ -2763,8 +2763,8 @@ fn register_http_bridges<'js>(
 }
 
 impl K6DriverInstance {
-    /// Lazily register the script-state bridges (`__tropel_pm_test`,
-    /// `__tropel_pm_custom_metric_add`, `__tropel_exec_*`, `__tropel_test_abort`).
+    /// Lazily register the script-state bridges (`__tropel_trp_test`,
+    /// `__tropel_trp_custom_metric_add`, `__tropel_exec_*`, `__tropel_test_abort`).
     /// The k6 driver doesn't depend on tropel-sandbox (which installs these for the
     /// declarative path), so it installs its own equivalents backed by the
     /// per-VU sample_sink / exec_state / abort flag.
@@ -2780,7 +2780,7 @@ impl K6DriverInstance {
             let sink_test = sink.clone();
             let group_test = self.group_stack.clone();
             let _ = globals.set(
-                "__tropel_pm_test",
+                "__tropel_trp_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
                 Func::from(
                     move |name: String, passed: bool, tags_json: Option<String>| {
@@ -2815,7 +2815,7 @@ impl K6DriverInstance {
             );
 
             // TR-262/327: pm.test.skip() — TrpBridge registers
-            // `__tropel_pm_test_skip` for the declarative path, but the k6
+            // `__tropel_trp_test_skip` for the declarative path, but the k6
             // driver never installed TrpBridge, so `pm.test.skip(name)` was a
             // silent no-op here (pm.js:575 guards on the function's
             // existence). Register the k6 equivalent: skips are not pass/fail
@@ -2940,7 +2940,7 @@ let _ = globals.set(
             // carry the full ::a::b path like checks (were untagged).
             let group_metric = self.group_stack.clone();
             let _ = globals.set(
-                "__tropel_pm_custom_metric_add",
+                "__tropel_trp_custom_metric_add",
                 Func::from(
                     move |name: String,
                           value: f64,
@@ -3051,7 +3051,7 @@ let _ = globals.set(
             );
 
             // group() → group_duration Trend sample (duration in ms). The
-            // shim's group() wraps fn() between __tropel_pm_group_start/end.
+            // shim's group() wraps fn() between __tropel_trp_group_start/end.
             // Backlog line 154: the START bridge pushes the name onto the
             // per-VU group stack (http bridges read the top when stamping
             // http_req_* tags), and END pops it — the two must balance or
@@ -3060,7 +3060,7 @@ let _ = globals.set(
             let sink_group = sink.clone();
             let group_start = self.group_stack.clone();
             let _ = globals.set(
-                "__tropel_pm_group_start",
+                "__tropel_trp_group_start",
                 Func::from(move |name: String| {
                     // Backlog line 63: push the FULL ::a::b path, not the bare
                     // leaf — every consumer reads group_stack.last() and k6
@@ -3077,7 +3077,7 @@ let _ = globals.set(
             );
             let group_end = self.group_stack.clone();
             let _ = globals.set(
-                "__tropel_pm_group_end",
+                "__tropel_trp_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
                     // Backlog line 63: pop the FULL ::a::b path (start pushed
                     // it) and tag group_duration with it — k6 tags nested
@@ -5923,7 +5923,7 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__pm_captured = [];
-                globalThis.__tropel_pm_send_request = function (method, url, headersJson, body) {
+                globalThis.__tropel_trp_send_request = function (method, url, headersJson, body) {
                     globalThis.__pm_captured.push({ headers: JSON.parse(headersJson), body: body });
                     return JSON.stringify({ code: 200, body: '{}', headers: {}, responseTime: 5 });
                 };
@@ -5987,7 +5987,7 @@ mod tests {
                 r#"
                 // Transport failure — what the real bridge returns on a
                 // connection error (code 0 + error field).
-                globalThis.__tropel_pm_send_request = function () {
+                globalThis.__tropel_trp_send_request = function () {
                     return JSON.stringify({
                         error: 'Request failed: error sending request for url (http://down:9/)',
                         code: 0, statusText: '', body: '', headers: {}, responseTime: 0
@@ -5999,7 +5999,7 @@ mod tests {
                 });
 
                 // A healthy response must still arrive via (null, resp).
-                globalThis.__tropel_pm_send_request = function () {
+                globalThis.__tropel_trp_send_request = function () {
                     return JSON.stringify({ code: 200, statusText: 'OK', body: '{}', headers: {},
                                             responseTime: 5 });
                 };
@@ -6056,7 +6056,7 @@ mod tests {
             .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_send_request = function () {
+                globalThis.__tropel_trp_send_request = function () {
                     return JSON.stringify({ code: 200, statusText: 'OK', body: '{}',
                                             headers: {}, responseTime: 5 });
                 };
@@ -6119,17 +6119,17 @@ mod tests {
             // Stub the response bridges with known values.
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
-                globalThis.__tropel_pm_response_time = function () { return 42.5; };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_status = function () { return 'OK'; };
+                globalThis.__tropel_trp_response_time = function () { return 42.5; };
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_header = function (key) {
+                globalThis.__tropel_trp_response_header = function (key) {
                     if (String(key).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_cookies = function () {
+                globalThis.__tropel_trp_response_cookies = function () {
                     return { session: 'abc123' };
                 };
                 globalThis.__type_code = typeof pm.response.code;
@@ -6254,8 +6254,8 @@ mod tests {
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_status = function () { return 'OK'; };
                 globalThis.__status_code = res.getStatus();
                 globalThis.__status_text = res.getStatusText();
                 globalThis.__status_code_type = typeof res.getStatus();
@@ -6265,8 +6265,8 @@ mod tests {
                 })());
                 // Non-200 trial: proves the bridge value is actually read
                 // (a hardcoded 200 constant could not distinguish itself).
-                globalThis.__tropel_pm_response_code = function () { return 404; };
-                globalThis.__tropel_pm_response_status = function () { return 'Not Found'; };
+                globalThis.__tropel_trp_response_code = function () { return 404; };
+                globalThis.__tropel_trp_response_status = function () { return 'Not Found'; };
                 globalThis.__status_404 = res.getStatus();
                 globalThis.__status_404_text = res.getStatusText();
             "#,
@@ -6312,7 +6312,7 @@ mod tests {
         // COLLECTION vars bridges — but Bruno's getVar/setVar are RUNTIME-scope
         // (in-memory, per collection run). The mis-scoping silently broke the
         // core request-chaining idiom (setVar in one request, getVar in the
-        // next). The shim now routes through __tropel_pm_variables_* (the same
+        // next). The shim now routes through __tropel_trp_variables_* (the same
         // fall-through store pm.variables uses), and the family
         // hasVar/deleteVar/getAllVars/deleteAllVars is exposed.
         let rt = rquickjs::Runtime::new().unwrap();
@@ -6324,32 +6324,32 @@ mod tests {
                 r#"
                 // Route-spy: the VARIABLES bridge must be the one called.
                 var __vars_calls = [];
-                globalThis.__tropel_pm_variables_get = function (key) {
+                globalThis.__tropel_trp_variables_get = function (key) {
                     __vars_calls.push('get:' + key);
                     if (key === 'userId') return '42';
                     if (key === 'token') return '"abc"';
                     return null;
                 };
-                globalThis.__tropel_pm_variables_set = function (key, value) {
+                globalThis.__tropel_trp_variables_set = function (key, value) {
                     __vars_calls.push('set:' + key + '=' + value);
                 };
-                globalThis.__tropel_pm_variables_unset = function (key) {
+                globalThis.__tropel_trp_variables_unset = function (key) {
                     __vars_calls.push('unset:' + key);
                 };
                 // The COLLECTION bridge must NOT be touched.
-                globalThis.__tropel_pm_collection_vars_get = function () {
+                globalThis.__tropel_trp_collection_vars_get = function () {
                     throw new Error('getVar must not read collection vars');
                 };
-                globalThis.__tropel_pm_collection_vars_set = function () {
+                globalThis.__tropel_trp_collection_vars_set = function () {
                     throw new Error('setVar must not write collection vars');
                 };
-                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                globalThis.__tropel_trp_collection_vars_to_object = function () {
                     throw new Error('getAllVars must not read collection vars');
                 };
                 // W2 line 182: getAllVars reads the LOCAL store setVar writes
                 // (the old code read collection_vars while setVar wrote
                 // local_vars — a runtime var never appeared in getAllVars).
-                globalThis.__tropel_pm_variables_to_object = function () {
+                globalThis.__tropel_trp_variables_to_object = function () {
                     return { userId: '42', token: '"abc"', flag: 'true' };
                 };
                 var v1 = bru.getVar('userId');
@@ -6418,7 +6418,7 @@ mod tests {
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_environment_get = function (key) {
+                globalThis.__tropel_trp_environment_get = function (key) {
                     if (key === 'baseUrl') return '"https://api.example.com"';
                     if (key === 'port') return '8080';
                     return null;
@@ -6462,7 +6462,7 @@ mod tests {
     #[test]
     fn test_bru_assert_records_via_bool_bridge() {
         // W2 line 182: bru.assert passed an INT (passed ? 1 : 0) where the
-        // __tropel_pm_test bridge takes a BOOL — rquickjs 0.12 has no bool
+        // __tropel_trp_test bridge takes a BOOL — rquickjs 0.12 has no bool
         // coercion, so every call THREW (pm.js:506-508 warns about the rule).
         // It also passed only 2 of the bridge's 3 args. It now passes a real
         // bool + the empty tags string.
@@ -6474,7 +6474,7 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 var __calls = [];
-                globalThis.__tropel_pm_test = function (name, passed, tags) {
+                globalThis.__tropel_trp_test = function (name, passed, tags) {
                     __calls.push(name + '|' + passed + '|' + typeof passed + '|' + tags);
                 };
                 bru.assert('1 === 1', 'one equals one');
@@ -6514,7 +6514,7 @@ mod tests {
         // TROPEL_PARITY_BRUNO.md §2: Bruno exposes the collection scope via
         // getCollectionVar/setCollectionVar/hasCollectionVar/delete* — the
         // shim only had getVar/setVar (aliased to collection). The explicit
-        // family now maps to the __tropel_pm_collection_vars_* bridges.
+        // family now maps to the __tropel_trp_collection_vars_* bridges.
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
@@ -6523,19 +6523,19 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 var __store = { baseUrl: '"https://api.example.com"', retries: '3' };
-                globalThis.__tropel_pm_collection_vars_get = function (key) {
+                globalThis.__tropel_trp_collection_vars_get = function (key) {
                     return Object.prototype.hasOwnProperty.call(__store, key) ? __store[key] : null;
                 };
-                globalThis.__tropel_pm_collection_vars_set = function (key, value) {
+                globalThis.__tropel_trp_collection_vars_set = function (key, value) {
                     __store[key] = value;
                 };
-                globalThis.__tropel_pm_collection_vars_has = function (key) {
+                globalThis.__tropel_trp_collection_vars_has = function (key) {
                     return Object.prototype.hasOwnProperty.call(__store, key);
                 };
-                globalThis.__tropel_pm_collection_vars_unset = function (key) {
+                globalThis.__tropel_trp_collection_vars_unset = function (key) {
                     delete __store[key];
                 };
-                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                globalThis.__tropel_trp_collection_vars_to_object = function () {
                     var out = {};
                     for (var k in __store) out[k] = __store[k];
                     return out;
@@ -6629,13 +6629,13 @@ mod tests {
                 globalThis.__json_body_ok = String((function () {
                     // to.have.jsonBody must deep-compare too (was key-order
                     // sensitive JSON.stringify comparison).
-                    var saved = globalThis.__tropel_pm_response_json;
-                    globalThis.__tropel_pm_response_json = function () {
+                    var saved = globalThis.__tropel_trp_response_json;
+                    globalThis.__tropel_trp_response_json = function () {
                         return '{"name":"ada","userId":1}';
                     };
                     try { pm.expect({}).to.have.jsonBody({ userId: 1, name: 'ada' }); return true; }
                     catch (e) { return 'threw: ' + e.message; }
-                    finally { globalThis.__tropel_pm_response_json = saved; }
+                    finally { globalThis.__tropel_trp_response_json = saved; }
                 })());
             "#,
             )
@@ -6872,19 +6872,19 @@ mod tests {
                     })());
                 }
                 // Stub the response bridges for the Postman extensions.
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
-                globalThis.__tropel_pm_response_time = function () { return 42.5; };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_status = function () { return 'OK'; };
+                globalThis.__tropel_trp_response_time = function () { return 42.5; };
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_header = function (key) {
+                globalThis.__tropel_trp_response_header = function (key) {
                     if (String(key).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_cookies = function () { return {}; };
-                globalThis.__tropel_pm_response_body = function () { return '{}'; };
-                globalThis.__tropel_pm_response_json = function () { return {}; };
+                globalThis.__tropel_trp_response_cookies = function () { return {}; };
+                globalThis.__tropel_trp_response_body = function () { return '{}'; };
+                globalThis.__tropel_trp_response_json = function () { return {}; };
 
                 // name: 'x' at the TOP LEVEL — chai's deep.include checks the
                 // expected object's keys directly against the target (no
@@ -7348,19 +7348,19 @@ mod tests {
                 // "against a 200", i.e. the plain-literal guard path
                 // (pm.response.to.be.*), which wraps a DIFFERENT target kind
                 // than the AssertChain instances pm.expect uses.
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
-                globalThis.__tropel_pm_response_time = function () { return 42.5; };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_status = function () { return 'OK'; };
+                globalThis.__tropel_trp_response_time = function () { return 42.5; };
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_header = function (key) {
+                globalThis.__tropel_trp_response_header = function (key) {
                     if (String(key).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_cookies = function () { return {}; };
-                globalThis.__tropel_pm_response_body = function () { return '{}'; };
-                globalThis.__tropel_pm_response_json = function () { return {}; };
+                globalThis.__tropel_trp_response_cookies = function () { return {}; };
+                globalThis.__tropel_trp_response_body = function () { return '{}'; };
+                globalThis.__tropel_trp_response_json = function () { return {}; };
 
                 globalThis.__r = {};
                 // Install the `.should` getter (chai.should() defines
@@ -7614,39 +7614,39 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 // Variable-store stubs.
-                globalThis.__tropel_pm_collection_vars_get = function (k) {
+                globalThis.__tropel_trp_collection_vars_get = function (k) {
                     if (k === 'base') return '"https://api.example.com"';
                     return null;
                 };
-                globalThis.__tropel_pm_collection_vars_set = function (k, v) { globalThis.__cv_set = k + '=' + v; };
-                globalThis.__tropel_pm_collection_vars_unset = function (k) { globalThis.__cv_unset = k; };
-                globalThis.__tropel_pm_collection_vars_has = function (k) { return k === 'base'; };
-                globalThis.__tropel_pm_collection_vars_to_object = function () { return { base: '"x"', n: '3' }; };
-                globalThis.__tropel_pm_globals_get = function (k) { return k === 'g' ? '"global"' : null; };
-                globalThis.__tropel_pm_globals_set = function (k, v) { globalThis.__g_set = k + '=' + v; };
-                globalThis.__tropel_pm_globals_unset = function (k) { globalThis.__g_unset = k; };
-                globalThis.__tropel_pm_globals_has = function (k) { return k === 'g'; };
-                globalThis.__tropel_pm_globals_to_object = function () { return { g: '"global"' }; };
-                globalThis.__tropel_pm_environment_has = function (k) { return k === 'env'; };
-                globalThis.__tropel_pm_environment_to_object = function () { return { env: 'e' }; };
+                globalThis.__tropel_trp_collection_vars_set = function (k, v) { globalThis.__cv_set = k + '=' + v; };
+                globalThis.__tropel_trp_collection_vars_unset = function (k) { globalThis.__cv_unset = k; };
+                globalThis.__tropel_trp_collection_vars_has = function (k) { return k === 'base'; };
+                globalThis.__tropel_trp_collection_vars_to_object = function () { return { base: '"x"', n: '3' }; };
+                globalThis.__tropel_trp_globals_get = function (k) { return k === 'g' ? '"global"' : null; };
+                globalThis.__tropel_trp_globals_set = function (k, v) { globalThis.__g_set = k + '=' + v; };
+                globalThis.__tropel_trp_globals_unset = function (k) { globalThis.__g_unset = k; };
+                globalThis.__tropel_trp_globals_has = function (k) { return k === 'g'; };
+                globalThis.__tropel_trp_globals_to_object = function () { return { g: '"global"' }; };
+                globalThis.__tropel_trp_environment_has = function (k) { return k === 'env'; };
+                globalThis.__tropel_trp_environment_to_object = function () { return { env: 'e' }; };
 
                 // pm.request stubs — capture what the shim sends back.
-                globalThis.__tropel_pm_request_url = function () { return 'http://x/old'; };
-                globalThis.__tropel_pm_request_url_set = function (u) { globalThis.__r_url = u; };
-                globalThis.__tropel_pm_request_method = function () { return 'GET'; };
-                globalThis.__tropel_pm_request_method_set = function (m) { globalThis.__r_method = m; };
-                globalThis.__tropel_pm_request_headers = function () { return { Authorization: 'Bearer old' }; };
-                globalThis.__tropel_pm_request_header_get = function (k) { return k.toLowerCase() === 'authorization' ? 'Bearer old' : null; };
-                globalThis.__tropel_pm_request_header_set = function (k, v) { globalThis.__r_hdr = k + '=' + v; };
-                globalThis.__tropel_pm_request_header_unset = function (k) { globalThis.__r_hdr_unset = k; };
-                globalThis.__tropel_pm_request_body = function () { return 'old-body'; };
-                globalThis.__tropel_pm_request_body_set = function (b) { globalThis.__r_body = b; };
-                globalThis.__tropel_pm_request_auth_set = function (a) { globalThis.__r_auth = a; };
+                globalThis.__tropel_trp_request_url = function () { return 'http://x/old'; };
+                globalThis.__tropel_trp_request_url_set = function (u) { globalThis.__r_url = u; };
+                globalThis.__tropel_trp_request_method = function () { return 'GET'; };
+                globalThis.__tropel_trp_request_method_set = function (m) { globalThis.__r_method = m; };
+                globalThis.__tropel_trp_request_headers = function () { return { Authorization: 'Bearer old' }; };
+                globalThis.__tropel_trp_request_header_get = function (k) { return k.toLowerCase() === 'authorization' ? 'Bearer old' : null; };
+                globalThis.__tropel_trp_request_header_set = function (k, v) { globalThis.__r_hdr = k + '=' + v; };
+                globalThis.__tropel_trp_request_header_unset = function (k) { globalThis.__r_hdr_unset = k; };
+                globalThis.__tropel_trp_request_body = function () { return 'old-body'; };
+                globalThis.__tropel_trp_request_body_set = function (b) { globalThis.__r_body = b; };
+                globalThis.__tropel_trp_request_auth_set = function (a) { globalThis.__r_auth = a; };
 
                 // Response cookies + test-skip + setNextRequest stubs.
-                globalThis.__tropel_pm_response_cookies = function () { return { sid: 'abc' }; };
-                globalThis.__tropel_pm_test_skip = function (n) { globalThis.__skipped = n; };
-                globalThis.__tropel_pm_set_next_request = function (n) { globalThis.__next_req = n; };
+                globalThis.__tropel_trp_response_cookies = function () { return { sid: 'abc' }; };
+                globalThis.__tropel_trp_test_skip = function (n) { globalThis.__skipped = n; };
+                globalThis.__tropel_trp_set_next_request = function (n) { globalThis.__next_req = n; };
 
                 // collectionVariables / globals surface.
                 globalThis.__cv_get = pm.collectionVariables.get('base');
@@ -7753,15 +7753,15 @@ mod tests {
                 // Bridge stubs — variables_get returns JSON-encoded strings
                 // (the real bridge JSON-encodes so the shim can restore the
                 // type), set/skipRequest capture what the shim sends.
-                globalThis.__tropel_pm_variables_get = function (k) {
+                globalThis.__tropel_trp_variables_get = function (k) {
                     if (k === 'id') return '"42"';
                     if (k === 'one10') return '"1.10"';
                     return null;
                 };
-                globalThis.__tropel_pm_variables_set = function (k, v) { globalThis.__v_set = k + '=' + v; };
-                globalThis.__tropel_pm_variables_unset = function (k) { globalThis.__v_unset = k; };
-                globalThis.__tropel_pm_skip_request = function () { globalThis.__skipped = true; };
-                globalThis.__tropel_pm_set_next_request = function (n) { globalThis.__next_req = n; };
+                globalThis.__tropel_trp_variables_set = function (k, v) { globalThis.__v_set = k + '=' + v; };
+                globalThis.__tropel_trp_variables_unset = function (k) { globalThis.__v_unset = k; };
+                globalThis.__tropel_trp_skip_request = function () { globalThis.__skipped = true; };
+                globalThis.__tropel_trp_set_next_request = function (n) { globalThis.__next_req = n; };
 
                 // 1) Number value must not throw, must be coerced like the
                 // other stores, and must reach the bridge as a string.
@@ -7829,7 +7829,7 @@ mod tests {
             );
             assert!(
                 ctx.eval::<bool, _>("__skipped_after").unwrap(),
-                "pm.execution.skipRequest must reach the dedicated __tropel_pm_skip_request bridge"
+                "pm.execution.skipRequest must reach the dedicated __tropel_trp_skip_request bridge"
             );
             assert_eq!(
                 ctx.eval::<String, _>("__next_req_after_skip").unwrap(),
@@ -7885,16 +7885,16 @@ mod tests {
                 }
 
                 var env = {};
-                globalThis.__tropel_pm_environment_set = function (k, v) { env[k] = decodeEnv(v); };
-                globalThis.__tropel_pm_environment_get = function (k) { return k in env ? JSON.stringify(env[k]) : null; };
+                globalThis.__tropel_trp_environment_set = function (k, v) { env[k] = decodeEnv(v); };
+                globalThis.__tropel_trp_environment_get = function (k) { return k in env ? JSON.stringify(env[k]) : null; };
 
                 var col = {};
-                globalThis.__tropel_pm_collection_vars_set = function (k, v) { col[k] = decodeVal(v); };
-                globalThis.__tropel_pm_collection_vars_get = function (k) { return k in col ? JSON.stringify(col[k]) : null; };
+                globalThis.__tropel_trp_collection_vars_set = function (k, v) { col[k] = decodeVal(v); };
+                globalThis.__tropel_trp_collection_vars_get = function (k) { return k in col ? JSON.stringify(col[k]) : null; };
 
                 var gl = {};
-                globalThis.__tropel_pm_globals_set = function (k, v) { gl[k] = decodeVal(v); };
-                globalThis.__tropel_pm_globals_get = function (k) { return k in gl ? JSON.stringify(gl[k]) : null; };
+                globalThis.__tropel_trp_globals_set = function (k, v) { gl[k] = decodeVal(v); };
+                globalThis.__tropel_trp_globals_get = function (k) { return k in gl ? JSON.stringify(gl[k]) : null; };
 
                 // env: '1234' string stays the STRING '1234' (never number).
                 pm.environment.set('s', '1234');
@@ -8251,10 +8251,10 @@ mod tests {
             // Stub the custom-metric bridge + group bridges.
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_group_start = function (name) {};
-                globalThis.__tropel_pm_group_end = function (name, dur) {};
-                globalThis.__tropel_pm_test = function (name, passed, tags) {};
-                globalThis.__tropel_pm_custom_metric_add = function (name, value, tags, type, isTime) {};
+                globalThis.__tropel_trp_group_start = function (name) {};
+                globalThis.__tropel_trp_group_end = function (name, dur) {};
+                globalThis.__tropel_trp_test = function (name, passed, tags) {};
+                globalThis.__tropel_trp_custom_metric_add = function (name, value, tags, type, isTime) {};
                 var results = {};
                 try {
                     check({a: 1}, {ok: async function () { return true; }});
@@ -8822,7 +8822,7 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__recorded = [];
-                globalThis.__tropel_pm_test = function (name, passed, tagsJson) {
+                globalThis.__tropel_trp_test = function (name, passed, tagsJson) {
                     globalThis.__recorded.push({
                         name: name,
                         passed: passed,
@@ -8918,7 +8918,7 @@ mod tests {
                     warn: function () {}
                 };
                 globalThis.__recorded = [];
-                globalThis.__tropel_pm_test = function (name, passed, tagsJson) {
+                globalThis.__tropel_trp_test = function (name, passed, tagsJson) {
                     globalThis.__recorded.push({
                         name: name,
                         passed: passed,
@@ -9423,16 +9423,16 @@ mod tests {
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 404; };
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_code = function () { return 404; };
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
-                globalThis.__tropel_pm_response_body = function () { return 'not found'; };
+                globalThis.__tropel_trp_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_trp_response_body = function () { return 'not found'; };
 
                 globalThis.__be_success = String((function () {
                     try { pm.response.to.be.success; return 'passed'; } catch (e) { return 'threw'; }
@@ -9526,7 +9526,7 @@ mod tests {
             // throw — re-point the json bridge at a throwing body.
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_json = function () { throw new Error('body is not JSON'); };
+                globalThis.__tropel_trp_response_json = function () { throw new Error('body is not JSON'); };
                 globalThis.__be_json_prop_bad = String((function () {
                     try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
                 })());
@@ -9640,18 +9640,18 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
                 // Present-NULL body: {a: null} — the key EXISTS with a null
                 // value, so jsonBody('a') must PASS (lodash get parity).
-                globalThis.__tropel_pm_response_json = function () { return '{"a":null}'; };
-                globalThis.__tropel_pm_response_body = function () { return '{"a":null}'; };
+                globalThis.__tropel_trp_response_json = function () { return '{"a":null}'; };
+                globalThis.__tropel_trp_response_body = function () { return '{"a":null}'; };
 
                 // pm.js chain: present-null key passes.
                 globalThis.__jb_null_key_pm = String((function () {
@@ -9697,16 +9697,16 @@ mod tests {
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 404; };
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_code = function () { return 404; };
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
-                globalThis.__tropel_pm_response_body = function () { return 'not found'; };
+                globalThis.__tropel_trp_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_trp_response_body = function () { return 'not found'; };
 
                 // Exact-status getters: only notFound passes on 404.
                 globalThis.__b_not_found = String((function () {
@@ -9763,7 +9763,7 @@ mod tests {
             // .notFound must now FAIL instead of recording PASS.
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_code = function () { return 200; };
                 globalThis.__b_not_found_200 = String((function () {
                     try { pm.response.to.be.notFound; return 'passed'; } catch (e) { return 'threw'; }
                 })());
@@ -9799,16 +9799,16 @@ mod tests {
             .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'text/html';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'text/html' };
                 };
-                globalThis.__tropel_pm_response_json = function () { return '<html>'; }; // NOT JSON
-                globalThis.__tropel_pm_response_body = function () { return '<html>'; };
+                globalThis.__tropel_trp_response_json = function () { return '<html>'; }; // NOT JSON
+                globalThis.__tropel_trp_response_body = function () { return '<html>'; };
 
                 // The silent-PASS probe from the backlog: bare property read
                 // on a text/html body must THROW now (was PASS).
@@ -9824,15 +9824,15 @@ mod tests {
                 })());
 
                 // Flip to a valid JSON body: both forms must pass.
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
-                globalThis.__tropel_pm_response_body = function () { return '{"a":1}'; };
+                globalThis.__tropel_trp_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_trp_response_body = function () { return '{"a":1}'; };
                 globalThis.__p_json_ok = String((function () {
                     try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
                 })());
