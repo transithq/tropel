@@ -20,6 +20,30 @@ Source: `TROPEL_MASTER_TODO.md` §P-H, §P-B · `TROPEL_PERF_VS_K6.md` §2.
 ---
 
 ## TR-501 · Stop loading 250–290 KB of JS into every VU
+
+> **k6-core extracted 2026-08-29.** `check`, `group`, `Counter`, `Gauge`,
+> `Rate` and `Trend` were defined in `js/scripting-api/pm.js` and installed
+> onto `globalThis` from there, so **every non-Postman format had to load the
+> whole 70 KB Postman shim just to get `check()`**. That is a layering bug and
+> it was the thing blocking format-driven shim selection: dropping pm.js for a
+> k6 or HAR run broke `check`, which made it look as though every format
+> genuinely needed pm.
+>
+> They now live in `js/shared/k6-core.js`, loaded before pm-shim. The rule the
+> bundles can now follow:
+>
+> | format | bundle |
+> |---|---|
+> | postman | k6-core + pm + chai + lodash + cryptojs |
+> | k6 | k6-core + k6-shim + deferred-modules |
+> | bru | k6-core + bru — a peer view over the same `__tropel_pm_*` native bridges, **not** a pm.js dependent (see `bru.js`'s own header) |
+> | har / openapi / http | k6-core |
+>
+> Measured headroom this unlocks (from the format-bundle work): script-free
+> formats drop **280,480 → 142,976 B/VU, a further −49 %**, which was measured
+> but not taken because dropping pm.js broke `check`. This removes that
+> blocker; taking it is the follow-up.
+
 **Effort:** L · **Blocked by:** TR-002 · **Blocks:** TR-503
 
 ### Problem
