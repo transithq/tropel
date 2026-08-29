@@ -1899,8 +1899,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
 
             // Stock install: pm + trp only — no aliases, no tropel.
             let installed: bool = ctx
@@ -1969,9 +1973,13 @@ mod tests {
         TrpBridge::new(state.clone())
             .install(&mut ctx)
             .expect("install");
-        ctx.eval(include_str!("../../../../js/scripting-api/pm.js"))
-            .await
-            .expect("pm shim must eval");
+        ctx.eval(concat!(
+            include_str!("../../../../js/shared/k6-core.js"),
+            "\n",
+            include_str!("../../../../js/scripting-api/pm.js")
+        ))
+        .await
+        .expect("pm shim must eval");
 
         // Reserved builtin name through pm.metrics.add — must be dropped.
         ctx.eval(
@@ -2017,9 +2025,13 @@ mod tests {
         TrpBridge::new(state.clone())
             .install(&mut ctx)
             .expect("install");
-        ctx.eval(include_str!("../../../../js/scripting-api/pm.js"))
-            .await
-            .expect("pm shim must eval");
+        ctx.eval(concat!(
+            include_str!("../../../../js/shared/k6-core.js"),
+            "\n",
+            include_str!("../../../../js/scripting-api/pm.js")
+        ))
+        .await
+        .expect("pm shim must eval");
 
         ctx.eval(
             "group('checkout', function () { \
@@ -2074,8 +2086,12 @@ mod tests {
                 .expect("config preamble should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
 
             // Custom canonical installed; aliases are true aliases of it.
             let installed: bool = ctx
@@ -2143,8 +2159,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
 
             // Iteration 1: a prerequest script SETS auth and a body mode.
             ctx.eval::<(), _>(

@@ -639,6 +639,10 @@ impl Engine {
             // TR-313: the scenario task reuses the bytes read at startup
             // instead of re-reading the script file.
             let script_bytes_sc = script_bytes.clone();
+            // Cloned out here, not inside the `async move`: the closure
+            // captures by move and this is a loop, so an inner clone moved
+            // the original on the first iteration.
+            let input_type_sc = config_input_type.clone();
 
             let handle = tokio::spawn(async move {
                 let resolved = resolve_input_or_driver(
@@ -666,7 +670,6 @@ impl Engine {
                 // share the scheme-keyed map across VUs so ANY non-HTTP URL
                 // scheme (`grpc://`, `ws://`, or a third-party one) dispatches
                 // to its registered protocol (the runner's scheme lookup).
-                let input_type_sc = config_input_type.clone();
                 let protocols: Arc<HashMap<String, Arc<dyn Protocol>>> =
                     Arc::new(registry_sc.instantiate_protocols());
                 let (init_failures, script_failures, abort_message) = match resolved {

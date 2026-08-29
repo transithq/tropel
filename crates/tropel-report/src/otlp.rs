@@ -283,11 +283,10 @@ impl OtlpOutput {
         // 100 ms window at the budgeted rate, i.e. the output could not keep
         // pace with its own window. gzip stays on for both encodings.
         let protocol = self.protocol;
-        let body_gz = tokio::task::spawn_blocking(move || {
-            gzip_body(&encode_export_body(&metrics, protocol))
-        })
-        .await
-        .map_err(|e| TropelError::Other(format!("otlp payload build panicked: {e}")))??;
+        let body_gz =
+            tokio::task::spawn_blocking(move || gzip_body(&encode_export_body(&metrics, protocol)))
+                .await
+                .map_err(|e| TropelError::Other(format!("otlp payload build panicked: {e}")))??;
 
         let resp = self
             .client
@@ -665,7 +664,8 @@ mod tests {
 
         // Explicit, not env-derived: cargo runs tests in one process, so a
         // test that mutated TROPEL_OTLP_PROTOCOL would race its siblings.
-        let output = OtlpOutput::new(format!("http://{addr}")).with_protocol(OtlpProtocol::Protobuf);
+        let output =
+            OtlpOutput::new(format!("http://{addr}")).with_protocol(OtlpProtocol::Protobuf);
         output
             .emit(&[sample("http_reqs", 1.0, SampleType::Counter)])
             .await
@@ -678,7 +678,10 @@ mod tests {
             head_lower.contains("content-type: application/x-protobuf"),
             "default flush must declare protobuf, got head:\n{head}"
         );
-        assert!(head_lower.contains("content-encoding: gzip"), "head:\n{head}");
+        assert!(
+            head_lower.contains("content-encoding: gzip"),
+            "head:\n{head}"
+        );
 
         let body = gunzip(&received);
         assert_ne!(body.first(), Some(&b'{'), "body is still JSON text");

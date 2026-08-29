@@ -710,7 +710,10 @@ type SeenRequest = (String, Option<String>);
 /// Keep-alive, because the point is that the jar — not the connection —
 /// carries the cookie: the requests must be indistinguishable to the server
 /// apart from their headers.
-async fn start_cookie_server() -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+async fn start_cookie_server() -> (
+    std::net::SocketAddr,
+    Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen: Arc<std::sync::Mutex<Vec<SeenRequest>>> = Arc::new(std::sync::Mutex::new(Vec::new()));

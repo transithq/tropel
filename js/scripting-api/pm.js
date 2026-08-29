@@ -1399,6 +1399,14 @@ pm.metrics = {
 // to load the whole 70 KB Postman shim just to get `check()` (TR-501).
 // They now live in js/shared/k6-core.js, which every bundle includes.
 
+    // Expose the Postman globals. The k6-style globals (check/group/Counter/
+    // Gauge/Rate/Trend) are installed by k6-core.js, which loads first.
+    if (typeof globalThis !== 'undefined') {
+        globalThis.postman = postman;
+    }
+    return pm;
+}
+
 // ── Install: pm (frozen Postman-compat peer view) + canonical + aliases ──
 // The canonical name and its aliases come from the host-set global
 // `__tropel_sandbox_config` (written by SandboxConfig::render_js_preamble

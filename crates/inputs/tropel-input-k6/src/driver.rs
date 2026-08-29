@@ -2239,13 +2239,15 @@ fn register_cookie_jar_bridges(
     let jar_read = jar.clone();
     let _ = globals.set(
         "__tropel_k6_jar_cookies_for_url",
-        Func::from(move |ctx: rquickjs::Ctx<'_>, url: String| -> rquickjs::Result<String> {
-            let jar = jar_or_throw!(ctx, jar_read);
-            let map = vu_jar::cookies_for_url(&jar, &url)
-                .map_err(|e| throw_js(&ctx, format!("cookieJar.cookiesForURL: {e}")))?;
-            serde_json::to_string(&map)
-                .map_err(|e| throw_js(&ctx, format!("cookieJar.cookiesForURL: {e}")))
-        }),
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>, url: String| -> rquickjs::Result<String> {
+                let jar = jar_or_throw!(ctx, jar_read);
+                let map = vu_jar::cookies_for_url(&jar, &url)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.cookiesForURL: {e}")))?;
+                serde_json::to_string(&map)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.cookiesForURL: {e}")))
+            },
+        ),
     );
 
     let jar_set = jar.clone();
@@ -4530,7 +4532,11 @@ const K6_BASE_SHIM_BUNDLE: &str = concat!(
 /// concatenated at COMPILE TIME into one bundle (see K6_BASE_SHIM_BUNDLE).
 const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: pm-api ====\n",
-    include_str!("../../../../js/scripting-api/pm.js"),
+    concat!(
+        include_str!("../../../../js/shared/k6-core.js"),
+        "\n",
+        include_str!("../../../../js/scripting-api/pm.js")
+    ),
     "\n",
     "// ==== shim: sleep-shim ====\n",
     include_str!("../../../../js/k6-shim/sleep-shim.js"),
@@ -5877,7 +5883,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -5936,8 +5942,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 // Transport failure — what the real bridge returns on a
@@ -6003,8 +6013,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__tropel_pm_send_request = function () {
@@ -6061,8 +6075,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             // Stub the response bridges with known values.
             ctx.eval::<(), _>(
                 r#"
@@ -6543,7 +6561,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6610,7 +6628,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -6723,7 +6741,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6807,7 +6825,7 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6966,7 +6984,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -7042,8 +7060,12 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 // Implemented getters must WORK (pass silently is fine — no throw).
@@ -7283,7 +7305,7 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7413,7 +7435,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7552,7 +7574,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7689,7 +7711,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7812,7 +7834,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -8189,7 +8211,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             // Stub the custom-metric bridge + group bridges.
             ctx.eval::<(), _>(
@@ -8760,7 +8782,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -8848,7 +8870,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9362,7 +9384,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9575,7 +9597,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -9636,7 +9658,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9734,8 +9756,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__tropel_pm_response_code = function () { return 200; };
@@ -12606,7 +12632,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             .expect("native bridge stubs must eval");
             let bundle = format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n",
-                include_str!("../../../../js/scripting-api/pm.js"),
+                concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")),
                 include_str!("../../../../js/k6-shim/sleep-shim.js"),
                 include_str!("../../../../js/k6-shim/k6-shim.js"),
                 include_str!("../../../../js/k6-shim/jslib-shim.js"),

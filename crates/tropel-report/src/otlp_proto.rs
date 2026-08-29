@@ -555,7 +555,10 @@ mod tests {
                 }
                 4 => {
                     assert_eq!(wire, 1, "as_double must be a double, not a varint");
-                    assert_eq!(f64::from_bits(u64::from_le_bytes(payload.try_into().unwrap())), 12.5);
+                    assert_eq!(
+                        f64::from_bits(u64::from_le_bytes(payload.try_into().unwrap())),
+                        12.5
+                    );
                     saw_double = true;
                 }
                 7 => {
@@ -580,9 +583,27 @@ mod tests {
         metrics.insert(
             "http_reqs".into(),
             vec![
-                sample_at("http_reqs", 1.0, SampleType::Counter, &[("status", "200")], 100),
-                sample_at("http_reqs", 1.0, SampleType::Counter, &[("status", "200")], 300),
-                sample_at("http_reqs", 1.0, SampleType::Counter, &[("status", "500")], 200),
+                sample_at(
+                    "http_reqs",
+                    1.0,
+                    SampleType::Counter,
+                    &[("status", "200")],
+                    100,
+                ),
+                sample_at(
+                    "http_reqs",
+                    1.0,
+                    SampleType::Counter,
+                    &[("status", "200")],
+                    300,
+                ),
+                sample_at(
+                    "http_reqs",
+                    1.0,
+                    SampleType::Counter,
+                    &[("status", "500")],
+                    200,
+                ),
             ],
         );
         let bytes = build_export_request_protobuf(&metrics);
@@ -609,9 +630,10 @@ mod tests {
         assert_eq!(points.len(), 2, "one aggregated delta point per tag-set");
         let mut seen: Vec<(String, f64, u64)> = Vec::new();
         for dp in points {
-            let status =
-                String::from_utf8(Scanner::field(Scanner::field(Scanner::field(dp, 7), 2), 1).to_vec())
-                    .unwrap();
+            let status = String::from_utf8(
+                Scanner::field(Scanner::field(Scanner::field(dp, 7), 2), 1).to_vec(),
+            )
+            .unwrap();
             let value = f64::from_bits(u64::from_le_bytes(
                 Scanner::field(dp, 4).try_into().unwrap(),
             ));
@@ -791,8 +813,20 @@ mod tests {
         metrics.insert(
             "http_reqs".into(),
             vec![
-                sample_at("http_reqs", 1.0, SampleType::Counter, &[("status", "200")], 10),
-                sample_at("http_reqs", 3.0, SampleType::Counter, &[("status", "200")], 20),
+                sample_at(
+                    "http_reqs",
+                    1.0,
+                    SampleType::Counter,
+                    &[("status", "200")],
+                    10,
+                ),
+                sample_at(
+                    "http_reqs",
+                    3.0,
+                    SampleType::Counter,
+                    &[("status", "200")],
+                    20,
+                ),
             ],
         );
         metrics.insert(
@@ -815,7 +849,12 @@ mod tests {
         let res = rm.resource.as_ref().unwrap();
         assert_eq!(res.attributes[0].key, "service.name");
         assert_eq!(
-            res.attributes[0].value.as_ref().unwrap().string_value.as_deref(),
+            res.attributes[0]
+                .value
+                .as_ref()
+                .unwrap()
+                .string_value
+                .as_deref(),
             Some("tropel")
         );
         assert_eq!(rm.scope_metrics.len(), 1);

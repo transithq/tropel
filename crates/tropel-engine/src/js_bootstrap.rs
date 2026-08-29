@@ -202,9 +202,9 @@ impl ShimBundle {
     /// | `postman` | core + pm + chai + lodash + cryptojs |
     /// | `bru` | core + bru + chai + lodash + cryptojs |
     /// | `har`, `openapi`, `http` | core only — no scripting surface exists |
-    /// | anything else | the full default bundle |
+    /// | anything else | falls through to content scanning (existing behaviour) |
     ///
-    /// **Unknown formats get the FULL bundle deliberately.** A missing shim is
+    /// **Unknown formats are never narrowed by format.** A missing shim is
     /// a `ReferenceError` in a customer's script; an extra one costs memory.
     /// The default must be the safe direction, so a new adapter that forgets
     /// to add itself here is merely un-optimised rather than broken.
@@ -560,14 +560,6 @@ mod tests {
     use tropel_sandbox::state::new_pm_state;
     use tropel_sdk::traits::DriverHttpClient;
 
-    /// W2 line 182: the TWO shim lists must stay in lockstep — JS_SHIM_BUNDLE
-    /// (the compile-time concat used by the bytecode path) used to carry 5
-    /// shims while ShimBundle::default() carried 6 (with bru), so bru.js was
-    /// compiled into the binary but NEVER evaluated (typeof bru ===
-    /// 'undefined' in every engine VU). Guard both invariants: the default
-    /// bundle must enumerate bru, and the bytecode source must embed the
-    /// same bru.js text.
-    #[test]
     /// TR-501: `check`, `group` and the metric constructors must NOT be
     /// installed by pm.js.
     ///
@@ -578,7 +570,6 @@ mod tests {
     ///
     /// **Fails on pre-fix code**: pm.js contained `globalThis.check = check;`
     /// and the five siblings, so the first assertion tripped.
-    #[test]
     /// TR-501: a format with no scripting surface must not carry the
     /// scripting shims.
     ///
@@ -593,7 +584,13 @@ mod tests {
                 .iter()
                 .map(|e| e.0)
                 .collect();
-            for dropped in ["pm-shim", "bru-shim", "chai-shim", "lodash-shim", "cryptojs-shim"] {
+            for dropped in [
+                "pm-shim",
+                "bru-shim",
+                "chai-shim",
+                "lodash-shim",
+                "cryptojs-shim",
+            ] {
                 assert!(
                     !names.contains(&dropped),
                     "{fmt} has no scripting surface, so it must not load {dropped}: {names:?}"
@@ -647,10 +644,11 @@ mod tests {
             .iter()
             .map(|e| e.0)
             .collect();
-        let full: Vec<&str> = ShimBundle::default().0.iter().map(|e| e.0).collect();
+        let scanned: Vec<&str> = ShimBundle::from_script(b"").0.iter().map(|e| e.0).collect();
         assert_eq!(
-            unknown, full,
-            "an unknown format must get the full bundle — the safe direction"
+            unknown, scanned,
+            "an unknown format must not be narrowed BY FORMAT — it falls through \
+             to content scanning, which is the pre-existing safe default"
         );
     }
 
@@ -666,19 +664,23 @@ mod tests {
             .iter()
             .map(|e| e.0)
             .collect();
-        let full: Vec<&str> = ShimBundle::default().0.iter().map(|e| e.0).collect();
-        assert_eq!(names, full, "insomnia stays on the full bundle for now");
+        let scanned: Vec<&str> = ShimBundle::from_script(b"").0.iter().map(|e| e.0).collect();
+        assert_eq!(
+            names, scanned,
+            "insomnia must not be narrowed by format — it falls through to \
+             content scanning until a real export proves what its scripts use"
+        );
     }
 
+    #[test]
     fn pm_shim_does_not_install_k6_builtins() {
         let d = ShimBundle::default();
-        let pm = d
-            .0
-            .iter()
-            .find(|e| e.0 == "pm-shim")
-            .expect("pm-shim present")
-            .1
-            .as_ref();
+        let pm =
+            d.0.iter()
+                .find(|e| e.0 == "pm-shim")
+                .expect("pm-shim present")
+                .1
+                .as_ref();
         for sym in ["check", "group", "Counter", "Gauge", "Rate", "Trend"] {
             assert!(
                 !pm.contains(&format!("globalThis.{sym} = {sym};")),
@@ -687,13 +689,12 @@ mod tests {
             );
         }
 
-        let core = d
-            .0
-            .iter()
-            .find(|e| e.0 == "k6-core-shim")
-            .expect("k6-core-shim present")
-            .1
-            .as_ref();
+        let core =
+            d.0.iter()
+                .find(|e| e.0 == "k6-core-shim")
+                .expect("k6-core-shim present")
+                .1
+                .as_ref();
         for sym in ["check", "group", "Counter", "Gauge", "Rate", "Trend"] {
             assert!(
                 core.contains(&format!("globalThis.{sym} = {sym};")),
@@ -716,6 +717,14 @@ mod tests {
         );
     }
 
+    /// W2 line 182: the TWO shim lists must stay in lockstep — JS_SHIM_BUNDLE
+    /// (the compile-time concat used by the bytecode path) used to carry 5
+    /// shims while ShimBundle::default() carried 6 (with bru), so bru.js was
+    /// compiled into the binary but NEVER evaluated (typeof bru ===
+    /// 'undefined' in every engine VU). Guard both invariants: the default
+    /// bundle must enumerate bru, and the bytecode source must embed the
+    /// same bru.js text.
+    #[test]
     fn shim_lists_stay_in_lockstep_with_bru() {
         let d = ShimBundle::default();
         assert_eq!(
@@ -766,10 +775,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_vu_js_context_honors_custom_sandbox_config() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> =
-            DriverHttpClientImpl::new_arc(VuCookieClient::new(
-                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ));
+        let client: Arc<dyn DriverHttpClient> = DriverHttpClientImpl::new_arc(VuCookieClient::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        ));
         let config = SandboxConfig {
             namespace: "acme".into(),
             aliases: vec!["product".into(), "wire".into()],
@@ -807,10 +815,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn per_vu_globals_are_isolated() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> =
-            DriverHttpClientImpl::new_arc(VuCookieClient::new(
-                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ));
+        let client: Arc<dyn DriverHttpClient> = DriverHttpClientImpl::new_arc(VuCookieClient::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        ));
         let mut ctx1 = create_vu_js_context(
             1,
             &pm_state,
@@ -873,10 +880,9 @@ mod tests {
         const TOLERANCE: f64 = 0.25;
 
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> =
-            DriverHttpClientImpl::new_arc(VuCookieClient::new(
-                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ));
+        let client: Arc<dyn DriverHttpClient> = DriverHttpClientImpl::new_arc(VuCookieClient::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        ));
         let ctx = create_vu_js_context(
             1,
             &pm_state,
@@ -978,10 +984,9 @@ mod tests {
     #[ignore = "measurement, not an assertion — run explicitly with --nocapture"]
     async fn measure_per_vu_quickjs_heap() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> =
-            DriverHttpClientImpl::new_arc(VuCookieClient::new(
-                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ));
+        let client: Arc<dyn DriverHttpClient> = DriverHttpClientImpl::new_arc(VuCookieClient::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        ));
         let bare = tropel_js::JsContext::new(None, None)
             .await
             .expect("bare context");

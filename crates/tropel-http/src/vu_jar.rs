@@ -241,11 +241,7 @@ pub fn parse_rfc1123(s: &str) -> Result<i64> {
     }
     let day: i64 = day.parse().map_err(|_| bad())?;
     let year: i64 = year.parse().map_err(|_| bad())?;
-    let month = MONTHS
-        .iter()
-        .position(|m| *m == month)
-        .ok_or_else(bad)? as i64
-        + 1;
+    let month = MONTHS.iter().position(|m| *m == month).ok_or_else(bad)? as i64 + 1;
     if !(1..=31).contains(&day) {
         return Err(bad());
     }
@@ -406,7 +402,9 @@ mod tests {
             expires: Some("tomorrow".into()),
             ..Default::default()
         };
-        let err = build_set_cookie("sid", "abc", &opts).unwrap_err().to_string();
+        let err = build_set_cookie("sid", "abc", &opts)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("RFC1123"),
             "a malformed expires must name the format, got: {err}"

@@ -259,13 +259,6 @@ Trend.prototype.add = function (value, tags) {
     return true;
 };
 
-    // Expose the k6-style globals the shim also provides (unchanged behavior).
-    if (typeof globalThis !== 'undefined') {
-        globalThis.postman = postman;
-    }
-    return pm;
-}
-
 
 // Install the k6 globals. pm.js no longer does this.
 if (typeof globalThis !== 'undefined') {

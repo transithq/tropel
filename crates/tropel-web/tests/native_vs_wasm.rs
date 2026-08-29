@@ -302,7 +302,11 @@ fn host_http(mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32) -> i
 fn host_shim(mut caller: Caller<'_, HostState>) -> i64 {
     const SHIM_SOURCES: [&str; 7] = [
         include_str!("../../../js/shared/deep-equal.js"),
-        include_str!("../../../js/scripting-api/pm.js"),
+        concat!(
+            include_str!("../../../js/shared/k6-core.js"),
+            "\n",
+            include_str!("../../../js/scripting-api/pm.js")
+        ),
         include_str!("../../../js/chai/chai-shim.js"),
         include_str!("../../../js/lodash/lodash-shim.js"),
         include_str!("../../../js/cryptojs-shim/cryptojs.js"),
