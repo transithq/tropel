@@ -673,39 +673,75 @@ mod tests {
         );
     }
 
-    /// TR-501: shim gating must not cost more than it saves.
+    // `shim_gating_currently_costs_more_than_it_saves` was removed here.
+    //
+    // It asserted gated > default and its own failure message said: "If this
+    // now passes, gating has been fixed — most likely by routing gated
+    // bundles through the bytecode cache in bootstrap_shims. Invert this
+    // test." That is exactly what the bundle-keyed bytecode cache in this
+    // merge does, so the test has served its purpose and would now fail by
+    // design. Removed rather than inverted: the format-bundle tests assert
+    // the real property directly.
+
+    /// TR-503: the per-VU cost of N real VU contexts, which is the only way to
+    /// measure a SHARED runtime.
     ///
-    /// The claim is *"an http-only k6 script pays nothing for chai, lodash,
-    /// cryptojs or `pm.js`"* and *"http-only saves ~120 KB/VU"*. Measured, it
-    /// is the other way round: a gated bundle is LARGER than the default.
+    /// `measure_per_vu_quickjs_heap` below creates contexts one at a time and
+    /// reads `quickjs_heap_bytes()`, which reports the whole **runtime**. With
+    /// sharing on, that number accumulates across every context on the thread,
+    /// so it cannot be read as a per-VU figure — the apparent growth is the
+    /// measurement, not a regression. Amortising over N is the honest form.
     ///
-    /// The cause is in `bootstrap_shims`: the shared, compile-once bytecode
-    /// path is taken only when `shim.is_default()`. Any gated bundle falls
-    /// through to per-VU **source eval**, and materialising the parser and
-    /// source text costs more than the two shims gating drops.
-    ///
-    /// So this asserts the honest direction and will FAIL the day gating is
-    /// made to pay off — at which point the number in TR-501 gets updated
-    /// from a real measurement instead of an aspiration. Asserting the claim
-    /// as written would pin a pessimisation as correct.
+    /// `cargo test -p tropel-engine --release amortised_per_vu_heap -- --nocapture --ignored`
+    /// Compare with `TROPEL_SHARED_RUNTIME=0`.
     #[tokio::test]
-    async fn shim_gating_currently_costs_more_than_it_saves() {
-        let http_only = b"import http from 'k6/http'; export default () => http.get('http://x');";
-
-        let default_heap = crate::bench_support::vu_context_heap_bytes()
-            .await
-            .expect("default VU context");
-        let gated_heap = crate::bench_support::vu_context_heap_bytes_for_script(http_only)
-            .await
-            .expect("gated VU context");
-
-        assert!(
-            gated_heap > default_heap,
-            "shim gating is expected to be a PESSIMISATION today (gated {gated_heap} B vs \
-             default {default_heap} B). If this now passes, gating has been fixed — most \
-             likely by routing gated bundles through the bytecode cache in bootstrap_shims. \
-             Invert this test, re-measure, and update TR-501 with the real saving."
+    #[ignore]
+    async fn amortised_per_vu_heap() {
+        const N: usize = 25;
+        let pm_state = new_pm_state();
+        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+            client: VuCookieClient::new(
+                HttpClient::new(&HttpConfig::default()).expect("http client"),
+            ),
+        });
+        // TROPEL_PROBE_BUNDLE=gated measures what an http-only script must
+        // actually pay for — the headroom any lazy-materialisation scheme
+        // could recover.
+        let bundle = if std::env::var("TROPEL_PROBE_BUNDLE").as_deref() == Ok("gated") {
+            ShimBundle::from_script(
+                b"import http from 'k6/http'; export default () => http.get('http://x');",
+            )
+        } else {
+            ShimBundle::default()
+        };
+        let mut ctxs = Vec::with_capacity(N);
+        for i in 0..N {
+            ctxs.push(
+                create_vu_js_context(
+                    i as u32,
+                    &pm_state,
+                    &client,
+                    &bundle,
+                    &SandboxConfig::default(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .expect("VU context"),
+            );
+        }
+        let total: u64 = if std::env::var("TROPEL_SHARED_RUNTIME").as_deref() == Ok("0") {
+            // Private runtimes: each reports only itself, so sum them.
+            ctxs.iter().map(|c| c.quickjs_heap_bytes()).sum()
+        } else {
+            // One shared runtime: any context reports the whole thing once.
+            ctxs[0].quickjs_heap_bytes()
+        };
+        println!(
+            "shared={} N={N} total={total} B per_vu={} B",
+            std::env::var("TROPEL_SHARED_RUNTIME").unwrap_or_else(|_| "1".into()),
+            total / N as u64
         );
+        std::hint::black_box(ctxs);
     }
 
     /// TR-503 / TR-501: print the ACTUAL per-VU QuickJS heap so the README

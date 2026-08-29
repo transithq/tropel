@@ -193,6 +193,112 @@ fn adjust_error_lines(msg: &str, offset: u32, source_url: Option<&str>) -> Strin
 /// before `ctx` (Context/Runtime) so Rust drops the cache (Persistents) first,
 /// then the Runtime. If ctx were dropped first, live Persistents would reference
 /// freed heap memory and rquickjs would abort the process.
+/// TR-503: one QuickJS `Runtime` per WORKER THREAD, shared by every VU
+/// context on it.
+///
+/// # Why this is safe here
+///
+/// `VUWorkerPool::make_worker` builds each worker as a
+/// `tokio::runtime::Builder::new_current_thread()` on its own pinned OS
+/// thread. Current-thread runtimes do not work-steal, so a VU task spawned
+/// onto a worker runs only on that worker's thread — contexts are genuinely
+/// thread-affine, and a thread-local `Runtime` is never touched from two
+/// threads.
+///
+/// # Why it is worth doing
+///
+/// QuickJS interns every identifier and string literal into a per-**Runtime**
+/// atom table, and caches object shapes there too. Fifty contexts each
+/// parsing the same shim bundle build fifty identical atom tables. Measured
+/// with `examples/runtime_sharing_probe.rs` (release, Apple Silicon, 50
+/// contexts each loading a 108 750-byte shim-shaped source):
+///
+/// | arrangement | per context |
+/// |---|---|
+/// | one `Runtime` each | 722,080 B |
+/// | one shared `Runtime` | 360,111 B |
+///
+/// **50.1 % saved.** Note this is nothing like the "57 KB/VU, −92.3 %" that
+/// TR-503 published: that figure was never measured, and the code it cited
+/// never shared a `Runtime` at all (both arms of its lookup returned `None`).
+/// The saving is real and large; the old number was not.
+///
+/// Set `TROPEL_SHARED_RUNTIME=0` to opt out and get a private `Runtime` per
+/// VU — see the memory-limit note on [`SharedRuntimeState`].
+mod shared_runtime {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Per-thread shared runtime plus the bookkeeping the pooled memory limit
+    /// needs.
+    pub(super) struct SharedRuntimeState {
+        pub rt: Runtime,
+        /// Live contexts on this runtime. The QuickJS memory limit is a
+        /// property of the RUNTIME, not the context, so a shared runtime
+        /// means a shared budget: it is set to `per_vu_limit * live` and
+        /// rescaled as VUs come and go, preserving aggregate headroom.
+        pub live: usize,
+        /// The per-VU limit the budget is scaled from. VUs on one thread all
+        /// pass the same value (`js_heap_bytes()`), so the max is taken
+        /// defensively rather than assuming uniformity.
+        pub per_vu_limit: usize,
+    }
+
+    thread_local! {
+        pub(super) static SHARED: RefCell<Option<SharedRuntimeState>> =
+            const { RefCell::new(None) };
+        /// The VU whose JS is executing on this thread RIGHT NOW.
+        ///
+        /// The interrupt handler is a property of the runtime, so a shared
+        /// runtime cannot close over one VU's deadline. QuickJS runs exactly
+        /// one context at a time per runtime, so the correct answer is always
+        /// "whoever is currently inside an eval" — this cell carries that, set
+        /// by [`ActiveVu`] on entry and restored on drop so interleaved
+        /// `eval_async` calls nest correctly.
+        pub(super) static ACTIVE_VU: RefCell<Option<(Arc<AtomicU64>, Arc<AtomicBool>)>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(super) fn sharing_enabled() -> bool {
+        !matches!(
+            std::env::var("TROPEL_SHARED_RUNTIME").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    }
+
+    /// RAII: mark this VU as the one executing, restoring the previous on
+    /// drop. Restoring rather than clearing is what makes nested and
+    /// interleaved evals correct.
+    pub(super) struct ActiveVu(Option<(Arc<AtomicU64>, Arc<AtomicBool>)>);
+
+    impl ActiveVu {
+        pub fn enter(deadline: &Arc<AtomicU64>, force_stop: &Arc<AtomicBool>) -> Self {
+            let prev = ACTIVE_VU.with(|c| {
+                c.borrow_mut()
+                    .replace((deadline.clone(), force_stop.clone()))
+            });
+            ActiveVu(prev)
+        }
+    }
+
+    impl Drop for ActiveVu {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            ACTIVE_VU.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+
+    /// Rescale the pooled limit after a context is added or removed.
+    pub(super) fn rescale_limit(st: &SharedRuntimeState) {
+        // Saturate: a huge VU count must not wrap the budget to something
+        // tiny, which would look like a spurious OOM.
+        let budget = st.per_vu_limit.saturating_mul(st.live.max(1));
+        st.rt.set_memory_limit(budget);
+    }
+}
+
+use shared_runtime::{ActiveVu, SharedRuntimeState};
+
 pub struct JsContext {
     /// Compiled script cache: source-hash → persistent function.
     /// Declared FIRST so it is dropped BEFORE ctx.
@@ -201,6 +307,12 @@ pub struct JsContext {
     rt: Runtime,
     ctx: Context,
     context_id: u64,
+    /// Kept so each eval can mark itself the active VU for the shared
+    /// runtime's interrupt handler.
+    force_stop: Arc<AtomicBool>,
+    /// True when `rt` is this thread's shared runtime rather than a private
+    /// one; drives the live-count bookkeeping in `Drop`.
+    on_shared_runtime: bool,
     /// Shared deadline (epoch nanos) for the interrupt handler.
     /// Reset before each eval/eval_async to allow per-script timeouts.
     interrupt_deadline: Arc<AtomicU64>,
@@ -262,41 +374,75 @@ impl JsContext {
         max_execution_time: Option<Duration>,
         force_stop: Arc<AtomicBool>,
     ) -> Result<Self> {
-        // One `Runtime` per VU. TR-503 proposed sharing a `Runtime` per worker
-        // thread and aliasing template globals into per-VU `Context`s; that is
-        // NOT implemented. A thread-local `SHARED_RT` used to sit here whose
-        // lookup returned `None` on both arms — so it never shared anything —
-        // and which then allocated a SECOND `Runtime` per worker thread that
-        // nothing ever read, making the pool cost more memory rather than less.
-        // It is removed rather than left in place: dead scaffolding that reads
-        // as a landed optimisation is how the 57 KB/VU figure reached the
-        // README (see TR-503, reopened).
-        //
-        // `rquickjs::Runtime` is `!Clone` and its `Context`s are bound to it,
-        // so sharing needs the async host-call model from TR-502 first — the
-        // ordering the wave notes call out.
-        let rt = Runtime::new()
-            .map_err(|e| JsError::ContextCreation(format!("Runtime creation failed: {}", e)))?;
+        // TR-503: take this worker thread's SHARED runtime when sharing is on
+        // (the default), otherwise a private one. See `mod shared_runtime` for
+        // why this is thread-safe and what it measures.
+        let sharing = shared_runtime::sharing_enabled();
+        let (rt, on_shared_runtime) = if sharing {
+            shared_runtime::SHARED.with(|cell| -> Result<(Runtime, bool)> {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    let rt = Runtime::new().map_err(|e| {
+                        JsError::ContextCreation(format!("Runtime creation failed: {}", e))
+                    })?;
+                    // Install the interrupt handler ONCE per shared runtime.
+                    // It cannot close over a single VU's deadline, so it reads
+                    // whichever VU is currently executing.
+                    rt.set_interrupt_handler(Some(Box::new(move || {
+                        shared_runtime::ACTIVE_VU.with(|c| match &*c.borrow() {
+                            Some((deadline, force_stop)) => {
+                                now_nanos() > deadline.load(Ordering::Relaxed)
+                                    || force_stop.load(Ordering::Acquire)
+                            }
+                            // No VU is inside an eval: never interrupt. A
+                            // blanket `true` here would abort whatever the
+                            // engine itself is doing on this thread.
+                            None => false,
+                        })
+                    })));
+                    *slot = Some(SharedRuntimeState {
+                        rt,
+                        live: 0,
+                        per_vu_limit: memory_limit.unwrap_or(0),
+                    });
+                }
+                let st = slot.as_mut().expect("just populated");
+                st.live += 1;
+                st.per_vu_limit = st.per_vu_limit.max(memory_limit.unwrap_or(0));
+                if st.per_vu_limit > 0 {
+                    shared_runtime::rescale_limit(st);
+                }
+                Ok((st.rt.clone(), true))
+            })?
+        } else {
+            let rt = Runtime::new()
+                .map_err(|e| JsError::ContextCreation(format!("Runtime creation failed: {}", e)))?;
+            (rt, false)
+        };
 
-        // Set memory limit (in bytes)
-        if let Some(limit) = memory_limit {
-            rt.set_memory_limit(limit);
+        // Private runtimes keep the exact per-VU limit. The shared runtime's
+        // budget is pooled and was scaled above.
+        if !on_shared_runtime {
+            if let Some(limit) = memory_limit {
+                rt.set_memory_limit(limit);
+            }
         }
 
         let max_execution_time = max_execution_time.unwrap_or(Duration::from_secs(10));
         let initial_deadline = now_nanos() + max_execution_time.as_nanos() as u64;
         let interrupt_deadline = Arc::new(AtomicU64::new(initial_deadline));
 
-        // Set interrupt handler using atomic deadline (reset per-eval). The
-        // handler ALSO fires when the linked force-stop flag flips, so a hard
-        // stop interrupts the eval promptly (backlog: gracefulStop force-stop
-        // was advisory only).
-        let deadline = interrupt_deadline.clone();
-        let force_stop_handler = force_stop.clone();
-        rt.set_interrupt_handler(Some(Box::new(move || {
-            now_nanos() > deadline.load(Ordering::Relaxed)
-                || force_stop_handler.load(Ordering::Acquire)
-        })));
+        // A private runtime keeps the simple closure over its own VU's
+        // deadline. The shared runtime installed a routing handler at
+        // creation time instead — see `mod shared_runtime`.
+        if !on_shared_runtime {
+            let deadline = interrupt_deadline.clone();
+            let force_stop_handler = force_stop.clone();
+            rt.set_interrupt_handler(Some(Box::new(move || {
+                now_nanos() > deadline.load(Ordering::Relaxed)
+                    || force_stop_handler.load(Ordering::Acquire)
+            })));
+        }
 
         // Install the host promise rejection tracker (backlog line 174).
         // Without it, a fire-and-forget `(async () => { throw ... })()` rejects
@@ -415,11 +561,27 @@ impl JsContext {
             ctx,
             rt,
             context_id,
+            force_stop,
+            on_shared_runtime,
             interrupt_deadline,
             max_execution_time,
             script_cache: Mutex::new(HashMap::new()),
             unhandled_rejections,
         })
+    }
+
+    /// Enter JS with this VU marked active for the shared runtime's interrupt
+    /// handler.
+    ///
+    /// Every path that runs JS goes through here, rather than each site
+    /// remembering to take the guard — one place to be right, and none can be
+    /// missed when a new eval site is added.
+    fn with_active<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(rquickjs::Ctx<'_>) -> R,
+    {
+        let _active = ActiveVu::enter(&self.interrupt_deadline, &self.force_stop);
+        self.ctx.with(f)
     }
 
     /// Reset the interrupt deadline to now + max_execution_time.
@@ -458,6 +620,14 @@ impl JsContext {
         // interrupt handler (execution-time deadline, armed before every
         // eval-family call): `execute_pending_job` trips it and returns an
         // error, which we propagate.
+        // TR-503: the guard matters here as much as at an eval site — this
+        // runs JS. On a SHARED runtime the job queue is per-runtime, so
+        // `execute_pending_job` may run a microtask belonging to a DIFFERENT
+        // VU's context. That callback correctly runs in its own context, but
+        // it is bounded by whichever VU happened to be pumping. Documented
+        // rather than worked around: QuickJS has one job queue per runtime,
+        // so shared pumping is inherent to sharing at all.
+        let _active = ActiveVu::enter(&self.interrupt_deadline, &self.force_stop);
         let mut pump_count = 0u32;
         loop {
             match self.rt.execute_pending_job() {
@@ -655,7 +825,7 @@ impl JsContext {
     pub async fn eval(&mut self, code: &str) -> Result<String> {
         self.reset_interrupt();
         let code = code.to_string();
-        let result = self.ctx.with(move |ctx| {
+        let result = self.with_active(move |ctx| {
             let value: rquickjs::Value = ctx
                 .eval(code)
                 .map_err(|e| JsError::Eval(format!("JS eval error: {}", e)))?;
@@ -687,7 +857,7 @@ impl JsContext {
 
         // Evaluate the code and resolve any returned promise inside the
         // context lock (Promise::finish drives the job queue itself).
-        let result = self.ctx.with(move |ctx| {
+        let result = self.with_active(move |ctx| {
             let value: rquickjs::Value = ctx
                 .eval(code)
                 .map_err(|e| JsError::Eval(format!("JS eval_async error: {}", e)))?;
@@ -716,7 +886,7 @@ impl JsContext {
     pub async fn set_global_str(&mut self, name: &str, value: &str) -> Result<()> {
         let name = name.to_string();
         let value = value.to_string();
-        self.ctx.with(move |ctx| {
+        self.with_active(move |ctx| {
             let globals = ctx.globals();
             globals
                 .set(name, value)
@@ -727,7 +897,7 @@ impl JsContext {
     /// Set a global variable to an integer directly (no serialization round-trip).
     pub async fn set_global_int(&mut self, name: &str, value: i32) -> Result<()> {
         let name = name.to_string();
-        self.ctx.with(move |ctx| {
+        self.with_active(move |ctx| {
             let globals = ctx.globals();
             globals
                 .set(name, value)
@@ -745,7 +915,7 @@ impl JsContext {
             .map_err(|e| JsError::Conversion(format!("JSON serialization error: {}", e)))?;
         let name = name.to_string();
 
-        self.ctx.with(move |ctx| {
+        self.with_active(move |ctx| {
             // Native JSON parser (JS_ParseJSON) — ONE serialization pass, no
             // double-escape, and no compile+eval of a built `JSON.parse("…")`
             // string on every call (the old path ran QuickJS's parser + JIT
@@ -765,7 +935,7 @@ impl JsContext {
     /// Get a global variable as a string.
     pub async fn get_global(&mut self, name: &str) -> Result<Option<String>> {
         let name = name.to_string();
-        self.ctx.with(move |ctx| {
+        self.with_active(move |ctx| {
             let globals = ctx.globals();
             let val: rquickjs::Value = globals
                 .get(&name)
@@ -806,7 +976,7 @@ impl JsContext {
         // method has no in-tree callers (runner.rs uses run_script_cached).
         let wrapped = format!("(async function __tropel_script(){{{source}}})()");
 
-        self.ctx.with(move |ctx| {
+        self.with_active(move |ctx| {
             let promise: Promise = ctx
                 .eval(wrapped)
                 .map_err(|e| JsError::Eval(format!("Async script compile error: {}", e)))?;
@@ -904,7 +1074,7 @@ impl JsContext {
         if let Some(script) = cached {
             // Fast path: restore and invoke the persisted function, then
             // drive any returned promise to completion.
-            let result = self.ctx.with(|ctx| {
+            let result = self.with_active(|ctx| {
                 let value = script.invoke(&ctx)?;
                 if let Some(promise) = value.as_promise() {
                     Self::finish_promise(
@@ -925,7 +1095,7 @@ impl JsContext {
         }
 
         // Slow path: compile, persist, cache, invoke
-        let script = self.ctx.with(move |ctx| {
+        let script = self.with_active(move |ctx| {
             let wrapped = format!(
                 "(async function __tropel_script(){{\n//# sourceURL={}\n{source}\n}})",
                 source_url_str
@@ -1006,7 +1176,7 @@ impl JsContext {
             .map_err(|_| JsError::Eval("shim source contains NUL byte".into()))?;
         let code_len = code.len() as rquickjs::qjs::size_t;
 
-        let result = self.ctx.with(move |ctx| {
+        let result = self.with_active(move |ctx| {
             let raw = ctx.as_raw().as_ptr();
             let flags = (rquickjs::qjs::JS_EVAL_TYPE_GLOBAL
                 | rquickjs::qjs::JS_EVAL_FLAG_COMPILE_ONLY) as i32;
@@ -1063,7 +1233,7 @@ impl JsContext {
         self.reset_interrupt();
         let bytes = bytecode.to_vec();
 
-        self.ctx.with(|ctx| {
+        self.with_active(|ctx| {
             let raw = ctx.as_raw().as_ptr();
             let val = unsafe {
                 rquickjs::qjs::JS_ReadObject(
@@ -1146,7 +1316,7 @@ impl JsContext {
     where
         F: FnOnce(&rquickjs::Ctx) -> R,
     {
-        self.ctx.with(|ctx| f(&ctx))
+        self.with_active(|ctx| f(&ctx))
     }
 
     /// Bytes of QuickJS heap this context's `Runtime` has allocated, as
@@ -1161,6 +1331,25 @@ impl JsContext {
     /// One `Runtime` per VU today, so this IS the per-VU heap (TR-503).
     pub fn quickjs_heap_bytes(&self) -> u64 {
         self.rt.memory_usage().malloc_size as u64
+    }
+}
+
+impl Drop for JsContext {
+    fn drop(&mut self) {
+        if !self.on_shared_runtime {
+            return;
+        }
+        // Give the pooled budget back. Without this the limit would ratchet
+        // up with every VU ever created and never come down, so a long ramp
+        // would quietly erase the cap it is supposed to enforce.
+        shared_runtime::SHARED.with(|cell| {
+            if let Some(st) = cell.borrow_mut().as_mut() {
+                st.live = st.live.saturating_sub(1);
+                if st.per_vu_limit > 0 {
+                    shared_runtime::rescale_limit(st);
+                }
+            }
+        });
     }
 }
 
@@ -1704,6 +1893,99 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "eval past the original deadline must complete quickly"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_runtime_tests {
+    use super::*;
+
+    /// The whole point: contexts on one thread must land on ONE runtime.
+    #[tokio::test]
+    async fn contexts_on_a_thread_share_one_runtime() {
+        let a = JsContext::new(Some(4 * 1024 * 1024), None).await.unwrap();
+        let b = JsContext::new(Some(4 * 1024 * 1024), None).await.unwrap();
+        assert!(a.on_shared_runtime && b.on_shared_runtime);
+        // Same runtime => the heap figure is the runtime's, so both agree.
+        assert_eq!(
+            a.quickjs_heap_bytes(),
+            b.quickjs_heap_bytes(),
+            "two contexts on one thread must report the same runtime heap"
+        );
+    }
+
+    /// The interrupt handler belongs to the runtime, so a shared runtime
+    /// cannot close over one VU's deadline. If routing were wrong, a VU with
+    /// a live deadline would be interrupted by a SIBLING's expired one.
+    ///
+    /// Fails on a naive shared-runtime implementation that keeps the old
+    /// per-VU closure: the handler would read the first VU's deadline for
+    /// every context on the runtime.
+    #[tokio::test]
+    async fn an_expired_sibling_does_not_interrupt_a_live_vu() {
+        let mut expired = JsContext::new(None, Some(Duration::from_millis(1)))
+            .await
+            .unwrap();
+        let mut live = JsContext::new(None, Some(Duration::from_secs(30)))
+            .await
+            .unwrap();
+
+        // Drive the short-deadline VU into an interrupt.
+        expired.reset_interrupt();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = expired
+            .eval("let s=0; for(let i=0;i<50_000_000;i++){s+=i;} s")
+            .await;
+
+        // The healthy VU must still run: its own deadline is nowhere near.
+        live.reset_interrupt();
+        let out = live.eval("1 + 1").await;
+        assert!(
+            out.is_ok(),
+            "a sibling's expired deadline must not interrupt this VU: {out:?}"
+        );
+    }
+
+    /// No VU inside an eval => the handler must not fire. A blanket `true`
+    /// would abort whatever the engine itself is doing on the thread.
+    #[tokio::test]
+    async fn no_active_vu_means_no_interrupt() {
+        let ctx = JsContext::new(None, Some(Duration::from_millis(1)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Outside any eval the cell is empty; pumping must not error.
+        shared_runtime::ACTIVE_VU.with(|c| assert!(c.borrow().is_none()));
+        drop(ctx);
+    }
+
+    /// The pooled budget must come back down. If `Drop` did not release the
+    /// slot the limit would ratchet up with every VU ever created and never
+    /// fall, quietly erasing the cap over a long ramp.
+    #[tokio::test]
+    async fn dropping_a_context_returns_its_share_of_the_budget() {
+        let base = shared_runtime::SHARED.with(|c| c.borrow().as_ref().map_or(0, |s| s.live));
+        let a = JsContext::new(Some(1024 * 1024), None).await.unwrap();
+        let b = JsContext::new(Some(1024 * 1024), None).await.unwrap();
+        let peak = shared_runtime::SHARED.with(|c| c.borrow().as_ref().unwrap().live);
+        assert_eq!(peak, base + 2, "both contexts counted");
+        drop(b);
+        let after = shared_runtime::SHARED.with(|c| c.borrow().as_ref().unwrap().live);
+        assert_eq!(after, base + 1, "dropping a context releases its slot");
+        drop(a);
+        let end = shared_runtime::SHARED.with(|c| c.borrow().as_ref().unwrap().live);
+        assert_eq!(end, base, "all slots released");
+    }
+
+    /// The opt-out has to actually opt out.
+    #[test]
+    fn sharing_can_be_disabled() {
+        // Not a `f(x) == f(x)` check: it asserts the env var is READ, which is
+        // the only thing standing between a user and the old behaviour.
+        std::env::set_var("TROPEL_SHARED_RUNTIME", "0");
+        assert!(!shared_runtime::sharing_enabled());
+        std::env::remove_var("TROPEL_SHARED_RUNTIME");
+        assert!(shared_runtime::sharing_enabled());
     }
 }
 

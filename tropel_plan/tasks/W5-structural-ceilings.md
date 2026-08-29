@@ -81,6 +81,35 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 ---
 
 ## TR-503 · Shared QuickJS `Runtime` with aliased globals
+
+> **IMPLEMENTED 2026-08-29 — and measured this time.**
+>
+> One QuickJS `Runtime` per **worker thread**, shared by every VU context on
+> it. Safe because `VUWorkerPool::make_worker` gives each worker a
+> `new_current_thread()` tokio runtime on its own pinned OS thread, and
+> current-thread runtimes do not work-steal — VU tasks are genuinely
+> thread-affine.
+>
+> ✅**MEAS** (release, Apple Silicon, 25 real VU contexts with the full shim
+> bundle, `amortised_per_vu_heap`):
+>
+> | | per VU | at 10k VUs |
+> |---|---|---|
+> | private `Runtime` each (previous) | 497,584 B | 4.98 GB |
+> | **shared `Runtime`** | **384,222 B** | **3.84 GB** |
+> | saving | **113,362 B — 22.8%** | ~1.1 GB |
+>
+> The saving is QuickJS's per-**Runtime** atom table and shape cache: every
+> context used to build its own copy of the identical shim bundle's atoms.
+>
+> Two corrections to the note that closed this the first time. It claimed
+> `rquickjs::Runtime` is `!Clone` — it is `#[derive(Clone)]`, a refcounted
+> handle — and that sharing "needs the async host-call model from TR-502
+> first", which the thread-affinity above makes untrue. Neither was checked.
+>
+> The published **"57 KB/VU, −92.3%"** remains withdrawn. The real figure is
+> 384 KB/VU and −22.8%.
+
 **Effort:** L · **Blocked by:** TR-502 · **Do not start early**
 
 > **REOPENED 2026-08-29.** This was marked done on the strength of a
