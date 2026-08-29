@@ -3663,9 +3663,38 @@ mod tests {
 
         let ms = |v: &[Duration]| -> Vec<u64> { v.iter().map(|d| d.as_millis() as u64).collect() };
 
-        // 1. The merged sequence must be evenly spaced at the GLOBAL period.
-        //    Bunching shows up here as gaps of 0 next to gaps of 2×period.
         let merged_ms = ms(&merged);
+
+        // 0. Guard the guards: every assertion below is over `windows(2)` or a
+        //    zip, all of which are vacuously true on an empty log. 20/s over
+        //    2s is 40 global arrivals; the 40th is due exactly ON the 2s
+        //    boundary, which the half-open `elapsed < duration` loop has
+        //    already left — so 39 or 40, and never 3x anything.
+        assert!(
+            (39..=40).contains(&merged_ms.len()),
+            "three stripes must partition the ~40 global arrivals exactly once each, \
+             got {} (per node: {} / {} / {})",
+            merged_ms.len(),
+            n0.len(),
+            n1.len(),
+            n2.len()
+        );
+        assert_eq!(
+            n0.len() + n1.len() + n2.len(),
+            merged_ms.len(),
+            "merged must be the union of the three stripes"
+        );
+        // 50/25/25 of ~40 arrivals.
+        assert!(
+            n0.len() >= 19 && n1.len() >= 9 && n2.len() >= 9,
+            "stripe shares must follow the segments: {} / {} / {}",
+            n0.len(),
+            n1.len(),
+            n2.len()
+        );
+
+        // 1. The merged sequence must be evenly spaced at the GLOBAL period.
+        //    Bunching shows up here as gaps of 0 next to gaps of 2xperiod.
         let mut worst_gap: i64 = 0;
         for w in merged_ms.windows(2) {
             let gap = w[1] as i64 - w[0] as i64;
