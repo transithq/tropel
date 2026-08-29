@@ -6,62 +6,28 @@
 
 use std::time::Instant;
 
+/// TR-501: per-VU QuickJS heap, measured on a context that actually carries
+/// the shims a VU carries.
+///
+/// This used to create a **bare** `JsContext::new(None, None)` — no shims —
+/// and measure RSS delta against the 900 KB budget. Its own comment said so:
+/// *"Use bare JsContext for budget — shims add ~734k, bare is smaller."* The
+/// gate therefore could not fail for the thing TR-501 exists to guard: shim
+/// loading is the whole budget. It also returned `None` on macOS, so the
+/// check silently passed there.
+///
+/// Now it measures QuickJS's own accounting (`JS_ComputeMemoryUsage` via
+/// `quickjs_heap_bytes`) on a context built through the real
+/// `create_vu_js_context` path, which is what a VU gets. That number is
+/// available on every platform and is not polluted by allocator arenas or by
+/// whatever else the process is doing, so the budget means the same thing
+/// everywhere.
 fn memory_per_vu_bytes() -> Option<u64> {
-    // TR-501: per-VU QuickJS heap budget. Measure RSS delta for N contexts
-    // with shims (when possible) — same logic as benches/perf.rs memory_per_vu
-    // but as a single CI gate value. Returns None when RSS unsupported.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
-    const N: usize = 25;
-    let before = process_rss_bytes();
-    let mut contexts = Vec::with_capacity(N);
-    for _ in 0..N {
-        // Use bare JsContext for budget — shims add ~734k, bare is smaller.
-        // The budget is set for the bare context + shims gated case (~715k).
-        // If bare already exceeds budget, gated will too.
-        let ctx = rt.block_on(tropel_js::JsContext::new(None, None)).ok()?;
-        contexts.push(ctx);
-    }
-    let after = process_rss_bytes();
-    std::hint::black_box(contexts);
-    match (before, after) {
-        (Some(b), Some(a)) => Some(a.saturating_sub(b) / N as u64),
-        _ => None,
-    }
-}
-
-#[cfg(windows)]
-fn process_rss_bytes() -> Option<u64> {
-    // Windows RSS via GetProcessMemoryInfo requires windows-sys which is only
-    // a dev-dependency of the bench harness. For the CI gate, treat Windows
-    // RSS as unsupported (skip the budget check) — Linux CI will enforce it.
-    None
-}
-#[cfg(not(windows))]
-fn process_rss_bytes() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        // macOS mach task_info
-        None
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Linux /proc/self/status VmRSS
-        let s = std::fs::read_to_string("/proc/self/status").ok()?;
-        for line in s.lines() {
-            if line.starts_with("VmRSS:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(kb) = parts[1].parse::<u64>() {
-                        return Some(kb * 1024);
-                    }
-                }
-            }
-        }
-        None
-    }
+    rt.block_on(async { tropel_engine::bench_support::vu_context_heap_bytes().await })
 }
 
 fn main() {
@@ -80,59 +46,142 @@ fn main() {
             .map(|n| n.get())
             .unwrap_or(1)
     );
-    let measure = |work: &mut dyn FnMut()| {
-        let samples = 100_000u64;
+    // Each gate drives PRODUCTION code. The four that used to be here did not:
+    // `egress` allocated a `Vec::with_capacity(256)`, `aggregator` summed
+    // 0..32, `ramp` added integers, and `allocations` built a two-element vec
+    // of string literals. All four were compared against one 1000 ns threshold
+    // they passed trivially, so the "release performance regression gate"
+    // gated nothing at all (TR-002).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+
+    // Egress: nanoseconds per sample through the real MetricsCollector. The
+    // 100 k samples/s budget is 10 000 ns/sample; the gate is set well inside
+    // that so a regression is caught before the budget is actually breached.
+    let egress = {
+        use std::sync::Arc;
+        use tropel_metrics::collector::MetricsCollector;
+        use tropel_sdk::types::{Sample, SampleType, TagMap};
+        const N: u64 = 50_000;
+        let collector = MetricsCollector::new();
+        let tags: Arc<TagMap> = Arc::new(TagMap::new());
         let start = Instant::now();
-        for _ in 0..samples {
-            work();
-        }
-        start.elapsed().as_nanos() as u64 / samples
+        rt.block_on(async {
+            for i in 0..N {
+                collector
+                    .record(&Sample {
+                        metric: format!("http_req_duration_{}", i % 100).into(),
+                        value: i as f64 * 0.1,
+                        tags: tags.clone(),
+                        timestamp: std::time::SystemTime::now(),
+                        sample_type: SampleType::Trend,
+                    })
+                    .await;
+            }
+        });
+        start.elapsed().as_nanos() as u64 / N
     };
-    let egress = measure(&mut || {
-        std::hint::black_box(Vec::<u8>::with_capacity(256));
-    });
-    let aggregator = measure(&mut || {
-        let mut sum = 0u64;
-        for i in 0..32 {
-            sum = sum.wrapping_add(i);
+
+    // Request path: nanoseconds to build the twelve-sample set one HTTP hop
+    // emits, over one shared Arc<TagMap> of seven tags (TR-312).
+    let request_path = {
+        use std::sync::Arc;
+        use tropel_sdk::types::{Sample, SampleType, TagMap};
+        const N: u64 = 100_000;
+        const HOP_METRICS: [&str; 12] = [
+            "http_req_duration",
+            "http_reqs",
+            "http_req_failed",
+            "http_req_blocked",
+            "http_req_dns",
+            "http_req_connecting",
+            "http_req_tls_handshaking",
+            "http_req_sending",
+            "http_req_waiting",
+            "http_req_receiving",
+            "data_sent",
+            "data_received",
+        ];
+        let start = Instant::now();
+        for _ in 0..N {
+            let mut tags = TagMap::with_capacity(7);
+            tags.insert("url", "https://example.test/api/resource/42");
+            tags.insert("method", "GET");
+            tags.insert("status", "200");
+            tags.insert("name", "getResource");
+            tags.insert("group", "::checkout");
+            tags.insert("scenario", "default");
+            tags.insert("expected_response", "true");
+            let tags = Arc::new(tags);
+            let now = std::time::SystemTime::now();
+            let mut samples = Vec::with_capacity(HOP_METRICS.len());
+            for name in HOP_METRICS {
+                samples.push(Sample {
+                    metric: name.into(),
+                    value: 12.5,
+                    tags: tags.clone(),
+                    timestamp: now,
+                    sample_type: SampleType::Trend,
+                });
+            }
+            std::hint::black_box(&samples);
         }
-        std::hint::black_box(sum);
-    });
-    let ramp = measure(&mut || {
-        let mut target = 0u32;
-        for stage in 0..10 {
-            target = target.saturating_add(1000 + stage);
-        }
-        std::hint::black_box(target);
-    });
-    let allocations = measure(&mut || {
-        let tags = vec![("url", "https://example.test/api"), ("status", "200")];
-        std::hint::black_box(tags);
-    });
-    let threshold = std::env::var("TROPEL_PERF_MAX_NS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1_000);
-    let passed_ns = [egress, aggregator, ramp, allocations]
-        .into_iter()
-        .all(|ns| ns <= threshold);
-    // TR-501: per-VU memory budget (RSS delta for bare context, ~835k with shims).
-    // Budget 900 KB — above current 835k but tight enough to catch regressions.
-    // When RSS unsupported (macOS), skip the check.
+        start.elapsed().as_nanos() as u64 / N
+    };
+
+    // Per-gate thresholds. One shared 1000 ns number across four unrelated
+    // measurements was how the old gate passed everything.
+    let ns_threshold = |name: &str, default: u64| -> u64 {
+        std::env::var(format!("TROPEL_PERF_MAX_NS_{name}"))
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default)
+    };
+    let egress_budget = ns_threshold("EGRESS", 4_000);
+    let request_path_budget = ns_threshold("REQUEST_PATH", 4_000);
+    let passed_ns = egress <= egress_budget && request_path <= request_path_budget;
+
+    // TR-501: per-VU QuickJS heap budget, measured on a REAL VU context.
+    // Budget 900 KB, above the measured ~486 KB with headroom for a shim to
+    // grow, tight enough to catch a regression. Unlike the previous RSS-based
+    // check, an unmeasurable value now FAILS rather than passing: "we could
+    // not measure it" and "it is within budget" must not look the same.
     let memory_per_vu = memory_per_vu_bytes();
     let memory_budget: u64 = 900 * 1024;
-    let memory_passed = memory_per_vu.map(|v| v <= memory_budget).unwrap_or(true);
+    let memory_passed = memory_per_vu.is_some_and(|v| v <= memory_budget);
     let passed = passed_ns && memory_passed;
     println!(
-        "{{\"machine\":\"{}\",\"profile\":\"release\",\"benchmarks\":{{\"samples_egress\":{},\"aggregator_duty_cycle\":{},\"ramp_wall_clock\":{},\"request_path_allocations\":{},\"memory_per_vu\":{},\"memory_budget\":{}}},\"threshold_ns\":{},\"passed\":{}}}",
-        machine.replace('"', "'"), egress, aggregator, ramp, allocations, memory_per_vu.unwrap_or(0), memory_budget, threshold, passed
+        "{{\"machine\":\"{}\",\"profile\":\"release\",\"benchmarks\":{{\"samples_egress_ns\":{},\"samples_egress_budget_ns\":{},\"request_path_ns\":{},\"request_path_budget_ns\":{},\"memory_per_vu\":{},\"memory_budget\":{}}},\"passed\":{}}}",
+        machine.replace('"', "'"),
+        egress,
+        egress_budget,
+        request_path,
+        request_path_budget,
+        memory_per_vu.unwrap_or(0),
+        memory_budget,
+        passed
     );
-    if !memory_passed {
+    if egress > egress_budget {
+        eprintln!("egress regression: {egress} ns/sample > budget {egress_budget} ns");
+    }
+    if request_path > request_path_budget {
         eprintln!(
-            "TR-501 memory budget failed: per-VU RSS {} > budget {} (900KB)",
-            memory_per_vu.unwrap_or(0),
-            memory_budget
+            "request-path regression: {request_path} ns/hop > budget {request_path_budget} ns"
         );
+    }
+    if !memory_passed {
+        match memory_per_vu {
+            Some(v) => eprintln!(
+                "TR-501 memory budget failed: per-VU QuickJS heap {v} B > budget {memory_budget} B (900 KB)"
+            ),
+            None => eprintln!(
+                "TR-501 memory budget failed: per-VU QuickJS heap could not be measured. \
+                 This gate fails closed — an unmeasurable budget that reports PASS is how \
+                 the shim-loading path went ungated in the first place."
+            ),
+        }
     }
     if !passed {
         std::process::exit(1);
