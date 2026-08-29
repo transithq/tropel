@@ -4471,9 +4471,9 @@ fn install_iteration_global(
 /// A missing/unreadable `options` yields k6's defaults — `declared_options`
 /// already reports a malformed `options` fatally, and a second error here
 /// would just compete with it.
-fn read_batch_limits(
-    ctx: &rquickjs::Ctx<'_>,
-    module: &rquickjs::Module<'_, rquickjs::module::Evaluated>,
+fn read_batch_limits<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    module: &rquickjs::Module<'js, rquickjs::module::Evaluated>,
 ) -> crate::options::K6BatchLimits {
     let json = (|| -> Option<String> {
         let value: rquickjs::Value = module.get("options").ok()?;
