@@ -123,14 +123,6 @@ function check(val, conds, tags) {
     return allPassed;
 }
 
-// ── pm.visualizer ──
-pm.visualizer = {
-    set: function (template, data) {
-        // Visualizer is not supported in CLI mode
-        console.log('[visualizer] template:', template, 'data:', data);
-    }
-};
-
 // ── k6-style Custom Metric Constructors ──
 // These provide the k6/metrics API: create a metric object, then
 // call .add(value, tags) to record a sample with optional tags.

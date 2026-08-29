@@ -1399,6 +1399,16 @@ pm.metrics = {
 // to load the whole 70 KB Postman shim just to get `check()` (TR-501).
 // They now live in js/shared/k6-core.js, which every bundle includes.
 
+    // ── pm.visualizer ── (stayed with pm: it is Postman surface, and it
+    // needs `pm` to exist. The k6-core extraction swept it up by accident
+    // because it sits between `check` and the metric constructors.)
+    pm.visualizer = {
+        set: function (template, data) {
+            // Visualizer is not supported in CLI mode
+            console.log('[visualizer] template:', template, 'data:', data);
+        }
+    };
+
     // Expose the Postman globals. The k6-style globals (check/group/Counter/
     // Gauge/Rate/Trend) are installed by k6-core.js, which loads first.
     if (typeof globalThis !== 'undefined') {
