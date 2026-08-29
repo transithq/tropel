@@ -673,6 +673,41 @@ mod tests {
         );
     }
 
+    /// TR-501: shim gating must not cost more than it saves.
+    ///
+    /// The claim is *"an http-only k6 script pays nothing for chai, lodash,
+    /// cryptojs or `pm.js`"* and *"http-only saves ~120 KB/VU"*. Measured, it
+    /// is the other way round: a gated bundle is LARGER than the default.
+    ///
+    /// The cause is in `bootstrap_shims`: the shared, compile-once bytecode
+    /// path is taken only when `shim.is_default()`. Any gated bundle falls
+    /// through to per-VU **source eval**, and materialising the parser and
+    /// source text costs more than the two shims gating drops.
+    ///
+    /// So this asserts the honest direction and will FAIL the day gating is
+    /// made to pay off — at which point the number in TR-501 gets updated
+    /// from a real measurement instead of an aspiration. Asserting the claim
+    /// as written would pin a pessimisation as correct.
+    #[tokio::test]
+    async fn shim_gating_currently_costs_more_than_it_saves() {
+        let http_only = b"import http from 'k6/http'; export default () => http.get('http://x');";
+
+        let default_heap = crate::bench_support::vu_context_heap_bytes()
+            .await
+            .expect("default VU context");
+        let gated_heap = crate::bench_support::vu_context_heap_bytes_for_script(http_only)
+            .await
+            .expect("gated VU context");
+
+        assert!(
+            gated_heap > default_heap,
+            "shim gating is expected to be a PESSIMISATION today (gated {gated_heap} B vs \
+             default {default_heap} B). If this now passes, gating has been fixed — most \
+             likely by routing gated bundles through the bytecode cache in bootstrap_shims. \
+             Invert this test, re-measure, and update TR-501 with the real saving."
+        );
+    }
+
     /// TR-503 / TR-501: print the ACTUAL per-VU QuickJS heap so the README
     /// number is derived, not asserted. Run with:
     /// `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored`

@@ -25,6 +25,24 @@ flate2 = { version = "1.1.9" }
 windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 # RSS measurement on macOS: mach task_info (MACH_TASK_BASIC_INFO).
 libc = "0.2"
+# TR-002/TR-304: the OTLP window bench measures the REAL encoder, so it needs
+# the reporter crate and a JSON serializer. The bench it replaced gzipped a
+# synthetic string and its CPU number described nothing in the product.
+tropel-report.workspace = true
+serde_json.workspace = true
+
+# `libc::mach_task_self` is deprecated in favour of `mach2`, and a deprecation
+# is an error under `-D warnings` — so this crate did not lint on macOS. CI runs
+# clippy on ubuntu only, and `cargo test` skips `harness = false` benches, so
+# nothing caught it: the bench crate went uncompiled on the very platform its
+# MEAS numbers were taken on (TR-002). `mach2` is already in the tree via
+# wasmtime, so this adds no dependency weight.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+mach2 = "0.5"
+
+[[bin]]
+name = "soak"
+path = "src/bin/soak.rs"
 
 [[bin]]
 name = "perf-regression"
@@ -33,3 +51,20 @@ path = "src/bin/perf-regression.rs"
 [[bench]]
 name = "perf"
 harness = false
+
+# RSS sampling for the soak harness. Scoped per-target so adding it does not
+# perturb the dependency graph on the other two platforms — declaring
+# windows-sys unconditionally re-unified it from 0.52 to 0.61 for unrelated
+# crates, which is a bigger change than a soak harness should make.
+#
+# `libc::mach_task_self` is deprecated in favour of `mach2`, and a deprecation
+# is an error under `-D warnings`. mach2 is already in the tree via wasmtime.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+mach2 = "0.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }

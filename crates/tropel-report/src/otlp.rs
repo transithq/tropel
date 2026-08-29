@@ -220,7 +220,12 @@ fn normalize_metrics_url(url: &str) -> String {
 /// would be wrong — raw counter samples are per-event increments, not
 /// running totals from process start, and a collector would interpret each
 /// as a cumulative total.
-fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::Value {
+///
+/// `pub` so the benchmark harness can measure the REAL encode path. The
+/// `otlp_per_window_cpu` bench used to gzip a synthetic string and never touch
+/// this function, which made its "18 ms per 100 ms window" number unrelated to
+/// the code it claimed to measure (TR-002).
+pub fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::Value {
     let mut metric_values = Vec::with_capacity(metrics.len());
 
     for (name, samples) in metrics {

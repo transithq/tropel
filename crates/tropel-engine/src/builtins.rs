@@ -130,16 +130,103 @@ mod tests {
         );
     }
 
+    /// Adapters that legitimately have no static `inventory::submit!`, with the
+    /// reason. Anything not listed here MUST be reachable from the CLI.
+    ///
+    /// Data rather than an `if`, so adding an exemption is a visible diff that
+    /// has to carry a justification.
+    const REGISTRATION_EXEMPT: &[(&str, &str)] = &[(
+        "tropel-input-subprocess",
+        "factory-only: takes a runtime --subprocess-adapter <cmd> argument, so it cannot \
+         be a compile-time registration. A static placeholder would be probed on every \
+         auto-detect and spawn a bogus `echo` (see its lib.rs Registration section).",
+    )];
+
+    /// TR-007: every adapter shipped in this workspace must be reachable from
+    /// the CLI. A new adapter that is never force-linked (or never wired into
+    /// `link_builtins`) registers in `inventory` but gets dead-stripped from
+    /// the binary, so `tropel run file` reports "no input adapter recognized".
+    /// This test walks the real `collect_inventory()` path the CLI uses.
+    ///
+    /// It ENUMERATES `crates/inputs/` rather than asserting a hardcoded list.
+    /// The criterion is "otherwise the next one ships unwired too", and a
+    /// hardcoded list cannot deliver that — the next adapter is by definition
+    /// not in it, so it passes silently. bru and insomnia shipped unreachable
+    /// for exactly this reason: they were in the wasm dispatch table and not
+    /// the native one, and nothing compared the two populations.
     #[test]
-    fn every_builtin_adapter_is_reachable_from_the_cli() {
+    fn every_adapter_in_the_workspace_is_reachable_from_the_cli() {
         register_builtins();
         let registry = ExtensionRegistry::new();
         let inputs = registry.list_inputs();
-        for expected in ["postman", "har", "openapi", "k6", "http", "bru", "insomnia"] {
+
+        let inputs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .join("crates/inputs");
+
+        let mut unreachable = Vec::new();
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&inputs_dir)
+            .expect("crates/inputs must exist")
+            .flatten()
+        {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let crate_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if REGISTRATION_EXEMPT.iter().any(|(n, _)| *n == crate_name) {
+                continue;
+            }
+            // The adapter id is what `list_inputs()` reports; by convention it
+            // is the crate name minus the `tropel-input-` prefix.
+            let Some(id) = crate_name.strip_prefix("tropel-input-") else {
+                continue;
+            };
+            checked += 1;
+            if !inputs.iter().any(|got| got == id) {
+                unreachable.push(id.to_string());
+            }
+        }
+
+        assert!(
+            checked >= 7,
+            "expected to enumerate at least the 7 known adapters, found {checked} — the \
+             directory layout changed and this test is no longer looking at anything \
+             (that is how a reachability test rots into a no-op)"
+        );
+        assert!(
+            unreachable.is_empty(),
+            "these adapters exist in crates/inputs but are NOT reachable from the CLI: \
+             {unreachable:?}. Add each to builtins::link_builtins(), or add an entry to \
+             REGISTRATION_EXEMPT with the reason it cannot be statically registered."
+        );
+    }
+
+    /// The exemption list must not become a way to hide a real gap: every crate
+    /// named in it has to still exist, and carry a real justification.
+    #[test]
+    fn registration_exemptions_still_exist_and_carry_a_reason() {
+        let inputs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .join("crates/inputs");
+        for (crate_name, reason) in REGISTRATION_EXEMPT {
             assert!(
-                inputs.iter().any(|id| id == expected),
-                "adapter '{expected}' is not reachable from the CLI — it must be added to \
-                 builtins::link_builtins() or the binary dead-strips its registration"
+                inputs_dir.join(crate_name).is_dir(),
+                "REGISTRATION_EXEMPT names '{crate_name}', which no longer exists — remove \
+                 the stale exemption"
+            );
+            assert!(
+                reason.len() > 40,
+                "exemption for '{crate_name}' needs a real justification, not a stub"
             );
         }
     }

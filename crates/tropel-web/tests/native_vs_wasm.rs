@@ -790,6 +790,73 @@ fn native_and_wasm_agree_over_request_corpus() {
             });
             r
         },
+        // TR-408/TR-409: the SIGNING schemes. These are the ones where a
+        // byte difference between native and wasm is a 403 that costs a day
+        // to find — which is the stated reason signing lives in Rust at all
+        // rather than being reimplemented in TypeScript. The corpus covered
+        // bearer/basic/apikey/digest, i.e. the four schemes where the header
+        // is a near-verbatim copy of the credential, and omitted every scheme
+        // that actually computes a signature over the request.
+        //
+        // OAuth1 and SigV4 sign the method, URL, query string and body, so
+        // any divergence in how the two legs canonicalise a request shows up
+        // here and nowhere else.
+        //
+        // The credentials are deliberately synthetic. This harness compares
+        // the two legs against EACH OTHER, so the key bytes are arbitrary —
+        // what matters is that both sides sign the same input. Correctness
+        // against published vectors (RFC 5849, RFC 7616, the AWS test suite)
+        // is `tropel-auth/src/signers.rs`'s job, and that is where the real
+        // vectors belong.
+        {
+            let mut r = base("https://fixture.test/oauth1");
+            r.method = Method::POST;
+            r.query_params.insert("b5".into(), "=%3D".into());
+            r.query_params.insert("a3".into(), "a".into());
+            r.body = Some(Body::UrlEncoded(vec![("c2".into(), "".into())]));
+            r.auth = Some(AuthConfig::OAuth1 {
+                consumer_key: "fixture-consumer-key".into(),
+                consumer_secret: "fixture-consumer-secret".into(),
+                token: Some("fixture-token".into()),
+                token_secret: Some("fixture-token-secret".into()),
+                signature_method: Some("HMAC-SHA1".into()),
+            });
+            r
+        },
+        {
+            // Consecutive slashes and an unencoded query value: the SigV4
+            // canonical-URI and canonical-query rules are where the two legs
+            // are most likely to disagree (TR-603's slash-normalisation bug
+            // lived exactly here).
+            let mut r = base("https://fixture.test//prod//users?x=1%20 2&a=b");
+            r.auth = Some(AuthConfig::AwsSigV4 {
+                access_key: "fixture-access-key".into(),
+                secret_key: "fixture-secret-key".into(),
+                region: Some("us-east-1".into()),
+                service: Some("service".into()),
+                session_token: None,
+            });
+            r
+        },
+        {
+            let mut r = base("https://fixture.test/hawk");
+            r.method = Method::POST;
+            r.body = Some(Body::Raw("Thank you for flying Hawk".into()));
+            r.auth = Some(AuthConfig::Hawk {
+                auth_id: "fixture-hawk-id".into(),
+                auth_key: "fixture-hawk-key".into(),
+                algorithm: Some("sha256".into()),
+            });
+            r
+        },
+        {
+            let mut r = base("https://fixture.test/oauth2");
+            r.auth = Some(AuthConfig::OAuth2 {
+                access_token: "fixture-access-token".into(),
+                token_type: Some("Bearer".into()),
+            });
+            r
+        },
         // Error statuses and redirects must produce IDENTICAL outcomes on
         // both legs (the fixture varies by path).
         base("https://fixture.test/404"),
@@ -868,6 +935,13 @@ fn native_and_wasm_agree_over_request_corpus() {
 #[test]
 fn native_and_wasm_agree_over_har_fixture() {
     let Some(wasm_path) = wasm_artifact_path() else {
+        // TR-408: the harness must be able to fail. Three of its tests —
+        // this one included — skipped even under TROPEL_REQUIRE_WASM=1,
+        // while the two corpus tests honoured it. So the fixture legs of
+        // "one engine, proven" were decoration in CI as much as locally.
+        if std::env::var("TROPEL_REQUIRE_WASM").as_deref() == Ok("1") {
+            panic!("F3 HAR fixture: tropel_web.wasm not found but TROPEL_REQUIRE_WASM=1");
+        }
         eprintln!("SKIP native_vs_wasm HAR fixture: tropel_web.wasm not built");
         return;
     };
@@ -911,6 +985,13 @@ fn native_and_wasm_agree_over_har_fixture() {
 #[test]
 fn native_and_wasm_agree_over_openapi_fixture() {
     let Some(wasm_path) = wasm_artifact_path() else {
+        // TR-408: the harness must be able to fail. Three of its tests —
+        // this one included — skipped even under TROPEL_REQUIRE_WASM=1,
+        // while the two corpus tests honoured it. So the fixture legs of
+        // "one engine, proven" were decoration in CI as much as locally.
+        if std::env::var("TROPEL_REQUIRE_WASM").as_deref() == Ok("1") {
+            panic!("F3 OpenAPI fixture: tropel_web.wasm not found but TROPEL_REQUIRE_WASM=1");
+        }
         eprintln!("SKIP native_vs_wasm OpenAPI fixture: tropel_web.wasm not built");
         return;
     };
@@ -950,6 +1031,13 @@ fn native_and_wasm_agree_over_openapi_fixture() {
 #[test]
 fn native_and_wasm_agree_over_postman_fixture() {
     let Some(wasm_path) = wasm_artifact_path() else {
+        // TR-408: the harness must be able to fail. Three of its tests —
+        // this one included — skipped even under TROPEL_REQUIRE_WASM=1,
+        // while the two corpus tests honoured it. So the fixture legs of
+        // "one engine, proven" were decoration in CI as much as locally.
+        if std::env::var("TROPEL_REQUIRE_WASM").as_deref() == Ok("1") {
+            panic!("F3 Postman fixture: tropel_web.wasm not found but TROPEL_REQUIRE_WASM=1");
+        }
         eprintln!("SKIP native_vs_wasm Postman fixture: tropel_web.wasm not built");
         return;
     };
