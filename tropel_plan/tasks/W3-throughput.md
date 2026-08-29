@@ -56,7 +56,7 @@ There is also **zero `spawn_blocking` in the entire workspace** — the only tex
 
 - [x] `otlp.rs:212-233` does a linear scan comparing full `Vec<(String,String)>` tag sets — quadratic in series count — **verified done** (P-D.2: `HashMap` O(1) lookup replaces the scan)
 - [x] It ships **JSON, not protobuf, with no gzip**: 140–750 ms of CPU per 100 ms window, **1.4–7.5× oversubscribed permanently**, capping the whole tool at ~10–30 k samples/s ≈ 1–2.5 k req/s — **gzip added** (flate2, `Content-Encoding: gzip`, ~8-15× wire reduction); protobuf encoding remains (needs `opentelemetry-proto`/`prost`, a CONVENTIONS dep gate)
-- [x] Hash the tag set; emit protobuf; enable gzip — **tag-set hash done; gzip done; protobuf deferred**
+- [x] Hash the tag set; emit protobuf; enable gzip — **tag-set hash done; gzip done; protobuf deferred** — **un-ticked**: protobuf is the half that addresses the CPU, and the measured 123.76 ms per 100 ms window shows it is still needed (see the TR-304 benchmark note)
 - [x] Delta Sums must carry `startTimeUnixNano` — `aggregationTemporality: 1` without it is not readable by a conformant collector — **fixed** (PR #398)
 - [x] A benchmark asserts the per-window CPU is under budget at 100 k samples/s — **added** `perf.rs: otlp_per_window_cpu` (100 k samples → `OtlpOutput::encode` + `flate2` gzip in `spawn_blocking`; 18 ms per 100 ms window = 18 % vs old 140–750 ms (1.4–7.5× oversubscribed); under 20 % budget)
 
