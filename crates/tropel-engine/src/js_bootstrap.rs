@@ -269,14 +269,22 @@ fn format_shims(format: &str) -> Option<&'static [Shim]> {
         // The k6 InputAdapter fallback (used when the k6 Driver is not
         // registered) wraps the transpiled script as one item's `test`.
         // Arbitrary JS again — minus Bruno's API.
-        // `Pm` STAYS. It is tempting to drop it now that K6Core carries
-        // `check`/`group`/metrics, but pm.js also installs the CANONICAL
-        // namespace — `trp` — plus `pm`/`postman`. Removing it would delete
-        // tropel's own scripting API from k6 runs, which
-        // `narrowing_removes_only_the_excluded_globals` catches. Extracting
-        // `trp` the way `check`/`group` were extracted is the follow-up that
-        // would make this row narrower.
-        "k6" => &[DeepEqual, K6Core, Pm, Chai, Lodash, CryptoJs, Exec],
+        // `k6` is deliberately NOT narrowed.
+        //
+        // A k6 script is arbitrary user JS. Unlike the collection formats,
+        // there is no structural guarantee about what it references — it can
+        // reach `pm.*`, `trp.*`, chai, lodash, CryptoJS, or anything the
+        // Driver installs. Narrowing it caused
+        // `cookie_jar_set_reaches_the_wire_and_reads_back_server_cookies` to
+        // fire ZERO of its four requests: the script failed at load and the
+        // run silently did nothing, which is exactly the failure mode this
+        // whole table has to avoid.
+        //
+        // Real k6 runs take the k6 Driver, which has its own bundle and does
+        // not consult this table at all; this row only covers the adapter
+        // fallback. Narrowing it buys little and risks a silent no-op, so it
+        // returns None and gets the full default bundle.
+        "k6" => return None,
         // These four adapters construct every `ScenarioItem` with
         // `prerequest: vec![]` and `test: vec![]`, at every construction
         // site — har/lib.rs:358, openapi/lib.rs:551, http/lib.rs:272,
@@ -837,26 +845,10 @@ mod tests {
         );
     }
 
-    /// TR-501: a k6 script cannot reach Bruno's API either.
-    ///
-    /// It DOES keep pm.js: `check`, `group`, `Counter`, `Gauge`, `Rate` and
-    /// `Trend` — the k6 globals — are installed by pm.js:1625, not by
-    /// `js/k6-shim/`. Dropping pm.js from a k6 bundle would be a
-    /// `ReferenceError: check is not defined` in the most common k6 idiom
-    /// there is.
-    #[test]
-    fn k6_bundle_excludes_bru_but_keeps_pm() {
-        let script = b"import http from 'k6/http';\nexport default function () { check(http.get('http://x'), {'ok': r => r.status === 200}); }";
-        let names = shim_names(&ShimBundle::for_format("k6", script));
-        assert!(
-            !names.contains(&"bru-shim"),
-            "a k6 run must not materialise bru.js — got {names:?}"
-        );
-        assert!(
-            names.contains(&"pm-shim"),
-            "pm.js installs k6's own `check`/`group`/metric constructors (pm.js:1625) — got {names:?}"
-        );
-    }
+    // `k6_bundle_excludes_bru_but_keeps_pm` was removed: it asserted the k6 row NARROWS.
+    // That row now returns the full default bundle on purpose — see
+    // `format_shims`. A k6 script is arbitrary JS, and narrowing it made a
+    // real test fire zero of its four requests.
 
     /// TR-501: har / openapi / http / insomnia adapters cannot emit a
     /// `prerequest` or `test` script (see
@@ -1262,11 +1254,16 @@ mod tests {
     /// difference directly instead of asserting a value nothing produces.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn k6_script_runs_under_the_k6_bundle() {
-        let script = b"import crypto from 'k6/crypto';\nexport default function () {\n  check(1, {'one': v => v === 1});\n}";
-        let bundle = ShimBundle::for_format("k6", script);
+        // Repointed from "k6" to "postman": the k6 row now returns the full
+        // bundle on purpose (a k6 script is arbitrary JS), so it is no longer
+        // a narrowed bundle and cannot serve as this test's subject.
+        // Mentions CryptoJS and _. so content gating keeps them — otherwise
+        // this probes content narrowing, not format narrowing.
+        let script = b"// CryptoJS _.map\nexport default function () {\n  check(1, {'one': v => v === 1});\n}";
+        let bundle = ShimBundle::for_format("postman", script);
         assert!(
             !shim_names(&bundle).contains(&"bru-shim"),
-            "precondition: this run is on the NARROWED k6 bundle"
+            "precondition: this run is on a NARROWED bundle"
         );
 
         let mut ctx = new_vu_ctx(22, &bundle).await;
@@ -1367,9 +1364,11 @@ mod tests {
                 br#"{"info":{"schema":"getpostman.com/collection"},"exec":"pm.expect(_.map([1],String)); CryptoJS.MD5('x')"}"#,
                 &["bru", "req", "res"],
             ),
+            // "k6" intentionally absent: that row returns the full bundle,
+            // so it removes nothing and this table asserts removal.
             (
-                "k6",
-                b"import crypto from 'k6/crypto'; export default () => check(1, {}); // _.map",
+                "postman",
+                b"export default () => check(1, {}); // _.map CryptoJS",
                 &["bru", "req", "res"],
             ),
             (
