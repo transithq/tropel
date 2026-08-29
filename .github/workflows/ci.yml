@@ -29,7 +29,6 @@ on:
   # literal 24 h run needs a self-hosted runner — see the `soak` job below.
   schedule:
     - cron: "0 3 * * 0"   # Sundays 03:00 UTC
-  workflow_dispatch:
   pull_request:
     # P4a (TROPEL_MODULARIZATION_TODO.md): docs-only PRs skip the full matrix.
     # Everything that can affect a build is covered: crates, the shim bundle,
