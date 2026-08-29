@@ -25,6 +25,11 @@ name: CI
 on:
   push:
     branches: [master]
+  # TR-315: the long soak. GitHub-hosted runners hard-cap a job at 6 h, so a
+  # literal 24 h run needs a self-hosted runner — see the `soak` job below.
+  schedule:
+    - cron: "0 3 * * 0"   # Sundays 03:00 UTC
+  workflow_dispatch:
   pull_request:
     # P4a (TROPEL_MODULARIZATION_TODO.md): docs-only PRs skip the full matrix.
     # Everything that can affect a build is covered: crates, the shim bundle,
@@ -376,6 +381,78 @@ jobs:
           key: publish-dry-run
       - run: bash scripts/publish-dry-run.sh
 
+  soak:
+    name: soak (TR-315 flat-memory under sustained load)
+    runs-on: ubuntu-latest
+    # 5 h: the longest a GitHub-hosted runner allows with headroom (the hard
+    # cap is 6 h). See the honesty note in the job summary below.
+    timeout-minutes: 330
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: soak
+      - name: Build soak harness
+        run: cargo build --release --locked -p tropel-bench --bin soak
+      - name: Long soak
+        env:
+          TROPEL_SOAK_SECS: "18000"          # 5 h
+          TROPEL_SOAK_SAMPLES_PER_SEC: "20000"
+          TROPEL_SOAK_SERIES: "5000"
+        run: ./target/release/soak
+      - name: Note the 24 h gap
+        if: always()
+        run: |
+          echo "TR-315 asks for 24 h. GitHub-hosted runners hard-cap a job at 6 h," >> $GITHUB_STEP_SUMMARY
+          echo "so this runs 5 h. A literal 24 h soak needs a self-hosted runner;" >> $GITHUB_STEP_SUMMARY
+          echo "the harness takes TROPEL_SOAK_SECS=86400 unchanged." >> $GITHUB_STEP_SUMMARY
+
+  soak-smoke:
+    name: soak harness self-check (both directions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Runs on EVERY PR. Not the soak itself — a check that the soak harness
+    # still works, in both directions:
+    #
+    #   clean run  -> must PASS
+    #   leak run   -> must FAIL
+    #
+    # The previous `soak_memory` "soak" was a HashMap insert/remove loop that
+    # could not fail, and nobody noticed for as long as it existed. A detector
+    # that has never been shown to fail is decoration; this makes that
+    # impossible to regress silently.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: soak-smoke
+      - name: Build soak harness
+        run: cargo build --release --locked -p tropel-bench --bin soak
+      - name: Clean run must PASS
+        env:
+          TROPEL_SOAK_SECS: "45"
+          TROPEL_SOAK_SAMPLES_PER_SEC: "20000"
+        run: ./target/release/soak
+      - name: Injected leak must FAIL
+        env:
+          TROPEL_SOAK_SECS: "30"
+          TROPEL_SOAK_SAMPLES_PER_SEC: "20000"
+          TROPEL_SOAK_INJECT_LEAK: "1"
+        run: |
+          if ./target/release/soak; then
+            echo "FAIL: the soak harness reported PASS on a deliberately leaking run." >&2
+            echo "      The leak detector is broken — it cannot fail, so it gates nothing." >&2
+            exit 1
+          fi
+          echo "ok: the harness correctly detected the injected leak"
+
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest
@@ -683,7 +760,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages, k6-conformance]
+    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages, k6-conformance, soak-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
