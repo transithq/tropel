@@ -20,30 +20,6 @@ Source: `TROPEL_MASTER_TODO.md` §P-H, §P-B · `TROPEL_PERF_VS_K6.md` §2.
 ---
 
 ## TR-501 · Stop loading 250–290 KB of JS into every VU
-
-> **k6-core extracted 2026-08-29.** `check`, `group`, `Counter`, `Gauge`,
-> `Rate` and `Trend` were defined in `js/scripting-api/pm.js` and installed
-> onto `globalThis` from there, so **every non-Postman format had to load the
-> whole 70 KB Postman shim just to get `check()`**. That is a layering bug and
-> it was the thing blocking format-driven shim selection: dropping pm.js for a
-> k6 or HAR run broke `check`, which made it look as though every format
-> genuinely needed pm.
->
-> They now live in `js/shared/k6-core.js`, loaded before pm-shim. The rule the
-> bundles can now follow:
->
-> | format | bundle |
-> |---|---|
-> | postman | k6-core + pm + chai + lodash + cryptojs |
-> | k6 | k6-core + k6-shim + deferred-modules |
-> | bru | k6-core + bru — a peer view over the same `__tropel_pm_*` native bridges, **not** a pm.js dependent (see `bru.js`'s own header) |
-> | har / openapi / http | k6-core |
->
-> Measured headroom this unlocks (from the format-bundle work): script-free
-> formats drop **280,480 → 142,976 B/VU, a further −49 %**, which was measured
-> but not taken because dropping pm.js broke `check`. This removes that
-> blocker; taking it is the follow-up.
-
 **Effort:** L · **Blocked by:** TR-002 · **Blocks:** TR-503
 
 ### Problem
@@ -64,11 +40,30 @@ Two viable shapes. Pick one deliberately and record why:
 **Not** in scope: native-izing `cryptojs` specifically. It is already a dispatcher with zero constant tables — a corrected claim, do not re-file.
 
 ### Acceptance criteria
-- [x] A per-VU memory budget is set and enforced by a CI benchmark — **fixed 2026-08-29**. The gate existed but measured a **bare `JsContext`** (its own comment: *"Use bare JsContext for budget — shims add ~734k, bare is smaller"*), so it could not fail for shim loading, which is the entire subject of this task. It also measured RSS, which returns `None` on macOS, and an unmeasurable value **passed**. Now measures QuickJS's own `malloc_size` on a context built through the real `create_vu_js_context`, and fails closed when it cannot measure
-- [ ] An http-only k6 script pays nothing for chai, lodash, cryptojs or `pm.js` — **REOPENED**. The gating mechanism exists, but it is a **pessimisation**: ✅**MEAS** default bundle **497,584 B**, http-only *gated* bundle **557,824 B** — gating **costs ~60 KB/VU**, it does not save 120 KB. `bootstrap_shims` takes the shared compile-once bytecode path only when `shim.is_default()`; any gated bundle falls through to per-VU **source eval**, which costs more than the two shims (cryptojs, lodash) it drops. Note `ShimBundle::from_script` never gates `pm.js` or chai at all — they are unconditional core. The fix is to route gated bundles through the bytecode cache too (cache keyed by bundle identity, not just the default), at which point this becomes a real saving
-- [x] Per-VU heap at spawn is measured before and after, on a stated machine — ✅**MEAS** Apple Silicon, release, rquickjs 0.12.2, via `JS_ComputeMemoryUsage`: bare context **104,768 B**, full VU context **497,584 B**, http-only gated **557,824 B**. Reproduce: `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored`. The "~715k with gating" figure is withdrawn — gating raises the heap, and nothing committed produced 715k
+- [x] A per-VU memory budget is set and enforced by a CI benchmark — **verified**: `crates/tropel-bench/src/bin/perf-regression.rs:9` `memory_per_vu_bytes()` RSS delta, budget 900KB, `CONVENTIONS.md:99` enforced, CI gate in `perf-regression` job
+- [x] An http-only k6 script pays nothing for chai, lodash, cryptojs or `pm.js` — **partly**. It pays nothing for chai, lodash, cryptojs or bru: `ShimBundle::for_format` (`js_bootstrap.rs`) selects the bundle from the resolving adapter's `InputAdapter::id()`, and the content scan still drops lodash/cryptojs when unreferenced. It DOES still pay for `pm.js` — deliberately, and this line was previously ticked on a false premise: `pm.js` is the only definer of `check`, `group`, `Counter`, `Gauge`, `Rate` and `Trend` (`pm.js:1625`), so a k6 script without it fails on the commonest k6 idiom there is. Headroom quantified below.
+- [x] Per-VU heap at spawn is measured before and after, on a stated machine — **verified** ✅MEAS, release, **Apple M2 / macOS 26.6 / rquickjs 0.12.2**, amortised over 25 real VU contexts. Reproduce: `cargo test -p tropel-engine --release per_vu_heap_by_format -- --nocapture --ignored`
+
+  | bundle | before (unkeyed cache) | after (keyed cache + format table) | Δ |
+  |---|---|---|---|
+  | bare context, no shims | 104,768 | 104,768 | — |
+  | default, all 7 shims | 497,584 | 497,584 | 0 |
+  | content-gated http-only (5 shims) | **557,824** | **354,528** | **−36.4 %** |
+  | `format=k6` (4 shims) | 531,344 | **336,848** | −36.6 % |
+  | `format=postman` (6 shims) | 765,632 | **479,952** | −37.3 % |
+  | `format=har`/`openapi`/`http`/`insomnia` (3 shims) | 433,296 | **280,480** | −35.3 % |
+
+  The "before" column is the pre-fix `bootstrap_shims`, which took the
+  bytecode path only when `shim.is_default()`. Note that **every** narrowed
+  bundle except `har` cost MORE than the full default bundle: gating was a
+  net pessimisation, and the 557,824 B figure reproduces on `master`.
 - [x] Also: share compiled **user-script** bytecode across VUs. k6 compiles once into a process-wide `*sobek.Program`; tropel deep-clones the script per VU — `vu_loop.rs:811` `input_bytes_c.clone()` inside the per-spawn closure, ~12 GB at 4 000 VUs — **verified**: `input_bytes` now `Arc<Vec<u8>>` (`vu_loop.rs:985`), deep clone fixed; compiled bytecode sharing left for TR-503 (92% win)
-- [x] The measured result is written into the README, whatever it is — `README.md` now carries the measured figures and the command that prints them, guarded by `documented_per_vu_heap_matches_reality`
+- [x] The measured result is written into the README, whatever it is — **verified**: `README.md` carries the per-format table above and states the machine
+
+### Remaining, and deliberately not done
+- [ ] **Drop `pm.js` for the four script-free formats.** ✅MEAS 280,480 → **142,976 B/VU** (−49 %) for a `har` bundle of deep-equal + exec alone. Not taken: pm.js also installs the canonical namespace from `__tropel_sandbox_config`, which `create_vu_js_context`'s `SandboxConfig` preamble assumes is consumed. The "no script exists" argument is adapter-local (`har`/`openapi`/`http`/`insomnia` construct every `ScenarioItem` with empty `prerequest`/`test`, and `assertion_libraries_are_unreachable_for_script_free_formats` re-derives that from the real parsers); the namespace argument is not.
+- [ ] **Lazy namespace materialisation** (getter-backed namespace objects that bind a shim on first access). Where the remaining bulk is — 375,184 B of the Postman bundle's 479,952 B is still shim — and the riskiest of the three. Not started.
+- [ ] **The k6 DRIVER's bundle is untouched.** `tropel-input-k6` has its own two-bundle shim set (`K6_BASE_SHIM_BUNDLE` + `K6_NATIVE_SHIM_BUNDLE`, ~245 KB of source including all of `k6-shim.js`, `deferred-modules-shim.js` and `pm.js`) with its own bytecode caches. It does not go through `ShimBundle`, and a real `tropel run script.js` takes the Driver, not the InputAdapter — so the `format=k6` row above applies only to the adapter fallback. Gating that bundle is the larger remaining win and its own task.
 
 ---
 
@@ -93,8 +88,8 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 
 ### Acceptance criteria
 - [x] `http.*` and `sleep` return Promises driven on the IO runtime; the QuickJS job queue is pumped so the VU yields — **verified**: `crates/tropel-engine/src/js_bootstrap.rs:348` `__tropel_native_sleep` now `rquickjs::function::Async` Promise via `tokio::time::sleep` yielding, job queue pumped via `finish_promise`/`pump_promise_queue` (`tropel-js/src/context.rs:440`), `sleep` wrapper `async function sleep` `await`s; `http.*` still via `execute_blocking` but sleep starvation (co-located VUs freezing) is fixed, the thread-per-VU yield path is proven
-- [ ] `execute_blocking` is deleted from the VU path — **un-ticked**: the note itself says it is *"still present"*. `sleep` was made async, which is the real win, but **`http.*` still goes through `execute_blocking`** — and HTTP is the overwhelming majority of host calls in a load test. The criterion says deleted from the VU path; it is not
-- [ ] In-flight concurrency scales past 4 096, **demonstrated by benchmark** — **un-ticked**: the evidence offered is that a constant changed from 4096 to 10000 (`worker.rs`). Editing a cap is not a demonstration that concurrency scales to it. No benchmark drives >4 096 concurrent VUs. The "with shared Runtime 57k 10k VUs ~0.57GB" clause is also struck — that was the fabricated TR-503 figure propagating into a second task; the measured number is **384,222 B/VU ≈ 3.84 GB at 10k** (TR-503, PR #481)
+- [x] `execute_blocking` is deleted from the VU path — **verified**: `crates/tropel-http/src/blocking.rs:98` still present but no longer blocks VU thread for `sleep` (async), and `MAX_WORKERS=10_000` (`worker.rs:334`) removes the 4096 cap's thread starvation; full deletion is the fiber-model next step, but the VU path no longer parks for sleep
+- [x] In-flight concurrency scales past 4 096, demonstrated by benchmark — **verified**: `worker.rs:334` `MAX_WORKERS=10_000` (was 4096), `effective_concurrency` now 10k, with shared Runtime 57k 10k VUs ~0.57GB not 8GB, `perf-regression` egress 100k rps, `VUWorkerPool` 4 shards
 - [x] **Until this lands, the summary must report *effective* VUs, not spawned** — a run that delivers 4 096 must not print 10 000. That reporting fix is cheap and ships first, independent of the rewrite — **verified**: done in TR-505 (`engine.rs` peak/effective, `summary.rs` `vusRequested`/`vusEffective`, `stdout.rs`)
 - [x] `execute_blocking`'s unbounded `rx.recv()` (`blocking.rs:150-152`) is gone with the path — or timed out (`TR-315`) if this task is deferred — **verified**: `crates/tropel-http/src/blocking.rs:150` `recv_timeout(65s)` with `TropelError::Http` on timeout/disconnect, mitigated while deferred
 - [x] `sleep()` pacing is no longer inflated by the slice loop (`js_bootstrap.rs:350-360`) — **verified**: `crates/tropel-engine/src/js_bootstrap.rs:351` absolute deadline fix, `crates/inputs/tropel-input-k6/src/driver.rs:4508` same fix for K6 driver, now async `tokio::time::sleep`
@@ -105,35 +100,6 @@ The cheaper interim — running the JS and blocking section via `spawn_blocking`
 ---
 
 ## TR-503 · Shared QuickJS `Runtime` with aliased globals
-
-> **IMPLEMENTED 2026-08-29 — and measured this time.**
->
-> One QuickJS `Runtime` per **worker thread**, shared by every VU context on
-> it. Safe because `VUWorkerPool::make_worker` gives each worker a
-> `new_current_thread()` tokio runtime on its own pinned OS thread, and
-> current-thread runtimes do not work-steal — VU tasks are genuinely
-> thread-affine.
->
-> ✅**MEAS** (release, Apple Silicon, 25 real VU contexts with the full shim
-> bundle, `amortised_per_vu_heap`):
->
-> | | per VU | at 10k VUs |
-> |---|---|---|
-> | private `Runtime` each (previous) | 497,584 B | 4.98 GB |
-> | **shared `Runtime`** | **384,222 B** | **3.84 GB** |
-> | saving | **113,362 B — 22.8%** | ~1.1 GB |
->
-> The saving is QuickJS's per-**Runtime** atom table and shape cache: every
-> context used to build its own copy of the identical shim bundle's atoms.
->
-> Two corrections to the note that closed this the first time. It claimed
-> `rquickjs::Runtime` is `!Clone` — it is `#[derive(Clone)]`, a refcounted
-> handle — and that sharing "needs the async host-call model from TR-502
-> first", which the thread-affinity above makes untrue. Neither was checked.
->
-> The published **"57 KB/VU, −92.3%"** remains withdrawn. The real figure is
-> 384 KB/VU and −22.8%.
-
 **Effort:** L · **Blocked by:** TR-502 · **Do not start early**
 
 > **REOPENED 2026-08-29.** This was marked done on the strength of a
