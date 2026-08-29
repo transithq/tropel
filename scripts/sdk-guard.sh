@@ -26,11 +26,48 @@ echo "=== Guard 2: sample extension builds from outside the workspace ==="
 # the actual proof of "no full checkout required".
 SDK_DIR="crates/tropel-sdk"
 if [[ ! -f "$SDK_DIR/Cargo.toml" ]]; then
-  echo "skip: tropel-sdk submodule not checked out — cannot test"
-  exit 0
+  # Fail closed. "Submodule absent" and "guard passed" were indistinguishable,
+  # and every cargo job in ci.yml checks out with `submodules: recursive`, so
+  # absence means something is wrong. Same shape as the version-lockstep pin
+  # check, which skipped silently for its entire life (TR-407).
+  echo "FAIL: tropel-sdk submodule not checked out — the guard cannot run, so it fails closed. Run 'git submodule update --init' (TR-407)." >&2
+  exit 1
 fi
+
+# Build against the PACKAGED crate, not the working tree.
+#
+# TR-407's criterion is explicit: "CI runs `cargo package -p tropel-sdk`, then
+# compiles an example extension in a temp dir against that packaged crate
+# only. This is the actual proof of 'no full checkout required'."
+#
+# A `path` dependency on `crates/tropel-sdk` reads the working tree and proves
+# something weaker — it cannot catch a file missing from the published
+# artifact, which is the failure a stranger running `cargo add tropel-sdk`
+# actually hits. `cargo package` applies include/exclude and .gitignore, so
+# building against its output is the real test.
+echo "packaging tropel-sdk…"
+cargo package -p tropel-sdk --allow-dirty --no-verify >/dev/null
+SDK_VERSION=$(grep -m1 '^version' "$SDK_DIR/Cargo.toml" | sed -E 's/version *= *"([^"]+)"/\1/')
+CRATE_FILE="target/package/tropel-sdk-${SDK_VERSION}.crate"
+if [[ ! -f "$CRATE_FILE" ]]; then
+  echo "FAIL: cargo package produced no $CRATE_FILE — cannot verify the published artifact" >&2
+  exit 1
+fi
+# Unpack the tarball rather than reusing cargo's verify-extract directory:
+# this is byte-for-byte what crates.io would serve, so a file dropped by
+# include/exclude is missing here exactly as it would be for a stranger.
+UNPACK=$(mktemp -d)
+trap "rm -rf '$UNPACK'" EXIT
+tar -xzf "$CRATE_FILE" -C "$UNPACK"
+PACKAGED="$UNPACK/tropel-sdk-${SDK_VERSION}"
+if [[ ! -f "$PACKAGED/Cargo.toml" ]]; then
+  echo "FAIL: $CRATE_FILE does not contain tropel-sdk-${SDK_VERSION}/Cargo.toml" >&2
+  exit 1
+fi
+echo "ok: packaged tropel-sdk $SDK_VERSION ($(tar -tzf "$CRATE_FILE" | wc -l | tr -d ' ') files)"
+
 TMPDIR=$(mktemp -d)
-trap "rm -rf '$TMPDIR'" EXIT
+trap "rm -rf '$TMPDIR' '$UNPACK'" EXIT
 mkdir -p "$TMPDIR/src"
 cat > "$TMPDIR/Cargo.toml" <<EOF
 [package]
@@ -38,7 +75,7 @@ name = "test-extension"
 version = "0.0.0"
 edition = "2021"
 [dependencies]
-tropel-sdk = { path = "$(realpath "$SDK_DIR")" }
+tropel-sdk = { path = "$(realpath "$PACKAGED")" }
 EOF
 cat > "$TMPDIR/src/lib.rs" <<EOF
 use tropel_sdk::types::{Request, Method, AuthConfig, Body, ResponseType};
@@ -86,7 +123,7 @@ fn touch_auth(auth: &AuthConfig, body: &Body) {
 }
 EOF
 if cargo build --manifest-path "$TMPDIR/Cargo.toml" 2>&1; then
-  echo "ok: sample extension builds from outside the workspace"
+  echo "ok: sample extension builds from outside the workspace, against the PACKAGED crate"
 else
   echo "FAIL: sample extension failed to build" >&2
   exit 1

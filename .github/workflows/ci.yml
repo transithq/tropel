@@ -261,6 +261,16 @@ jobs:
           set -euo pipefail
           npm install --no-audit --no-fund
           echo "ok: root npm install resolved the workspace"
+      # TR-013: `packages/shims/deep-equal.test.mjs` is the test TR-013's
+      # acceptance criteria require ("property test over generated object
+      # pairs, asserting agreement with a reference implementation"). It
+      # exists, it passes, and no CI job ran it — so the shared deep-equal
+      # that pm.expect(...).to.eql, chai's deepEqual and the k6 shim all
+      # delegate to had no gate. It needs no Rust toolchain and no wasm
+      # artifact, so it belongs here rather than in the wasm job.
+      - name: Run the JS unit tests that need no build (TR-013)
+        run: node packages/shims/deep-equal.test.mjs
+
       # TR-009: @tropel/core-wasm must load from a clean clone with NO Rust
       # toolchain present. `src/index.js` used a static top-level import of
       # build-generated pkg/meta.js, which failed at module load with ENOENT.
