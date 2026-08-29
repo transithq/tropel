@@ -673,6 +673,67 @@ mod tests {
         );
     }
 
+    /// TR-503: the per-VU cost of N real VU contexts, which is the only way to
+    /// measure a SHARED runtime.
+    ///
+    /// `measure_per_vu_quickjs_heap` below creates contexts one at a time and
+    /// reads `quickjs_heap_bytes()`, which reports the whole **runtime**. With
+    /// sharing on, that number accumulates across every context on the thread,
+    /// so it cannot be read as a per-VU figure — the apparent growth is the
+    /// measurement, not a regression. Amortising over N is the honest form.
+    ///
+    /// `cargo test -p tropel-engine --release amortised_per_vu_heap -- --nocapture --ignored`
+    /// Compare with `TROPEL_SHARED_RUNTIME=0`.
+    #[tokio::test]
+    #[ignore]
+    async fn amortised_per_vu_heap() {
+        const N: usize = 25;
+        let pm_state = new_pm_state();
+        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+            client: VuCookieClient::new(
+                HttpClient::new(&HttpConfig::default()).expect("http client"),
+            ),
+        });
+        // TROPEL_PROBE_BUNDLE=gated measures what an http-only script must
+        // actually pay for — the headroom any lazy-materialisation scheme
+        // could recover.
+        let bundle = if std::env::var("TROPEL_PROBE_BUNDLE").as_deref() == Ok("gated") {
+            ShimBundle::from_script(
+                b"import http from 'k6/http'; export default () => http.get('http://x');",
+            )
+        } else {
+            ShimBundle::default()
+        };
+        let mut ctxs = Vec::with_capacity(N);
+        for i in 0..N {
+            ctxs.push(
+                create_vu_js_context(
+                    i as u32,
+                    &pm_state,
+                    &client,
+                    &bundle,
+                    &SandboxConfig::default(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .expect("VU context"),
+            );
+        }
+        let total: u64 = if std::env::var("TROPEL_SHARED_RUNTIME").as_deref() == Ok("0") {
+            // Private runtimes: each reports only itself, so sum them.
+            ctxs.iter().map(|c| c.quickjs_heap_bytes()).sum()
+        } else {
+            // One shared runtime: any context reports the whole thing once.
+            ctxs[0].quickjs_heap_bytes()
+        };
+        println!(
+            "shared={} N={N} total={total} B per_vu={} B",
+            std::env::var("TROPEL_SHARED_RUNTIME").unwrap_or_else(|_| "1".into()),
+            total / N as u64
+        );
+        std::hint::black_box(ctxs);
+    }
+
     /// TR-503 / TR-501: print the ACTUAL per-VU QuickJS heap so the README
     /// number is derived, not asserted. Run with:
     /// `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored`
