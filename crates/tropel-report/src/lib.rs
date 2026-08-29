@@ -8,6 +8,7 @@ pub mod influxdb;
 pub mod json_reporter;
 pub mod json_stream;
 pub mod otlp;
+pub mod otlp_proto;
 pub mod output;
 pub mod prometheus;
 pub mod statsd;
