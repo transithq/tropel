@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 use tropel_core::config::ExecutionConfig;
+use tropel_core::segment::ArrivalStripe;
 use tropel_sdk::{Result, TropelError};
 
 /// Hard bound on the trailing VU-handle join. After `grace` expires the
@@ -124,6 +125,19 @@ pub struct VUScheduler {
     /// Backlog line 424: throttle the O(n) retain scan in `reap_and_respawn`
     /// to once per 100 ms to avoid ~50M atomic loads on a 10k ramp.
     last_reap: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// TR-221: this node's slice of the GLOBAL arrival sequence.
+    ///
+    /// Defaults to [`ArrivalStripe::full`] — owns every global tick, which
+    /// reproduces the single-node schedule exactly, so nothing changes for a
+    /// non-distributed run. A distributed node installs its striped slice via
+    /// [`VUScheduler::with_arrival_stripe`] and then passes the **global**
+    /// (unscaled) rate to the arrival-rate executors, so N nodes interleave
+    /// into the exact original global rate instead of each firing its own
+    /// scaled rate from its own `t = 0`.
+    ///
+    /// Not shared/atomic like the other fields: it is a plain cursor read
+    /// only by the single executor loop, which clones it once at start.
+    arrival_stripe: ArrivalStripe,
 }
 
 /// RAII guard for the arrival-rate idle count. Marks the VU idle on
@@ -205,7 +219,26 @@ impl VUScheduler {
             control_notify: Arc::new(tokio::sync::Notify::new()),
             control_tainted: Arc::new(AtomicBool::new(false)),
             last_reap: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            arrival_stripe: ArrivalStripe::full(),
         }
+    }
+
+    /// Install this node's striped slice of the global arrival sequence
+    /// (TR-221).
+    ///
+    /// The rate handed to `run_arrival_rate` / `run_ramping_arrival_rate`
+    /// must then be the **global** (unscaled) rate — the stripe, not the
+    /// rate, expresses this node's share. Build the pair with
+    /// [`ExecutionSegment::apply_with`] +
+    /// [`RateSegmentation::GlobalRate`]; installing the stripe without
+    /// leaving the rate global divides the load twice, and leaving the rate
+    /// global without the stripe is an N× overload.
+    ///
+    /// [`ExecutionSegment::apply_with`]: tropel_core::segment::ExecutionSegment::apply_with
+    /// [`RateSegmentation::GlobalRate`]: tropel_core::segment::RateSegmentation::GlobalRate
+    pub fn with_arrival_stripe(mut self, stripe: ArrivalStripe) -> Self {
+        self.arrival_stripe = stripe;
+        self
     }
 
     /// Get the stop signal (Notify for waking VUs mid-iteration).
@@ -1136,6 +1169,12 @@ impl VUScheduler {
     /// Uses a time-based token bucket (no 1ms timer floor — resilient at high rates)
     /// and a dynamically growing VU pool (`pre_alloc_vus → max_vus`). VUs are
     /// spawned on demand when the current pool is saturated.
+    ///
+    /// TR-221: `rate` is the **global** arrival rate whenever an
+    /// [`ArrivalStripe`] has been installed (see
+    /// [`with_arrival_stripe`](Self::with_arrival_stripe)); the stripe picks
+    /// the global ticks this node owns. With the default full stripe the two
+    /// coincide and this is the ordinary single-node schedule.
     async fn run_arrival_rate<F>(
         &self,
         rate: f64,
@@ -1148,7 +1187,7 @@ impl VUScheduler {
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         tracing::info!(
-            "Starting constant arrival rate: {}/s for {:?} (pre_alloc={}, max_vus={}, grace: {:?})",
+            "Starting constant arrival rate: {}/s (global) for {:?} (pre_alloc={}, max_vus={}, grace: {:?})",
             rate,
             duration,
             pre_alloc,
@@ -1173,11 +1212,19 @@ impl VUScheduler {
         let start = time::Instant::now();
         let mut last_target: u64 = 0;
         let mut next_reap = time::Instant::now();
+        // TR-221: this node's cursor over the global arrival sequence. Cloned
+        // per run so the executor can be re-run from a fresh cursor.
+        let mut stripe = self.arrival_stripe.clone();
 
         // P1 line 139: check SIGINT stop so Ctrl-C ends the run immediately
         while start.elapsed() < duration && !self.is_stop_requested() {
             let elapsed_secs = start.elapsed().as_secs_f64();
-            let target_tokens = (elapsed_secs * rate) as u64;
+            // TR-221: count the GLOBAL arrivals due by now (k6's `gi` walked
+            // against `notScaledTickerPeriod`), then ask the stripe how many
+            // of them belong to this node. With the default full stripe this
+            // is `floor(elapsed × rate)` — the original expression.
+            let global_arrivals = (elapsed_secs * rate) as u64;
+            let target_tokens = stripe.due_by(global_arrivals);
 
             if target_tokens > last_target {
                 let to_add = target_tokens - last_target;
@@ -1260,6 +1307,10 @@ impl VUScheduler {
     /// Uses a time-based token bucket (same as `run_arrival_rate`) but the rate
     /// linearly interpolates across stages over the total stage duration.
     /// VUs are spawned on demand when the current pool is saturated, up to max_vus.
+    ///
+    /// TR-221: `start_rate` and the stage targets are the **global** rate
+    /// curve whenever an [`ArrivalStripe`] has been installed; the stripe
+    /// picks this node's ticks out of the global sequence.
     async fn run_ramping_arrival_rate<F>(
         &self,
         start_rate: f64,
@@ -1374,12 +1425,18 @@ impl VUScheduler {
         let start = time::Instant::now();
         let mut last_target: u64 = 0;
         let mut next_reap = time::Instant::now();
+        // TR-221: same striped walk as run_arrival_rate — the only difference
+        // is that the global arrival count comes from the integrated rate
+        // curve rather than `elapsed × rate` (k6 does exactly this split:
+        // `ramping_arrival_rate.go`'s `cal()` solves the curve and steps the
+        // same striped offsets).
+        let mut stripe = self.arrival_stripe.clone();
 
         // P1 line 139: check SIGINT stop so Ctrl-C ends the run immediately
         while start.elapsed() < total_duration && !self.is_stop_requested() {
             let elapsed_secs = start.elapsed().as_secs_f64();
-            let exact_tokens = tokens_at(elapsed_secs);
-            let target = exact_tokens as u64;
+            let global_arrivals = tokens_at(elapsed_secs) as u64;
+            let target = stripe.due_by(global_arrivals);
 
             if target > last_target {
                 let to_add = target - last_target;
@@ -1838,6 +1895,11 @@ impl VUScheduler {
             control_notify: self.control_notify.clone(),
             control_tainted: self.control_tainted.clone(),
             last_reap: self.last_reap.clone(),
+            // TR-221: the stripe is a cursor owned by the executor loop, not
+            // shared state — VU tasks and the control API never read it. The
+            // clone here is the pristine (un-advanced) cursor, so a shared
+            // handle can never rewind or double-advance the running one.
+            arrival_stripe: self.arrival_stripe.clone(),
         })
     }
 
@@ -3387,5 +3449,396 @@ mod tests {
         VUScheduler::await_handles_bounded(&mut handles, Duration::from_millis(10)).await;
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(handles[0].is_finished());
+    }
+
+    // ── TR-221: striped offsets in the arrival-rate executor ──────────────
+
+    /// A VU that records the wall-clock offset (from `t0`) of every arrival
+    /// token it consumes. Structurally identical to `arrival_test_vu` (same
+    /// idle guard, same pinned-`notified()` wait) but with zero simulated
+    /// latency and a timestamp log, so the recorded instants ARE the
+    /// executor's arrival schedule.
+    fn recording_arrival_vu(
+        sched: Arc<VUScheduler>,
+        t0: tokio::time::Instant,
+        log: Arc<std::sync::Mutex<Vec<Duration>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let arrival_notify = sched.arrival_notify();
+            let stop = sched.stop_signal();
+            loop {
+                if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                    break;
+                }
+                let _idle_guard = sched.idle_guard();
+                let mut arrival_ready = std::pin::pin!(arrival_notify.notified());
+                let mut stop_ready = std::pin::pin!(stop.notified());
+                loop {
+                    if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                        return;
+                    }
+                    if sched.try_acquire_arrival_token() {
+                        log.lock().unwrap().push(t0.elapsed());
+                        break;
+                    }
+                    tokio::select! {
+                        _ = &mut arrival_ready => {
+                            arrival_ready.set(arrival_notify.notified());
+                        }
+                        _ = &mut stop_ready => {
+                            stop_ready.set(stop.notified());
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                }
+            }
+        })
+    }
+
+    /// Builds one node's arrival-rate executor exactly the way `engine.rs`
+    /// does for a node running `segment_spec` of `sequence`: the segment is
+    /// applied with [`RateSegmentation::GlobalRate`] (so the rate stays
+    /// global and `pre_alloc_vus`/`max_vus` are still telescoped) and the
+    /// matching [`ArrivalStripe`] is installed on the scheduler.
+    ///
+    /// Returns the wall-clock offsets, from the shared `t0`, at which the
+    /// executor released each iteration.
+    fn node_scheduler(
+        segment_spec: &str,
+        sequence: &str,
+        global: &ExecutionConfig,
+    ) -> (VUScheduler, ExecutionConfig) {
+        let seg = tropel_core::segment::ExecutionSegment::parse(segment_spec, Some(sequence))
+            .expect("valid segment");
+        let seq = tropel_core::segment::ExecutionSegmentSequence::parse(sequence)
+            .expect("valid sequence");
+        let idx = seq.index_of(&seg).expect("segment is part of the sequence");
+        let wrapper = tropel_core::segment::ExecutionSegmentSequenceWrapper::new(&seq)
+            .expect("full sequence");
+        let node_cfg = seg.apply_with(global, tropel_core::segment::RateSegmentation::GlobalRate);
+        let sched = VUScheduler::new(&node_cfg).with_arrival_stripe(wrapper.arrival_stripe(idx));
+        (sched, node_cfg)
+    }
+
+    async fn node_arrival_times(
+        segment_spec: &str,
+        sequence: &str,
+        global_rate: f64,
+        window: Duration,
+        t0: tokio::time::Instant,
+    ) -> Vec<Duration> {
+        let global = ExecutionConfig::ConstantArrivalRate {
+            rate: global_rate,
+            time_unit: "1s".to_string(),
+            duration: format!("{}ms", window.as_millis()),
+            pre_alloc_vus: 16,
+            max_vus: 16,
+            graceful_stop: Some("0s".to_string()),
+            think_time: Default::default(),
+        };
+        let (sched, node_cfg) = node_scheduler(segment_spec, sequence, &global);
+        let (node_rate, pre_alloc, max_vus) = match &node_cfg {
+            ExecutionConfig::ConstantArrivalRate {
+                rate,
+                pre_alloc_vus,
+                max_vus,
+                ..
+            } => (*rate, *pre_alloc_vus, *max_vus),
+            _ => unreachable!(),
+        };
+        // The rate handed to the executor is the GLOBAL one on every node —
+        // that is the whole point: the stripe, not the rate, is the share.
+        assert_eq!(
+            node_rate, global_rate,
+            "striped mode must leave the arrival rate global"
+        );
+        let log: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_c = log.clone();
+        let run_vu =
+            move |s: Arc<VUScheduler>, _vu: u32| recording_arrival_vu(s, t0, log_c.clone());
+        sched
+            .run_arrival_rate(
+                node_rate,
+                pre_alloc,
+                max_vus,
+                window,
+                Duration::ZERO,
+                &run_vu,
+            )
+            .await;
+        let mut v = log.lock().unwrap().clone();
+        v.sort();
+        v
+    }
+
+    /// Ramping twin of [`node_arrival_times`] — same wiring, driven through
+    /// `run_ramping_arrival_rate` with a FLAT rate curve so the expected
+    /// merged schedule is the same even cadence.
+    async fn node_ramping_arrival_times(
+        segment_spec: &str,
+        sequence: &str,
+        global_rate: f64,
+        window: Duration,
+        t0: tokio::time::Instant,
+    ) -> Vec<Duration> {
+        let stages = vec![tropel_core::config::ArrivalRateStage {
+            duration: format!("{}ms", window.as_millis()),
+            target: global_rate,
+        }];
+        let global = ExecutionConfig::RampingArrivalRate {
+            start_rate: global_rate,
+            stages,
+            time_unit: "1s".to_string(),
+            pre_alloc_vus: 16,
+            max_vus: 16,
+            graceful_stop: Some("0s".to_string()),
+            think_time: Default::default(),
+        };
+        let (sched, node_cfg) = node_scheduler(segment_spec, sequence, &global);
+        let (start_rate, stages, pre_alloc, max_vus) = match &node_cfg {
+            ExecutionConfig::RampingArrivalRate {
+                start_rate,
+                stages,
+                pre_alloc_vus,
+                max_vus,
+                ..
+            } => (*start_rate, stages.clone(), *pre_alloc_vus, *max_vus),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            start_rate, global_rate,
+            "striped mode must leave the ramping rate curve global"
+        );
+        let log: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_c = log.clone();
+        let run_vu =
+            move |s: Arc<VUScheduler>, _vu: u32| recording_arrival_vu(s, t0, log_c.clone());
+        sched
+            .run_ramping_arrival_rate(
+                start_rate,
+                &stages,
+                pre_alloc,
+                max_vus,
+                Duration::ZERO,
+                &run_vu,
+            )
+            .await;
+        let mut v = log.lock().unwrap().clone();
+        v.sort();
+        v
+    }
+
+    /// TR-221 · the arrival-rate executor must INTERLEAVE across nodes.
+    ///
+    /// k6's `constant_arrival_rate.go:316-330` walks a GLOBAL iteration index
+    /// and fires only the ticks this segment owns, so N instances merge back
+    /// into the exact original global rate. Tropel ran an independent
+    /// arrival-rate executor per node, so every node fired its own scaled rate
+    /// from its own t=0 and the arrivals BUNCHED.
+    ///
+    /// 3 nodes at 50%/25%/25% (the k6 `execution_segment.go` doc example) at a
+    /// global 20/s: the merged arrival sequence must be evenly spaced at 50 ms
+    /// and must match, instant for instant, what ONE node at the full 20/s
+    /// schedules.
+    #[tokio::test(start_paused = true)]
+    async fn arrival_rate_interleaves_across_segments() {
+        const SEQUENCE: &str = "0,1/2,3/4,1";
+        const GLOBAL_RATE: f64 = 20.0;
+        let window = Duration::from_secs(2);
+        let period_ms = 1000.0 / GLOBAL_RATE; // 50 ms
+
+        let t0 = tokio::time::Instant::now();
+        let (n0, n1, n2, full) = tokio::join!(
+            node_arrival_times("0:1/2", SEQUENCE, GLOBAL_RATE, window, t0),
+            node_arrival_times("1/2:3/4", SEQUENCE, GLOBAL_RATE, window, t0),
+            node_arrival_times("3/4:1", SEQUENCE, GLOBAL_RATE, window, t0),
+            node_arrival_times("0:1", "0,1", GLOBAL_RATE, window, t0),
+        );
+
+        let mut merged: Vec<Duration> = Vec::new();
+        merged.extend_from_slice(&n0);
+        merged.extend_from_slice(&n1);
+        merged.extend_from_slice(&n2);
+        merged.sort();
+
+        let ms = |v: &[Duration]| -> Vec<u64> { v.iter().map(|d| d.as_millis() as u64).collect() };
+
+        let merged_ms = ms(&merged);
+
+        // 0. Guard the guards: every assertion below is over `windows(2)` or a
+        //    zip, all of which are vacuously true on an empty log. 20/s over
+        //    2s is 40 global arrivals; the 40th is due exactly ON the 2s
+        //    boundary, which the half-open `elapsed < duration` loop has
+        //    already left — so 39 or 40, and never 3x anything.
+        assert!(
+            (39..=40).contains(&merged_ms.len()),
+            "three stripes must partition the ~40 global arrivals exactly once each, \
+             got {} (per node: {} / {} / {})",
+            merged_ms.len(),
+            n0.len(),
+            n1.len(),
+            n2.len()
+        );
+        assert_eq!(
+            n0.len() + n1.len() + n2.len(),
+            merged_ms.len(),
+            "merged must be the union of the three stripes"
+        );
+        // 50/25/25 of ~40 arrivals.
+        assert!(
+            n0.len() >= 19 && n1.len() >= 9 && n2.len() >= 9,
+            "stripe shares must follow the segments: {} / {} / {}",
+            n0.len(),
+            n1.len(),
+            n2.len()
+        );
+
+        // 1. The merged sequence must be evenly spaced at the GLOBAL period.
+        //    Bunching shows up here as gaps of 0 next to gaps of 2xperiod.
+        let mut worst_gap: i64 = 0;
+        for w in merged_ms.windows(2) {
+            let gap = w[1] as i64 - w[0] as i64;
+            worst_gap = worst_gap.max((gap - period_ms as i64).abs());
+        }
+        assert!(
+            worst_gap <= 3,
+            "merged arrivals must be evenly spaced at {period_ms}ms (worst deviation {worst_gap}ms).\n  \
+             node 0:1/2   -> {:?}\n  node 1/2:3/4 -> {:?}\n  node 3/4:1   -> {:?}\n  merged       -> {:?}",
+            &ms(&n0)[..ms(&n0).len().min(10)],
+            &ms(&n1)[..ms(&n1).len().min(10)],
+            &ms(&n2)[..ms(&n2).len().min(10)],
+            &merged_ms[..merged_ms.len().min(16)],
+        );
+
+        // 2. The merged sequence must equal what a SINGLE node at the full
+        //    global rate schedules — the property that makes N nodes
+        //    indistinguishable from one, which is the whole point of striping.
+        let full_ms = ms(&full);
+        assert_eq!(
+            merged_ms.len(),
+            full_ms.len(),
+            "merged arrival count {} != single-node-at-full-rate count {}",
+            merged_ms.len(),
+            full_ms.len()
+        );
+        for (i, (m, f)) in merged_ms.iter().zip(full_ms.iter()).enumerate() {
+            assert!(
+                (*m as i64 - *f as i64).abs() <= 3,
+                "arrival {i}: striped-merged {m}ms != single-node {f}ms\n  merged -> {:?}\n  single -> {:?}",
+                &merged_ms[..merged_ms.len().min(16)],
+                &full_ms[..full_ms.len().min(16)],
+            );
+        }
+    }
+
+    /// TR-221 · the same interleaving property for `ramping-arrival-rate`.
+    ///
+    /// The ramping executor integrates the rate curve instead of multiplying
+    /// by elapsed time, but the striped walk is identical — k6 splits it the
+    /// same way (`ramping_arrival_rate.go`'s `cal()` solves the curve and
+    /// steps the same striped offsets). A FLAT curve (start == target) makes
+    /// the expected merged schedule the same even cadence, so a regression in
+    /// either executor is visible here.
+    #[tokio::test(start_paused = true)]
+    async fn ramping_arrival_rate_interleaves_across_segments() {
+        const SEQUENCE: &str = "0,1/2,3/4,1";
+        const GLOBAL_RATE: f64 = 20.0;
+        let window = Duration::from_secs(2);
+        let period_ms = 1000.0 / GLOBAL_RATE; // 50 ms
+
+        let t0 = tokio::time::Instant::now();
+        let (n0, n1, n2) = tokio::join!(
+            node_ramping_arrival_times("0:1/2", SEQUENCE, GLOBAL_RATE, window, t0),
+            node_ramping_arrival_times("1/2:3/4", SEQUENCE, GLOBAL_RATE, window, t0),
+            node_ramping_arrival_times("3/4:1", SEQUENCE, GLOBAL_RATE, window, t0),
+        );
+
+        let mut merged: Vec<u64> = Vec::new();
+        for n in [&n0, &n1, &n2] {
+            merged.extend(n.iter().map(|d| d.as_millis() as u64));
+        }
+        merged.sort();
+
+        let mut worst_gap: i64 = 0;
+        for w in merged.windows(2) {
+            let gap = w[1] as i64 - w[0] as i64;
+            worst_gap = worst_gap.max((gap - period_ms as i64).abs());
+        }
+        assert!(
+            worst_gap <= 3,
+            "merged ramping arrivals must be evenly spaced at {period_ms}ms \
+             (worst deviation {worst_gap}ms); merged -> {:?}",
+            &merged[..merged.len().min(16)],
+        );
+        // Sanity on the total: 20/s over 2s is 40 global arrivals, and the
+        // three stripes must partition them (not duplicate or drop any). The
+        // 40th is due exactly ON the 2s boundary, which the executor's
+        // half-open `elapsed < total_duration` loop has already left — so 39
+        // or 40, never 41 and never 3× anything.
+        assert!(
+            (39..=40).contains(&merged.len()),
+            "three stripes must partition the ~40 global arrivals exactly once each, got {} \
+             (per node: {} / {} / {})",
+            merged.len(),
+            n0.len(),
+            n1.len(),
+            n2.len()
+        );
+        assert_eq!(
+            n0.len() + n1.len() + n2.len(),
+            merged.len(),
+            "merged must be the union of the three stripes"
+        );
+        // 50/25/25 of ~40 arrivals.
+        assert!(
+            n0.len() >= 19 && n1.len() >= 9 && n2.len() >= 9,
+            "stripe shares must follow the segments: {} / {} / {}",
+            n0.len(),
+            n1.len(),
+            n2.len()
+        );
+    }
+
+    /// TR-221 · the un-segmented schedule must be BYTE-IDENTICAL to what it
+    /// was before striping existed: the default `ArrivalStripe::full()` owns
+    /// every global tick, so `due_by(n) == n` and the executor still fires at
+    /// `k / rate`. Guards the fallback path against the striping change.
+    #[tokio::test(start_paused = true)]
+    async fn unsegmented_arrival_schedule_is_unchanged() {
+        let window = Duration::from_secs(1);
+        let t0 = tokio::time::Instant::now();
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
+            rate: 20.0,
+            time_unit: "1s".to_string(),
+            duration: "1s".to_string(),
+            pre_alloc_vus: 8,
+            max_vus: 8,
+            graceful_stop: Some("0s".to_string()),
+            think_time: Default::default(),
+        });
+        let log: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_c = log.clone();
+        let run_vu =
+            move |s: Arc<VUScheduler>, _vu: u32| recording_arrival_vu(s, t0, log_c.clone());
+        sched
+            .run_arrival_rate(20.0, 8, 8, window, Duration::ZERO, &run_vu)
+            .await;
+        let mut got: Vec<u64> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_millis() as u64)
+            .collect();
+        got.sort();
+        // 20/s for 1s: the k-th arrival lands at k × 50 ms, k = 1..=19 within
+        // the window (the 20th is due exactly at the 1s boundary, at which
+        // point the loop has already exited).
+        let expect: Vec<u64> = (1..=got.len() as u64).map(|k| k * 50).collect();
+        assert_eq!(got, expect, "un-segmented arrivals must stay at k/rate");
+        assert!(
+            (19..=20).contains(&got.len()),
+            "20/s for 1s must release ~20 arrivals, got {}",
+            got.len()
+        );
     }
 }
