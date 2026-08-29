@@ -34,6 +34,7 @@
 //!    and drains metrics/abort state from the `VuContext`.
 
 use crate::options::K6Options;
+use crate::system_tags::{SystemTag, SystemTagSet};
 use async_trait::async_trait;
 use futures::future::join_all;
 use futures_util::{SinkExt, StreamExt};
@@ -50,7 +51,6 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
-use crate::system_tags::{SystemTag, SystemTagSet};
 use tropel_js::JsContext;
 use tropel_sdk::{
     AuthConfig, Body, Cookie, Method, Request, Response, Sample, SampleType, TagMap, Timings,
@@ -165,7 +165,10 @@ impl SystemTagsHandle {
 
     /// The effective set — k6's default 14 until filled.
     fn get(&self) -> SystemTagSet {
-        self.0.get().copied().unwrap_or_else(SystemTagSet::k6_default)
+        self.0
+            .get()
+            .copied()
+            .unwrap_or_else(SystemTagSet::k6_default)
     }
 }
 
@@ -3143,6 +3146,11 @@ let _ = globals.set(
                 }),
             );
             let group_end = self.group_stack.clone();
+            // TR-212: `group` is a system tag on group_duration too. This was
+            // the one sample builder the first pass missed -- the http, checks,
+            // custom-metric and ws builders were all gated, so a run with
+            // `systemTags: ['url']` still got `group=::checkout` here.
+            let sys_group = self.system_tags;
             let _ = globals.set(
                 "__tropel_pm_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
@@ -3163,7 +3171,9 @@ let _ = globals.set(
                     }
                     let mut v = sink_group.lock().unwrap();
                     let mut tags = TagMap::with_capacity(1);
-                    tags.insert("group", full);
+                    if sys_group.has(SystemTag::Group) {
+                        tags.insert("group", full);
+                    }
                     v.push(Sample {
                         metric: "group_duration".into(),
                         value: duration_ms, // ms — the public unit (k6 semantics)
@@ -4596,7 +4606,9 @@ fn install_iteration_global(
 /// `42` as an unrecognized name rather than silently dropping the whole list
 /// (dropping it would restore all 14 — the exact silent-fallback failure this
 /// task removes).
-fn read_declared_system_tags(module: &rquickjs::Module<'_, rquickjs::module::Evaluated>) -> Option<Vec<String>> {
+fn read_declared_system_tags(
+    module: &rquickjs::Module<'_, rquickjs::module::Evaluated>,
+) -> Option<Vec<String>> {
     let options: rquickjs::Object = module.get("options").ok()?;
     let value: rquickjs::Value = options.get("systemTags").ok()?;
     let array = value.as_array()?;
@@ -8992,6 +9004,79 @@ mod tests {
         assert!(
             sample.tags.get("scenario").is_none(),
             "the drain must not re-add `scenario` after the bridge dropped it"
+        );
+    }
+
+    /// TR-212 twin: `group_duration` is a FIFTH sample builder, and the one
+    /// the first pass of this task missed. `http_tags_for`, the checks
+    /// bridge, the custom-metric bridge and both ws builders were all gated
+    /// on the system-tag set while `__tropel_pm_group_end` still stamped
+    /// `group` unconditionally — so `systemTags: ['url']` produced narrowed
+    /// http/checks samples and a wide `group_duration` in the same run.
+    #[tokio::test]
+    async fn test_system_tags_narrows_group_duration_sample() {
+        let driver = K6Driver;
+        let script = br#"
+            export const options = { systemTags: ['url'] };
+            export default function () {
+                group('checkout', function () {});
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "group_duration")
+            .expect("group_duration sample");
+        assert!(
+            sample.tags.get("group").is_none(),
+            "`group` is a system tag and was not requested, but \
+             group_duration still carries it; got {:?}",
+            sample.tags
+        );
+    }
+
+    /// The companion to the test above: with no `systemTags` declared,
+    /// `group_duration` must still carry the full `::a::b` group path. Gating
+    /// a tag must not become deleting it — without this, the cheapest way to
+    /// pass the narrowing test is to stop emitting `group` altogether.
+    #[tokio::test]
+    async fn test_group_duration_keeps_group_tag_by_default() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    group('payment', function () {});
+                });
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let nested = ctx
+            .samples
+            .iter()
+            .find(|s| {
+                s.metric == "group_duration" && s.tags.get("group") == Some("::checkout::payment")
+            })
+            .map(|s| s.tags.get("group").map(|v| v.to_string()));
+        assert_eq!(
+            nested,
+            Some(Some("::checkout::payment".to_string())),
+            "default set → group_duration keeps the full nested path; got {:?}",
+            ctx.samples
+                .iter()
+                .filter(|s| s.metric == "group_duration")
+                .map(|s| s.tags.get("group").map(|v| v.to_string()))
+                .collect::<Vec<_>>()
         );
     }
 
