@@ -47,11 +47,14 @@ pub(crate) const SHIM_BUNDLE_VERSION: &str = "0.1.0";
 /// previously carried only 5 shims while the default bundle carried 6 (with
 /// bru), so the bytecode path short-circuited on `is_default()` and bru.js
 /// was compiled into the binary but NEVER evaluated (`typeof bru ===
-/// 'undefined'` in every engine VU). Keep the two in lockstep: same 6 shims,
+/// 'undefined'` in every engine VU). Keep the two in lockstep: same shims,
 /// same order, same section headers.
 const JS_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: deep-equal-shim ====\n",
     include_str!("../../../js/shared/deep-equal.js"),
+    "\n",
+    "// ==== shim: k6-core-shim ====\n",
+    include_str!("../../../js/shared/k6-core.js"),
     "\n",
     "// ==== shim: pm-shim ====\n",
     include_str!("../../../js/scripting-api/pm.js"),
@@ -127,6 +130,16 @@ impl Default for ShimBundle {
                 "deep-equal-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/shared/deep-equal.js")),
             ),
+            // TR-501: `check`, `group` and the metric constructors are k6's
+            // API, not Postman's. They used to live in pm.js and be installed
+            // onto globalThis from there, so every non-Postman format had to
+            // load the whole 70 KB Postman shim to get `check()`. Split out so
+            // format-driven bundles can drop pm.js without breaking k6
+            // builtins. Ordered before pm-shim: pm.js no longer installs them.
+            ShimEntry(
+                "k6-core-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/shared/k6-core.js")),
+            ),
             ShimEntry(
                 "pm-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/scripting-api/pm.js")),
@@ -193,6 +206,13 @@ impl ShimBundle {
             ShimEntry(
                 "deep-equal-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/shared/deep-equal.js")),
+            ),
+            // Unconditional: `check`/`group`/metrics are k6 builtins a script
+            // may call without importing anything, so gating them on content
+            // would turn a working script into a ReferenceError (TR-501).
+            ShimEntry(
+                "k6-core-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/shared/k6-core.js")),
             ),
             ShimEntry(
                 "pm-shim",
@@ -487,12 +507,69 @@ mod tests {
     /// bundle must enumerate bru, and the bytecode source must embed the
     /// same bru.js text.
     #[test]
+    /// TR-501: `check`, `group` and the metric constructors must NOT be
+    /// installed by pm.js.
+    ///
+    /// They are k6's API, not Postman's. While pm.js installed them, "drop
+    /// pm.js for non-Postman formats" broke `check()`, which made it look as
+    /// though every format genuinely needed the 70 KB Postman shim. It did
+    /// not — it needed these six symbols.
+    ///
+    /// **Fails on pre-fix code**: pm.js contained `globalThis.check = check;`
+    /// and the five siblings, so the first assertion tripped.
+    #[test]
+    fn pm_shim_does_not_install_k6_builtins() {
+        let d = ShimBundle::default();
+        let pm = d
+            .0
+            .iter()
+            .find(|e| e.0 == "pm-shim")
+            .expect("pm-shim present")
+            .1
+            .as_ref();
+        for sym in ["check", "group", "Counter", "Gauge", "Rate", "Trend"] {
+            assert!(
+                !pm.contains(&format!("globalThis.{sym} = {sym};")),
+                "pm.js must not install the k6 builtin `{sym}` — it belongs to \
+                 k6-core so non-Postman formats can drop pm.js (TR-501)"
+            );
+        }
+
+        let core = d
+            .0
+            .iter()
+            .find(|e| e.0 == "k6-core-shim")
+            .expect("k6-core-shim present")
+            .1
+            .as_ref();
+        for sym in ["check", "group", "Counter", "Gauge", "Rate", "Trend"] {
+            assert!(
+                core.contains(&format!("globalThis.{sym} = {sym};")),
+                "k6-core must install `{sym}` — it is what makes dropping pm.js safe"
+            );
+        }
+    }
+
+    /// k6-core has to load BEFORE pm.js. pm.js no longer defines these
+    /// globals, so a bundle that ordered them the other way would still work
+    /// today by accident and break the moment anything in pm referenced them.
+    #[test]
+    fn k6_core_loads_before_pm() {
+        let names: Vec<&str> = ShimBundle::default().0.iter().map(|e| e.0).collect();
+        let core = names.iter().position(|n| *n == "k6-core-shim");
+        let pm = names.iter().position(|n| *n == "pm-shim");
+        assert!(
+            core < pm,
+            "k6-core-shim must precede pm-shim, got {names:?}"
+        );
+    }
+
     fn shim_lists_stay_in_lockstep_with_bru() {
         let d = ShimBundle::default();
         assert_eq!(
             d.0.len(),
-            7,
-            "ShimBundle::default() must enumerate 7 shims (deep-equal/pm/chai/lodash/crypto/exec/bru)"
+            8,
+            "ShimBundle::default() must enumerate 8 shims (deep-equal/k6-core/pm/chai/lodash/crypto/exec/bru)"
         );
         let bru_entry = d.0.iter().find(|e| e.0 == "bru-shim");
         assert!(
@@ -508,6 +585,7 @@ mod tests {
             d.0.iter().map(|e| e.0).collect::<Vec<_>>(),
             vec![
                 "deep-equal-shim",
+                "k6-core-shim",
                 "pm-shim",
                 "chai-shim",
                 "lodash-shim",
