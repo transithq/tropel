@@ -151,8 +151,8 @@ The thesis is *"one engine, with a differential harness proving they agree."* Wi
 
 ### Acceptance criteria
 - [x] `native_vs_wasm` over a request corpus: identical wire bytes, identical signing, identical script results
-- [x] The corpus includes every fixture collection, and every auth scheme
-- [x] Runs in CI on every PR and **blocks merge** on divergence
+- [x] The corpus includes every fixture collection, and every auth scheme — **expanded**: it covered bearer/basic/api-key/digest, i.e. only the schemes where the header is a near-verbatim copy of the credential, and omitted every scheme that computes a signature. OAuth1 (HMAC-SHA1), AWS SigV4 and Hawk are now in the corpus, plus OAuth2. Those are the schemes where a byte difference is a 403, which is the stated reason signing is Rust-side at all. NTLM/WSSE/JWT/Akamai remain uncovered because they are reported `unsupported` rather than implemented — recorded in `native_vs_wasm_divergences.md`
+- [x] Runs in CI on every PR and **blocks merge** on divergence — **fixed**: three of the harness's five tests (the HAR, OpenAPI and Postman fixture legs) skipped even under `TROPEL_REQUIRE_WASM=1`, so they blocked nothing. Only the two corpus tests honoured the flag. All five now fail closed
 - [x] Divergences that are genuinely unavoidable are enumerated in a checked-in file; the suite fails on any divergence **not** on that list
 - [x] Extends the conformance suite rather than forking it — a second harness is the bug this harness exists to catch — **verified**: `crates/tropel-web/tests/native_vs_wasm.rs:1-26` now documents `TR-408: this harness extends the conformance suite (tropel_engine/tests/conformance_k6.rs TR-202 + native_vs_wasm_divergences.md) — corpus and divergences file are shared; both harnesses run in CI and block merge; the corpus reuses the same examples/ collections and fixture axes (status/headers/variable state/assertion/setNextRequest)`
 - [x] Published as a badge
