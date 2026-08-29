@@ -448,6 +448,10 @@ impl Engine {
         // Build scenario configs. Script-declared scenarios/execution (from a
         // k6 `export const options`) take precedence over the default profile
         // but not over explicit user config (execution_explicit check above).
+        // TR-501: the user-declared input format, snapshotted before the
+        // per-scenario loop so each VU-loop can pick a shim bundle the
+        // format can actually use instead of scanning the file.
+        let config_input_type: Option<String> = config.input_type.clone();
         let scenario_configs: Vec<ScenarioConfigEntry> = if let Some(scs) = declared_scenarios {
             scs.iter()
                 .map(|(name, sc)| {
@@ -635,6 +639,10 @@ impl Engine {
             // TR-313: the scenario task reuses the bytes read at startup
             // instead of re-reading the script file.
             let script_bytes_sc = script_bytes.clone();
+            // Cloned out here, not inside the `async move`: the closure
+            // captures by move and this is a loop, so an inner clone moved
+            // the original on the first iteration.
+            let input_type_sc = config_input_type.clone();
 
             let handle = tokio::spawn(async move {
                 let resolved = resolve_input_or_driver(
@@ -685,6 +693,12 @@ impl Engine {
                             control_port,
                             rps_limiter_sc,
                             &input_path,
+                            // TR-501: when the user names the format
+                            // (`--input-type`), trust it over scanning the
+                            // file — a HAR input cannot need pm/chai/lodash
+                            // whatever strings it contains. `None` falls back
+                            // to the content scan, which is the safe default.
+                            input_type_sc.clone(),
                         )
                         .await
                     }

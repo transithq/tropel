@@ -1450,6 +1450,16 @@ impl VuCookieClient {
         &self.inner
     }
 
+    /// This VU's cookie jar — the SAME jar [`execute`](Self::execute) injects
+    /// from and stores into. Handed to the scripting surface (k6
+    /// `http.cookieJar()`) via [`crate::vu_jar`] so a script's jar edits are
+    /// visible to the very next request, and the server's `Set-Cookie` is
+    /// visible to the script. A second jar here would be a capability that
+    /// changes nothing.
+    pub fn jar(&self) -> Arc<reqwest::cookie::Jar> {
+        self.jar.clone()
+    }
+
     /// Get a cached signer for this auth config. Digest signers are cached
     /// so their session maps persist across requests within the same VU.
     /// Stateless signers (Bearer, Basic, ApiKey) are also cached for
@@ -1738,7 +1748,7 @@ fn parse_set_cookie(header: &str) -> Option<Cookie> {
 /// may contain `=` but never `;` (the pair separator), so splitting on `;`
 /// and then on the FIRST `=` is correct — the same split the jar merge uses
 /// to apply k6's replace semantics per cookie name.
-fn parse_cookie_header_value(value: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_cookie_header_value(value: &str) -> Vec<(String, String)> {
     value
         .split(';')
         .map(str::trim)

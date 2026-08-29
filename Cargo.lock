@@ -4297,10 +4297,8 @@ name = "tropel-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "flate2",
  "libc",
  "mach2 0.5.0",
- "serde_json",
  "tokio",
  "tropel-engine",
  "tropel-http",
@@ -4679,6 +4677,7 @@ dependencies = [
  "chrono",
  "flate2",
  "insta",
+ "prost",
  "reqwest",
  "serde",
  "serde_json",

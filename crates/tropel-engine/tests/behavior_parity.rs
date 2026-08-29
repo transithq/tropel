@@ -680,3 +680,403 @@ async fn force_stop_interrupts_sleeping_vu() -> Result<()> {
     let _ = std::fs::remove_file(&coll);
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// TR-233 · `http.cookieJar()` and `options.batch` / `options.batchPerHost`
+//
+// Both halves were *declared but not forwarded* (CONTEXT invariant 3), and
+// both were "covered" by shape tests that could not see it: one asserted the
+// four jar methods EXIST, the other asserted the batch limiter exists with
+// k6's hardcoded defaults. So these two tests assert only what a user can
+// observe from outside the process — the bytes on the wire:
+//
+//   * cookies: the `Cookie:` header the SERVER receives, and the request path
+//     the script builds out of what the jar told it.
+//   * batch:   the PEAK number of simultaneously in-flight requests the
+//     SERVER counts.
+//
+// Neither can pass against a jar that stores nothing or a limiter sized from
+// a constant. See the PR body for the pre-fix failure output.
+// ──────────────────────────────────────────────────────────────────────
+
+/// One request the cookie server saw: its path, and the `Cookie:` header the
+/// client actually sent (`None` when the client sent no `Cookie:` header at
+/// all — which is precisely the pre-fix behaviour).
+type SeenRequest = (String, Option<String>);
+
+/// HTTP/1.1 server that records every request's path and `Cookie:` header,
+/// and answers `/set-cookie` with a `Set-Cookie:` of its own.
+///
+/// Keep-alive, because the point is that the jar — not the connection —
+/// carries the cookie: the requests must be indistinguishable to the server
+/// apart from their headers.
+async fn start_cookie_server() -> (
+    std::net::SocketAddr,
+    Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: Arc<std::sync::Mutex<Vec<SeenRequest>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_out = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let mut head = Vec::new();
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head).into_owned();
+                    let path = text
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let cookie = text
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                        .map(|l| l[7..].trim().to_string());
+                    seen.lock().unwrap().push((path.clone(), cookie));
+
+                    let body = r#"{"ok":true}"#;
+                    // Only `/set-cookie` hands a cookie back, so a cookie
+                    // observed on any OTHER path can only have come from the
+                    // jar the script wrote to.
+                    let set = if path.starts_with("/set-cookie") {
+                        "Set-Cookie: srv=from_server; Path=/\r\n"
+                    } else {
+                        ""
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\n{set}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, seen_out)
+}
+
+/// k6 script that drives all four `http.cookieJar()` verbs and encodes what
+/// the jar told it into a request PATH, so the script's own view of the jar
+/// is observable on the wire rather than through an in-process assertion.
+fn write_k6_cookie_jar_script(base: &str, tag: &str) -> String {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tropel-k6-e2e-{}-{}.js", std::process::id(), tag));
+    let script = format!(
+        r#"import http from 'k6/http';
+
+export default function () {{
+  const jar = http.cookieJar();
+
+  // (1) A cookie the SCRIPT set must ride on the next request.
+  jar.set('{base}/', 'scripted', 'from_jar', {{ path: '/' }});
+  http.get('{base}/first');
+
+  // (2) The server sets one of its own.
+  http.get('{base}/set-cookie');
+
+  // (3) …which the script must be able to READ back out of the same jar.
+  //     Whatever it saw becomes the path, so the server records it.
+  const seen = jar.cookiesForURL('{base}/');
+  const srv = (seen && seen['srv'] && seen['srv'][0]) ? seen['srv'][0] : 'MISSING';
+  http.get('{base}/probe-' + srv);
+
+  // (4) delete() drops ONLY the named cookie — the server's must survive.
+  jar.delete('{base}/', 'scripted');
+  http.get('{base}/after-delete');
+}}
+"#
+    );
+    std::fs::write(&path, script).unwrap();
+    path.to_string_lossy().to_string()
+}
+
+/// TR-233 · `http.cookieJar()` had a full JS surface and no jar behind it:
+/// `jar.set()` changed nothing about the next request, and `cookiesForURL()`
+/// returned `[]` no matter what the server had set. A declared capability
+/// that forwards nothing is worse than a missing one — a script that logs in
+/// by seeding a session cookie ran green against an unauthenticated server.
+///
+/// Everything asserted here is observed by the SERVER, so no in-process
+/// stub can satisfy it: the jar must be the same jar `VuCookieClient` puts
+/// on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cookie_jar_set_reaches_the_wire_and_reads_back_server_cookies() -> Result<()> {
+    let (srv, seen) = start_cookie_server().await;
+    let script = write_k6_cookie_jar_script(&format!("http://{srv}"), "cookiejar");
+
+    let config = JobConfig {
+        input: script.clone(),
+        input_type: Some("k6".to_string()),
+        // Exactly one iteration: the four requests below are the whole run,
+        // so their order and count are deterministic.
+        execution: ExecutionConfig::SharedIterations {
+            iterations: 1,
+            max_duration: Some("30s".to_string()),
+            vus: 1,
+            graceful_stop: Some("5s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+    assert!(
+        result.metrics.http_reqs >= 4,
+        "the script's four requests must all fire, got {}",
+        result.metrics.http_reqs
+    );
+
+    let seen = seen.lock().unwrap().clone();
+    let find = |p: &str| -> SeenRequest {
+        seen.iter()
+            .find(|(path, _)| path == p)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the server never received {p}; it saw: {:?}",
+                    seen.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>()
+                )
+            })
+            .clone()
+    };
+
+    // 1. THE regression: a cookie the script put in the jar is on the wire.
+    //    Pre-fix the bridge did not exist, the shim's `set` silently no-oped,
+    //    and this request carried no `Cookie:` header at all.
+    let (_, first_cookie) = find("/first");
+    let first_cookie = first_cookie.unwrap_or_else(|| {
+        panic!("jar.set() must put a Cookie header on the next request; none was sent")
+    });
+    assert!(
+        first_cookie.contains("scripted=from_jar"),
+        "jar.set() must reach the wire; server saw Cookie: {first_cookie}"
+    );
+
+    // 2. The server's own Set-Cookie is readable through cookiesForURL() —
+    //    the script built this path out of what the jar handed back, so a jar
+    //    that cannot see server cookies produces `/probe-MISSING`.
+    let (probe_path, _) = seen
+        .iter()
+        .find(|(p, _)| p.starts_with("/probe-"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the server never received a /probe- request; it saw: {:?}",
+                seen.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>()
+            )
+        })
+        .clone();
+    assert_eq!(
+        probe_path, "/probe-from_server",
+        "cookiesForURL() must return the server's cookie VALUE keyed by name \
+         (k6 returns map[string][]string, so cookies['srv'][0]); \
+         `/probe-MISSING` means the jar read nothing back"
+    );
+
+    // 3. delete(url, name) drops only the named cookie. k6's `clear` takes a
+    //    URL alone and drops everything; the old shim aliased the two, so
+    //    this distinction had no test at all.
+    let (_, after_delete) = find("/after-delete");
+    let after_delete = after_delete.unwrap_or_else(|| {
+        panic!("the server's own cookie must survive delete('scripted'); no Cookie header was sent")
+    });
+    assert!(
+        !after_delete.contains("scripted="),
+        "delete() must stop the named cookie being sent; server saw Cookie: {after_delete}"
+    );
+    assert!(
+        after_delete.contains("srv=from_server"),
+        "delete() must NOT drop other cookies; server saw Cookie: {after_delete}"
+    );
+
+    let _ = std::fs::remove_file(&script);
+    Ok(())
+}
+
+/// HTTP/1.1 server that tracks the peak number of simultaneously IN-FLIGHT
+/// requests (not connections — `http.batch` runs over a pooled client, so
+/// counting sockets would measure the pool, not the batch limiter).
+///
+/// Each request is held `hold_ms` before answering so overlapping requests
+/// genuinely overlap; a server that answered instantly would serialize the
+/// batch and report a peak of 1 whatever the limit is.
+async fn start_inflight_peak_server(
+    hold_ms: u64,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let total = Arc::new(AtomicUsize::new(0));
+    let (peak_out, total_out) = (peak.clone(), total.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let (active, peak, total) = (active.clone(), peak.clone(), total.clone());
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let mut head = Vec::new();
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    total.fetch_add(1, Ordering::SeqCst);
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+                    let body = r#"{"ok":true}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let wrote = sock.write_all(resp.as_bytes()).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    if wrote.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, peak_out, total_out)
+}
+
+/// k6 script that issues `n` requests in ONE `http.batch()` under the given
+/// declared limits. All requests go to the same host, so the effective
+/// ceiling is `min(batch, batchPerHost)`.
+fn write_k6_batch_script(base: &str, tag: &str, batch: usize, per_host: usize, n: usize) -> String {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tropel-k6-e2e-{}-{}.js", std::process::id(), tag));
+    let script = format!(
+        r#"import http from 'k6/http';
+
+export const options = {{ batch: {batch}, batchPerHost: {per_host} }};
+
+export default function () {{
+  const reqs = [];
+  for (let i = 0; i < {n}; i++) {{ reqs.push(['GET', '{base}/b' + i]); }}
+  http.batch(reqs);
+}}
+"#
+    );
+    std::fs::write(&path, script).unwrap();
+    path.to_string_lossy().to_string()
+}
+
+/// Run one `http.batch()` of `n` requests under the declared limits and
+/// return `(observed peak in-flight, total requests served)`.
+async fn observed_batch_concurrency(
+    tag: &str,
+    batch: usize,
+    per_host: usize,
+    n: usize,
+) -> Result<(usize, usize)> {
+    let (srv, peak, total) = start_inflight_peak_server(150).await;
+    let script = write_k6_batch_script(&format!("http://{srv}"), tag, batch, per_host, n);
+    let config = JobConfig {
+        input: script.clone(),
+        input_type: Some("k6".to_string()),
+        execution: ExecutionConfig::SharedIterations {
+            iterations: 1,
+            max_duration: Some("60s".to_string()),
+            vus: 1,
+            graceful_stop: Some("10s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let engine = Engine::new(ExtensionRegistry::new());
+    engine.run(&config).await?;
+    let _ = std::fs::remove_file(&script);
+    Ok((peak.load(Ordering::SeqCst), total.load(Ordering::SeqCst)))
+}
+
+/// TR-233 · `options.batch` / `options.batchPerHost` were parsed into the
+/// `unknown` bag, warned about, and dropped: the limiter was built from k6's
+/// hardcoded 20/6 whatever the script declared. Both directions matter and
+/// both are user-visible only as concurrency on the wire —
+///
+///   * RAISING it (`batch: 10` above the per-host default of 6) is the case
+///     the user is denied throughput they asked for;
+///   * LOWERING it (`batch: 2`) is the case the user asked to be gentle with
+///     a fragile endpoint and was ignored — the dangerous one.
+///
+/// Pre-fix BOTH observe a peak of 6 (the per-host default), which is what
+/// makes a single hardcoded expectation unable to hide here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declared_batch_limit_is_the_observed_concurrency() -> Result<()> {
+    // 12 requests, cap 2 → the server must never see a third in flight.
+    let (peak_low, total_low) = observed_batch_concurrency("batch-low", 2, 2, 12).await?;
+    assert_eq!(total_low, 12, "all 12 batch requests must be served");
+    assert_eq!(
+        peak_low, 2,
+        "declared `batch: 2` must be the observed ceiling; the server saw \
+         {peak_low} requests in flight at once (6 = k6's per-host default \
+         still hardcoded, i.e. the declared option was dropped)"
+    );
+
+    // 12 requests, cap 10 → above the per-host default of 6, so a dropped
+    // option pins this at 6 and a forwarded one reaches 10.
+    let (peak_high, total_high) = observed_batch_concurrency("batch-high", 10, 10, 12).await?;
+    assert_eq!(total_high, 12, "all 12 batch requests must be served");
+    assert_eq!(
+        peak_high, 10,
+        "declared `batch: 10` must raise the ceiling above k6's per-host \
+         default of 6; the server saw {peak_high} in flight at once"
+    );
+
+    Ok(())
+}
+
+/// The per-host limiter runs UNDER the global one, so for a single-host
+/// batch the ceiling is `min(batch, batchPerHost)`. Without this, `batch`
+/// alone could be wired while `batchPerHost` was quietly ignored — the same
+/// declared-but-not-forwarded shape one level down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_per_host_caps_below_the_global_batch_limit() -> Result<()> {
+    let (peak, total) = observed_batch_concurrency("batch-perhost", 12, 3, 12).await?;
+    assert_eq!(total, 12, "all 12 batch requests must be served");
+    assert_eq!(
+        peak, 3,
+        "`batchPerHost: 3` must cap a single-host batch below `batch: 12`; \
+         the server saw {peak} in flight at once"
+    );
+    Ok(())
+}

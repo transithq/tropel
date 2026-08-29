@@ -20,7 +20,11 @@ use tropel_sandbox::state::SharedPmState;
 #[cfg(not(target_arch = "wasm32"))]
 const SHIM_SOURCES: [&str; 7] = [
     include_str!("../../../js/shared/deep-equal.js"),
-    include_str!("../../../js/scripting-api/pm.js"),
+    concat!(
+        include_str!("../../../js/shared/k6-core.js"),
+        "\n",
+        include_str!("../../../js/scripting-api/pm.js")
+    ),
     include_str!("../../../js/chai/chai-shim.js"),
     include_str!("../../../js/lodash/lodash-shim.js"),
     include_str!("../../../js/cryptojs-shim/cryptojs.js"),

@@ -47,11 +47,14 @@ pub(crate) const SHIM_BUNDLE_VERSION: &str = "0.1.0";
 /// previously carried only 5 shims while the default bundle carried 6 (with
 /// bru), so the bytecode path short-circuited on `is_default()` and bru.js
 /// was compiled into the binary but NEVER evaluated (`typeof bru ===
-/// 'undefined'` in every engine VU). Keep the two in lockstep: same 6 shims,
+/// 'undefined'` in every engine VU). Keep the two in lockstep: same shims,
 /// same order, same section headers.
 const JS_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: deep-equal-shim ====\n",
     include_str!("../../../js/shared/deep-equal.js"),
+    "\n",
+    "// ==== shim: k6-core-shim ====\n",
+    include_str!("../../../js/shared/k6-core.js"),
     "\n",
     "// ==== shim: pm-shim ====\n",
     include_str!("../../../js/scripting-api/pm.js"),
@@ -127,6 +130,16 @@ impl Default for ShimBundle {
                 "deep-equal-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/shared/deep-equal.js")),
             ),
+            // TR-501: `check`, `group` and the metric constructors are k6's
+            // API, not Postman's. They used to live in pm.js and be installed
+            // onto globalThis from there, so every non-Postman format had to
+            // load the whole 70 KB Postman shim to get `check()`. Split out so
+            // format-driven bundles can drop pm.js without breaking k6
+            // builtins. Ordered before pm-shim: pm.js no longer installs them.
+            ShimEntry(
+                "k6-core-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/shared/k6-core.js")),
+            ),
             ShimEntry(
                 "pm-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/scripting-api/pm.js")),
@@ -174,6 +187,67 @@ impl ShimBundle {
     /// Build a minimal shim bundle by scanning a file path for keywords.
     /// Reads the file once (OS page cache makes this cheap after the first
     /// VU) and delegates to [`Self::from_script_bytes`].
+    /// TR-501: the bundle a given INPUT FORMAT can possibly need.
+    ///
+    /// Content scanning (`from_script`) guesses from the script text. The
+    /// adapter already *knows* the format, and a format is a much stronger
+    /// signal: a HAR file has no scripting surface at all, so it cannot need
+    /// pm, chai, lodash or cryptojs no matter what strings appear inside it.
+    ///
+    /// The rule, after `check`/`group`/metrics moved to k6-core so that
+    /// dropping pm.js no longer breaks them:
+    ///
+    /// | format | bundle |
+    /// |---|---|
+    /// | `postman` | core + pm + chai + lodash + cryptojs |
+    /// | `bru` | core + bru + chai + lodash + cryptojs |
+    /// | `har`, `openapi`, `http` | core only — no scripting surface exists |
+    /// | anything else | falls through to content scanning (existing behaviour) |
+    ///
+    /// **Unknown formats are never narrowed by format.** A missing shim is
+    /// a `ReferenceError` in a customer's script; an extra one costs memory.
+    /// The default must be the safe direction, so a new adapter that forgets
+    /// to add itself here is merely un-optimised rather than broken.
+    ///
+    /// `insomnia` is deliberately NOT narrowed: newer Insomnia supports
+    /// request scripting and there is no insomnia-specific shim in the tree,
+    /// so which API those scripts use is unproven. Narrowing it needs a real
+    /// Insomnia export to check against (see TR-006's fixture gap).
+    pub fn for_format(format: &str, script: &[u8]) -> Self {
+        const CORE: [&str; 3] = ["deep-equal-shim", "k6-core-shim", "exec-shim"];
+        let keep: &[&str] = match format {
+            "postman" => &[
+                "deep-equal-shim",
+                "k6-core-shim",
+                "exec-shim",
+                "pm-shim",
+                "chai-shim",
+                "lodash-shim",
+                "cryptojs-shim",
+            ],
+            "bru" => &[
+                "deep-equal-shim",
+                "k6-core-shim",
+                "exec-shim",
+                "bru-shim",
+                "chai-shim",
+                "lodash-shim",
+                "cryptojs-shim",
+            ],
+            // Pure request descriptions: no pre-request or test scripts exist
+            // in these formats, so no scripting shim can be reachable.
+            "har" | "openapi" | "http" => &CORE,
+            _ => return Self::from_script(script),
+        };
+        Self(
+            Self::default()
+                .0
+                .into_iter()
+                .filter(|e| keep.contains(&e.0))
+                .collect(),
+        )
+    }
+
     pub fn from_script_path(path: &std::path::Path) -> Self {
         match std::fs::read(path) {
             Ok(bytes) => Self::from_script_bytes(&bytes),
@@ -193,6 +267,13 @@ impl ShimBundle {
             ShimEntry(
                 "deep-equal-shim",
                 std::borrow::Cow::Borrowed(include_str!("../../../js/shared/deep-equal.js")),
+            ),
+            // Unconditional: `check`/`group`/metrics are k6 builtins a script
+            // may call without importing anything, so gating them on content
+            // would turn a working script into a ReferenceError (TR-501).
+            ShimEntry(
+                "k6-core-shim",
+                std::borrow::Cow::Borrowed(include_str!("../../../js/shared/k6-core.js")),
             ),
             ShimEntry(
                 "pm-shim",
@@ -479,6 +560,163 @@ mod tests {
     use tropel_sandbox::state::new_pm_state;
     use tropel_sdk::traits::DriverHttpClient;
 
+    /// TR-501: `check`, `group` and the metric constructors must NOT be
+    /// installed by pm.js.
+    ///
+    /// They are k6's API, not Postman's. While pm.js installed them, "drop
+    /// pm.js for non-Postman formats" broke `check()`, which made it look as
+    /// though every format genuinely needed the 70 KB Postman shim. It did
+    /// not — it needed these six symbols.
+    ///
+    /// **Fails on pre-fix code**: pm.js contained `globalThis.check = check;`
+    /// and the five siblings, so the first assertion tripped.
+    /// TR-501: a format with no scripting surface must not carry the
+    /// scripting shims.
+    ///
+    /// **Fails before k6-core was extracted**: dropping pm-shim removed
+    /// `check`/`group`/metrics with it, so this bundle could not run a k6
+    /// script at all. That is exactly why the format split was blocked.
+    #[test]
+    fn script_free_formats_drop_the_scripting_shims() {
+        for fmt in ["har", "openapi", "http"] {
+            let names: Vec<&str> = ShimBundle::for_format(fmt, b"")
+                .0
+                .iter()
+                .map(|e| e.0)
+                .collect();
+            for dropped in [
+                "pm-shim",
+                "bru-shim",
+                "chai-shim",
+                "lodash-shim",
+                "cryptojs-shim",
+            ] {
+                assert!(
+                    !names.contains(&dropped),
+                    "{fmt} has no scripting surface, so it must not load {dropped}: {names:?}"
+                );
+            }
+            assert!(
+                names.contains(&"k6-core-shim"),
+                "{fmt} must still get k6-core — `check`/`group`/metrics are \
+                 reachable without any import: {names:?}"
+            );
+        }
+    }
+
+    /// Postman keeps its own shim; Bruno keeps its own and does NOT get pm.
+    ///
+    /// bru.js is a peer view over the same `__tropel_pm_*` native bridges, not
+    /// a pm.js dependent — its own header says so. Loading pm for a Bruno run
+    /// was 70 KB/VU of nothing.
+    #[test]
+    fn each_scripting_format_gets_only_its_own_binding() {
+        let postman: Vec<&str> = ShimBundle::for_format("postman", b"")
+            .0
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        assert!(postman.contains(&"pm-shim"), "{postman:?}");
+        assert!(!postman.contains(&"bru-shim"), "{postman:?}");
+
+        let bru: Vec<&str> = ShimBundle::for_format("bru", b"")
+            .0
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        assert!(bru.contains(&"bru-shim"), "{bru:?}");
+        assert!(
+            !bru.contains(&"pm-shim"),
+            "Bruno is a peer view over the same native bridges, not a pm.js \
+             dependent — it must not load the Postman shim: {bru:?}"
+        );
+    }
+
+    /// An unrecognised format must get the FULL bundle, not a narrowed one.
+    ///
+    /// A missing shim is a ReferenceError in a customer's script; an extra one
+    /// costs memory. A new adapter that forgets to register here should be
+    /// un-optimised, never broken.
+    #[test]
+    fn unknown_formats_fall_back_to_the_full_bundle() {
+        let unknown: Vec<&str> = ShimBundle::for_format("some-new-adapter", b"")
+            .0
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        let scanned: Vec<&str> = ShimBundle::from_script(b"").0.iter().map(|e| e.0).collect();
+        assert_eq!(
+            unknown, scanned,
+            "an unknown format must not be narrowed BY FORMAT — it falls through \
+             to content scanning, which is the pre-existing safe default"
+        );
+    }
+
+    /// Insomnia is deliberately NOT narrowed: newer Insomnia supports request
+    /// scripting, there is no insomnia-specific shim in the tree, and which
+    /// API those scripts use is unproven. Narrowing it needs a real export to
+    /// check against (TR-006's fixture gap). This pins the decision so it is
+    /// revisited on purpose rather than assumed safe.
+    #[test]
+    fn insomnia_is_not_narrowed_pending_a_real_fixture() {
+        let names: Vec<&str> = ShimBundle::for_format("insomnia", b"")
+            .0
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        let scanned: Vec<&str> = ShimBundle::from_script(b"").0.iter().map(|e| e.0).collect();
+        assert_eq!(
+            names, scanned,
+            "insomnia must not be narrowed by format — it falls through to \
+             content scanning until a real export proves what its scripts use"
+        );
+    }
+
+    #[test]
+    fn pm_shim_does_not_install_k6_builtins() {
+        let d = ShimBundle::default();
+        let pm =
+            d.0.iter()
+                .find(|e| e.0 == "pm-shim")
+                .expect("pm-shim present")
+                .1
+                .as_ref();
+        for sym in ["check", "group", "Counter", "Gauge", "Rate", "Trend"] {
+            assert!(
+                !pm.contains(&format!("globalThis.{sym} = {sym};")),
+                "pm.js must not install the k6 builtin `{sym}` — it belongs to \
+                 k6-core so non-Postman formats can drop pm.js (TR-501)"
+            );
+        }
+
+        let core =
+            d.0.iter()
+                .find(|e| e.0 == "k6-core-shim")
+                .expect("k6-core-shim present")
+                .1
+                .as_ref();
+        for sym in ["check", "group", "Counter", "Gauge", "Rate", "Trend"] {
+            assert!(
+                core.contains(&format!("globalThis.{sym} = {sym};")),
+                "k6-core must install `{sym}` — it is what makes dropping pm.js safe"
+            );
+        }
+    }
+
+    /// k6-core has to load BEFORE pm.js. pm.js no longer defines these
+    /// globals, so a bundle that ordered them the other way would still work
+    /// today by accident and break the moment anything in pm referenced them.
+    #[test]
+    fn k6_core_loads_before_pm() {
+        let names: Vec<&str> = ShimBundle::default().0.iter().map(|e| e.0).collect();
+        let core = names.iter().position(|n| *n == "k6-core-shim");
+        let pm = names.iter().position(|n| *n == "pm-shim");
+        assert!(
+            core < pm,
+            "k6-core-shim must precede pm-shim, got {names:?}"
+        );
+    }
+
     /// W2 line 182: the TWO shim lists must stay in lockstep — JS_SHIM_BUNDLE
     /// (the compile-time concat used by the bytecode path) used to carry 5
     /// shims while ShimBundle::default() carried 6 (with bru), so bru.js was
@@ -491,8 +729,8 @@ mod tests {
         let d = ShimBundle::default();
         assert_eq!(
             d.0.len(),
-            7,
-            "ShimBundle::default() must enumerate 7 shims (deep-equal/pm/chai/lodash/crypto/exec/bru)"
+            8,
+            "ShimBundle::default() must enumerate 8 shims (deep-equal/k6-core/pm/chai/lodash/crypto/exec/bru)"
         );
         let bru_entry = d.0.iter().find(|e| e.0 == "bru-shim");
         assert!(
@@ -508,6 +746,7 @@ mod tests {
             d.0.iter().map(|e| e.0).collect::<Vec<_>>(),
             vec![
                 "deep-equal-shim",
+                "k6-core-shim",
                 "pm-shim",
                 "chai-shim",
                 "lodash-shim",
@@ -536,11 +775,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_vu_js_context_honors_custom_sandbox_config() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(
-                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ),
-        });
+        let client: Arc<dyn DriverHttpClient> = DriverHttpClientImpl::new_arc(VuCookieClient::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        ));
         let config = SandboxConfig {
             namespace: "acme".into(),
             aliases: vec!["product".into(), "wire".into()],
@@ -578,11 +815,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn per_vu_globals_are_isolated() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(
-                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ),
-        });
+        let client: Arc<dyn DriverHttpClient> = DriverHttpClientImpl::new_arc(VuCookieClient::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        ));
         let mut ctx1 = create_vu_js_context(
             1,
             &pm_state,
@@ -645,11 +880,9 @@ mod tests {
         const TOLERANCE: f64 = 0.25;
 
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(
-                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ),
-        });
+        let client: Arc<dyn DriverHttpClient> = DriverHttpClientImpl::new_arc(VuCookieClient::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        ));
         let ctx = create_vu_js_context(
             1,
             &pm_state,
@@ -673,39 +906,75 @@ mod tests {
         );
     }
 
-    /// TR-501: shim gating must not cost more than it saves.
+    // `shim_gating_currently_costs_more_than_it_saves` was removed here.
+    //
+    // It asserted gated > default and its own failure message said: "If this
+    // now passes, gating has been fixed — most likely by routing gated
+    // bundles through the bytecode cache in bootstrap_shims. Invert this
+    // test." That is exactly what the bundle-keyed bytecode cache in this
+    // merge does, so the test has served its purpose and would now fail by
+    // design. Removed rather than inverted: the format-bundle tests assert
+    // the real property directly.
+
+    /// TR-503: the per-VU cost of N real VU contexts, which is the only way to
+    /// measure a SHARED runtime.
     ///
-    /// The claim is *"an http-only k6 script pays nothing for chai, lodash,
-    /// cryptojs or `pm.js`"* and *"http-only saves ~120 KB/VU"*. Measured, it
-    /// is the other way round: a gated bundle is LARGER than the default.
+    /// `measure_per_vu_quickjs_heap` below creates contexts one at a time and
+    /// reads `quickjs_heap_bytes()`, which reports the whole **runtime**. With
+    /// sharing on, that number accumulates across every context on the thread,
+    /// so it cannot be read as a per-VU figure — the apparent growth is the
+    /// measurement, not a regression. Amortising over N is the honest form.
     ///
-    /// The cause is in `bootstrap_shims`: the shared, compile-once bytecode
-    /// path is taken only when `shim.is_default()`. Any gated bundle falls
-    /// through to per-VU **source eval**, and materialising the parser and
-    /// source text costs more than the two shims gating drops.
-    ///
-    /// So this asserts the honest direction and will FAIL the day gating is
-    /// made to pay off — at which point the number in TR-501 gets updated
-    /// from a real measurement instead of an aspiration. Asserting the claim
-    /// as written would pin a pessimisation as correct.
+    /// `cargo test -p tropel-engine --release amortised_per_vu_heap -- --nocapture --ignored`
+    /// Compare with `TROPEL_SHARED_RUNTIME=0`.
     #[tokio::test]
-    async fn shim_gating_currently_costs_more_than_it_saves() {
-        let http_only = b"import http from 'k6/http'; export default () => http.get('http://x');";
-
-        let default_heap = crate::bench_support::vu_context_heap_bytes()
-            .await
-            .expect("default VU context");
-        let gated_heap = crate::bench_support::vu_context_heap_bytes_for_script(http_only)
-            .await
-            .expect("gated VU context");
-
-        assert!(
-            gated_heap > default_heap,
-            "shim gating is expected to be a PESSIMISATION today (gated {gated_heap} B vs \
-             default {default_heap} B). If this now passes, gating has been fixed — most \
-             likely by routing gated bundles through the bytecode cache in bootstrap_shims. \
-             Invert this test, re-measure, and update TR-501 with the real saving."
+    #[ignore]
+    async fn amortised_per_vu_heap() {
+        const N: usize = 25;
+        let pm_state = new_pm_state();
+        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+            client: VuCookieClient::new(
+                HttpClient::new(&HttpConfig::default()).expect("http client"),
+            ),
+        });
+        // TROPEL_PROBE_BUNDLE=gated measures what an http-only script must
+        // actually pay for — the headroom any lazy-materialisation scheme
+        // could recover.
+        let bundle = if std::env::var("TROPEL_PROBE_BUNDLE").as_deref() == Ok("gated") {
+            ShimBundle::from_script(
+                b"import http from 'k6/http'; export default () => http.get('http://x');",
+            )
+        } else {
+            ShimBundle::default()
+        };
+        let mut ctxs = Vec::with_capacity(N);
+        for i in 0..N {
+            ctxs.push(
+                create_vu_js_context(
+                    i as u32,
+                    &pm_state,
+                    &client,
+                    &bundle,
+                    &SandboxConfig::default(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .expect("VU context"),
+            );
+        }
+        let total: u64 = if std::env::var("TROPEL_SHARED_RUNTIME").as_deref() == Ok("0") {
+            // Private runtimes: each reports only itself, so sum them.
+            ctxs.iter().map(|c| c.quickjs_heap_bytes()).sum()
+        } else {
+            // One shared runtime: any context reports the whole thing once.
+            ctxs[0].quickjs_heap_bytes()
+        };
+        println!(
+            "shared={} N={N} total={total} B per_vu={} B",
+            std::env::var("TROPEL_SHARED_RUNTIME").unwrap_or_else(|_| "1".into()),
+            total / N as u64
         );
+        std::hint::black_box(ctxs);
     }
 
     /// TR-503 / TR-501: print the ACTUAL per-VU QuickJS heap so the README
@@ -715,11 +984,9 @@ mod tests {
     #[ignore = "measurement, not an assertion — run explicitly with --nocapture"]
     async fn measure_per_vu_quickjs_heap() {
         let pm_state = new_pm_state();
-        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
-            client: VuCookieClient::new(
-                HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
-            ),
-        });
+        let client: Arc<dyn DriverHttpClient> = DriverHttpClientImpl::new_arc(VuCookieClient::new(
+            HttpClient::new(&HttpConfig::default()).expect("http client should construct"),
+        ));
         let bare = tropel_js::JsContext::new(None, None)
             .await
             .expect("bare context");

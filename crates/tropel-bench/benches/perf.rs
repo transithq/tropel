@@ -599,31 +599,36 @@ fn h2_lanes(c: &mut Criterion) {
     );
 }
 
-/// TR-301: slow output isolation — a deliberately slow output (50 ms sleep per
-/// emit) must not back-pressure the VU hot loop; VU throughput stays flat and
-/// the drop counter is reported. Benches `record_batch` throughput at 10 k
-/// samples/s against a laggy sink vs a fast one.
 /// TR-304: OTLP per-window CPU — the REAL encode path plus gzip, at the
-/// egress rate the budget is written for.
+/// egress rate the budget is written for, in **both** wire encodings.
 ///
-/// The previous version of this bench gzipped `"a".repeat(50_000)` and never
-/// called `OtlpOutput`'s encoder at all, so its "18 ms per 100 ms window"
-/// number described nothing in the product (TR-002). It also compressed 50 KB
-/// of one repeated byte, which is the best case gzip has — real OTLP JSON is
-/// nothing like it.
+/// The version of this bench before TR-002 gzipped `"a".repeat(50_000)` and
+/// never called `OtlpOutput`'s encoder at all, so its "18 ms per 100 ms
+/// window" number described nothing in the product. It also compressed 50 KB
+/// of one repeated byte, which is the best case gzip has — real OTLP payloads
+/// are nothing like it.
 ///
 /// This builds one REAL 100 ms window at the budgeted egress rate: 100 k
 /// samples/s means 10 000 samples per window, spread over 100 tagged series.
-/// It runs `build_export_request` (the O(1) HashMap grouping that replaced the
-/// O(n^2) tag-set scan), serializes, and gzips.
+/// Both arms run the production `encode_export_body` and the production
+/// `gzip_body` over the *same* `HashMap`, so the JSON arm IS the pre-TR-304
+/// flush path and the two are directly comparable — neither is a
+/// re-implementation.
 ///
 /// Read the reported time against **20 ms** — that is 20 % of one core per
 /// 100 ms window, the `CONVENTIONS.md` aggregator budget. Above 100 ms the
 /// output cannot keep up with its own window at all and the drop counter
 /// starts moving.
+///
+/// The window is Trends, so it exercises the `Gauge` encoding — one data
+/// point per observation, the shape that dominates a real run. The `Sum`
+/// (DELTA counter) branch is covered by the correctness tests in
+/// `tropel-report`, not here; adding a second workload would double the
+/// bench's wall time without changing the budget verdict.
 fn otlp_per_window_cpu(c: &mut Criterion) {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tropel_report::otlp::{encode_export_body, gzip_body, OtlpProtocol};
     use tropel_sdk::types::{Sample, SampleType, TagMap};
 
     let mut group = c.benchmark_group("throughput");
@@ -659,14 +664,40 @@ fn otlp_per_window_cpu(c: &mut Criterion) {
         }
     }
 
-    group.bench_function("otlp_encode_and_gzip_one_100ms_window", |b| {
+    // Wire sizes, printed once. `cargo bench` shows this on stderr; it is the
+    // number that justifies protobuf being the default beyond CPU alone.
+    let json_body = encode_export_body(&metrics, OtlpProtocol::Json);
+    let pb_body = encode_export_body(&metrics, OtlpProtocol::Protobuf);
+    eprintln!(
+        "otlp 100ms window bytes: json {} B (gz {} B) | protobuf {} B (gz {} B)",
+        json_body.len(),
+        gzip_body(&json_body).expect("gzip json").len(),
+        pb_body.len(),
+        gzip_body(&pb_body).expect("gzip protobuf").len(),
+    );
+    drop((json_body, pb_body));
+
+    // Encode only — isolates the `serde_json::Value` tree build from deflate.
+    group.bench_function("otlp_json_encode_one_100ms_window", |b| {
+        b.iter(|| std::hint::black_box(encode_export_body(&metrics, OtlpProtocol::Json)).len())
+    });
+    group.bench_function("otlp_protobuf_encode_one_100ms_window", |b| {
+        b.iter(|| std::hint::black_box(encode_export_body(&metrics, OtlpProtocol::Protobuf)).len())
+    });
+
+    // Encode + gzip — the whole `spawn_blocking` body of `flush_buffered`,
+    // i.e. the CPU one window actually costs. These are the two numbers that
+    // go in the `CONVENTIONS.md` egress row.
+    group.bench_function("otlp_json_encode_and_gzip_one_100ms_window", |b| {
         b.iter(|| {
-            use std::io::Write as _;
-            let payload = tropel_report::otlp::build_export_request(&metrics);
-            let json = serde_json::to_vec(&payload).expect("export request serializes");
-            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            enc.write_all(&json).expect("gzip write");
-            std::hint::black_box(enc.finish().expect("gzip finish").len())
+            let body = encode_export_body(&metrics, OtlpProtocol::Json);
+            std::hint::black_box(gzip_body(&body).expect("gzip json")).len()
+        })
+    });
+    group.bench_function("otlp_protobuf_encode_and_gzip_one_100ms_window", |b| {
+        b.iter(|| {
+            let body = encode_export_body(&metrics, OtlpProtocol::Protobuf);
+            std::hint::black_box(gzip_body(&body).expect("gzip protobuf")).len()
         })
     });
     group.finish();

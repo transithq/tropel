@@ -33,7 +33,7 @@
 //! 6. **Run**: each call to `run_iteration()` invokes `__tropel_iteration()`
 //!    and drains metrics/abort state from the `VuContext`.
 
-use crate::options::K6Options;
+use crate::options::{BatchLimitsCell, K6Options};
 use async_trait::async_trait;
 use futures::future::join_all;
 use futures_util::{SinkExt, StreamExt};
@@ -202,7 +202,15 @@ impl Driver for K6Driver {
         // otherwise fall back to the module's `default` export. Modules are
         // the only mode where `export const options` (the k6 load profile) and
         // `export default function` survive together.
-        install_iteration_global(&mut js_ctx, &final_source, exec)?;
+        // TR-233: the module handle is right here, so read `options.batch` /
+        // `options.batchPerHost` off it while it exists. This is the only
+        // route those two have: `DriverDeclaredOptions` (the engine's
+        // channel) lives in the pinned published SDK and cannot carry them.
+        let batch_limits = Arc::new(BatchLimitsCell::new(install_iteration_global(
+            &mut js_ctx,
+            &final_source,
+            exec,
+        )?));
 
         // Verify __tropel_iteration was defined
         let has_iter = js_ctx
@@ -231,6 +239,7 @@ impl Driver for K6Driver {
             js_ctx,
             _source_path: source_path.map(|p| p.to_path_buf()),
             http_bridge_registered: false,
+            batch_limits,
             script_bridges_registered: false,
             sample_sink: Arc::new(Mutex::new(Vec::new())),
             group_stack: Arc::new(Mutex::new(Vec::new())),
@@ -733,6 +742,12 @@ pub struct K6DriverInstance {
     /// registered. Registration happens on the first run_iteration() call
     /// because the HttpClient isn't available until init() completes.
     http_bridge_registered: bool,
+    /// TR-233: this script's `options.batch` / `options.batchPerHost`, read
+    /// from the module's own `options` export in init(). The batch bridge
+    /// sizes its two-level semaphore from here, so a script that sets
+    /// `batch: 50` gets 50 — previously the value was warned as an unknown
+    /// option and the hardcoded k6 defaults were used regardless.
+    batch_limits: Arc<BatchLimitsCell>,
     /// Whether the script-state bridges (__tropel_pm_test,
     /// __tropel_pm_custom_metric_add, __tropel_exec_*, __tropel_test_abort)
     /// have been registered. Same lazy pattern as the HTTP bridge; these
@@ -2011,6 +2026,7 @@ impl K6DriverInstance {
         // cannot declare — the registration lives in the generic free fn
         // below. Behavior is identical; only the marshalling changes.
         let (deadline, max_exec) = self.js_ctx.interrupt_deadline_handle();
+        let batch_limits = self.batch_limits.clone();
         self.js_ctx.with_ctx(|rq_ctx| {
             register_http_bridges(
                 rq_ctx,
@@ -2020,6 +2036,7 @@ impl K6DriverInstance {
                 self.group_stack.clone(),
                 deadline,
                 max_exec,
+                batch_limits.clone(),
             );
         });
 
@@ -2170,6 +2187,117 @@ fn build_k6_request(
     (req, params, method_error)
 }
 
+/// Throw a JS `Error` carrying `msg` out of a native bridge.
+fn throw_js(ctx: &rquickjs::Ctx<'_>, msg: String) -> rquickjs::Error {
+    match rquickjs::Exception::from_message(ctx.clone(), &msg) {
+        Ok(exc) => ctx.throw(exc.into_object().into_value()),
+        Err(_) => rquickjs::Error::Exception,
+    }
+}
+
+/// Register the `http.cookieJar()` bridges against **this VU's** cookie jar
+/// — the jar `VuCookieClient` puts on every request (TR-233).
+///
+/// Before this, the shim's four methods existed with nothing behind them:
+/// `jar.set()` changed no subsequent request, and `jar.cookiesForURL()` could
+/// not see a cookie the server had set. A declared capability that forwards
+/// nothing is worse than a missing one (CONTEXT invariant 3), so when the
+/// handle is not jar-backed the bridges are registered anyway and **throw** —
+/// they never silently succeed.
+fn register_cookie_jar_bridges(
+    rq_ctx: &rquickjs::Ctx<'_>,
+    http_client: &Arc<dyn DriverHttpClient + Send + Sync>,
+) {
+    use tropel_http::vu_jar;
+
+    let globals = rq_ctx.globals();
+    let jar = vu_jar::vu_jar_for_client(http_client);
+    if jar.is_none() {
+        tracing::warn!(
+            "k6 http.cookieJar(): this VU's HTTP client exposes no cookie jar — \
+             jar methods will throw rather than silently do nothing"
+        );
+    }
+
+    /// `Some(jar)` or a JS exception naming why the jar is unreachable.
+    macro_rules! jar_or_throw {
+        ($ctx:expr, $jar:expr) => {
+            match $jar.as_ref() {
+                Some(j) => j.clone(),
+                None => {
+                    return Err(throw_js(
+                        &$ctx,
+                        "http.cookieJar() is unavailable: this VU's HTTP client has no \
+                         cookie jar bound. Cookies set here would not reach any request."
+                            .to_string(),
+                    ))
+                }
+            }
+        };
+    }
+
+    let jar_read = jar.clone();
+    let _ = globals.set(
+        "__tropel_k6_jar_cookies_for_url",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>, url: String| -> rquickjs::Result<String> {
+                let jar = jar_or_throw!(ctx, jar_read);
+                let map = vu_jar::cookies_for_url(&jar, &url)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.cookiesForURL: {e}")))?;
+                serde_json::to_string(&map)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.cookiesForURL: {e}")))
+            },
+        ),
+    );
+
+    let jar_set = jar.clone();
+    let _ = globals.set(
+        "__tropel_k6_jar_set",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>,
+                  url: String,
+                  name: String,
+                  value: String,
+                  options_json: String|
+                  -> rquickjs::Result<()> {
+                let jar = jar_or_throw!(ctx, jar_set);
+                // The bridge closure is arity-capped (ctx + 6 script args) and
+                // k6's option bag keeps growing, so the options travel as ONE
+                // JSON string — the same packing the request bridge uses.
+                let opts: vu_jar::K6CookieOptions = serde_json::from_str(&options_json)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.set options: {e}")))?;
+                vu_jar::set_cookie(&jar, &url, &name, &value, &opts)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.set: {e}")))
+            },
+        ),
+    );
+
+    let jar_delete = jar.clone();
+    let _ = globals.set(
+        "__tropel_k6_jar_delete",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>, url: String, name: String| -> rquickjs::Result<()> {
+                let jar = jar_or_throw!(ctx, jar_delete);
+                vu_jar::delete_cookie(&jar, &url, &name)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.delete: {e}")))
+            },
+        ),
+    );
+
+    let jar_clear = jar;
+    let _ = globals.set(
+        "__tropel_k6_jar_clear",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>, url: String| -> rquickjs::Result<()> {
+                let jar = jar_or_throw!(ctx, jar_clear);
+                vu_jar::clear_cookies(&jar, &url)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.clear: {e}")))
+            },
+        ),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn register_http_bridges<'js>(
     rq_ctx: &rquickjs::Ctx<'js>,
     http_client: Arc<dyn DriverHttpClient + Send + Sync>,
@@ -2178,8 +2306,10 @@ fn register_http_bridges<'js>(
     group_stack: Arc<Mutex<Vec<String>>>,
     deadline: Arc<AtomicU64>,
     max_exec: Duration,
+    batch_limits: Arc<BatchLimitsCell>,
 ) {
     let globals = rq_ctx.globals();
+    register_cookie_jar_bridges(rq_ctx, &http_client);
     let http_client_request = http_client.clone();
     let sink_req = sink.clone();
     // The scenario name is constant per VU — capture it once here (as an
@@ -2388,9 +2518,12 @@ fn register_http_bridges<'js>(
     let group_stack_batch = group_stack.clone();
     let deadline_batch = deadline.clone();
     let max_exec_batch = max_exec;
-    // TR-233: batch concurrency limiter — k6 defaults: 20 global, 6 per-host.
-    // TODO: wire `batch`/`batchPerHost` from k6 options; these are placeholders.
-    let batch_limit = Arc::new(tokio::sync::Semaphore::new(20));
+    // TR-233: batch concurrency limiter, sized from the script's own
+    // `options.batch` / `options.batchPerHost` (k6 defaults 20 global / 6
+    // per-host when unset). Read at CALL time from the cell, and the
+    // semaphores are built per `http.batch()` call — the same shape as k6's
+    // `MakeBatchRequests`, which constructs its limiters per call.
+    let batch_limits_bridge = batch_limits.clone();
     let _ = globals.set(
         "__tropel_k6_http_batch",
         Func::from(
@@ -2401,7 +2534,9 @@ fn register_http_bridges<'js>(
                     serde_json::from_str(&requests_json).unwrap_or_default();
 
                 let http_for_io = http_client.clone();
-                let batch_limit = batch_limit.clone();
+                let limits = batch_limits_bridge.get();
+                let batch_limit = Arc::new(tokio::sync::Semaphore::new(limits.batch));
+                let per_host_permits = limits.per_host;
                 // Per-host limiters (lazily created on first request to a host).
                 let per_host_limits: Arc<
                     std::sync::Mutex<
@@ -2469,7 +2604,9 @@ fn register_http_bridges<'js>(
                         let host_limit = {
                             let mut map = per_host_limits.lock().unwrap();
                             map.entry(host.clone())
-                                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(6)))
+                                .or_insert_with(|| {
+                                    Arc::new(tokio::sync::Semaphore::new(per_host_permits))
+                                })
                                 .clone()
                         };
                         let _host = host_limit.acquire().await.ok();
@@ -4066,6 +4203,13 @@ async fn eval_module_call_export(
         let mut gs = group_stack.lock().unwrap();
         gs.push(format!("::{}", export));
     }
+    // TR-233: setup()/teardown() may call `http.batch()` too, and the bridges
+    // are registered BEFORE the module is evaluated here (module top level may
+    // itself make requests). The cell is therefore filled by the module eval
+    // inside `call_module_export` and read at batch-call time — so a script's
+    // `options.batch` applies in the lifecycle contexts as well, not only in
+    // the VU loop.
+    let batch_limits = Arc::new(BatchLimitsCell::default());
     js_ctx.with_ctx(|rq_ctx| {
         register_http_bridges(
             rq_ctx,
@@ -4075,6 +4219,7 @@ async fn eval_module_call_export(
             group_stack.clone(),
             deadline,
             max_exec,
+            batch_limits.clone(),
         );
     });
 
@@ -4090,7 +4235,7 @@ async fn eval_module_call_export(
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
 
     js_ctx.reset_interrupt();
-    match js_ctx.with_ctx(|ctx| call_module_export(ctx, source, export, arg_json)) {
+    match js_ctx.with_ctx(|ctx| call_module_export(ctx, source, export, arg_json, &batch_limits)) {
         Ok(Some(s)) => Ok(Some(s)),
         Ok(None) => Ok(None),
         // Do NOT warn here — the callers own the error path: setup() logs a
@@ -4110,10 +4255,15 @@ fn call_module_export(
     source: &str,
     export: &str,
     arg_json: Option<&str>,
+    batch_limits: &BatchLimitsCell,
 ) -> std::result::Result<Option<String>, rquickjs::Error> {
     let module = rquickjs::Module::declare(ctx.clone(), "k6-script", source)?;
     let (module, promise) = module.eval()?;
     promise.finish::<()>()?;
+
+    // TR-233: the module is now evaluated, so `options` is readable — fill the
+    // cell the already-registered batch bridge reads at call time.
+    batch_limits.set(read_batch_limits(ctx, &module));
 
     let func: rquickjs::Function = match module.get::<_, rquickjs::Function>(export) {
         Ok(f) => f,
@@ -4261,7 +4411,7 @@ fn install_iteration_global(
     js_ctx: &mut JsContext,
     source: &str,
     exec: Option<&str>,
-) -> Result<()> {
+) -> Result<crate::options::K6BatchLimits> {
     // Arm the per-eval timeout: this evals the module directly via with_ctx,
     // bypassing the eval-family methods that normally reset the deadline.
     js_ctx.reset_interrupt();
@@ -4274,6 +4424,12 @@ fn install_iteration_global(
         promise
             .finish::<()>()
             .map_err(|e| TropelError::Other(format!("k6 script module resolve error: {}", e)))?;
+
+        // TR-233: `options.batch` / `options.batchPerHost`, parsed by the SAME
+        // serde model `declared_options` uses (one implementation per
+        // behaviour). Read from the evaluated module rather than re-evaluated
+        // in a throwaway context — the handle is already here.
+        let batch_limits = read_batch_limits(rq_ctx, &module);
 
         // P-E: whitespace-only exec strings (e.g. Postman's exec:["",""]) pass
         // is_empty() but fail the module lookup. Trim first.
@@ -4305,8 +4461,32 @@ fn install_iteration_global(
                 tracing::warn!("k6 script has no default export function: {}", e);
             }
         }
-        Ok(())
+        Ok(batch_limits)
     })
+}
+
+/// Read `options.batch` / `options.batchPerHost` off an evaluated k6 module.
+///
+/// Stringifies the `options` export and hands it to
+/// [`K6Options::batch_limits_from_options_json`], so the k6 field names,
+/// aliases and defaults are defined in exactly one place (`options.rs`).
+/// A missing/unreadable `options` yields k6's defaults — `declared_options`
+/// already reports a malformed `options` fatally, and a second error here
+/// would just compete with it.
+fn read_batch_limits<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    module: &rquickjs::Module<'js, rquickjs::module::Evaluated>,
+) -> crate::options::K6BatchLimits {
+    let json = (|| -> Option<String> {
+        let value: rquickjs::Value = module.get("options").ok()?;
+        if value.is_undefined() || value.is_null() {
+            return None;
+        }
+        let json_obj: rquickjs::Object = ctx.globals().get("JSON").ok()?;
+        let stringify: rquickjs::Function = json_obj.get("stringify").ok()?;
+        stringify.call((value,)).ok()
+    })();
+    K6Options::batch_limits_from_options_json(json.as_deref())
 }
 
 /// Check if a file path has a TypeScript extension (used in tests).
@@ -4352,7 +4532,11 @@ const K6_BASE_SHIM_BUNDLE: &str = concat!(
 /// concatenated at COMPILE TIME into one bundle (see K6_BASE_SHIM_BUNDLE).
 const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: pm-api ====\n",
-    include_str!("../../../../js/scripting-api/pm.js"),
+    concat!(
+        include_str!("../../../../js/shared/k6-core.js"),
+        "\n",
+        include_str!("../../../../js/scripting-api/pm.js")
+    ),
     "\n",
     "// ==== shim: sleep-shim ====\n",
     include_str!("../../../../js/k6-shim/sleep-shim.js"),
@@ -5699,7 +5883,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -5758,8 +5942,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 // Transport failure — what the real bridge returns on a
@@ -5825,8 +6013,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__tropel_pm_send_request = function () {
@@ -5883,8 +6075,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             // Stub the response bridges with known values.
             ctx.eval::<(), _>(
                 r#"
@@ -6365,7 +6561,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6432,7 +6628,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -6545,7 +6741,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6629,7 +6825,7 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6788,7 +6984,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -6864,8 +7060,12 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 // Implemented getters must WORK (pass silently is fine — no throw).
@@ -7105,7 +7305,7 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7235,7 +7435,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7374,7 +7574,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7511,7 +7711,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7634,7 +7834,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -8011,7 +8211,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             // Stub the custom-metric bridge + group bridges.
             ctx.eval::<(), _>(
@@ -8582,7 +8782,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -8670,7 +8870,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9184,7 +9384,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9397,7 +9597,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -9458,7 +9658,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9556,8 +9756,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__tropel_pm_response_code = function () { return 200; };
@@ -12428,7 +12632,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             .expect("native bridge stubs must eval");
             let bundle = format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n",
-                include_str!("../../../../js/scripting-api/pm.js"),
+                concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")),
                 include_str!("../../../../js/k6-shim/sleep-shim.js"),
                 include_str!("../../../../js/k6-shim/k6-shim.js"),
                 include_str!("../../../../js/k6-shim/jslib-shim.js"),

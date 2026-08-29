@@ -1836,7 +1836,11 @@ mod tests {
             .await
             .expect("shared deep-equal should eval");
         js_ctx
-            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .eval(concat!(
+                include_str!("../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../js/scripting-api/pm.js")
+            ))
             .await
             .expect("pm shim should eval");
         let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
@@ -1948,7 +1952,11 @@ mod tests {
             .await
             .expect("shared deep-equal should eval");
         js_ctx
-            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .eval(concat!(
+                include_str!("../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../js/scripting-api/pm.js")
+            ))
             .await
             .expect("pm shim should eval");
         let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
@@ -2050,7 +2058,11 @@ mod tests {
             .await
             .expect("shared deep-equal should eval");
         js_ctx
-            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .eval(concat!(
+                include_str!("../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../js/scripting-api/pm.js")
+            ))
             .await
             .expect("pm shim should eval");
         let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
@@ -2112,7 +2124,11 @@ mod tests {
             .await
             .expect("shared deep-equal should eval");
         js_ctx
-            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .eval(concat!(
+                include_str!("../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../js/scripting-api/pm.js")
+            ))
             .await
             .expect("pm shim should eval");
         let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
