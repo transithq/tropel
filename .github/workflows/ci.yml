@@ -218,6 +218,32 @@ jobs:
             }
             console.log("ok: all packages/* have committed manifests and are workspace members");
           '
+      # TR-008: the rule that ate the manifests must not come back. A blanket
+      # `*.json` / `*.csv` ignore is what consumed three package.json files
+      # across three incidents, and every fix added another `!` negation
+      # instead of scoping the rule — so the next manifest, and every .json
+      # test fixture, was ignored by default. Assert the shape, not just the
+      # symptom: checking that today's manifests exist (below) passes right up
+      # until someone adds a new package.
+      - name: .gitignore must not blanket-ignore source extensions (TR-008)
+        run: |
+          set -euo pipefail
+          if grep -nE '^\*\.(json|csv|toml|yaml|yml|rs|js|ts)$' .gitignore; then
+            echo "FAIL: .gitignore blanket-ignores a source extension (above)." >&2
+            echo "      Scope it to where output lands (/results/, /output/, named files)." >&2
+            echo "      This rule ate packages/input-wasm/package.json and broke" >&2
+            echo "      knockport's install from a clean clone." >&2
+            exit 1
+          fi
+          echo "ok: no blanket source-extension ignores"
+          # And nothing currently tracked may be ignored — a belt-and-braces
+          # check that a future negation-based patch cannot mask.
+          if git ls-files | git check-ignore --stdin --no-index | grep .; then
+            echo "FAIL: the files above are tracked AND ignored — the ignore rules disagree with the index" >&2
+            exit 1
+          fi
+          echo "ok: no tracked file is ignored"
+
       # TR-008: a clean clone must run `npm install` at the root with no
       # missing-manifest error (the workspace resolves every packages/* dir).
       # Deliberately after the manifest assert, so a failure here names the

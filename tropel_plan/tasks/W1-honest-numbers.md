@@ -150,7 +150,7 @@ Every item here is a wrong number **caused by** having two implementations. Fixi
 ## TR-134 · The npm workspace resolves `@tropel/shims` locally
 **Effort:** S · **Blocked by:** TR-008
 
-- [x] With no root `package.json` workspace entry and no `file:` dep, `@tropel/shims` resolves **from npmjs.org** — the published copy, not the tree you are editing — **fixed**: root `package.json` declares `"workspaces": ["packages/*"]`; `package-lock.json` links `@tropel/shims` to `packages/shims`
+- [x] With no root `package.json` workspace entry and no `file:` dep, `@tropel/shims` resolves **from npmjs.org** — the published copy, not the tree you are editing — **fixed**: root `package.json` declares `"workspaces": ["packages/*"]`, which is what makes `npm install` resolve the local sibling. Note the `package-lock.json` half of this claim was never true: the lockfile is **not tracked** (the blanket `*.json` ate it too), so a clean clone has none. The workspaces field is doing the work on its own
 - [x] Every package in `packages/` is a workspace member (asserted by the `TR-008` check)
 
 ## TR-135 · Sweep the seven lying comments and the four bug-pinning tests

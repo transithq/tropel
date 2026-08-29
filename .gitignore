@@ -28,27 +28,33 @@ Desktop.ini
 ehthumbs.db
 $RECYCLE.BIN/
 
-# ── Tropel output / reports ───────────────────────────────────
-*.csv
-*.json
-# graphify knowledge-graph output (generated, not source)
+# ── Tropel run output / reports ───────────────────────────────
+#
+# SCOPED, not a blanket `*.json` (TR-008).
+#
+# The blanket rule ate three `package.json` files across three separate
+# incidents — `packages/input-wasm/package.json` was the third, and it broke
+# knockport's `pnpm install` from a clean clone. Each incident was patched by
+# adding another `!` negation rather than fixing the rule, so it accumulated
+# eight of them and still could not be trusted: the next manifest, and every
+# `.json` test fixture, was ignored by default. `crates/inputs/tropel-input-bru`
+# and `-insomnia` have no fixture files at all, which is why TR-005/TR-006
+# still test against hand-written inline JSON — the gap that let them ship
+# broken.
+#
+# A stray output file left untracked shows up in `git status`. A silently
+# ignored source file does not. Ignore the places output actually lands, and
+# nothing else.
+/results/
+/output/
 /graphify-out/
-# The e2e smoke fixture is committed despite the *.json rule above.
-!.github/ci/www/ok.json
-!examples/collections/
-# npm package manifests must be TRACKED despite the *.json rule.
-# TR-401: exec-wasm was renamed to runtime-wasm; dead lines removed.
-!packages/runtime-wasm/package.json
-!packages/runtime-wasm/tsconfig.json
-!packages/shims/package.json
-!packages/core-wasm/package.json
-!packages/input-wasm/package.json
-# W2 #186: the ROOT npm workspace manifest must be tracked — CI's npm install
-# resolves @tropel/shims to the local packages/ sibling only via this file.
-!/package.json
-!examples/openapi/working_api.json
-results/
-output/
+# `--summary-export` / `-o` / `-r csv` written into the working tree. Runs in
+# CI use /tmp; these cover local runs without hiding sources.
+/*.csv
+/summary-export.json
+/tropel-summary.json
+/tropel-report*.json
+/k6-summary.json
 
 # ── Environment & secrets ─────────────────────────────────────
 .env
