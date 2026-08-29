@@ -187,6 +187,67 @@ impl ShimBundle {
     /// Build a minimal shim bundle by scanning a file path for keywords.
     /// Reads the file once (OS page cache makes this cheap after the first
     /// VU) and delegates to [`Self::from_script_bytes`].
+    /// TR-501: the bundle a given INPUT FORMAT can possibly need.
+    ///
+    /// Content scanning (`from_script`) guesses from the script text. The
+    /// adapter already *knows* the format, and a format is a much stronger
+    /// signal: a HAR file has no scripting surface at all, so it cannot need
+    /// pm, chai, lodash or cryptojs no matter what strings appear inside it.
+    ///
+    /// The rule, after `check`/`group`/metrics moved to k6-core so that
+    /// dropping pm.js no longer breaks them:
+    ///
+    /// | format | bundle |
+    /// |---|---|
+    /// | `postman` | core + pm + chai + lodash + cryptojs |
+    /// | `bru` | core + bru + chai + lodash + cryptojs |
+    /// | `har`, `openapi`, `http` | core only — no scripting surface exists |
+    /// | anything else | the full default bundle |
+    ///
+    /// **Unknown formats get the FULL bundle deliberately.** A missing shim is
+    /// a `ReferenceError` in a customer's script; an extra one costs memory.
+    /// The default must be the safe direction, so a new adapter that forgets
+    /// to add itself here is merely un-optimised rather than broken.
+    ///
+    /// `insomnia` is deliberately NOT narrowed: newer Insomnia supports
+    /// request scripting and there is no insomnia-specific shim in the tree,
+    /// so which API those scripts use is unproven. Narrowing it needs a real
+    /// Insomnia export to check against (see TR-006's fixture gap).
+    pub fn for_format(format: &str, script: &[u8]) -> Self {
+        const CORE: [&str; 3] = ["deep-equal-shim", "k6-core-shim", "exec-shim"];
+        let keep: &[&str] = match format {
+            "postman" => &[
+                "deep-equal-shim",
+                "k6-core-shim",
+                "exec-shim",
+                "pm-shim",
+                "chai-shim",
+                "lodash-shim",
+                "cryptojs-shim",
+            ],
+            "bru" => &[
+                "deep-equal-shim",
+                "k6-core-shim",
+                "exec-shim",
+                "bru-shim",
+                "chai-shim",
+                "lodash-shim",
+                "cryptojs-shim",
+            ],
+            // Pure request descriptions: no pre-request or test scripts exist
+            // in these formats, so no scripting shim can be reachable.
+            "har" | "openapi" | "http" => &CORE,
+            _ => return Self::from_script(script),
+        };
+        Self(
+            Self::default()
+                .0
+                .into_iter()
+                .filter(|e| keep.contains(&e.0))
+                .collect(),
+        )
+    }
+
     pub fn from_script_path(path: &std::path::Path) -> Self {
         match std::fs::read(path) {
             Ok(bytes) => Self::from_script_bytes(&bytes),
@@ -518,6 +579,97 @@ mod tests {
     /// **Fails on pre-fix code**: pm.js contained `globalThis.check = check;`
     /// and the five siblings, so the first assertion tripped.
     #[test]
+    /// TR-501: a format with no scripting surface must not carry the
+    /// scripting shims.
+    ///
+    /// **Fails before k6-core was extracted**: dropping pm-shim removed
+    /// `check`/`group`/metrics with it, so this bundle could not run a k6
+    /// script at all. That is exactly why the format split was blocked.
+    #[test]
+    fn script_free_formats_drop_the_scripting_shims() {
+        for fmt in ["har", "openapi", "http"] {
+            let names: Vec<&str> = ShimBundle::for_format(fmt, b"")
+                .0
+                .iter()
+                .map(|e| e.0)
+                .collect();
+            for dropped in ["pm-shim", "bru-shim", "chai-shim", "lodash-shim", "cryptojs-shim"] {
+                assert!(
+                    !names.contains(&dropped),
+                    "{fmt} has no scripting surface, so it must not load {dropped}: {names:?}"
+                );
+            }
+            assert!(
+                names.contains(&"k6-core-shim"),
+                "{fmt} must still get k6-core — `check`/`group`/metrics are \
+                 reachable without any import: {names:?}"
+            );
+        }
+    }
+
+    /// Postman keeps its own shim; Bruno keeps its own and does NOT get pm.
+    ///
+    /// bru.js is a peer view over the same `__tropel_pm_*` native bridges, not
+    /// a pm.js dependent — its own header says so. Loading pm for a Bruno run
+    /// was 70 KB/VU of nothing.
+    #[test]
+    fn each_scripting_format_gets_only_its_own_binding() {
+        let postman: Vec<&str> = ShimBundle::for_format("postman", b"")
+            .0
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        assert!(postman.contains(&"pm-shim"), "{postman:?}");
+        assert!(!postman.contains(&"bru-shim"), "{postman:?}");
+
+        let bru: Vec<&str> = ShimBundle::for_format("bru", b"")
+            .0
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        assert!(bru.contains(&"bru-shim"), "{bru:?}");
+        assert!(
+            !bru.contains(&"pm-shim"),
+            "Bruno is a peer view over the same native bridges, not a pm.js \
+             dependent — it must not load the Postman shim: {bru:?}"
+        );
+    }
+
+    /// An unrecognised format must get the FULL bundle, not a narrowed one.
+    ///
+    /// A missing shim is a ReferenceError in a customer's script; an extra one
+    /// costs memory. A new adapter that forgets to register here should be
+    /// un-optimised, never broken.
+    #[test]
+    fn unknown_formats_fall_back_to_the_full_bundle() {
+        let unknown: Vec<&str> = ShimBundle::for_format("some-new-adapter", b"")
+            .0
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        let full: Vec<&str> = ShimBundle::default().0.iter().map(|e| e.0).collect();
+        assert_eq!(
+            unknown, full,
+            "an unknown format must get the full bundle — the safe direction"
+        );
+    }
+
+    /// Insomnia is deliberately NOT narrowed: newer Insomnia supports request
+    /// scripting, there is no insomnia-specific shim in the tree, and which
+    /// API those scripts use is unproven. Narrowing it needs a real export to
+    /// check against (TR-006's fixture gap). This pins the decision so it is
+    /// revisited on purpose rather than assumed safe.
+    #[test]
+    fn insomnia_is_not_narrowed_pending_a_real_fixture() {
+        let names: Vec<&str> = ShimBundle::for_format("insomnia", b"")
+            .0
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        let full: Vec<&str> = ShimBundle::default().0.iter().map(|e| e.0).collect();
+        assert_eq!(names, full, "insomnia stays on the full bundle for now");
+    }
+
     fn pm_shim_does_not_install_k6_builtins() {
         let d = ShimBundle::default();
         let pm = d
