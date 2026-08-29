@@ -283,6 +283,44 @@ jobs:
             });
           '
 
+  k6-conformance:
+    name: k6 conformance (TR-202 http_req_duration parity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # TR-202 is the highest-impact parity item in the plan: k6 defines
+    # http_req_duration as sending + waiting + receiving, deliberately
+    # excluding blocked/connecting/tls_handshaking. Get it wrong and every
+    # duration threshold ported from a k6 script is off by one connection
+    # setup — in the direction that HIDES regressions on a warm pool.
+    #
+    # The conformance test runs the SAME script through both engines against
+    # one server. It has always existed; it has also always skipped, because
+    # no job installed k6. The number quoted as evidence for TR-202 ("k6 avg
+    # 33.65ms vs tropel 32.19ms") was therefore a one-off local run that no
+    # CI job could ever re-check. TROPEL_REQUIRE_K6=1 turns a missing binary
+    # into a failure, the same way the wasm job treats a missing artifact.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: k6-conformance
+      - name: Install k6
+        run: |
+          set -euo pipefail
+          # Pinned: parity is measured against a stated k6 version, and a
+          # floating "latest" would silently move the reference mid-review.
+          K6_VERSION=v1.3.0
+          curl -fsSL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local/bin "k6-${K6_VERSION}-linux-amd64/k6"
+          k6 version
+      - name: Run the k6 conformance comparison
+        env:
+          TROPEL_REQUIRE_K6: "1"
+        run: cargo test -p tropel-engine --test conformance_k6 -- --nocapture
+
   semver:
     name: semver-checks (tropel-sdk API breaks)
     runs-on: ubuntu-latest
@@ -613,7 +651,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages]
+    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages, k6-conformance]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
