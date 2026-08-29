@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changed
+- **Per-VU JS shims are now selected by input format, and the bytecode cache is keyed by bundle (TR-501).** The compiled-shim-bytecode cache was a single `OnceLock` keyed on nothing, so only the full default bundle could use it and every narrowed bundle paid a per-VU source parse+compile — which made shim gating a *pessimisation*: an http-only script measured **557,824 B/VU** against the full bundle's **497,584 B/VU**. The cache is now keyed by bundle identity, and `ShimBundle::for_format` picks the shim set from the resolving `InputAdapter::id()`. ✅MEAS (Apple M2, release, N=25): har/openapi/http/insomnia **280,480 B/VU**, k6 **336,848**, postman **479,952**, unknown format **497,584** (bare context 104,768). Behaviour change: a context created by `create_vu_js_context` no longer necessarily has all of `pm`/`chai`/`_`/`CryptoJS`/`bru` — `bru` is dropped for every format except `bru`, and the assertion/utility libraries are dropped for the four formats whose adapters cannot emit a script. `pm.js` is still loaded for every format. The k6 *Driver*'s own shim bundle (`tropel-input-k6`) is unchanged.
 - **License: dual MIT OR Apache-2.0 → Apache-2.0 only.** `LICENSE-MIT` removed; `LICENSE-APACHE` now carries the full canonical text (previously a placeholder stub) and is copied into `crates/tropel-sdk/` so published artifacts include it. `deny.toml` keeps `MIT` on the *dependency* allowlist (third-party crates only).
 
 ## [runtime set 0.1.0] - 2026-08-10

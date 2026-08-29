@@ -345,6 +345,11 @@ async fn run_vus<F>(
     test_start: Instant,
     control_port: Option<u16>,
     setup_data: Option<String>,
+    // TR-221: this node's slice of the GLOBAL arrival sequence, or `None`
+    // for the un-segmented (full-workload) schedule. When it is `Some`, the
+    // arrival rates in `exec_cfg` are the GLOBAL rates — the stripe is what
+    // expresses the segment share (see `ExecutionSegment::apply_with`).
+    arrival_stripe: Option<tropel_core::segment::ArrivalStripe>,
     run_vu: F,
 ) -> (u32, u64, Option<String>)
 where
@@ -365,7 +370,10 @@ where
     let mut vu_env = base_env;
     vu_env.extend(sc_env);
 
-    let executor = VUScheduler::new(&exec_cfg);
+    let executor = match arrival_stripe {
+        Some(stripe) => VUScheduler::new(&exec_cfg).with_arrival_stripe(stripe),
+        None => VUScheduler::new(&exec_cfg),
+    };
     // A panic inside the executor's ramp/spawn path unwinds through
     // `executor.run(...)` below and skips the scheduler's own `request_stop()`
     // tail — this guard fires on that unwind path so VUs spawned so far stop
@@ -802,7 +810,12 @@ pub(crate) async fn run_scenario_vus(
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
     input_path: &str,
-    input_format: Option<String>,
+    // TR-501: the id of the `InputAdapter` that produced `scenario`
+    // (`postman` / `har` / `openapi` / `bru` / `insomnia` / `http` / `k6`).
+    // Selects the shim bundle; an id the table does not know yields the
+    // full default bundle.
+    format_id: &str,
+    arrival_stripe: Option<tropel_core::segment::ArrivalStripe>,
 ) -> (u32, u64, Option<String>) {
     // Expected statuses are read by every VU's ScenarioRunner — snapshot them once
     // and share (the closure no longer captures the whole HttpConfig, which
@@ -856,22 +869,23 @@ pub(crate) async fn run_scenario_vus(
     let names_c: Arc<Vec<String>> =
         Arc::new(flattened_c.iter().map(|item| item.name.clone()).collect());
 
-    // P-B: source-gated bundle split — scan the script once per scenario
-    // and build a minimal shim bundle (skipping cryptojs/lodash when unused).
-    // This is shared across all VUs — one scan, one bundle, ~120KB/VU saved.
-    // TR-501: prefer the FORMAT the adapter reported over scanning the file.
-    // A HAR or OpenAPI input has no scripting surface at all, so it cannot
-    // need pm/chai/lodash/cryptojs regardless of what strings appear inside
-    // it — content scanning can only ever guess that. Falls back to the scan
-    // when the format is unknown, which keeps the safe direction (full
-    // bundle) for any adapter not yet listed.
-    let shim = Arc::new(match input_format.as_deref() {
-        Some(fmt) => match std::fs::read(input_path) {
-            Ok(bytes) => ShimBundle::for_format(fmt, &bytes),
-            Err(_) => ShimBundle::default(),
-        },
-        None => ShimBundle::from_script_path(std::path::Path::new(input_path)),
-    });
+    // TR-501: build the shim bundle ONCE per scenario from the input FORMAT
+    // (what the adapter's scripts can name at all) plus a keyword scan of the
+    // input (whether the two optional libraries are named). Shared across all
+    // VUs by Arc — one read, one scan, one bundle. Every distinct bundle is
+    // compiled to bytecode once process-wide, so narrowing it is now a
+    // saving; before the cache was keyed, narrowing it cost MORE per VU than
+    // the shims it dropped.
+    let shim = Arc::new(ShimBundle::for_format_path(
+        format_id,
+        std::path::Path::new(input_path),
+    ));
+    tracing::debug!(
+        "Scenario '{}': input format '{}' → shim bundle [{}]",
+        sc_name,
+        format_id,
+        shim.0.iter().map(|e| e.0).collect::<Vec<_>>().join("+")
+    );
 
     // Backlog line 426: pre-warm connections during the serial startup
     // window. Extract every distinct URL from the flattened scenario items
@@ -900,6 +914,7 @@ pub(crate) async fn run_scenario_vus(
         test_start,
         control_port,
         None, // run_scenario_vus has no driver → no setup data
+        arrival_stripe,
         move |sched, vu_id, shared| {
             let shared = shared.clone();
             let lane_idx = vu_id as usize % lanes.len();
@@ -1019,6 +1034,7 @@ pub(crate) async fn run_driver_vus(
     // shared map into every VU's VuContext so drivers dispatch non-HTTP
     // schemes through the same lookup the declarative runner uses.
     protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
+    arrival_stripe: Option<tropel_core::segment::ArrivalStripe>,
 ) -> (u32, u64, Option<String>) {
     let driver_id = driver.id().to_string();
     let input_bytes = match std::fs::read(input_path) {
@@ -1121,6 +1137,7 @@ pub(crate) async fn run_driver_vus(
         test_start,
         control_port,
         setup_data_c.clone(),
+        arrival_stripe,
         move |sched, vu_id, shared| {
             let shared = shared.clone();
             let driver_id = driver_id_c.clone();
@@ -1194,10 +1211,9 @@ pub(crate) async fn run_driver_vus(
 
                 // Cheap struct clone of the shared client (Arc bumps + small
                 // config snapshots) — the pooled reqwest Clients are shared.
+                let client = VuCookieClient::new(http_client_vu.as_ref().clone());
                 let http_client_handle: Arc<dyn DriverHttpClient + Send + Sync> =
-                    DriverHttpClientImpl::new_arc(VuCookieClient::new(
-                        http_client_vu.as_ref().clone(),
-                    ));
+                    DriverHttpClientImpl::new_arc(client);
 
                 let mut source = DriverVuSource {
                     instance: driver_instance,

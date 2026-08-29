@@ -448,10 +448,6 @@ impl Engine {
         // Build scenario configs. Script-declared scenarios/execution (from a
         // k6 `export const options`) take precedence over the default profile
         // but not over explicit user config (execution_explicit check above).
-        // TR-501: the user-declared input format, snapshotted before the
-        // per-scenario loop so each VU-loop can pick a shim bundle the
-        // format can actually use instead of scanning the file.
-        let config_input_type: Option<String> = config.input_type.clone();
         let scenario_configs: Vec<ScenarioConfigEntry> = if let Some(scs) = declared_scenarios {
             scs.iter()
                 .map(|(name, sc)| {
@@ -522,11 +518,67 @@ impl Engine {
             },
             None => None,
         };
+
+        // TR-221: express this node's share of an ARRIVAL-RATE workload by
+        // striping the global iteration sequence (k6's model) instead of by
+        // scaling the rate. Scaling gives every node its own independent rate
+        // from its own t=0, so N nodes' arrivals BUNCH — three nodes at
+        // 50/25/25 all fire together every 200 ms instead of filling a 50 ms
+        // cadence. Striping skips the global ticks this segment doesn't own,
+        // so the merged sequence is indistinguishable from one node at the
+        // full rate (`constant_arrival_rate.go:316-330`).
+        //
+        // This needs the FULL sequence: a lone segment cannot be striped
+        // consistently, because each node would fill the missing pieces
+        // differently and two nodes would claim the same global ticks. k6 has
+        // the same requirement — that is what `executionSegmentSequence` is
+        // for. Without it we fall back to rate scaling and say so.
+        let mut arrival_stripe: Option<tropel_core::segment::ArrivalStripe> = None;
+        let mut rate_mode = tropel_core::segment::RateSegmentation::ScaleRate;
+        if let Some(seg) = &segment {
+            match config.execution_segment_sequence.as_deref() {
+                Some(seq_spec) => {
+                    let seq = tropel_core::segment::ExecutionSegmentSequence::parse(seq_spec)?;
+                    // `ExecutionSegment::parse` already rejected a segment
+                    // that is not a consecutive pair of this sequence, so the
+                    // lookup cannot miss — but a silent mis-index would put
+                    // the node on another node's stripe, so it errors.
+                    let idx = seq.index_of(seg).ok_or_else(|| {
+                        tropel_sdk::TropelError::Config(format!(
+                            "execution segment [{:.6}, {:.6}) is not a segment of \
+                             execution_segment_sequence '{seq_spec}'",
+                            seg.from(),
+                            seg.to()
+                        ))
+                    })?;
+                    let wrapper = tropel_core::segment::ExecutionSegmentSequenceWrapper::new(&seq)?;
+                    let (start, offsets, lcd) = wrapper.get_striped_offsets(idx);
+                    tracing::info!(
+                        "TR-221: arrival-rate striping active — segment {} of {} owns global \
+                         tick {start}, then offsets {offsets:?}, repeating every {lcd} ticks. \
+                         Arrival rates stay GLOBAL; the stripe is the segment share.",
+                        idx + 1,
+                        seq.0.len()
+                    );
+                    arrival_stripe = Some(wrapper.arrival_stripe(idx));
+                    rate_mode = tropel_core::segment::RateSegmentation::GlobalRate;
+                }
+                None => {
+                    tracing::warn!(
+                        "execution_segment was given without execution_segment_sequence — \
+                         arrival-rate scenarios fall back to per-node rate scaling, so arrivals \
+                         BUNCH instead of interleaving across nodes (TR-221). Pass the same \
+                         --execution-segment-sequence to every node to interleave."
+                    );
+                }
+            }
+        }
+
         let scenario_configs: Vec<ScenarioConfigEntry> = scenario_configs
             .into_iter()
             .map(|mut sc| {
                 if let Some(seg) = &segment {
-                    sc.execution = seg.apply(&sc.execution);
+                    sc.execution = seg.apply_with(&sc.execution, rate_mode);
                 }
                 sc
             })
@@ -639,10 +691,10 @@ impl Engine {
             // TR-313: the scenario task reuses the bytes read at startup
             // instead of re-reading the script file.
             let script_bytes_sc = script_bytes.clone();
-            // Cloned out here, not inside the `async move`: the closure
-            // captures by move and this is a loop, so an inner clone moved
-            // the original on the first iteration.
-            let input_type_sc = config_input_type.clone();
+            // TR-221: each scenario's arrival-rate executor walks its OWN
+            // cursor over the global sequence (k6 gives every executor its
+            // own SegmentedIndex), so clone rather than share.
+            let arrival_stripe_sc = arrival_stripe.clone();
 
             let handle = tokio::spawn(async move {
                 let resolved = resolve_input_or_driver(
@@ -673,7 +725,7 @@ impl Engine {
                 let protocols: Arc<HashMap<String, Arc<dyn Protocol>>> =
                     Arc::new(registry_sc.instantiate_protocols());
                 let (init_failures, script_failures, abort_message) = match resolved {
-                    ResolvedInput::Scenario(scenario) => {
+                    ResolvedInput::Scenario(scenario, format_id) => {
                         run_scenario_vus(
                             sc_name,
                             start_delay,
@@ -693,12 +745,10 @@ impl Engine {
                             control_port,
                             rps_limiter_sc,
                             &input_path,
-                            // TR-501: when the user names the format
-                            // (`--input-type`), trust it over scanning the
-                            // file — a HAR input cannot need pm/chai/lodash
-                            // whatever strings it contains. `None` falls back
-                            // to the content scan, which is the safe default.
-                            input_type_sc.clone(),
+                            // TR-501: the resolving adapter's id decides
+                            // which shims each VU materialises.
+                            &format_id,
+                            arrival_stripe_sc,
                         )
                         .await
                     }
@@ -728,6 +778,7 @@ impl Engine {
                             // declarative path (clone — the Scenario arm
                             // moves the original).
                             protocols.clone(),
+                            arrival_stripe_sc,
                         )
                         .await
                     }
