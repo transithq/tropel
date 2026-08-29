@@ -571,7 +571,7 @@ impl Protocol for GrpcProtocol {
         };
 
         let now = std::time::SystemTime::now();
-        let mut tags = TagMap::with_capacity(5);
+        let mut tags = TagMap::with_capacity(6);
         tags.insert(Arc::clone(&tag_keys::URL), req.url.clone());
         tags.insert(
             Arc::clone(&tag_keys::METHOD),
@@ -583,6 +583,15 @@ impl Protocol for GrpcProtocol {
             format!("{service_full}/{method_name}"),
         );
         tags.insert(Arc::clone(&tag_keys::GROUP), "grpc");
+        // TR-212: `service` is one of k6's 14 default system tags and the only
+        // way to aggregate grpc_req_duration per service — `method` here holds
+        // the joined `pkg.Service/Method`, so without this tag every series is
+        // per-method and a per-service threshold cannot be written at all.
+        // `service_full` is the URL path's first segment, already validated
+        // against the descriptor pool above, so this is the real service name
+        // rather than a re-parse. `tag_keys::SERVICE` was declared in the SDK
+        // for exactly this and had zero references until now.
+        tags.insert(Arc::clone(&tag_keys::SERVICE), service_full);
         let tags = std::sync::Arc::new(tags);
 
         let sent = body_to_json(req)

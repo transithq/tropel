@@ -74,6 +74,18 @@ pub struct K6Options {
     /// config. Previously unmodelled, so it was silently dropped.
     #[serde(alias = "insecureSkipTLSVerify")]
     pub insecure_skip_tls_verify: Option<bool>,
+    /// TR-212: which system tags are stamped on every sample (k6
+    /// `options.systemTags`). `None` = k6's default 14; `Some(list)` REPLACES
+    /// that set (it is not additive); `Some([])` disables system tags
+    /// entirely. Consumed by the driver, which owns tag construction — it
+    /// deliberately does NOT travel through `DriverDeclaredOptions`, because
+    /// nothing outside the k6 driver builds k6 tags.
+    ///
+    /// Before this existed the option was accepted by the `unknown` catch-all
+    /// and warned about, so a script narrowing its tag set got all 14 anyway:
+    /// `CONTEXT.md` invariant 3.
+    #[serde(alias = "systemTags")]
+    pub system_tags: Option<Vec<String>>,
     // TR-201: catch unrecognized options — ~20 k6 root options are currently
     // silently dropped. This field collects them so we can warn per-key.
     #[serde(flatten)]

@@ -333,6 +333,58 @@ async fn unary_roundtrip() {
         .any(|s| s.metric == "grpc_req_failed"));
 }
 
+/// TR-212: `service` is one of k6's 14 default system tags, and gRPC samples
+/// never carried it — `method` held the joined `pkg.Service/Method`, so there
+/// was no dimension to aggregate on and a per-service threshold could not be
+/// written at all.
+///
+/// Asserts the VALUE against a real server call, not just presence: the tag
+/// must be the package-qualified service name `test.Greeter`, not the bare
+/// `Greeter`, not the full path, and not the URL.
+#[tokio::test]
+async fn samples_carry_the_grpc_service_tag() {
+    let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
+    let addr = spawn_server(pool).await;
+
+    let proto = tropel_x_grpc::GrpcProtocol::default();
+    let outcome = proto
+        .execute(
+            &make_req(format!("grpc://{addr}/test.Greeter/SayHello")),
+            Some(&serde_json::json!({"proto": TEST_PROTO})),
+        )
+        .await
+        .unwrap();
+
+    let sample = outcome
+        .samples
+        .iter()
+        .find(|s| s.metric == "grpc_req_duration")
+        .expect("grpc_req_duration sample");
+
+    assert_eq!(
+        sample.tags.get("service").map(|v| v.as_ref()),
+        Some("test.Greeter"),
+        "grpc samples must carry k6's `service` system tag = the \
+         package-qualified service name; got tags: {:?}",
+        sample.tags
+    );
+
+    // Every grpc metric shares one Arc<TagMap>, so the tag must be on all of
+    // them — a per-service threshold on grpc_reqs has to resolve too.
+    for metric in ["grpc_reqs", "data_sent", "data_received"] {
+        let s = outcome
+            .samples
+            .iter()
+            .find(|s| s.metric == metric)
+            .unwrap_or_else(|| panic!("{metric} sample"));
+        assert_eq!(
+            s.tags.get("service").map(|v| v.as_ref()),
+            Some("test.Greeter"),
+            "{metric} must carry the service tag too"
+        );
+    }
+}
+
 #[tokio::test]
 async fn server_streaming_roundtrip() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
