@@ -354,6 +354,28 @@ jobs:
           tool: cargo-semver-checks
       - run: cargo semver-checks check-release -p tropel-sdk
 
+  publish-dry-run:
+    name: publish dry-run (TR-601 release-gate readiness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Reports whether the 0.1.0 release gate line "cargo publish --dry-run
+    # succeeds for every publishable crate" is actually met. It was ticked
+    # while four of seven crates failed.
+    #
+    # Deliberately NOT in ci-ok's needs: the blocker is that tropel-sdk 0.3.0
+    # is not on crates.io yet, publishing needs a human (versions are
+    # permanent), and wedging every PR on a release-readiness fact helps
+    # nobody. Set TROPEL_PUBLISH_GATE=1 in the release job to make it block.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-dry-run
+      - run: bash scripts/publish-dry-run.sh
+
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest
