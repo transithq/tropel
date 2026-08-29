@@ -20,16 +20,21 @@ tokio.workspace = true
 [dev-dependencies]
 # Minimal criterion (no plotters/html_reports/rayon — keeps the dep tree lean).
 criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
-flate2 = { version = "1.1.9" }
 # RSS measurement for the memory-per-VU bench (Windows). Already in the tree.
 windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 # RSS measurement on macOS: mach task_info (MACH_TASK_BASIC_INFO).
 libc = "0.2"
-# TR-002/TR-304: the OTLP window bench measures the REAL encoder, so it needs
-# the reporter crate and a JSON serializer. The bench it replaced gzipped a
-# synthetic string and its CPU number described nothing in the product.
+# TR-002/TR-304: the OTLP window bench measures the REAL encoder. It calls
+# `tropel_report::otlp::{encode_export_body, gzip_body}` — the exact functions
+# the flush path calls — for BOTH the JSON and protobuf arms, so neither arm is
+# a re-implementation and the two are directly comparable. The bench this
+# replaced gzipped a synthetic string and its CPU number described nothing in
+# the product.
+#
+# `serde_json` and `flate2` were direct dev-deps here only because the bench
+# used to serialise and compress by hand. Routing through the production
+# functions orphaned both, so they are dropped rather than left dangling.
 tropel-report.workspace = true
-serde_json.workspace = true
 
 # `libc::mach_task_self` is deprecated in favour of `mach2`, and a deprecation
 # is an error under `-D warnings` — so this crate did not lint on macOS. CI runs

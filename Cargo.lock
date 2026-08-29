@@ -4679,6 +4679,7 @@ dependencies = [
  "chrono",
  "flate2",
  "insta",
+ "prost",
  "reqwest",
  "serde",
  "serde_json",

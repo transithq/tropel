@@ -1,8 +1,32 @@
 //! # OTLP/HTTP streaming output
 //!
 //! Exports samples to an OpenTelemetry Collector over OTLP/HTTP
-//! (e.g. `http://localhost:4318/v1/metrics`) using the JSON encoding
-//! (`Content-Type: application/json`).
+//! (e.g. `http://localhost:4318/v1/metrics`).
+//!
+//! ## Encoding (TR-304)
+//!
+//! Two encodings ship, selected once at construction by
+//! [`OtlpProtocol::from_env`]:
+//!
+//! - **protobuf** (`application/x-protobuf`) — the default. This is the
+//!   encoding the OTLP spec requires every OTLP/HTTP receiver to support;
+//!   JSON is optional there, so protobuf is the *more* interoperable of the
+//!   two, and it is dramatically cheaper to produce (see below).
+//! - **JSON** (`application/json`) — opt in with `TROPEL_OTLP_PROTOCOL=json`
+//!   for a receiver that only speaks JSON.
+//!
+//! The JSON encoder builds a `serde_json::Value` tree — a `serde_json::Map`
+//! per data point and per attribute, with an owned `String` for every tag
+//! key and value — and then serialises it. At the budgeted rate that
+//! dominates the flush: measured at **123.9 ms of CPU per 100 ms window**
+//! (10 000 samples across 100 tagged series, encode + gzip, release, Apple
+//! Silicon M-series), against a 20 ms budget. It could not keep pace with
+//! its own window. The protobuf encoder writes borrowed `&str` straight onto
+//! a `Vec<u8>` and allocates nothing per attribute.
+//!
+//! Both encodings are gzip-compressed (`Content-Encoding: gzip`) and carry
+//! identical semantics — same DELTA Sum aggregation, same
+//! `startTimeUnixNano`, same resource/scope attributes.
 //!
 //! Samples are buffered per metric name and flushed every `FLUSH_INTERVAL`
 //! (or when the buffer exceeds `MAX_BUFFERED_SAMPLES`), with a final flush
@@ -29,6 +53,7 @@ use tokio::sync::broadcast;
 use tropel_sdk::types::{Sample, SampleType};
 use tropel_sdk::{Result, TropelError};
 
+use crate::otlp_proto::build_export_request_protobuf;
 use crate::output::TagPolicy;
 use crate::Output;
 
@@ -36,6 +61,99 @@ use crate::Output;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Max buffered samples before a forced export.
 const MAX_BUFFERED_SAMPLES: usize = 10_000;
+
+/// Environment variable selecting the OTLP/HTTP encoding.
+///
+/// This is an env var rather than an `OutputConfig` field because
+/// `OutputConfig` lives in the pinned `tropel-sdk` submodule, which this
+/// change must not move.
+pub const OTLP_PROTOCOL_ENV: &str = "TROPEL_OTLP_PROTOCOL";
+
+/// Wire encoding used for the `ExportMetricsServiceRequest` body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OtlpProtocol {
+    /// Binary protobuf, `Content-Type: application/x-protobuf`. The default,
+    /// and the encoding every conformant OTLP/HTTP receiver must accept.
+    #[default]
+    Protobuf,
+    /// OTLP/JSON, `Content-Type: application/json`.
+    Json,
+}
+
+impl OtlpProtocol {
+    /// Read the protocol from [`OTLP_PROTOCOL_ENV`], defaulting to protobuf.
+    ///
+    /// Called **once**, at output construction — never per flush. A
+    /// `std::env::var` on a hot path takes the process-global environment
+    /// lock; TR-306 is the cautionary tale (two `env::var` calls per gRPC
+    /// request capped the whole process).
+    ///
+    /// An unrecognised value falls back to the default and warns rather than
+    /// failing the run: an output misconfiguration must not take down a load
+    /// test, but it must not be silent either.
+    pub fn from_env() -> Self {
+        match std::env::var(OTLP_PROTOCOL_ENV) {
+            Ok(v) => Self::parse(&v).unwrap_or_else(|| {
+                tracing::warn!(
+                    "{OTLP_PROTOCOL_ENV}={v:?} is not one of protobuf|json; \
+                     using protobuf"
+                );
+                Self::Protobuf
+            }),
+            Err(_) => Self::Protobuf,
+        }
+    }
+
+    /// Parse a protocol name. `None` for anything unrecognised — never a
+    /// silent fallback at this level (see the `unwrap_or` rule in
+    /// `CONVENTIONS.md`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "protobuf" | "proto" | "pb" | "grpc" | "http/protobuf" => Some(Self::Protobuf),
+            "json" | "http/json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+
+    /// The `Content-Type` this encoding ships under.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Protobuf => "application/x-protobuf",
+            Self::Json => "application/json",
+        }
+    }
+}
+
+/// Encode buffered metrics as an uncompressed OTLP
+/// `ExportMetricsServiceRequest` body in `protocol`.
+///
+/// This is the function the flush path calls and the function the
+/// `otlp_encode_100ms_window` benchmark measures — the benchmark exercises
+/// production code, not a `#[cfg(test)]` twin.
+pub fn encode_export_body(
+    metrics: &HashMap<String, Vec<Sample>>,
+    protocol: OtlpProtocol,
+) -> Vec<u8> {
+    match protocol {
+        OtlpProtocol::Protobuf => build_export_request_protobuf(metrics),
+        OtlpProtocol::Json => build_export_request(metrics).to_string().into_bytes(),
+    }
+}
+
+/// gzip `body` at the flush path's compression level.
+///
+/// Shared with the benchmark so the measured window includes exactly the
+/// compression the wire pays for.
+pub fn gzip_body(body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::with_capacity(body.len() / 4),
+        flate2::Compression::fast(),
+    );
+    enc.write_all(body)
+        .and_then(|_| enc.finish())
+        .map_err(|e| TropelError::Other(format!("otlp gzip failed: {e}")))
+}
 
 /// OTLP/HTTP metrics output.
 ///
@@ -52,11 +170,16 @@ pub struct OtlpOutput {
     total_buffered: AtomicUsize,
     /// Tag forwarding policy (allowlist + cardinality cap).
     tag_policy: TagPolicy,
+    /// Wire encoding, resolved once at construction (never per flush).
+    protocol: OtlpProtocol,
 }
 
 impl OtlpOutput {
     /// Create a new OTLP output pushing to `endpoint` (base URL or full
     /// `/v1/metrics` path).
+    ///
+    /// The encoding comes from [`OtlpProtocol::from_env`] — protobuf unless
+    /// `TROPEL_OTLP_PROTOCOL=json` is set.
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: normalize_metrics_url(&endpoint.into()),
@@ -64,12 +187,19 @@ impl OtlpOutput {
             metrics: Mutex::new(HashMap::new()),
             total_buffered: AtomicUsize::new(0),
             tag_policy: TagPolicy::default(),
+            protocol: OtlpProtocol::from_env(),
         }
     }
 
     /// Set the tag forwarding policy (allowlist + cardinality cap).
     pub fn with_tag_policy(mut self, policy: TagPolicy) -> Self {
         self.tag_policy = policy;
+        self
+    }
+
+    /// Override the wire encoding, ignoring the environment.
+    pub fn with_protocol(mut self, protocol: OtlpProtocol) -> Self {
+        self.protocol = protocol;
         self
     }
 
@@ -148,19 +278,13 @@ impl OtlpOutput {
         }
 
         // Move the CPU-heavy payload build off the async worker.
-        // TR-304: gzip the JSON body — OTLP JSON payloads are dominated by
-        // repeated tag names/values; gzip typically cuts the wire bytes
-        // 8-15× (the old code shipped uncompressed JSON, so a 100 ms window
-        // of samples cost 140-750 ms of collector CPU and kept the tool
-        // permanently oversubscribed on the network path).
+        // TR-304: encode as protobuf (default) and gzip. The old code built a
+        // `serde_json::Value` tree and serialised it — 123.9 ms of CPU per
+        // 100 ms window at the budgeted rate, i.e. the output could not keep
+        // pace with its own window. gzip stays on for both encodings.
+        let protocol = self.protocol;
         let body_gz = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let body = build_export_request(&metrics);
-            let json = body.to_string();
-            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            enc.write_all(json.as_bytes())
-                .and_then(|_| enc.finish())
-                .map_err(|e| TropelError::Other(format!("otlp gzip failed: {e}")))
+            gzip_body(&encode_export_body(&metrics, protocol))
         })
         .await
         .map_err(|e| TropelError::Other(format!("otlp payload build panicked: {e}")))??;
@@ -168,7 +292,7 @@ impl OtlpOutput {
         let resp = self
             .client
             .post(&self.endpoint)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", self.protocol.content_type())
             .header("Content-Encoding", "gzip")
             .body(body_gz)
             .send()
@@ -221,10 +345,16 @@ fn normalize_metrics_url(url: &str) -> String {
 /// running totals from process start, and a collector would interpret each
 /// as a cumulative total.
 ///
-/// `pub` so the benchmark harness can measure the REAL encode path. The
-/// `otlp_per_window_cpu` bench used to gzip a synthetic string and never touch
-/// this function, which made its "18 ms per 100 ms window" number unrelated to
-/// the code it claimed to measure (TR-002).
+/// Kept reachable for receivers that only speak OTLP/JSON
+/// (`TROPEL_OTLP_PROTOCOL=json`).
+///
+/// `pub` so the benchmark harness can measure the REAL encode path — this
+/// exact function, against
+/// [`crate::otlp_proto::build_export_request_protobuf`], rather than a
+/// re-implementation of either. The `otlp_per_window_cpu` bench used to gzip
+/// a synthetic string and never touch this function, which made its "18 ms
+/// per 100 ms window" number unrelated to the code it claimed to measure
+/// (TR-002).
 pub fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::Value {
     let mut metric_values = Vec::with_capacity(metrics.len());
 
@@ -462,17 +592,13 @@ mod tests {
         );
     }
 
-    /// End-to-end: buffer samples, export to a live TCP server, and verify the
-    /// received payload is valid OTLP JSON.
-    #[tokio::test]
-    async fn flush_posts_to_endpoint() {
+    /// Read one HTTP request off a fresh loopback listener and return
+    /// `(head, body)`.
+    async fn capture_one_request(
+        listener: tokio::net::TcpListener,
+    ) -> tokio::task::JoinHandle<(String, Vec<u8>)> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
+        tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = Vec::new();
             let mut chunk = [0u8; 2048];
@@ -501,33 +627,177 @@ mod tests {
                 }
             }
             let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
             let body = buf[head_end..].to_vec();
             let resp =
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".to_string();
             sock.write_all(resp.as_bytes()).await.unwrap();
             sock.flush().await.unwrap();
-            body
-        });
+            (head, body)
+        })
+    }
 
-        let output = OtlpOutput::new(format!("http://{addr}"));
+    fn gunzip(b: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut dec = flate2::read::GzDecoder::new(b);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    /// End-to-end on the DEFAULT path: buffer samples, export to a live TCP
+    /// server, and verify what actually left the process is gzipped OTLP
+    /// **protobuf** under `Content-Type: application/x-protobuf`.
+    ///
+    /// FAILS ON PRE-FIX CODE. This is the inversion of the old
+    /// `flush_posts_to_endpoint`, which asserted the body parsed as
+    /// `serde_json` under `application/json` — it pinned the JSON wire as
+    /// correct, which is exactly what TR-304 changes. Run against the
+    /// pre-fix encoder, the `application/x-protobuf` assertion fails on the
+    /// header and the first body byte is `{` (0x7b), not a protobuf tag.
+    #[tokio::test]
+    async fn flush_posts_protobuf_by_default() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = capture_one_request(listener).await;
+
+        // Explicit, not env-derived: cargo runs tests in one process, so a
+        // test that mutated TROPEL_OTLP_PROTOCOL would race its siblings.
+        let output = OtlpOutput::new(format!("http://{addr}")).with_protocol(OtlpProtocol::Protobuf);
         output
             .emit(&[sample("http_reqs", 1.0, SampleType::Counter)])
             .await
             .unwrap();
         output.flush().await.unwrap();
 
-        let received = server.await.unwrap();
-        // TR-304: the body is gzip-compressed now — decompress before parsing.
-        use std::io::Read;
-        let mut dec = flate2::read::GzDecoder::new(received.as_slice());
-        let mut text_bytes = Vec::new();
-        dec.read_to_end(&mut text_bytes).unwrap();
-        let text = String::from_utf8(text_bytes).unwrap();
+        let (head, received) = server.await.unwrap();
+        let head_lower = head.to_lowercase();
+        assert!(
+            head_lower.contains("content-type: application/x-protobuf"),
+            "default flush must declare protobuf, got head:\n{head}"
+        );
+        assert!(head_lower.contains("content-encoding: gzip"), "head:\n{head}");
+
+        let body = gunzip(&received);
+        assert_ne!(body.first(), Some(&b'{'), "body is still JSON text");
+        // ExportMetricsServiceRequest.resource_metrics = field 1, wire type 2.
+        assert_eq!(body[0], 0x0a, "first byte is not the resource_metrics tag");
+        // The metric name survives the round trip on the wire.
+        assert!(
+            body.windows(9).any(|w| w == b"http_reqs"),
+            "metric name missing from the protobuf body"
+        );
+        assert!(
+            body.windows(12).any(|w| w == b"service.name"),
+            "resource attribute missing from the protobuf body"
+        );
+    }
+
+    /// The JSON encoding stays reachable for receivers that only speak it.
+    ///
+    /// FAILS ON PRE-FIX CODE: `OtlpProtocol` / `with_protocol` did not exist,
+    /// so there was no way to *choose* JSON — it was the only wire.
+    #[tokio::test]
+    async fn json_protocol_still_reachable() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = capture_one_request(listener).await;
+
+        let output = OtlpOutput::new(format!("http://{addr}")).with_protocol(OtlpProtocol::Json);
+        output
+            .emit(&[sample("http_reqs", 1.0, SampleType::Counter)])
+            .await
+            .unwrap();
+        output.flush().await.unwrap();
+
+        let (head, received) = server.await.unwrap();
+        assert!(
+            head.to_lowercase()
+                .contains("content-type: application/json"),
+            "head:\n{head}"
+        );
+        let text = String::from_utf8(gunzip(&received)).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         let metrics = &json["resourceMetrics"][0]["scopeMetrics"][0]["metrics"];
         assert!(metrics.is_array() && !metrics.as_array().unwrap().is_empty());
         assert!(json["resourceMetrics"][0]["resource"]["attributes"]
             .as_array()
             .is_some());
+    }
+
+    /// The env toggle resolves the documented spellings and refuses the rest.
+    ///
+    /// FAILS ON PRE-FIX CODE: `OtlpProtocol` did not exist.
+    #[test]
+    fn protocol_parse_and_content_type() {
+        assert_eq!(OtlpProtocol::parse("json"), Some(OtlpProtocol::Json));
+        assert_eq!(OtlpProtocol::parse("  JSON "), Some(OtlpProtocol::Json));
+        assert_eq!(OtlpProtocol::parse("http/json"), Some(OtlpProtocol::Json));
+        assert_eq!(
+            OtlpProtocol::parse("protobuf"),
+            Some(OtlpProtocol::Protobuf)
+        );
+        assert_eq!(
+            OtlpProtocol::parse("http/protobuf"),
+            Some(OtlpProtocol::Protobuf)
+        );
+        // A typo must NOT silently resolve to a valid-looking value — the
+        // `ExpectedStatus` rule in CONVENTIONS.md.
+        assert_eq!(OtlpProtocol::parse("jsonn"), None);
+        assert_eq!(OtlpProtocol::parse(""), None);
+
+        assert_eq!(
+            OtlpProtocol::Protobuf.content_type(),
+            "application/x-protobuf"
+        );
+        assert_eq!(OtlpProtocol::Json.content_type(), "application/json");
+        assert_eq!(OtlpProtocol::default(), OtlpProtocol::Protobuf);
+    }
+
+    /// The two encodings must describe the same window. Protobuf is not a
+    /// re-encoding of the JSON text, so this compares the *decoded* content
+    /// of each — not `f(x)` against `f(x)`.
+    ///
+    /// FAILS ON PRE-FIX CODE: only one encoder existed.
+    #[test]
+    fn both_encodings_describe_the_same_window() {
+        let mut tags_a = TagMap::new();
+        tags_a.insert("status", "200");
+        let mut metrics: HashMap<String, Vec<Sample>> = HashMap::new();
+        metrics.insert(
+            "http_reqs".to_string(),
+            vec![
+                sample_typed("http_reqs", 1.0, SampleType::Counter, tags_a.clone()),
+                sample_typed("http_reqs", 2.0, SampleType::Counter, tags_a.clone()),
+            ],
+        );
+
+        let json = String::from_utf8(encode_export_body(&metrics, OtlpProtocol::Json)).unwrap();
+        let pb = encode_export_body(&metrics, OtlpProtocol::Protobuf);
+
+        // JSON: aggregated to 3.0, DELTA, monotonic.
+        assert!(json.contains("\"asDouble\":3.0"));
+        assert!(json.contains("\"aggregationTemporality\":1"));
+        // Protobuf: the same 3.0 as an IEEE-754 double, the same DELTA=1 and
+        // is_monotonic=true varints, reached by an independent encoder.
+        assert!(
+            pb.windows(8).any(|w| w == 3.0f64.to_bits().to_le_bytes()),
+            "protobuf body is missing the aggregated 3.0 double"
+        );
+        assert!(
+            pb.windows(4).any(|w| w == [0x10, 0x01, 0x18, 0x01]),
+            "protobuf body is missing DELTA(field 2 = 1) + is_monotonic(field 3 = true)"
+        );
+        // And the protobuf wire is materially smaller than the JSON text.
+        assert!(
+            pb.len() < json.len(),
+            "protobuf {} B should be smaller than JSON {} B",
+            pb.len(),
+            json.len()
+        );
     }
 }
