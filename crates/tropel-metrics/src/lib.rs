@@ -128,10 +128,32 @@ pub mod time_metrics {
             || name.ends_with("_lookup")
             || name.contains("ttfb")
             || name.contains("latency")
+            // TR-203: time-to-failure on the transport-error path. Not a k6
+            // metric (k6 folds nothing here — it emits genuine zeros), so it
+            // matches none of the suffixes above and would otherwise render
+            // unitless while carrying milliseconds.
+            || name.ends_with("_time_to_failure")
         {
             return MetricUnit::Time;
         }
         MetricUnit::Default
+    }
+}
+
+#[cfg(test)]
+mod time_to_failure_unit_tests {
+    use super::{time_metrics, MetricUnit};
+
+    /// TR-203: `http_req_time_to_failure` carries milliseconds, so it must
+    /// classify as Time. It ends with `_failure`, matching none of the
+    /// duration suffixes, so without an explicit arm it would render unitless
+    /// while holding ms — the systemic µs/ms confusion TR-222 is about.
+    #[test]
+    fn time_to_failure_is_a_time_metric() {
+        assert_eq!(
+            time_metrics::unit_of("http_req_time_to_failure"),
+            MetricUnit::Time
+        );
     }
 }
 

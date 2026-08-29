@@ -50,6 +50,12 @@ k6 defines it as **`sending + waiting + receiving`**, deliberately excluding `bl
 
 **[SILENT]** k6's `measureAndEmitMetrics` has **no error branch**; `SaveSamples` is called unconditionally (`transport.go:144`). A DNS failure never fires `GotConn`/`WroteRequest`, so every timing records a genuine **`0`** — the sample exists, it is just zero. Dropping them makes `http_reqs` and `http_req_duration` counts disagree and biases every percentile.
 
+- [x] All eight emitted, sub-timings as genuine zeros, on **both** drivers
+- [x] `http_req_duration` is `0` on failure, not the elapsed time — it is defined as `sending + waiting + receiving` (TR-202) and all three are zero, so anything else contradicts tropel's own formula on exactly the samples a saturated run produces most of. Two tests pinned the old behaviour and were inverted
+- [x] **[SUPERSET]** k6 loses the time-to-failure signal completely: a connection refused in 2 ms and a 30 s timeout are indistinguishable in its output. Tropel keeps it in its own series, **`http_req_time_to_failure`** (Trend, ms), so parity costs nothing. Registered as a `Time` metric so it renders with `ms` — it matches none of the duration-suffix conventions and would otherwise print unitless while carrying milliseconds
+
+> **Note on k6's zeros.** They are honest *per phase* — those phases genuinely did not run — but feeding them into the duration Trend drags percentiles down, so a run where half the requests are refused can show a healthy `p(95)`. Tropel matches k6 on the shared series (a ported threshold must get k6's answer) and fixes the visibility gap with the extra series rather than by diverging on the shared one. `http_req_failed` remains the honest denominator.
+
 ## TR-204 · `error`, `error_code` and `expected_response` tags
 **Effort:** M · **Blocked by:** TR-203
 
