@@ -10,7 +10,16 @@ use tropel_sdk::traits::{Driver, InputAdapter};
 use tropel_sdk::{Result, TropelError};
 
 pub(crate) enum ResolvedInput {
-    Scenario(Arc<Scenario>),
+    /// A declarative scenario, plus the id of the [`InputAdapter`] that
+    /// produced it (`postman` / `har` / `openapi` / `bru` / `insomnia` /
+    /// `http` / `k6`).
+    ///
+    /// TR-501: the adapter id is the ONLY reliable statement of the input
+    /// format, and it decides which JS shims each VU has to materialise
+    /// (`ShimBundle::for_format`). It used to be logged and thrown away, so
+    /// `run_scenario_vus` had nothing but a keyword scan of the file bytes to
+    /// go on.
+    Scenario(Arc<Scenario>, String),
     Driver(Box<dyn Driver>),
 }
 
@@ -79,6 +88,7 @@ pub(crate) fn resolve_input_or_driver(
         adapter.id()
     );
 
+    let format_id = adapter.id().to_string();
     let mut scenario = adapter.parse_with_path(&bytes, Some(input_p))?;
     for (key, val) in base_env {
         scenario
@@ -87,5 +97,5 @@ pub(crate) fn resolve_input_or_driver(
             .or_insert_with(|| serde_json::Value::String(val.clone()));
     }
 
-    Ok(ResolvedInput::Scenario(Arc::new(scenario)))
+    Ok(ResolvedInput::Scenario(Arc::new(scenario), format_id))
 }

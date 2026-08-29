@@ -694,32 +694,6 @@ pub(crate) struct DriverHttpClientImpl {
     pub(crate) client: VuCookieClient,
 }
 
-impl DriverHttpClientImpl {
-    /// Build the `Arc` the drivers are handed, publishing this VU's cookie jar
-    /// against it so a driver's scripting surface (k6 `http.cookieJar()`) acts
-    /// on the SAME jar the requests carry.
-    ///
-    /// TR-233: always construct through this — a plain `Arc::new(…)` leaves
-    /// the jar unreachable and `http.cookieJar()` degrades to a no-op shim,
-    /// which is the defect this replaced (CONTEXT invariant 3).
-    pub(crate) fn new_arc(client: VuCookieClient) -> Arc<Self> {
-        let jar = client.jar();
-        let arc = Arc::new(Self { client });
-        tropel_http::vu_jar::register_vu_jar(tropel_http::vu_jar::client_key(&arc), jar);
-        arc
-    }
-}
-
-impl Drop for DriverHttpClientImpl {
-    /// Pairs with [`DriverHttpClientImpl::new_arc`]. The registry is keyed by
-    /// this value's address, so the entry MUST die with the value — otherwise
-    /// a later allocation at the same address would inherit a dead VU's jar.
-    /// `self` here is the address inside the `Arc`, i.e. exactly the key.
-    fn drop(&mut self) {
-        tropel_http::vu_jar::unregister_vu_jar(self as *const Self as usize);
-    }
-}
-
 #[async_trait]
 impl DriverHttpClient for DriverHttpClientImpl {
     async fn execute(&self, req: &Request) -> Result<Response> {
@@ -802,7 +776,11 @@ pub(crate) async fn run_scenario_vus(
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
     input_path: &str,
-    input_format: Option<String>,
+    // TR-501: the id of the `InputAdapter` that produced `scenario`
+    // (`postman` / `har` / `openapi` / `bru` / `insomnia` / `http` / `k6`).
+    // Selects the shim bundle; an id the table does not know yields the
+    // full default bundle.
+    format_id: &str,
 ) -> (u32, u64, Option<String>) {
     // Expected statuses are read by every VU's ScenarioRunner — snapshot them once
     // and share (the closure no longer captures the whole HttpConfig, which
@@ -856,22 +834,23 @@ pub(crate) async fn run_scenario_vus(
     let names_c: Arc<Vec<String>> =
         Arc::new(flattened_c.iter().map(|item| item.name.clone()).collect());
 
-    // P-B: source-gated bundle split — scan the script once per scenario
-    // and build a minimal shim bundle (skipping cryptojs/lodash when unused).
-    // This is shared across all VUs — one scan, one bundle, ~120KB/VU saved.
-    // TR-501: prefer the FORMAT the adapter reported over scanning the file.
-    // A HAR or OpenAPI input has no scripting surface at all, so it cannot
-    // need pm/chai/lodash/cryptojs regardless of what strings appear inside
-    // it — content scanning can only ever guess that. Falls back to the scan
-    // when the format is unknown, which keeps the safe direction (full
-    // bundle) for any adapter not yet listed.
-    let shim = Arc::new(match input_format.as_deref() {
-        Some(fmt) => match std::fs::read(input_path) {
-            Ok(bytes) => ShimBundle::for_format(fmt, &bytes),
-            Err(_) => ShimBundle::default(),
-        },
-        None => ShimBundle::from_script_path(std::path::Path::new(input_path)),
-    });
+    // TR-501: build the shim bundle ONCE per scenario from the input FORMAT
+    // (what the adapter's scripts can name at all) plus a keyword scan of the
+    // input (whether the two optional libraries are named). Shared across all
+    // VUs by Arc — one read, one scan, one bundle. Every distinct bundle is
+    // compiled to bytecode once process-wide, so narrowing it is now a
+    // saving; before the cache was keyed, narrowing it cost MORE per VU than
+    // the shims it dropped.
+    let shim = Arc::new(ShimBundle::for_format_path(
+        format_id,
+        std::path::Path::new(input_path),
+    ));
+    tracing::debug!(
+        "Scenario '{}': input format '{}' → shim bundle [{}]",
+        sc_name,
+        format_id,
+        shim.0.iter().map(|e| e.0).collect::<Vec<_>>().join("+")
+    );
 
     // Backlog line 426: pre-warm connections during the serial startup
     // window. Extract every distinct URL from the flattened scenario items
@@ -939,10 +918,11 @@ pub(crate) async fn run_scenario_vus(
                 let vu_client = VuCookieClient::new(http_client_vu.as_ref().clone());
                 // Derive the bridge BEFORE moving vu_client into the runner
                 // (clone_with_shared_jar reuses the same jar Arc).
-                let bridge_client: Arc<dyn DriverHttpClient> =
-                    DriverHttpClientImpl::new_arc(vu_client.clone_with_shared_jar());
+                let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+                    client: vu_client.clone_with_shared_jar(),
+                });
                 let http_client_handle: Arc<dyn DriverHttpClient> =
-                    DriverHttpClientImpl::new_arc(vu_client);
+                    Arc::new(DriverHttpClientImpl { client: vu_client });
                 let mut runner = ScenarioRunner::new(
                     scenario,
                     flattened_vu,
@@ -1088,7 +1068,9 @@ pub(crate) async fn run_driver_vus(
     setup_env.extend(sc_env.clone());
     // Lifecycle client for setup()/teardown() — uses lane 0 (arbitrary).
     let lifecycle_client: Arc<dyn DriverHttpClient + Send + Sync> =
-        DriverHttpClientImpl::new_arc(VuCookieClient::new(lanes[0].as_ref().clone()));
+        Arc::new(DriverHttpClientImpl {
+            client: VuCookieClient::new(lanes[0].as_ref().clone()),
+        });
     let setup_sink: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
     let setup_data = driver
         .setup(
@@ -1194,10 +1176,9 @@ pub(crate) async fn run_driver_vus(
 
                 // Cheap struct clone of the shared client (Arc bumps + small
                 // config snapshots) — the pooled reqwest Clients are shared.
+                let client = VuCookieClient::new(http_client_vu.as_ref().clone());
                 let http_client_handle: Arc<dyn DriverHttpClient + Send + Sync> =
-                    DriverHttpClientImpl::new_arc(VuCookieClient::new(
-                        http_client_vu.as_ref().clone(),
-                    ));
+                    Arc::new(DriverHttpClientImpl { client });
 
                 let mut source = DriverVuSource {
                     instance: driver_instance,
