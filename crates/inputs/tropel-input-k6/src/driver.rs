@@ -4367,8 +4367,21 @@ const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
 /// One cache exists per bundle (base + native-dependent): the native bundle
 /// can only run AFTER `tropel_native::install_all`, so they are separate
 /// blobs and must never be cross-served.
+///
+/// TR-501 twin check: that "one cache per bundle" pairing was a CONVENTION,
+/// not an invariant — `bootstrap()` takes the bundle as a parameter, so
+/// `K6_BASE_BYTECODE.bootstrap(ctx, K6_NATIVE_SHIM_BUNDLE)` would compile one
+/// bundle and then silently serve its bytecode for the other. The engine's
+/// copy of this shape (`js_bootstrap.rs`) had the same hole and was closed by
+/// keying the cache on bundle identity; here, where there are exactly two
+/// fixed bundles, [`ShimBytecodeCache::compiled_from`] records which one the
+/// blob came from and a mismatch falls back to source eval, loudly, instead
+/// of running the wrong code.
 struct ShimBytecodeCache {
     bytecode: OnceLock<Option<Vec<u8>>>,
+    /// The bundle this cache's bytecode was compiled from. Set once,
+    /// alongside `bytecode`.
+    compiled_from: OnceLock<&'static str>,
     /// True once compilation failed — every context then falls back to the
     /// per-VU source eval path instead of retrying the compile each time.
     compile_failed: AtomicBool,
@@ -4383,6 +4396,7 @@ impl ShimBytecodeCache {
     const fn new() -> Self {
         Self {
             bytecode: OnceLock::new(),
+            compiled_from: OnceLock::new(),
             compile_failed: AtomicBool::new(false),
             run_failed: AtomicBool::new(false),
         }
@@ -4392,6 +4406,27 @@ impl ShimBytecodeCache {
     /// and known-good, otherwise fall back to a source eval (and remember the
     /// failure so the doomed path is not retried per VU).
     async fn bootstrap(&self, ctx: &mut JsContext, bundle: &'static str) {
+        // TR-501 twin check: never serve one bundle's bytecode for another.
+        // The two statics are paired with two bundles by convention only;
+        // if that pairing is ever broken, run the source rather than the
+        // wrong compiled blob.
+        if let Some(seen) = self.compiled_from.get() {
+            if !std::ptr::eq(*seen, bundle) {
+                tracing::error!(
+                    "k6 shim bytecode cache asked for a DIFFERENT bundle than it compiled \
+                     ({} B vs {} B) — falling back to source eval rather than serving the \
+                     wrong bytecode",
+                    seen.len(),
+                    bundle.len()
+                );
+                if let Err(e) = ctx.bootstrap_library(bundle).await {
+                    tracing::warn!("Failed to bootstrap k6 shim bundle: {}", e);
+                }
+                return;
+            }
+        }
+        let _ = self.compiled_from.set(bundle);
+
         let bytecode = self.bytecode.get_or_init(|| {
             if self.compile_failed.load(Ordering::Relaxed) {
                 return None;

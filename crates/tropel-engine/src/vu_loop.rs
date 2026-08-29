@@ -776,6 +776,11 @@ pub(crate) async fn run_scenario_vus(
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
     input_path: &str,
+    // TR-501: the id of the `InputAdapter` that produced `scenario`
+    // (`postman` / `har` / `openapi` / `bru` / `insomnia` / `http` / `k6`).
+    // Selects the shim bundle; an id the table does not know yields the
+    // full default bundle.
+    format_id: &str,
 ) -> (u32, u64, Option<String>) {
     // Expected statuses are read by every VU's ScenarioRunner — snapshot them once
     // and share (the closure no longer captures the whole HttpConfig, which
@@ -829,12 +834,23 @@ pub(crate) async fn run_scenario_vus(
     let names_c: Arc<Vec<String>> =
         Arc::new(flattened_c.iter().map(|item| item.name.clone()).collect());
 
-    // P-B: source-gated bundle split — scan the script once per scenario
-    // and build a minimal shim bundle (skipping cryptojs/lodash when unused).
-    // This is shared across all VUs — one scan, one bundle, ~120KB/VU saved.
-    let shim = Arc::new(ShimBundle::from_script_path(std::path::Path::new(
-        input_path,
-    )));
+    // TR-501: build the shim bundle ONCE per scenario from the input FORMAT
+    // (what the adapter's scripts can name at all) plus a keyword scan of the
+    // input (whether the two optional libraries are named). Shared across all
+    // VUs by Arc — one read, one scan, one bundle. Every distinct bundle is
+    // compiled to bytecode once process-wide, so narrowing it is now a
+    // saving; before the cache was keyed, narrowing it cost MORE per VU than
+    // the shims it dropped.
+    let shim = Arc::new(ShimBundle::for_format_path(
+        format_id,
+        std::path::Path::new(input_path),
+    ));
+    tracing::debug!(
+        "Scenario '{}': input format '{}' → shim bundle [{}]",
+        sc_name,
+        format_id,
+        shim.0.iter().map(|e| e.0).collect::<Vec<_>>().join("+")
+    );
 
     // Backlog line 426: pre-warm connections during the serial startup
     // window. Extract every distinct URL from the flattened scenario items

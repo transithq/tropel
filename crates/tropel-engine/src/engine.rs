@@ -665,7 +665,7 @@ impl Engine {
                 let protocols: Arc<HashMap<String, Arc<dyn Protocol>>> =
                     Arc::new(registry_sc.instantiate_protocols());
                 let (init_failures, script_failures, abort_message) = match resolved {
-                    ResolvedInput::Scenario(scenario) => {
+                    ResolvedInput::Scenario(scenario, format_id) => {
                         run_scenario_vus(
                             sc_name,
                             start_delay,
@@ -685,6 +685,9 @@ impl Engine {
                             control_port,
                             rps_limiter_sc,
                             &input_path,
+                            // TR-501: the resolving adapter's id decides
+                            // which shims each VU materialises.
+                            &format_id,
                         )
                         .await
                     }

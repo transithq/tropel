@@ -73,15 +73,31 @@ Notable limitations today:
   by tasks — the fiber model that removes that bound is TR-502's remaining
   half. Kubernetes `pids.max` and Docker `--pids-limit` cap this further, and
   the summary reports the effective number.
-- **~486 KB of QuickJS heap per VU before a line of user script runs**
-  ✅MEAS — `malloc_size` from `JS_ComputeMemoryUsage`, release build, Apple
-  Silicon (M-series), rquickjs 0.12.2. Reproduce with
-  `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored`.
-  Breakdown: a bare context is 104,768 B; the full shim bundle takes it to
-  497,584 B. At 10 000 VUs that is **~4.6 GB of QuickJS heap alone**.
+- **274–486 KB of QuickJS heap per VU before a line of user script runs,
+  depending on the input format** ✅MEAS — `malloc_size` from
+  `JS_ComputeMemoryUsage`, release build, Apple M2 / macOS 26.6, rquickjs
+  0.12.2, amortised over 25 real VU contexts. Reproduce with
+  `cargo test -p tropel-engine --release per_vu_heap_by_format -- --nocapture --ignored`.
+  A bare context is 104,768 B; the rest is the JS shim bundle, and TR-501 now
+  picks that bundle from the resolving adapter's format:
+
+  | input format | B/VU | at 10 000 VUs |
+  |---|---|---|
+  | (bare context, no shims) | 104,768 | 1.05 GB |
+  | `har` / `openapi` / `http` / `insomnia` | 280,480 | 2.80 GB |
+  | `k6` | 336,848 | 3.37 GB |
+  | `postman` (script uses lodash + CryptoJS) | 479,952 | 4.80 GB |
+  | full bundle (unknown / third-party format) | 497,584 | 4.98 GB |
+
+  Shim *gating* used to make this WORSE, not better: the compiled-bytecode
+  cache was keyed on nothing, so only the full default bundle could use it and
+  every narrowed bundle paid a per-VU source parse+compile — an http-only
+  script measured 557,824 B/VU against the full bundle's 497,584 B/VU. The
+  cache is now keyed by bundle identity, so narrowing is finally a saving
+  (same http-only bundle: 354,528 B/VU).
   User-script bytes are shared across VUs via `Arc` (that one is fixed — it was
   a per-VU deep clone). Sharing a `Runtime` per worker thread and aliasing
-  template globals — the change that would make this number small — is
+  template globals — the change that would make these numbers small — is
   **designed but not implemented**; see TR-503. Do not quote a per-VU figure
   that this command does not print.
 
