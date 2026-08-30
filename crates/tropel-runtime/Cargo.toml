@@ -28,7 +28,23 @@ async-trait.workspace = true
 
 [dev-dependencies]
 # Test-only concrete DriverHttpClient wrapper (TestHttpClient) in runner.rs.
-tropel-http.workspace = true
+#
+# PATH ONLY — deliberately NOT `.workspace = true`. The workspace entry
+# carries `version = "0.2.0"`, and a dev-dependency with a version must
+# resolve from crates.io at publish time. `tropel-http` is `publish = false`
+# and its sole registry version (0.1.0) is yanked, so that resolution cannot
+# succeed and `cargo publish -p tropel-runtime` failed with:
+#
+#   no matching package named `tropel-http` found
+#   help: packages with similar names: tropel-http
+#
+# (That "similar names" hint is cargo saying the crate exists but no usable
+# version does — which is what a fully-yanked crate looks like.)
+#
+# A dev-dependency with only a path is STRIPPED from the published manifest:
+# consumers never build this crate's tests, so they never need it. Local
+# `cargo test` resolves it by path exactly as before.
+tropel-http = { path = "../tropel-http" }
 # tokio is TEST-ONLY in this crate (`#[tokio::test]` + `tokio::time::timeout`
 # in runner.rs). Declaring it as a dev-dep keeps the library build free of
 # tokio's wasm-incompatible features (`net`/`signal`/`rt-multi-thread` don't
