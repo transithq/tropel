@@ -15,11 +15,11 @@
 //
 //   postman  -> k6-core + pm + chai + lodash + cryptojs
 //   k6       -> k6-core + k6-shim + deferred-modules
-//   bru      -> k6-core + bru        (a peer view over the same __tropel_pm_*
+//   bru      -> k6-core + bru        (a peer view over the same __tropel_trp_*
 //                                     native bridges, NOT a pm.js dependent)
 //   har/openapi/http -> k6-core
 //
-// State lives in Rust behind the `__tropel_pm_*` bridges, which is why this
+// State lives in Rust behind the `__tropel_trp_*` bridges, which is why this
 // file is a thin redirection layer and why every binding can share it.
 
 // Local copy rather than an import: this shim and pm.js load independently and
@@ -42,8 +42,8 @@ function group(name, fn) {
     if (typeof fn === 'function' && isAsyncFunction(fn)) {
         throw new TypeError('group() does not support async callbacks (k6 rejects them)');
     }
-    if (typeof __tropel_pm_group_start === 'function') {
-        __tropel_pm_group_start(name);
+    if (typeof __tropel_trp_group_start === 'function') {
+        __tropel_trp_group_start(name);
         var startTime = Date.now();
         try {
             if (typeof fn === 'function') {
@@ -51,7 +51,7 @@ function group(name, fn) {
             }
         } finally {
             var duration = Date.now() - startTime;
-            __tropel_pm_group_end(name, duration);
+            __tropel_trp_group_end(name, duration);
         }
     } else {
         // No native group support — run the function directly
@@ -100,8 +100,8 @@ function check(val, conds, tags) {
             try {
                 passed = !!condition(val);
             } catch (e) {
-                if (typeof __tropel_pm_test === 'function') {
-                    __tropel_pm_test(name, false, tagsJson);
+                if (typeof __tropel_trp_test === 'function') {
+                    __tropel_trp_test(name, false, tagsJson);
                 }
                 throw e;
             }
@@ -112,8 +112,8 @@ function check(val, conds, tags) {
 
         // Record the check pass/fail via the existing test bridge — raw
         // name (k6 does not prefix) + optional tags.
-        if (typeof __tropel_pm_test === 'function') {
-            __tropel_pm_test(name, passed, tagsJson);
+        if (typeof __tropel_trp_test === 'function') {
+            __tropel_trp_test(name, passed, tagsJson);
         }
 
         if (!passed) {
@@ -163,9 +163,9 @@ Counter.prototype.add = function (value, tags) {
     if (!isFinite(v)) {
         return false;
     }
-    if (typeof __tropel_pm_custom_metric_add === 'function') {
+    if (typeof __tropel_trp_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
+        __tropel_trp_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
     }
     return true;
 };
@@ -190,9 +190,9 @@ Gauge.prototype.add = function (value, tags) {
     if (!isFinite(v)) {
         return false;
     }
-    if (typeof __tropel_pm_custom_metric_add === 'function') {
+    if (typeof __tropel_trp_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
+        __tropel_trp_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
     }
     return true;
 };
@@ -217,9 +217,9 @@ Rate.prototype.add = function (value, tags) {
     if (!isFinite(v)) {
         return false;
     }
-    if (typeof __tropel_pm_custom_metric_add === 'function') {
+    if (typeof __tropel_trp_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
+        __tropel_trp_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
     }
     return true;
 };
@@ -244,9 +244,9 @@ Trend.prototype.add = function (value, tags) {
     if (!isFinite(v)) {
         return false;
     }
-    if (typeof __tropel_pm_custom_metric_add === 'function') {
+    if (typeof __tropel_trp_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
+        __tropel_trp_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
     }
     return true;
 };

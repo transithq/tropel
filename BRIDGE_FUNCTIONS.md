@@ -7,7 +7,7 @@ Each VU gets a rquickjs `JsContext` at startup. The engine bootstraps in this or
 1. Create `JsContext` (rquickjs Runtime + Context with memory limits and interrupt handler)
 2. Evaluate vendored JS shims: `pm-api/pm.js`, `chai-shim.js`, `lodash-shim.js`, `cryptojs-shim.js`
 3. `tropel_native::install_all()` — registers pure-Rust utility functions as JS globals
-4. `PmBridge::install()` — registers `__tropel_pm_*` bridge functions that read/write `PmState`
+4. `PmBridge::install()` — registers `__tropel_trp_*` bridge functions that read/write `PmState`
 
 ## PmBridge — Registered functions
 
@@ -16,31 +16,31 @@ These functions are registered via `rquickjs::function::Func::from` closures cap
 
 | JS global name | Signature | What it does |
 |---|---|---|
-| `__tropel_pm_environment_get` | `(key: String) -> Option<String>` | Reads env var |
-| `__tropel_pm_environment_set` | `(key: String, value: String)` | Writes env var |
-| `__tropel_pm_environment_unset` | `(key: String)` | Removes env var |
-| `__tropel_pm_environment_clear` | `() -> ()` | Clears all env vars |
-| `__tropel_pm_variables_get` | `(key: String) -> Option<String>` | Reads var (env → collection → globals); complex values JSON-encoded |
-| `__tropel_pm_variables_set` | `(key: String, value: String)` | Sets collection var (value stored as string) |
-| `__tropel_pm_variables_unset` | `(key: String)` | Removes from all scopes |
-| `__tropel_pm_response_code` | `() -> u16` | HTTP status code |
-| `__tropel_pm_response_status` | `() -> String` | Status text |
-| `__tropel_pm_response_body` | `() -> Option<String>` | Raw response body text |
-| `__tropel_pm_response_header` | `(key: String) -> Option<String>` | Single response header value |
-| `__tropel_pm_response_time` | `() -> f64` | Response time in ms |
-| `__tropel_pm_test` | `(name: String, passed: bool)` | Records assertion → emits `checks` sample |
-| `__tropel_pm_set_next_request` | `(request_id: String)` | Flow control: jump to request index |
-| `__tropel_pm_skip_tests` | `() -> ()` | Skip remaining tests for current request |
+| `__tropel_trp_environment_get` | `(key: String) -> Option<String>` | Reads env var |
+| `__tropel_trp_environment_set` | `(key: String, value: String)` | Writes env var |
+| `__tropel_trp_environment_unset` | `(key: String)` | Removes env var |
+| `__tropel_trp_environment_clear` | `() -> ()` | Clears all env vars |
+| `__tropel_trp_variables_get` | `(key: String) -> Option<String>` | Reads var (env → collection → globals); complex values JSON-encoded |
+| `__tropel_trp_variables_set` | `(key: String, value: String)` | Sets collection var (value stored as string) |
+| `__tropel_trp_variables_unset` | `(key: String)` | Removes from all scopes |
+| `__tropel_trp_response_code` | `() -> u16` | HTTP status code |
+| `__tropel_trp_response_status` | `() -> String` | Status text |
+| `__tropel_trp_response_body` | `() -> Option<String>` | Raw response body text |
+| `__tropel_trp_response_header` | `(key: String) -> Option<String>` | Single response header value |
+| `__tropel_trp_response_time` | `() -> f64` | Response time in ms |
+| `__tropel_trp_test` | `(name: String, passed: bool)` | Records assertion → emits `checks` sample |
+| `__tropel_trp_set_next_request` | `(request_id: String)` | Flow control: jump to request index |
+| `__tropel_trp_skip_tests` | `() -> ()` | Skip remaining tests for current request |
 
 ## PmBridge — NOT registered (with rationale)
 
 | JS global name | Reason | JS fallback |
 |---|---|---|
-| `__tropel_pm_response_headers` | Return type `HashMap<String, String>` not supported by `Func::from` | JS returns `{}` |
-| `__tropel_pm_response_cookies` | Return type `Vec<Cookie>` not supported by `Func::from` | JS returns `[]` |
-| `__tropel_pm_response_json` | Would return `String` (JSON string) but `pm.response.json()` expects parsed object. Silent breakage. | JS returns `null`. Workaround: `JSON.parse(pm.response.text())` |
-| `__tropel_pm_iteration_data_get` | Data is injected by VURunner before each iteration, not via bridge | JS returns `null` |
-| `__tropel_pm_send_request` | Would require async request chaining (complex) | JS fallback uses XMLHttpRequest (unavailable in QuickJS) |
+| `__tropel_trp_response_headers` | Return type `HashMap<String, String>` not supported by `Func::from` | JS returns `{}` |
+| `__tropel_trp_response_cookies` | Return type `Vec<Cookie>` not supported by `Func::from` | JS returns `[]` |
+| `__tropel_trp_response_json` | Would return `String` (JSON string) but `pm.response.json()` expects parsed object. Silent breakage. | JS returns `null`. Workaround: `JSON.parse(pm.response.text())` |
+| `__tropel_trp_iteration_data_get` | Data is injected by VURunner before each iteration, not via bridge | JS returns `null` |
+| `__tropel_trp_send_request` | Would require async request chaining (complex) | JS fallback uses XMLHttpRequest (unavailable in QuickJS) |
 
 ## Native modules — Registered functions
 

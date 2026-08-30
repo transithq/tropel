@@ -26,42 +26,42 @@ function isAsyncFunction(fn) {
 // build_scope decodes the same encoding for {{var}} substitution.
 pm.environment = {
     get: function (key) {
-        if (typeof __tropel_pm_environment_get === 'function') {
-            var raw = __tropel_pm_environment_get(key);
+        if (typeof __tropel_trp_environment_get === 'function') {
+            var raw = __tropel_trp_environment_get(key);
             if (raw === null || raw === undefined) return null;
             try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return null;
     },
     set: function (key, value) {
-        if (typeof __tropel_pm_environment_set === 'function') {
+        if (typeof __tropel_trp_environment_set === 'function') {
             var encoded;
             try { encoded = value === undefined ? '' : JSON.stringify(value); }
             catch (e) { encoded = value === undefined ? '' : String(value); }
-            __tropel_pm_environment_set(key, encoded);
+            __tropel_trp_environment_set(key, encoded);
         }
     },
     unset: function (key) {
-        if (typeof __tropel_pm_environment_unset === 'function') {
-            __tropel_pm_environment_unset(key);
+        if (typeof __tropel_trp_environment_unset === 'function') {
+            __tropel_trp_environment_unset(key);
         }
     },
     clear: function () {
-        if (typeof __tropel_pm_environment_clear === 'function') {
-            __tropel_pm_environment_clear();
+        if (typeof __tropel_trp_environment_clear === 'function') {
+            __tropel_trp_environment_clear();
         }
     },
     // Backlog line 145: Postman's pm.environment exposes has()/toObject()/
     // replaceIn() alongside get/set/unset/clear.
     has: function (key) {
-        if (typeof __tropel_pm_environment_has === 'function') {
-            return __tropel_pm_environment_has(key);
+        if (typeof __tropel_trp_environment_has === 'function') {
+            return __tropel_trp_environment_has(key);
         }
         return pm.environment.get(key) !== null;
     },
     toObject: function () {
-        if (typeof __tropel_pm_environment_to_object === 'function') {
-            var map = __tropel_pm_environment_to_object() || {};
+        if (typeof __tropel_trp_environment_to_object === 'function') {
+            var map = __tropel_trp_environment_to_object() || {};
             var out = {};
             for (var k in map) {
                 if (map.hasOwnProperty(k)) {
@@ -83,35 +83,35 @@ pm.environment = {
 // the bridge like pm.variables (JSON.parse restores the correct type).
 pm.collectionVariables = {
     get: function (key) {
-        if (typeof __tropel_pm_collection_vars_get === 'function') {
-            var raw = __tropel_pm_collection_vars_get(key);
+        if (typeof __tropel_trp_collection_vars_get === 'function') {
+            var raw = __tropel_trp_collection_vars_get(key);
             if (raw === null || raw === undefined) return undefined;
             try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return undefined;
     },
     set: function (key, value) {
-        if (typeof __tropel_pm_collection_vars_set === 'function') {
+        if (typeof __tropel_trp_collection_vars_set === 'function') {
             var encoded;
             try { encoded = value === undefined ? '' : JSON.stringify(value); }
             catch (e) { encoded = value === undefined ? '' : String(value); }
-            __tropel_pm_collection_vars_set(key, encoded);
+            __tropel_trp_collection_vars_set(key, encoded);
         }
     },
     unset: function (key) {
-        if (typeof __tropel_pm_collection_vars_unset === 'function') {
-            __tropel_pm_collection_vars_unset(key);
+        if (typeof __tropel_trp_collection_vars_unset === 'function') {
+            __tropel_trp_collection_vars_unset(key);
         }
     },
     has: function (key) {
-        if (typeof __tropel_pm_collection_vars_has === 'function') {
-            return __tropel_pm_collection_vars_has(key);
+        if (typeof __tropel_trp_collection_vars_has === 'function') {
+            return __tropel_trp_collection_vars_has(key);
         }
         return false;
     },
     toObject: function () {
-        if (typeof __tropel_pm_collection_vars_to_object === 'function') {
-            var map = __tropel_pm_collection_vars_to_object() || {};
+        if (typeof __tropel_trp_collection_vars_to_object === 'function') {
+            var map = __tropel_trp_collection_vars_to_object() || {};
             var out = {};
             for (var k in map) {
                 if (map.hasOwnProperty(k)) {
@@ -131,35 +131,35 @@ pm.collectionVariables = {
 // Backlog line 145: global-scoped variable store, lowest-precedence scope.
 pm.globals = {
     get: function (key) {
-        if (typeof __tropel_pm_globals_get === 'function') {
-            var raw = __tropel_pm_globals_get(key);
+        if (typeof __tropel_trp_globals_get === 'function') {
+            var raw = __tropel_trp_globals_get(key);
             if (raw === null || raw === undefined) return undefined;
             try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return undefined;
     },
     set: function (key, value) {
-        if (typeof __tropel_pm_globals_set === 'function') {
+        if (typeof __tropel_trp_globals_set === 'function') {
             var encoded;
             try { encoded = value === undefined ? '' : JSON.stringify(value); }
             catch (e) { encoded = value === undefined ? '' : String(value); }
-            __tropel_pm_globals_set(key, encoded);
+            __tropel_trp_globals_set(key, encoded);
         }
     },
     unset: function (key) {
-        if (typeof __tropel_pm_globals_unset === 'function') {
-            __tropel_pm_globals_unset(key);
+        if (typeof __tropel_trp_globals_unset === 'function') {
+            __tropel_trp_globals_unset(key);
         }
     },
     has: function (key) {
-        if (typeof __tropel_pm_globals_has === 'function') {
-            return __tropel_pm_globals_has(key);
+        if (typeof __tropel_trp_globals_has === 'function') {
+            return __tropel_trp_globals_has(key);
         }
         return false;
     },
     toObject: function () {
-        if (typeof __tropel_pm_globals_to_object === 'function') {
-            var map = __tropel_pm_globals_to_object() || {};
+        if (typeof __tropel_trp_globals_to_object === 'function') {
+            var map = __tropel_trp_globals_to_object() || {};
             var out = {};
             for (var k in map) {
                 if (map.hasOwnProperty(k)) {
@@ -178,8 +178,8 @@ pm.globals = {
 // ── pm.variables ──
 pm.variables = {
     get: function (key) {
-        if (typeof __tropel_pm_variables_get === 'function') {
-            var raw = __tropel_pm_variables_get(key);
+        if (typeof __tropel_trp_variables_get === 'function') {
+            var raw = __tropel_trp_variables_get(key);
             if (raw === null || raw === undefined) return null;
             // Try JSON.parse — non-string values (objects, arrays, numbers,
             // booleans) come JSON-encoded from the bridge. If parse fails,
@@ -190,7 +190,7 @@ pm.variables = {
         return null;
     },
     set: function (key, value) {
-        if (typeof __tropel_pm_variables_set === 'function') {
+        if (typeof __tropel_trp_variables_set === 'function') {
             // Backlog line 89/146: JSON-encode so set/get are inverses (an
             // object set once comes back as an object; '1234' stays the
             // string '1234'). Line 146: never pass the RAW value into the
@@ -198,12 +198,12 @@ pm.variables = {
             var encoded;
             try { encoded = value === undefined ? '' : JSON.stringify(value); }
             catch (e) { encoded = value === undefined ? '' : String(value); }
-            __tropel_pm_variables_set(key, encoded);
+            __tropel_trp_variables_set(key, encoded);
         }
     },
     unset: function (key) {
-        if (typeof __tropel_pm_variables_unset === 'function') {
-            __tropel_pm_variables_unset(key);
+        if (typeof __tropel_trp_variables_unset === 'function') {
+            __tropel_trp_variables_unset(key);
         }
     },
     replaceIn: function (text) {
@@ -224,7 +224,7 @@ pm.variables = {
 // TypeError (headers was a function). Only text()/json() are methods in
 // Postman; the rest are values.
 //
-// The native __tropel_pm_response_* bridges are registered LAZILY (first
+// The native __tropel_trp_response_* bridges are registered LAZILY (first
 // iteration, after this shim bootstraps), so these are GETTERS that re-fetch
 // the bridge on every read — same pattern as exec.js. That keeps the read
 // shape a plain number/string/object exactly like Postman while staying live.
@@ -232,8 +232,8 @@ pm.response = {};
 
 Object.defineProperty(pm.response, 'code', {
     get: function () {
-        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_code === 'function') {
-            return globalThis.__tropel_pm_response_code();
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_trp_response_code === 'function') {
+            return globalThis.__tropel_trp_response_code();
         }
         return 0;
     },
@@ -243,8 +243,8 @@ Object.defineProperty(pm.response, 'code', {
 
 Object.defineProperty(pm.response, 'status', {
     get: function () {
-        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_status === 'function') {
-            return globalThis.__tropel_pm_response_status();
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_trp_response_status === 'function') {
+            return globalThis.__tropel_trp_response_status();
         }
         return '';
     },
@@ -254,8 +254,8 @@ Object.defineProperty(pm.response, 'status', {
 
 Object.defineProperty(pm.response, 'responseTime', {
     get: function () {
-        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_time === 'function') {
-            return globalThis.__tropel_pm_response_time();
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_trp_response_time === 'function') {
+            return globalThis.__tropel_trp_response_time();
         }
         return 0;
     },
@@ -266,17 +266,17 @@ Object.defineProperty(pm.response, 'responseTime', {
 // Postman's pm.response.headers is a Headers object: pm.response.headers.get('X')
 // is the canonical idiom. Returns a fresh object per read (the underlying map
 // can change between iterations; the get() delegate is case-insensitive via the
-// __tropel_pm_response_header bridge, matching Postman).
+// __tropel_trp_response_header bridge, matching Postman).
 Object.defineProperty(pm.response, 'headers', {
     get: function () {
         var map = {};
-        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_headers === 'function') {
-            map = globalThis.__tropel_pm_response_headers() || {};
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_trp_response_headers === 'function') {
+            map = globalThis.__tropel_trp_response_headers() || {};
         }
         return {
             get: function (key) {
-                if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_header === 'function') {
-                    var v = globalThis.__tropel_pm_response_header(key);
+                if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_trp_response_header === 'function') {
+                    var v = globalThis.__tropel_trp_response_header(key);
                     return v !== undefined && v !== null ? v : undefined;
                 }
                 return undefined;
@@ -300,8 +300,8 @@ Object.defineProperty(pm.response, 'headers', {
 Object.defineProperty(pm.response, 'cookies', {
     get: function () {
         var map = {};
-        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_cookies === 'function') {
-            map = globalThis.__tropel_pm_response_cookies() || {};
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_trp_response_cookies === 'function') {
+            map = globalThis.__tropel_trp_response_cookies() || {};
         }
         var list = [];
         for (var ck in map) {
@@ -322,15 +322,15 @@ Object.defineProperty(pm.response, 'cookies', {
 });
 
 pm.response.text = function () {
-    if (typeof __tropel_pm_response_body === 'function') {
-        return __tropel_pm_response_body();
+    if (typeof __tropel_trp_response_body === 'function') {
+        return __tropel_trp_response_body();
     }
     return '';
 };
 
 pm.response.json = function () {
-    if (typeof __tropel_pm_response_json === 'function') {
-        var raw = __tropel_pm_response_json();
+    if (typeof __tropel_trp_response_json === 'function') {
+        var raw = __tropel_trp_response_json();
         if (raw) {
             return JSON.parse(raw);
         }
@@ -340,8 +340,8 @@ pm.response.json = function () {
 };
 
 pm.response.header = function (key) {
-    if (typeof __tropel_pm_response_header === 'function') {
-        return __tropel_pm_response_header(key);
+    if (typeof __tropel_trp_response_header === 'function') {
+        return __tropel_trp_response_header(key);
     }
     return null;
 };
@@ -532,19 +532,19 @@ pm.test = function (name, fn) {
             return result.then(
                 function (v) {
                     var passed = v !== false;
-                    if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name, passed, '');
+                    if (typeof __tropel_trp_test === 'function') {
+                        __tropel_trp_test(name, passed, '');
                     }
                     return passed;
                 },
                 function (e) {
-                    if (typeof __tropel_pm_test === 'function') {
+                    if (typeof __tropel_trp_test === 'function') {
                         // W1-A: record under the ORIGINAL name — Postman/k6
                         // record failures under the check's own name, and a
                         // CI gate on `checks{check:...}` must see the failures
                         // (renaming produced a second series that was 100%
                         // pass by construction).
-                        __tropel_pm_test(name, false, '');
+                        __tropel_trp_test(name, false, '');
                     }
                     console.error(__ns + '.test error:', e);
                     return false;
@@ -552,18 +552,18 @@ pm.test = function (name, fn) {
             );
         }
         var passed = result !== false;
-        if (typeof __tropel_pm_test === 'function') {
+        if (typeof __tropel_trp_test === 'function') {
             // 3rd arg (tags) always passed — rquickjs enforces arity, so a
             // 2-arg call against the 3-param bridge would throw (line 149).
-            __tropel_pm_test(name, passed, '');
+            __tropel_trp_test(name, passed, '');
         }
         return passed;
     } catch (e) {
-        if (typeof __tropel_pm_test === 'function') {
+        if (typeof __tropel_trp_test === 'function') {
             // W1-A: see the async rejection path above — failures must be
             // recorded under the original name, not a derived ` (error)`
             // series that a check-name gate never reads.
-            __tropel_pm_test(name, false, '');
+            __tropel_trp_test(name, false, '');
         }
         console.error(__ns + '.test error:', e);
         return false;
@@ -573,8 +573,8 @@ pm.test = function (name, fn) {
 // Backlog line 145: pm.test.skip(name, fn) marks a test skipped WITHOUT
 // running it. Skipped tests are not pass/fail checks.
 pm.test.skip = function (name) {
-    if (typeof __tropel_pm_test_skip === 'function') {
-        __tropel_pm_test_skip(name);
+    if (typeof __tropel_trp_test_skip === 'function') {
+        __tropel_trp_test_skip(name);
     }
 };
 
@@ -845,17 +845,17 @@ pm.expect = function (actual) {
 // request from the static collection item, discarding mutations. The runner
 // now reads PmState.request (seeded from item.request before prerequest) when
 // building the outgoing request, so mutations made here go out on the wire.
-// Live getters/setters delegate to the __tropel_pm_request_* bridges
+// Live getters/setters delegate to the __tropel_trp_request_* bridges
 // (registered lazily, like exec.js).
 pm.request = {};
 
 Object.defineProperty(pm.request, 'url', {
     get: function () {
-        if (typeof __tropel_pm_request_url === 'function') return __tropel_pm_request_url();
+        if (typeof __tropel_trp_request_url === 'function') return __tropel_trp_request_url();
         return '';
     },
     set: function (url) {
-        if (typeof __tropel_pm_request_url_set === 'function') __tropel_pm_request_url_set(String(url));
+        if (typeof __tropel_trp_request_url_set === 'function') __tropel_trp_request_url_set(String(url));
     },
     enumerable: true,
     configurable: true
@@ -863,11 +863,11 @@ Object.defineProperty(pm.request, 'url', {
 
 Object.defineProperty(pm.request, 'method', {
     get: function () {
-        if (typeof __tropel_pm_request_method === 'function') return __tropel_pm_request_method();
+        if (typeof __tropel_trp_request_method === 'function') return __tropel_trp_request_method();
         return 'GET';
     },
     set: function (method) {
-        if (typeof __tropel_pm_request_method_set === 'function') __tropel_pm_request_method_set(String(method));
+        if (typeof __tropel_trp_request_method_set === 'function') __tropel_trp_request_method_set(String(method));
     },
     enumerable: true,
     configurable: true
@@ -878,28 +878,28 @@ Object.defineProperty(pm.request, 'method', {
 pm.request.headers = {
     add: function (header) {
         if (!header || header.key === undefined || header.key === null) return;
-        if (typeof __tropel_pm_request_header_set === 'function') {
-            __tropel_pm_request_header_set(String(header.key), header.value == null ? '' : String(header.value));
+        if (typeof __tropel_trp_request_header_set === 'function') {
+            __tropel_trp_request_header_set(String(header.key), header.value == null ? '' : String(header.value));
         }
     },
     upsert: function (header) {
         pm.request.headers.add(header);
     },
     get: function (key) {
-        if (typeof __tropel_pm_request_header_get === 'function') {
-            var v = __tropel_pm_request_header_get(key);
+        if (typeof __tropel_trp_request_header_get === 'function') {
+            var v = __tropel_trp_request_header_get(key);
             return v !== null && v !== undefined ? v : undefined;
         }
         return undefined;
     },
     remove: function (key) {
-        if (typeof __tropel_pm_request_header_unset === 'function') {
-            __tropel_pm_request_header_unset(key);
+        if (typeof __tropel_trp_request_header_unset === 'function') {
+            __tropel_trp_request_header_unset(key);
         }
     },
     all: function () {
-        if (typeof __tropel_pm_request_headers === 'function') {
-            var map = __tropel_pm_request_headers() || {};
+        if (typeof __tropel_trp_request_headers === 'function') {
+            var map = __tropel_trp_request_headers() || {};
             var arr = [];
             for (var k in map) {
                 if (map.hasOwnProperty(k)) arr.push({ key: k, value: map[k] });
@@ -913,8 +913,8 @@ pm.request.headers = {
         for (var i = 0; i < all.length; i++) cb(all[i]);
     },
     toObject: function () {
-        if (typeof __tropel_pm_request_headers === 'function') {
-            return __tropel_pm_request_headers() || {};
+        if (typeof __tropel_trp_request_headers === 'function') {
+            return __tropel_trp_request_headers() || {};
         }
         return {};
     }
@@ -927,14 +927,14 @@ pm.request.headers = {
 // Backlog line 101: `mode` was a plain module-scope property — a fresh
 // request per iteration re-seeded the raw text but NOT the mode, so
 // `pm.request.body.mode` leaked the previous iteration's value. It is now
-// a live getter backed by __tropel_pm_request_body_mode (falling back to
+// a live getter backed by __tropel_trp_request_body_mode (falling back to
 // the last-assigned value when the bridge is absent, e.g. test stubs).
 var _pmRequestBody = {};
 var _pmBodyModeFallback = 'raw';
 Object.defineProperty(_pmRequestBody, 'mode', {
     get: function () {
-        if (typeof __tropel_pm_request_body_mode === 'function') {
-            var m = __tropel_pm_request_body_mode();
+        if (typeof __tropel_trp_request_body_mode === 'function') {
+            var m = __tropel_trp_request_body_mode();
             if (m) return m;
         }
         return _pmBodyModeFallback;
@@ -945,15 +945,15 @@ Object.defineProperty(_pmRequestBody, 'mode', {
 });
 Object.defineProperty(_pmRequestBody, 'raw', {
     get: function () {
-        if (typeof __tropel_pm_request_body === 'function') {
-            var b = __tropel_pm_request_body();
+        if (typeof __tropel_trp_request_body === 'function') {
+            var b = __tropel_trp_request_body();
             if (b !== null && b !== undefined) return b;
         }
         return '';
     },
     set: function (raw) {
-        if (typeof __tropel_pm_request_body_set === 'function') {
-            __tropel_pm_request_body_set(raw == null ? '' : String(raw));
+        if (typeof __tropel_trp_request_body_set === 'function') {
+            __tropel_trp_request_body_set(raw == null ? '' : String(raw));
         }
     },
     enumerable: true,
@@ -965,8 +965,8 @@ Object.defineProperty(pm.request, 'body', {
         // Accept a plain string OR an object {mode, raw} — both are common
         // Postman spellings.
         var raw = body == null ? '' : (typeof body === 'object' ? (body.raw != null ? String(body.raw) : '') : String(body));
-        if (typeof __tropel_pm_request_body_set === 'function') {
-            __tropel_pm_request_body_set(raw);
+        if (typeof __tropel_trp_request_body_set === 'function') {
+            __tropel_trp_request_body_set(raw);
         }
         _pmRequestBody.mode = body && body.mode ? body.mode : 'raw';
     },
@@ -983,11 +983,11 @@ Object.defineProperty(pm.request, 'auth', {
     // Backlog line 101: the getter was a module-scope singleton, so a
     // request with NO auth (or a different auth) on the next iteration
     // still read the previous iteration's value. Read LIVE from the current
-    // request's auth via __tropel_pm_request_auth; fall back to the stored
+    // request's auth via __tropel_trp_request_auth; fall back to the stored
     // copy only when the bridge is absent (test stubs / browser slice).
     get: function () {
-        if (typeof __tropel_pm_request_auth === 'function') {
-            var j = __tropel_pm_request_auth();
+        if (typeof __tropel_trp_request_auth === 'function') {
+            var j = __tropel_trp_request_auth();
             if (j) {
                 try { return JSON.parse(j); } catch (e) { return null; }
             }
@@ -1001,8 +1001,8 @@ Object.defineProperty(pm.request, 'auth', {
         // the Rust parse) when clearing auth; use {type:'noauth'} to clear
         // explicitly, exactly like Postman.
         if (auth === undefined || auth === null) return;
-        if (typeof __tropel_pm_request_auth_set === 'function') {
-            __tropel_pm_request_auth_set(JSON.stringify(auth));
+        if (typeof __tropel_trp_request_auth_set === 'function') {
+            __tropel_trp_request_auth_set(JSON.stringify(auth));
         }
     },
     enumerable: true,
@@ -1012,7 +1012,7 @@ Object.defineProperty(pm.request, 'auth', {
 // ── pm.cookies ──
 // Backlog line 145: Postman's pm.cookies reads the cookie jar for the current
 // domain. In a headless load runner the closest proxy is the response's
-// Set-Cookie map (__tropel_pm_response_cookies).
+// Set-Cookie map (__tropel_trp_response_cookies).
 pm.cookies = {
     get: function (name) {
         var jar = pm.cookies.toObject();
@@ -1022,8 +1022,8 @@ pm.cookies = {
         return pm.cookies.toObject().hasOwnProperty(name);
     },
     toObject: function () {
-        if (typeof __tropel_pm_response_cookies === 'function') {
-            return __tropel_pm_response_cookies() || {};
+        if (typeof __tropel_trp_response_cookies === 'function') {
+            return __tropel_trp_response_cookies() || {};
         }
         return {};
     },
@@ -1083,8 +1083,8 @@ function includesValue(container, value) {
 // ── pm.iterationData ──
 pm.iterationData = {
     get: function (key) {
-        if (typeof __tropel_pm_iteration_data_get === 'function') {
-            var raw = __tropel_pm_iteration_data_get(key);
+        if (typeof __tropel_trp_iteration_data_get === 'function') {
+            var raw = __tropel_trp_iteration_data_get(key);
             if (raw === null || raw === undefined) return null;
             // Values come JSON-encoded from the bridge — parse to restore type
             try { return JSON.parse(raw); }
@@ -1137,7 +1137,7 @@ function escapeMultipartFieldName(name) {
 // Handles both Postman-style options and simple string URLs.
 pm.sendRequest = function (options, callback) {
     // Delegate to native implementation
-    if (typeof __tropel_pm_send_request === 'function') {
+    if (typeof __tropel_trp_send_request === 'function') {
         // Normalize options
         var url = '';
         var method = 'GET';
@@ -1235,7 +1235,7 @@ pm.sendRequest = function (options, callback) {
             }
         }
 
-        var resultJson = __tropel_pm_send_request(
+        var resultJson = __tropel_trp_send_request(
             method.toUpperCase(),
             url,
             JSON.stringify(headers),
@@ -1291,7 +1291,7 @@ pm.sendRequest = function (options, callback) {
     }
 
     // No native function available - throw a clear error
-    throw new Error(__ns + '.sendRequest is not available in this runtime (native __tropel_pm_send_request not found)');
+    throw new Error(__ns + '.sendRequest is not available in this runtime (native __tropel_trp_send_request not found)');
 };
 
 // ── pm.execution ──
@@ -1305,8 +1305,8 @@ postman.setNextRequest = function (requestName) {
 
 pm.execution = {
     setNextRequest: function (requestName) {
-        if (typeof __tropel_pm_set_next_request === 'function') {
-            __tropel_pm_set_next_request(requestName);
+        if (typeof __tropel_trp_set_next_request === 'function') {
+            __tropel_trp_set_next_request(requestName);
         }
     },
     skipRequest: function () {
@@ -1314,9 +1314,9 @@ pm.execution = {
         // and move to the next item. Routing it through setNextRequest(null)
         // (a) threw — null into a strict String param — and (b) inherited
         // setNextRequest's "stop the whole run" semantics. Use the dedicated
-        // __tropel_pm_skip_request bridge instead.
-        if (typeof __tropel_pm_skip_request === 'function') {
-            __tropel_pm_skip_request();
+        // __tropel_trp_skip_request bridge instead.
+        if (typeof __tropel_trp_skip_request === 'function') {
+            __tropel_trp_skip_request();
         }
     }
     // W1-A: stopOnError deliberately ABSENT — Postman has no such method
@@ -1329,7 +1329,7 @@ pm.execution = {
 // ── pm.info (live, backlog line 101) ──
 // Was a hardcoded stub (eventName 'test', iteration 0, iterationCount 1,
 // requestName '', requestId ''). Each field is now a getter backed by the
-// __tropel_pm_info bridge, so a test script sees the real iteration,
+// __tropel_trp_info bridge, so a test script sees the real iteration,
 // request name, and configured iteration count. Falls back to the old
 // stub values when the bridge is absent (test stubs / browser slice).
 var _pmInfoFallback = {
@@ -1340,8 +1340,8 @@ var _pmInfoFallback = {
     requestId: ''
 };
 function _pmInfoRead() {
-    if (typeof __tropel_pm_info === 'function') {
-        var raw = __tropel_pm_info();
+    if (typeof __tropel_trp_info === 'function') {
+        var raw = __tropel_trp_info();
         if (raw) {
             try { return JSON.parse(raw); } catch (e) { /* fall through */ }
         }
@@ -1362,15 +1362,15 @@ pm.metrics = {
     // Add a value to a custom metric (creates it if it doesn't exist).
     // Metric types: 'counter', 'gauge', 'rate', 'trend' (default: 'trend')
     add: function (name, value, metricType) {
-        if (typeof __tropel_pm_metrics_add === 'function') {
+        if (typeof __tropel_trp_metrics_add === 'function') {
             var type = metricType || 'trend';
-            __tropel_pm_metrics_add(name, Number(value), type);
+            __tropel_trp_metrics_add(name, Number(value), type);
         }
     },
     // Get the current value of a custom metric.
     get: function (name) {
-        if (typeof __tropel_pm_metrics_get === 'function') {
-            return __tropel_pm_metrics_get(name);
+        if (typeof __tropel_trp_metrics_get === 'function') {
+            return __tropel_trp_metrics_get(name);
         }
         return null;
     },
