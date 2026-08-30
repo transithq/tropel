@@ -378,6 +378,12 @@ pub struct JsContext {
 // If either becomes possible, `Send` must be removed (or the runtime made
 // per-context again) — the compiler will not catch it.
 //
+// `REJECTION_ROUTES` carries the same affinity: a context registers its
+// unhandled-rejection map into its creating thread's map and removes it in
+// `Drop`. Polled on another thread, the tracker would find no route and drop
+// the VU's rejections silently; dropped on another thread, it would leak the
+// entry. Both are failures of the same assumption, and both are silent.
+//
 // `Sync` is deliberately NOT implemented: rquickjs is built with
 // `full-async` (no `parallel` feature), so `Runtime`/`Context` are `!Sync`
 // and `Persistent` is `!Send + !Sync`. `&JsContext` across threads would
