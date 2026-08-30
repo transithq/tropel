@@ -701,3 +701,44 @@ mod tests {
         assert_eq!(req.query_params.get("ids"), Some(&"1, 2".to_string()));
     }
 }
+
+#[cfg(test)]
+mod meta_sort_key_regression {
+    use super::*;
+
+    /// TR-006: Insomnia assigns `metaSortKey` by **midpoint averaging**, so the
+    /// values go fractional the first time a user drags anything to reorder.
+    /// The field was typed `Option<i64>`, so the whole export failed to
+    /// deserialize — and every test used hand-written integers, which can
+    /// never reproduce it.
+    ///
+    /// The criterion is a workspace exported AFTER reordering (still open:
+    /// nobody with Insomnia has produced one). This asserts the property that
+    /// export would have proved, so the defect cannot return while the fixture
+    /// question is settled separately.
+    ///
+    /// Fails on the pre-fix adapter: `1.5` is not an i64, so parsing errors.
+    #[test]
+    fn fractional_meta_sort_keys_parse_and_order_correctly() {
+        // Midpoint of 1 and 2 — exactly what one drag produces.
+        let export = r#"{"_type":"export","__export_format":4,"resources":[
+            {"_id":"wrk_1","_type":"workspace","name":"w"},
+            {"_id":"req_b","_type":"request","parentId":"wrk_1","name":"second",
+             "method":"GET","url":"https://example.test/b","metaSortKey":2},
+            {"_id":"req_a","_type":"request","parentId":"wrk_1","name":"first",
+             "method":"GET","url":"https://example.test/a","metaSortKey":1.5}
+        ]}"#;
+
+        let scenario = InsomniaInputAdapter
+            .parse(export.as_bytes())
+            .expect("a drag-reordered export has FRACTIONAL metaSortKey and must parse");
+
+        let names: Vec<&str> = scenario.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["first", "second"],
+            "1.5 sorts before 2 — truncating to an integer would tie them and \
+             lose the user's ordering"
+        );
+    }
+}
