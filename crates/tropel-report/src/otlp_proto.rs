@@ -408,7 +408,7 @@ mod tests {
         // non-representable test timestamp fails on every platform at
         // authoring time, not on one platform at CI time.
         assert!(
-            nanos % 100 == 0,
+            nanos.is_multiple_of(100),
             "test timestamp {nanos} ns is not representable on Windows \
              (SystemTime tick = 100 ns; it would truncate to {}). Use a \
              multiple of 100.",
