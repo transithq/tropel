@@ -659,13 +659,23 @@ pub(crate) async fn create_vu_js_context(
         );
     });
 
+    // EXPLICIT globalThis assignment, not a declaration. The previous form —
+    // `if (typeof sleep === 'undefined') { async function sleep(…) {…} }` —
+    // was a no-op: a function declaration inside a block is BLOCK-SCOPED in
+    // ES2015+, and Annex B's sloppy-mode hoisting does not apply to async
+    // functions, so QuickJS (correctly) never put it on the global object.
+    // The wrapper evaluated, went out of scope, and `sleep` stayed undefined
+    // on the whole declarative path — a stock k6 pacing idiom
+    // (`http.get(u); sleep(1);` in a collection script) threw ReferenceError.
+    // The k6 Driver path was unaffected only because its own bundle carries
+    // js/k6-shim/sleep-shim.js.
     let sleep_code = [
-        "if (typeof sleep === 'undefined') {",
-        "  async function sleep(seconds) {",
+        "if (typeof globalThis.sleep === 'undefined') {",
+        "  globalThis.sleep = async function sleep(seconds) {",
         "    if (typeof __tropel_native_sleep === 'function') {",
         "      await __tropel_native_sleep(seconds * 1000);",
         "    }",
-        "  }",
+        "  };",
         "}",
     ]
     .join("\n");
@@ -1033,6 +1043,42 @@ mod tests {
     /// another's. Each VU owns a separate QuickJS Runtime, so a global set
     /// in one must be undefined in the other. This is the 34 leaking globals
     /// guard: if a shim leaks, this fails.
+    /// `sleep` must be a GLOBAL function on the declarative path.
+    ///
+    /// The wrapper `create_vu_js_context` appends used to be a block-scoped
+    /// `async function` inside an `if` — which ES2015 block-scopes and Annex B
+    /// does not rescue for async functions — so it never reached globalThis
+    /// and every collection script calling `sleep(1)` threw ReferenceError.
+    /// TROPEL_MASTER_TODO.md:405 flagged the adjacent comment as asserting
+    /// the opposite of reality; this pins the reality.
+    ///
+    /// Fails on the pre-fix code: `typeof sleep` evaluated to "undefined".
+    #[tokio::test]
+    async fn sleep_is_a_global_function_on_the_declarative_path() {
+        let pm_state = new_pm_state();
+        let client: Arc<dyn DriverHttpClient> = Arc::new(DriverHttpClientImpl {
+            client: VuCookieClient::new(
+                HttpClient::new(&HttpConfig::default()).expect("http client"),
+            ),
+        });
+        let mut ctx = create_vu_js_context(
+            1,
+            &pm_state,
+            &client,
+            &ShimBundle::default(),
+            &SandboxConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("VU context");
+        let ty = ctx.eval("typeof sleep").await.expect("eval");
+        assert_eq!(
+            ty, "function",
+            "sleep must be installed on globalThis for the declarative path — \
+             a block-scoped declaration silently leaves it undefined"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn per_vu_globals_are_isolated() {
         let pm_state = new_pm_state();
@@ -1244,10 +1290,11 @@ mod tests {
     /// `CryptoJS`.
     ///
     /// NOT asserted, deliberately: `sleep` and `http`. Both are `undefined`
-    /// in this path on master, under the FULL default bundle as well — the
-    /// `sleep` wrapper `create_vu_js_context` appends is a block-scoped
-    /// `async function` inside `if (typeof sleep === 'undefined') { … }`,
-    /// which QuickJS does not hoist to the global object, and `http.*` comes
+    /// in this path on master under the FULL default bundle as well — the
+    /// `sleep` wrapper `create_vu_js_context` appended used to be a
+    /// block-scoped `async function` that never reached the global object
+    /// (fixed: it is now an explicit `globalThis.sleep = …` assignment), and
+    /// `http.*` comes
     /// from the k6 DRIVER's own bundle in `tropel-input-k6`, which never goes
     /// through `ShimBundle`. Neither is something this change removed; see
     /// `narrowing_removes_only_the_excluded_globals`, which pins that

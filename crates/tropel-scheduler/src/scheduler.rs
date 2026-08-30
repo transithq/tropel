@@ -496,11 +496,11 @@ impl VUScheduler {
         self.arrival_dropped.swap(0, Ordering::Relaxed)
     }
 
-    /// Read the total dropped iterations counter without resetting.
-    /// Used by the periodic sampler (backlog line 262).
-    pub fn total_dropped_iterations(&self) -> u64 {
-        self.arrival_dropped.load(Ordering::Relaxed)
-    }
+    // `total_dropped_iterations` (a non-resetting read) was DELETED, not just
+    // de-called: while it existed, one emitter took deltas of the running
+    // total and another drained the counter with `take`, so every drop was
+    // reported twice. With only the swap-to-zero accessor available, the
+    // compiler enforces that each drop can be consumed exactly once.
 
     /// Get active VU count.
     pub async fn active_vus(&self) -> u32 {
