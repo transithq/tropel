@@ -450,12 +450,27 @@ impl MetricsCollector {
         collector
     }
 
-    /// Hash a metric key to a shard index. Uses the metric name's hash;
-    /// per-shard channel retains ordering for a given metric.
+    /// Hash a metric key to a shard index. Hashes ONLY the metric **name**, so
+    /// every series of a given metric lands on the same shard.
+    ///
+    /// This is load-bearing for correctness, not just an optimisation. It used
+    /// to hash the whole key (name *and* tags), which scattered
+    /// `http_req_duration{url:/a}` and `{url:/b}` across different shards. Each
+    /// shard then computed its own partial `http_req_duration` summary, and
+    /// `merge_results` picked the single largest-count one and discarded the
+    /// rest — so the headline count, avg, min, max and p95 that users read were
+    /// computed from roughly 1/SHARD_COUNT of the population. The percentiles
+    /// could not be repaired at merge time either, because `MetricSummary`
+    /// carries precomputed scalars rather than a histogram.
+    ///
+    /// With name-only hashing a metric is owned end-to-end by one shard, which
+    /// aggregates it over the complete population with a real histogram. Load
+    /// stays balanced because a request emits ~12 distinct metric names, which
+    /// spread across the shards.
     fn shard_for_key(key: &MetricKey) -> usize {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
+        key.metric.hash(&mut hasher);
         (hasher.finish() as usize) % SHARD_COUNT
     }
 
@@ -678,6 +693,8 @@ impl MetricsCollector {
             return shards.remove(0);
         }
         let mut out = MetricsResult::default();
+        let mut failed_weighted = 0.0f64;
+        let mut failed_weight = 0.0f64;
         // Keep the config from the first shard (all shards share the same config via broadcast).
         out.summary_trend_stats = shards[0].summary_trend_stats.clone();
         out.effective_thresholds = shards[0].effective_thresholds.clone();
@@ -714,13 +731,16 @@ impl MetricsCollector {
             out.data_sent += r.data_sent;
             out.errors += r.errors;
             out.series_dropped += r.series_dropped;
-            out.output_samples_dropped += r.output_samples_dropped;
-            out.aggregator_samples_dropped += r.aggregator_samples_dropped;
             out.dropped_iterations += r.dropped_iterations;
-            // http_req_failed is a rate; recompute from totals after merge would be ideal,
-            // but each shard's rate is already computed. Use weighted average by http_reqs.
-            // For now, max approximates the worst shard; will be refined by totals.
-            out.http_req_failed = out.http_req_failed.max(r.http_req_failed);
+            // `http_req_failed` is a RATE: it cannot be summed, and taking the
+            // max reported the worst shard as if it were the run (10 failures
+            // all landing on one of four 100-request shards read as 0.10, not
+            // the true 0.025). Sum the numerator and denominator instead and
+            // divide once, after the loop. Note this cannot be weighted by
+            // `r.http_reqs` — `shard_for_key` hashes the metric name, so
+            // `http_reqs` and `http_req_failed` live on different shards.
+            failed_weighted += r.http_req_failed_count;
+            failed_weight += r.http_req_failed_total;
             out.iterations += r.iterations;
             out.vus_max = out.vus_max.max(r.vus_max);
             out.requested_vus = out.requested_vus.max(r.requested_vus);
@@ -729,9 +749,19 @@ impl MetricsCollector {
                 out.effective_vus_reason = r.effective_vus_reason.clone();
             }
         }
-        // Recompute http_req_failed as weighted average if we have http_reqs
-        // (each shard's http_req_failed is failed/total for that shard).
-        // For now, keep max as conservative.
+        out.http_req_failed_count = failed_weighted;
+        out.http_req_failed_total = failed_weight;
+        if failed_weight > 0.0 {
+            out.http_req_failed = failed_weighted / failed_weight;
+        }
+        // These two are PROCESS-GLOBAL atomics, so every shard's `build_results`
+        // loaded the same figure and the loop above summed it SHARD_COUNT times —
+        // one lagging output that dropped 1,000 samples reported 4,000 lost.
+        // Read them exactly once, here, after the merge.
+        out.output_samples_dropped =
+            crate::OUTPUT_SAMPLES_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        out.aggregator_samples_dropped =
+            crate::AGGREGATOR_SAMPLES_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
         out
     }
 
@@ -1444,6 +1474,8 @@ impl Aggregator {
                 .get("dropped_iterations")
                 .copied()
                 .unwrap_or(0.0) as u64,
+            http_req_failed_count,
+            http_req_failed_total,
             http_req_failed: if http_req_failed_total > 0.0 {
                 http_req_failed_count / http_req_failed_total
             } else {
@@ -1587,6 +1619,11 @@ impl Aggregator {
                     // P2 line 165: respect the cardinality cap. Without this,
                     // 50 agents x 100k cap = 5M series on the controller.
                     if data_len >= self.max_series {
+                        // Count it. `Aggregator::record`'s equivalent guard does,
+                        // and `is_unverified()` reads `series_dropped` — silently
+                        // discarding here let a controller merge that lost
+                        // millions of series still report `"unverified": false`.
+                        self.series_dropped += 1;
                         continue;
                     }
                     v.insert(MetricSet {
@@ -1895,6 +1932,12 @@ pub struct MetricsResult {
     pub dropped_iterations: u64,
     /// HTTP request failure rate (0.0 - 1.0).
     pub http_req_failed: f64,
+    /// Numerator of [`Self::http_req_failed`] — failed requests. Carried
+    /// separately so sharded results can be merged: a rate cannot be summed,
+    /// and taking the max across shards reported the worst shard as the run.
+    pub http_req_failed_count: f64,
+    /// Denominator of [`Self::http_req_failed`] — requests observed.
+    pub http_req_failed_total: f64,
     /// Total iterations completed.
     pub iterations: u64,
     /// Maximum concurrent VUs observed.
@@ -1975,6 +2018,8 @@ impl Default for MetricsResult {
             aggregator_samples_dropped: 0,
             dropped_iterations: 0,
             http_req_failed: 0.0,
+            http_req_failed_count: 0.0,
+            http_req_failed_total: 0.0,
             iterations: 0,
             vus_max: 0,
             requested_vus: 0,
@@ -3461,6 +3506,84 @@ mod tests {
         assert_eq!(
             res.http_req_failed, 0.5,
             "rate must cover the dropped-series PASS too (1 failed / 2 total)"
+        );
+    }
+
+    /// Every series of one metric must land on one shard.
+    ///
+    /// Fails on the pre-fix code, which hashed the whole `MetricKey`: the two
+    /// keys below differ only by a tag, scattered across shards, and each
+    /// shard then built its own partial `http_req_duration` summary that
+    /// `merge_results` discarded all but one of.
+    #[test]
+    fn shard_is_chosen_by_metric_name_not_by_tags() {
+        let mk = |url: &str| {
+            let mut tags = tropel_sdk::types::TagMap::new();
+            tags.insert("url", url);
+            MetricKey::new("http_req_duration", &tags)
+        };
+        let a = MetricsCollector::shard_for_key(&mk("/a"));
+        for url in ["/b", "/c", "/d", "/e", "/f", "/g", "/h"] {
+            assert_eq!(
+                a,
+                MetricsCollector::shard_for_key(&mk(url)),
+                "http_req_duration{{url:{url}}} landed on a different shard \
+                 than {{url:/a}} — the headline summary would be computed from \
+                 a fraction of the population"
+            );
+        }
+    }
+
+    /// Process-global drop counters must be read once, not once per shard.
+    ///
+    /// Fails on the pre-fix code with `4000`, because every shard's
+    /// `build_results` loaded the same global and `merge_results` summed them.
+    #[test]
+    fn global_drop_counters_are_not_multiplied_by_shard_count() {
+        let shards: Vec<MetricsResult> = (0..SHARD_COUNT)
+            .map(|_| MetricsResult {
+                output_samples_dropped: 1000,
+                aggregator_samples_dropped: 7,
+                ..Default::default()
+            })
+            .collect();
+        let out = MetricsCollector::merge_results(shards);
+        let expected = crate::OUTPUT_SAMPLES_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            out.output_samples_dropped, expected,
+            "output_samples_dropped must be the global's single value, not \
+             SHARD_COUNT x it"
+        );
+        assert!(
+            out.output_samples_dropped < 1000 * SHARD_COUNT as u64,
+            "the per-shard values were summed"
+        );
+    }
+
+    /// A rate must merge by summing numerator and denominator.
+    ///
+    /// Fails on the pre-fix `max` with `0.10` — the worst shard reported as if
+    /// it were the whole run.
+    #[test]
+    fn http_req_failed_merges_as_a_rate_not_as_a_max() {
+        let shard = |failed: f64, total: f64| MetricsResult {
+            http_req_failed: if total > 0.0 { failed / total } else { 0.0 },
+            http_req_failed_count: failed,
+            http_req_failed_total: total,
+            ..Default::default()
+        };
+        // 10 failures out of 400 requests, all landing on one shard.
+        let out = MetricsCollector::merge_results(vec![
+            shard(0.0, 100.0),
+            shard(0.0, 100.0),
+            shard(0.0, 100.0),
+            shard(10.0, 100.0),
+        ]);
+        assert!(
+            (out.http_req_failed - 0.025).abs() < 1e-9,
+            "expected the true run rate 0.025, got {} (0.10 means the worst \
+             shard was reported as the run)",
+            out.http_req_failed
         );
     }
 

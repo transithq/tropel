@@ -6874,7 +6874,16 @@ mod tests {
                     return out;
                 };
                 var b1 = bru.getCollectionVar('baseUrl');
-                bru.setCollectionVar('token', '"abc"');
+                // Plain 'abc', NOT the hand-pre-quoted '"abc"' this used to
+                // pass. The store holds JSON-encoded values (see the seeded
+                // baseUrl), and the setter now encodes — so a caller passing a
+                // plain string gets a plain string back. Pre-quoting was the
+                // workaround for the setter using String() while the getter
+                // used JSON.parse.
+                bru.setCollectionVar('token', 'abc');
+                var rt = bru.getCollectionVar('token');
+                globalThis.__rt_type = typeof rt;
+                globalThis.__rt = String(rt);
                 var h1 = bru.hasCollectionVar('baseUrl');
                 var h2 = bru.hasCollectionVar('missing');
                 bru.deleteCollectionVar('retries');
@@ -6909,6 +6918,20 @@ mod tests {
                 ctx.eval::<String, _>("__after").unwrap(),
                 "{\"baseUrl\":\"\\\"https://api.example.com\\\"\",\"token\":\"\\\"abc\\\"\"}",
                 "setCollectionVar must add, deleteCollectionVar must remove (the stub store keeps JSON-encoded values, hence the escaped quotes)"
+            );
+            // The property that matters: set/get are inverses. Fails on the
+            // pre-fix String()-in / JSON.parse-out asymmetry, where setting
+            // 'abc' stored the bare 3 chars and getting it back threw or
+            // returned undefined.
+            assert_eq!(
+                ctx.eval::<String, _>("__rt_type").unwrap(),
+                "string",
+                "bru.setCollectionVar('token','abc') must read back as a string"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__rt").unwrap(),
+                "abc",
+                "bru collection var set/get must round-trip unchanged"
             );
             assert_eq!(
                 ctx.eval::<String, _>("__after_all").unwrap(),

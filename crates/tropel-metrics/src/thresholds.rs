@@ -1082,6 +1082,8 @@ mod tests {
         let metrics = MetricsResult {
             http_reqs: 0,
             errors: 0,
+            http_req_failed_count: 0.0,
+            http_req_failed_total: 0.0,
             series_dropped: 0,
             output_samples_dropped: 0,
             aggregator_samples_dropped: 0,

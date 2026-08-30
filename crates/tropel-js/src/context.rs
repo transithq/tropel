@@ -257,6 +257,31 @@ mod shared_runtime {
         /// `eval_async` calls nest correctly.
         pub(super) static ACTIVE_VU: RefCell<Option<(Arc<AtomicU64>, Arc<AtomicBool>)>> =
             const { RefCell::new(None) };
+        /// Per-VU unhandled-rejection maps, keyed by the VU's deadline `Arc`
+        /// address (a stable per-context identity).
+        ///
+        /// Like the interrupt handler, the rejection tracker is a property of
+        /// the RUNTIME, so a shared runtime cannot close over one VU's map.
+        /// It used to be installed unconditionally per context, so each new VU
+        /// REPLACED its predecessors' tracker: VU 3's rejection was recorded
+        /// into VU 50's map, VU 3 then drained an empty map and silently
+        /// passed, and VU 50 later failed with VU 3's error. This registry lets
+        /// one tracker route each rejection to whichever VU is executing.
+        pub(super) static REJECTION_ROUTES: RefCell<
+            std::collections::HashMap<usize, super::RejectionMap>,
+        > = RefCell::new(std::collections::HashMap::new());
+    }
+
+    /// Route a rejection to the currently-executing VU's map, if any.
+    pub(super) fn with_active_rejection_map<F: FnOnce(&super::RejectionMap)>(f: F) {
+        let key = ACTIVE_VU.with(|c| c.borrow().as_ref().map(|(d, _)| Arc::as_ptr(d) as usize));
+        if let Some(key) = key {
+            REJECTION_ROUTES.with(|r| {
+                if let Some(map) = r.borrow().get(&key) {
+                    f(map);
+                }
+            });
+        }
     }
 
     pub(super) fn sharing_enabled() -> bool {
@@ -299,6 +324,9 @@ mod shared_runtime {
 
 use shared_runtime::{ActiveVu, SharedRuntimeState};
 
+/// A VU's unhandled-rejection map: promise identity -> rejection reason.
+pub(crate) type RejectionMap = Arc<Mutex<HashMap<u64, String>>>;
+
 pub struct JsContext {
     /// Compiled script cache: source-hash → persistent function.
     /// Declared FIRST so it is dropped BEFORE ctx.
@@ -324,7 +352,7 @@ pub struct JsContext {
     /// rejected with no handler attached, and `true` when a handler is later
     /// attached — so a promise rejected then caught is inserted then removed,
     /// and only genuinely-unhandled rejections remain when we drain.
-    unhandled_rejections: Arc<Mutex<HashMap<u64, String>>>,
+    unhandled_rejections: RejectionMap,
 }
 
 // Safety: each JsContext owns its own rquickjs Runtime, and the thread-per-
@@ -451,23 +479,43 @@ impl JsContext {
         // and removes them when a handler is attached later (true); the
         // eval-family methods drain the map after pumping and fail the script
         // if anything is still unhandled.
-        let unhandled_rejections = Arc::new(Mutex::new(HashMap::new()));
-        {
-            let pending = unhandled_rejections.clone();
-            rt.set_host_promise_rejection_tracker(Some(Box::new(
-                move |ctx, promise, reason, is_handled| {
-                    let key = promise_identity(&promise);
+        let unhandled_rejections: RejectionMap = Arc::new(Mutex::new(HashMap::new()));
+        // Register this VU's map under its deadline-Arc address, then install a
+        // tracker that closes over NOTHING and routes via `ACTIVE_VU`. The
+        // statelessness is the point: the tracker is a property of the runtime,
+        // so on a shared runtime every context's install overwrites the last
+        // one. A tracker that captured its own VU's map therefore sent every
+        // VU's rejections into the newest VU's map. This closure is identical
+        // for every context, so overwriting it is a no-op.
+        shared_runtime::REJECTION_ROUTES.with(|r| {
+            r.borrow_mut().insert(
+                Arc::as_ptr(&interrupt_deadline) as usize,
+                unhandled_rejections.clone(),
+            );
+        });
+        rt.set_host_promise_rejection_tracker(Some(Box::new(
+            move |ctx, promise, reason, is_handled| {
+                let key = promise_identity(&promise);
+                let reason = if is_handled {
+                    None
+                } else {
+                    Some(rejection_reason_string(&ctx, &reason))
+                };
+                shared_runtime::with_active_rejection_map(|pending| {
                     // Poison-tolerant: a panicked thread must not permanently
                     // silence unhandled-rejection reporting (backlog P3).
                     let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
-                    if is_handled {
-                        map.remove(&key);
-                    } else {
-                        map.insert(key, rejection_reason_string(&ctx, &reason));
+                    match &reason {
+                        None => {
+                            map.remove(&key);
+                        }
+                        Some(r) => {
+                            map.insert(key, r.clone());
+                        }
                     }
-                },
-            )));
-        }
+                });
+            },
+        )));
 
         // Create a full-featured context
         let ctx = Context::full(&rt)
@@ -1336,6 +1384,12 @@ impl JsContext {
 
 impl Drop for JsContext {
     fn drop(&mut self) {
+        // Unconditional: the route is registered for private runtimes too, and
+        // leaving it behind would leak the map for the thread's whole life.
+        shared_runtime::REJECTION_ROUTES.with(|r| {
+            r.borrow_mut()
+                .remove(&(Arc::as_ptr(&self.interrupt_deadline) as usize));
+        });
         if !self.on_shared_runtime {
             return;
         }

@@ -620,42 +620,42 @@ pub(crate) async fn create_vu_js_context(
     ctx.with_ctx(|rq_ctx| {
         let globals = rq_ctx.globals();
         let deadline_sleep = deadline.clone();
-        // TR-502 proper fix: sleep is now async (Promise-based) so the VU's
-        // thread yields and other VUs on the same worker can progress. The old
-        // sync std::thread::sleep parked the OS thread. With rquickjs
-        // full-async, host functions can be async and the job queue is pumped
-        // via finish_promise/pump_promise_queue.
+        // MUST be a SYNC host fn. `JsContext` builds a plain `rquickjs::Runtime`
+        // (tropel-js/src/context.rs), which has NO spawner — `Opaque::spawner()`
+        // is `.expect("tried to use async function in non async runtime")`. An
+        // `Async` host fn calls `ctx.spawn` on first invocation and panics
+        // there; rquickjs's ffi layer catches the panic, stashes it in the
+        // runtime's `Opaque`, and throws into JS, so the VU sees an opaque
+        // "Async script rejected" — and the stashed payload then `resume_unwind`s
+        // on whichever VU next raises an exception, which on a shared runtime is
+        // a DIFFERENT VU. A previous revision registered this as `Async` and the
+        // guard below only checked `typeof sleep`, so 1130 tests passed while
+        // `sleep()` was dead on every declarative format.
+        //
+        // Absolute deadline, not `remaining -= slice`: OS overshoot compounds
+        // in the subtractive form (TR-502). Mirrors the k6 driver's copy.
         let _ = globals.set(
             "__tropel_native_sleep",
-            rquickjs::function::Func::from(rquickjs::function::Async(
-                move |_ctx: rquickjs::Ctx<'_>, ms: f64| {
-                    let deadline_sleep = deadline_sleep.clone();
-                    let force_stop_sleep = force_stop_sleep.clone();
-                    async move {
-                        if ms <= 0.0 {
-                            tropel_js::rearm_deadline(&deadline_sleep, max_exec);
-                            return Ok::<(), rquickjs::Error>(());
+            rquickjs::function::Func::from(move |ms: f64| {
+                if ms > 0.0 {
+                    let total = Duration::from_secs_f64(ms / 1000.0);
+                    let deadline_inner = std::time::Instant::now() + total;
+                    let step = Duration::from_millis(10);
+                    loop {
+                        if force_stop_sleep.load(Ordering::Acquire) {
+                            deadline_sleep.store(0, Ordering::Relaxed);
+                            return;
                         }
-                        let total = Duration::from_secs_f64(ms / 1000.0);
-                        let deadline_inner = std::time::Instant::now() + total;
-                        let step = Duration::from_millis(10);
-                        loop {
-                            if force_stop_sleep.load(Ordering::Acquire) {
-                                deadline_sleep.store(0, Ordering::Relaxed);
-                                return Err(rquickjs::Error::Exception);
-                            }
-                            let now = std::time::Instant::now();
-                            if now >= deadline_inner {
-                                break;
-                            }
-                            let remaining = deadline_inner - now;
-                            tokio::time::sleep(remaining.min(step)).await;
+                        let now = std::time::Instant::now();
+                        if now >= deadline_inner {
+                            break;
                         }
-                        tropel_js::rearm_deadline(&deadline_sleep, max_exec);
-                        Ok::<(), rquickjs::Error>(())
+                        let remaining = deadline_inner - now;
+                        std::thread::sleep(remaining.min(step));
                     }
-                },
-            )),
+                }
+                tropel_js::rearm_deadline(&deadline_sleep, max_exec);
+            }),
         );
     });
 
@@ -1076,6 +1076,23 @@ mod tests {
             ty, "function",
             "sleep must be installed on globalThis for the declarative path — \
              a block-scoped declaration silently leaves it undefined"
+        );
+
+        // `typeof` alone is not evidence: it passed for the whole period in
+        // which `sleep` was backed by an `Async` host fn on a runtime with no
+        // spawner, so the first CALL panicked with "tried to use async function
+        // in non async runtime". Call it, and assert it actually waits.
+        let elapsed = ctx
+            .eval_async(
+                "(async () => { const t = Date.now(); await sleep(0.05); return Date.now() - t; })()",
+            )
+            .await
+            .expect("sleep must be callable, not merely defined");
+        let ms: f64 = elapsed.trim().parse().unwrap_or(-1.0);
+        assert!(
+            ms >= 40.0,
+            "await sleep(0.05) must block ~50ms; got {elapsed:?} — the host fn \
+             is registered but not actually sleeping"
         );
     }
 
@@ -1599,10 +1616,22 @@ mod tests {
             for i in 0..N {
                 ctxs.push(new_vu_ctx(i, &bundle).await);
             }
-            let total: u64 = ctxs.iter().map(|c| c.quickjs_heap_bytes()).sum();
+            // `quickjs_heap_bytes()` reads the RUNTIME's heap, and since TR-503
+            // every context on this thread shares one runtime — so all N reads
+            // return the same figure and summing them is N x double-counting.
+            // The previous `sum / N` therefore printed the whole N-context
+            // runtime heap under a `B/VU` label, ~N x too large. Read once and
+            // divide once.
+            let whole = ctxs[0].quickjs_heap_bytes();
+            debug_assert_eq!(
+                whole,
+                ctxs[N as usize - 1].quickjs_heap_bytes(),
+                "contexts on one thread must share a runtime; if this fires, \
+                 sharing regressed and the arithmetic below is wrong"
+            );
             println!(
-                "{label:<40} = {:>9} B/VU  (N={N}, shims: {})",
-                total / u64::from(N),
+                "{label:<40} = {:>9} B/VU  (N={N}, runtime total {whole} B, shims: {})",
+                whole / u64::from(N),
                 shim_names(&bundle).join("+")
             );
             std::hint::black_box(ctxs);

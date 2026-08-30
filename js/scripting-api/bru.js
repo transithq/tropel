@@ -30,9 +30,24 @@
         }
         return null;
     };
+    // The three setters below MUST JSON-encode, because their getters
+    // JSON.parse. `String(value)` made set/get non-inverse: setVar('id','1234')
+    // read back as the NUMBER 1234, and setVar('u',{id:7}) read back as the
+    // string "[object Object]" — a collection doing
+    // `bru.setVar('p', res.getBody()); req.setBody(bru.getVar('p'))` put that
+    // literal string on the wire and still ran green. pm.js has always
+    // stringified here; this is the sibling that was missed.
+    function encodeBruValue(value) {
+        if (value === undefined) return '';
+        try {
+            return JSON.stringify(value);
+        } catch (e) {
+            return String(value);
+        }
+    }
     bru.setEnvVar = function (key, value) {
         if (typeof __tropel_trp_environment_set === 'function') {
-            __tropel_trp_environment_set(key, String(value));
+            __tropel_trp_environment_set(key, encodeBruValue(value));
         }
     };
 
@@ -52,7 +67,7 @@
     };
     bru.setVar = function (key, value) {
         if (typeof __tropel_trp_variables_set === 'function') {
-            __tropel_trp_variables_set(key, value === undefined ? '' : String(value));
+            __tropel_trp_variables_set(key, encodeBruValue(value));
         }
     };
     bru.hasVar = function (key) {
@@ -110,7 +125,7 @@
     };
     bru.setCollectionVar = function (key, value) {
         if (typeof __tropel_trp_collection_vars_set === 'function') {
-            __tropel_trp_collection_vars_set(key, value === undefined ? '' : String(value));
+            __tropel_trp_collection_vars_set(key, encodeBruValue(value));
         }
     };
     bru.hasCollectionVar = function (key) {
