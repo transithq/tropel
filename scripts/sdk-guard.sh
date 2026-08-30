@@ -7,15 +7,30 @@ cd "$(dirname "$0")/.."
 echo "=== Guard 1: every in-tree adapter depends only on tropel-sdk ==="
 # postman is the documented exception (it needs tropel-collection's parser).
 # All other adapters must depend on tropel-sdk only — no tropel-core.
+# Fail CLOSED when `cargo tree` itself fails. The old form —
+# `cargo tree -p X 2>/dev/null | grep -q` — discarded stderr, so a failed
+# invocation (crate renamed, broken workspace) produced empty output, grep
+# found nothing, and the guard said "ok" about a dependency graph it never
+# saw. "Could not inspect" and "no forbidden dependency" must not look alike.
 for adapter in tropel-input-har tropel-input-openapi tropel-input-bru tropel-input-insomnia; do
-  if cargo tree -p "$adapter" 2>/dev/null | grep -q 'tropel-core'; then
+  if ! tree_out=$(cargo tree -p "$adapter" 2>&1); then
+    echo "FAIL: cargo tree -p $adapter failed — the guard cannot verify its dependency graph, so it fails closed:" >&2
+    echo "$tree_out" | sed 's/^/    /' >&2
+    exit 1
+  fi
+  if grep -q 'tropel-core' <<<"$tree_out"; then
     echo "FAIL: $adapter depends on tropel-core (should depend on tropel-sdk only)" >&2
     exit 1
   fi
   echo "ok: $adapter (no tropel-core)"
 done
 # postman: must NOT depend on tropel-core either (it may pull tropel-collection).
-if cargo tree -p tropel-input-postman 2>/dev/null | grep -q 'tropel-core'; then
+if ! tree_out=$(cargo tree -p tropel-input-postman 2>&1); then
+  echo "FAIL: cargo tree -p tropel-input-postman failed — fails closed:" >&2
+  echo "$tree_out" | sed 's/^/    /' >&2
+  exit 1
+fi
+if grep -q 'tropel-core' <<<"$tree_out"; then
   echo "FAIL: tropel-input-postman depends on tropel-core (exception: tropel-collection is allowed)" >&2
   exit 1
 fi

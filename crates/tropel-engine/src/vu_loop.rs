@@ -636,8 +636,9 @@ where
     let final_active = last_active_vus.load(std::sync::atomic::Ordering::SeqCst);
     utils_emit_vus_metrics(&metrics, final_active, executor.peak_vus(), &sc_tags).await;
 
-    // Record dropped iterations (carries the scenario tags like every other
-    // sample this scenario emits).
+    // Flush the REMAINDER of the dropped-iterations counter — whatever the
+    // 2s sampler has not already taken (both use the same atomic swap, so no
+    // drop can be emitted twice; see dropped_sampler_task).
     {
         let dropped = executor.take_dropped_iterations();
         if dropped > 0 {
@@ -1377,12 +1378,16 @@ async fn dropped_sampler_task(
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut prev_total: u64 = 0;
     loop {
         ticker.tick().await;
-        let total = sched.total_dropped_iterations();
-        let delta = total.saturating_sub(prev_total);
-        prev_total = total;
+        // take (swap-to-zero), NOT a read of the running total. This sampler
+        // used to emit deltas of a never-reset total while the end-of-scenario
+        // flush at `take_dropped_iterations` ALSO drained the full counter —
+        // so every drop the sampler had already reported was reported again
+        // at scenario end and a run with T drops summed to ~2T on the one
+        // counter `is_unverified()` trusts (TR-001). With both consumers on
+        // the atomic swap, each drop lands in exactly one sample.
+        let delta = sched.take_dropped_iterations();
         if delta > 0 {
             let now = std::time::SystemTime::now();
             let mut tags = TagMap::new();
