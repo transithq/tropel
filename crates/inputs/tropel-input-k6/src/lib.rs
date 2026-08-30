@@ -13,6 +13,7 @@
 
 pub mod driver;
 mod options;
+pub mod system_tags;
 
 use std::path::Path;
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};

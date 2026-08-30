@@ -34,6 +34,7 @@
 //!    and drains metrics/abort state from the `VuContext`.
 
 use crate::options::{BatchLimitsCell, K6Options};
+use crate::system_tags::{SystemTag, SystemTagSet};
 use async_trait::async_trait;
 use futures::future::join_all;
 use futures_util::{SinkExt, StreamExt};
@@ -90,6 +91,107 @@ fn k6_deadline() -> Duration {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_K6_DEADLINE_S),
     )
+}
+
+/// TR-212: drop the system tags this run disabled from an already-built tag
+/// map.
+///
+/// Used for samples produced OUTSIDE the k6 driver — the gRPC protocol builds
+/// its own tags and is shared with the declarative runner, which has no k6
+/// options to consult. Filtering after the fact keeps one implementation of
+/// the gRPC tag set instead of two.
+///
+/// Only names k6 defines as system tags are considered; anything else in the
+/// map is a user tag and is always kept, because `systemTags` governs only the
+/// tags tropel adds on the user's behalf.
+fn retain_system_tags(tags: &mut Arc<TagMap>, sys: SystemTagSet) {
+    let needs_filtering = tags
+        .iter()
+        .any(|(k, _)| SystemTag::from_name(k).is_some_and(|tag| !sys.has(tag)));
+    if !needs_filtering {
+        // Common case (the default set keeps everything): no allocation.
+        return;
+    }
+    // `TagMap` exposes no `retain` and its backing map is `pub(crate)` in
+    // tropel-sdk, so rebuild from the owned Arc pairs — key and value are
+    // refcount bumps, not string copies.
+    let kept: Vec<(Arc<str>, Arc<str>)> = tags
+        .to_sorted_arc_vec()
+        .into_iter()
+        .filter(|(k, _)| SystemTag::from_name(k.as_ref()).is_none_or(|tag| sys.has(tag)))
+        .collect();
+    *tags = Arc::new(TagMap::from_pairs(kept));
+}
+
+/// TR-212: how the HTTP bridges learn the run's system-tag set.
+///
+/// Two registration orders exist and both must honour `systemTags`, or the
+/// option is silently ignored on whichever path nobody wired — the exact
+/// partial-fix pattern `CONVENTIONS.md` calls out (three of four original P0s
+/// were re-appearances on an uncovered sibling path).
+///
+/// * **VU path** — `init()` evaluates the module, so the set is known before
+///   `register_http_bridges` runs: [`SystemTagsHandle::ready`].
+/// * **setup()/teardown() path** — bridges are registered BEFORE
+///   `call_module_export` evaluates the module, so the set cannot be known
+///   yet: [`SystemTagsHandle::pending`], filled by `call_module_export` the
+///   moment `options` becomes readable and before the export can issue its
+///   first HTTP call.
+///
+/// Reading is a relaxed atomic load, the same cost as the `interned()` lookups
+/// already on this path. An unfilled cell reads as k6's default set.
+#[derive(Clone)]
+struct SystemTagsHandle(Arc<OnceLock<SystemTagSet>>);
+
+impl SystemTagsHandle {
+    /// The set is already known (VU path).
+    fn ready(set: SystemTagSet) -> Self {
+        let cell = OnceLock::new();
+        // Infallible: the cell was created empty one line above.
+        cell.get_or_init(|| set);
+        SystemTagsHandle(Arc::new(cell))
+    }
+
+    /// The set is not known yet; [`SystemTagsHandle::fill`] supplies it.
+    fn pending() -> Self {
+        SystemTagsHandle(Arc::new(OnceLock::new()))
+    }
+
+    /// Publish the set. Later calls are no-ops (`OnceLock`), which is why the
+    /// VU path can hand out a pre-filled handle safely.
+    fn fill(&self, set: SystemTagSet) {
+        self.0.get_or_init(|| set);
+    }
+
+    /// The effective set — k6's default 14 until filled.
+    fn get(&self) -> SystemTagSet {
+        self.0
+            .get()
+            .copied()
+            .unwrap_or_else(SystemTagSet::k6_default)
+    }
+}
+
+/// TR-212: resolve the effective system-tag set for this run.
+///
+/// Precedence mirrors k6: the `--system-tags` CLI flag beats the script's
+/// `options.systemTags`. Tropel spells the flag as the `TROPEL_K6_SYSTEM_TAGS`
+/// env var (same shape as `TROPEL_K6_HEAP_MB` / `TROPEL_K6_DEADLINE_S`)
+/// because a real CLI flag would need a field on `DriverDeclaredOptions`,
+/// which lives in the pinned `tropel-sdk` submodule. Comma-separated; an
+/// empty value means "no system tags", matching `k6 --system-tags=`.
+fn k6_system_tags(declared: Option<&Vec<String>>) -> SystemTagSet {
+    match std::env::var("TROPEL_K6_SYSTEM_TAGS") {
+        Ok(raw) => {
+            let names: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            SystemTagSet::resolve(Some(&names))
+        }
+        Err(_) => SystemTagSet::resolve(declared),
+    }
 }
 
 /// TR-240: k6's `setupTimeout`/`teardownTimeout` default is 60 seconds.
@@ -202,15 +304,15 @@ impl Driver for K6Driver {
         // otherwise fall back to the module's `default` export. Modules are
         // the only mode where `export const options` (the k6 load profile) and
         // `export default function` survive together.
-        // TR-233: the module handle is right here, so read `options.batch` /
-        // `options.batchPerHost` off it while it exists. This is the only
-        // route those two have: `DriverDeclaredOptions` (the engine's
-        // channel) lives in the pinned published SDK and cannot carry them.
-        let batch_limits = Arc::new(BatchLimitsCell::new(install_iteration_global(
-            &mut js_ctx,
-            &final_source,
-            exec,
-        )?));
+        // ONE module evaluation, both declared values. TR-212 wants
+        // `options.systemTags`; TR-233 wants `options.batch` /
+        // `options.batchPerHost`. Both are the only route their values have —
+        // `DriverDeclaredOptions` (the engine's channel) lives in the pinned
+        // published SDK and cannot carry either — and evaluating the module
+        // twice would run a request-issuing top level twice.
+        let declared = install_iteration_global(&mut js_ctx, &final_source, exec)?;
+        let system_tags = k6_system_tags(declared.system_tags.as_ref());
+        let batch_limits = Arc::new(BatchLimitsCell::new(declared.batch_limits));
 
         // Verify __tropel_iteration was defined
         let has_iter = js_ctx
@@ -252,6 +354,7 @@ impl Driver for K6Driver {
             iteration_script_hash,
             force_stop,
             sched_link,
+            system_tags,
         }))
     }
 
@@ -788,6 +891,12 @@ pub struct K6DriverInstance {
     /// only refreshes the per-iteration values (__ITER, data row, exec.*)
     /// thereafter.
     globals_seeded: bool,
+    /// TR-212: which k6 system tags this run stamps (`options.systemTags`,
+    /// or `TROPEL_K6_SYSTEM_TAGS`). Resolved once in `init()` and threaded
+    /// into every tag builder — http, checks, ws and the grpc bridge — so a
+    /// script that narrows the set narrows it everywhere, not just on the
+    /// path someone remembered to wire.
+    system_tags: SystemTagSet,
     /// Pre-computed hash of the iteration wrapper script (backlog line 347).
     /// The same `return __tropel_iteration(__tropel_setup)` string is hashed
     /// on every call to run_script_cached; caching the hash here avoids
@@ -821,6 +930,15 @@ struct WsSession {
     start: Instant,
     /// Handshake duration (ws_connecting trend).
     connecting: Duration,
+    /// TR-212: the subprotocol the SERVER selected, read from the handshake
+    /// response's `Sec-WebSocket-Protocol` header — k6's `subproto` system
+    /// tag (`conn.Subprotocol()` in k6's own ws module). Empty when the
+    /// client offered none or the server selected none, in which case the
+    /// tag is omitted rather than stamped empty. This is the negotiated
+    /// value, never the requested one: they differ whenever the server
+    /// declines an offered protocol, and tagging the request would report a
+    /// protocol that is not in use.
+    subproto: String,
     /// Counters accumulated by the JS-facing bridges (atomics: the session
     /// is shared through an `Arc` across the send/step/finish closures).
     msgs_sent: AtomicU64,
@@ -958,6 +1076,7 @@ fn http_tags(
     group: Option<&str>,
     protocol: &str,
     error_code: i32,
+    sys: SystemTagSet,
 ) -> TagMap {
     http_tags_for(
         &req.url,
@@ -968,6 +1087,7 @@ fn http_tags(
         group,
         protocol,
         error_code,
+        sys,
     )
 }
 
@@ -992,40 +1112,70 @@ fn http_tags_for(
     group: Option<&str>,
     protocol: &str,
     error_code: i32,
+    // TR-212: which system tags this run stamps. User tags (`extra`) are NOT
+    // filtered by it — `systemTags` governs only the tags tropel adds on the
+    // user's behalf, never the user's own `params.tags`/`exec.vu.tags`.
+    sys: SystemTagSet,
 ) -> TagMap {
     let mut tags = TagMap::with_capacity(7);
     let url_arc: Arc<str> = Arc::from(url);
-    tags.insert(interned("url"), url_arc.clone());
-    tags.insert(interned("method"), intern_method(method));
-    tags.insert(interned("status"), intern_status(status));
-    tags.insert(interned("name"), url_arc);
-    tags.insert(
-        interned("group"),
-        group.map(Arc::from).unwrap_or_else(|| Arc::from("")),
-    );
+    if sys.has(SystemTag::Url) {
+        tags.insert(interned("url"), url_arc.clone());
+    }
+    if sys.has(SystemTag::Method) {
+        tags.insert(interned("method"), intern_method(method));
+    }
+    if sys.has(SystemTag::Status) {
+        tags.insert(interned("status"), intern_status(status));
+    }
+    if sys.has(SystemTag::Name) {
+        tags.insert(interned("name"), url_arc);
+    }
+    if sys.has(SystemTag::Group) {
+        tags.insert(
+            interned("group"),
+            group.map(Arc::from).unwrap_or_else(|| Arc::from("")),
+        );
+    }
     // TR-212: `proto` is k6's systemTag (the old name was `protocol`, which
     // k6-ecosystem consumers keyed on never matched). k6 only tags proto on
     // success; tropel tags every sample (better — it can tell you which
     // protocol failures happened on).
-    if !protocol.is_empty() {
+    if sys.has(SystemTag::Proto) && !protocol.is_empty() {
         tags.insert(interned("proto"), Arc::from(protocol));
     }
-    if !scenario.is_empty() {
+    // TR-212: `tls_version` is NOT emitted — there is no producer for it.
+    // reqwest 0.13.4 (the pinned client) computes the negotiated version
+    // during the handshake and discards it: `reqwest::tls::TlsInfo` carries
+    // only `peer_certificate` (tls.rs:790-799), and `protocol_version`
+    // appears in the crate solely to CONFIGURE min/max (client.rs:582,592).
+    // The connector layer cannot recover it either — `Conn`/`Unnameable` are
+    // sealed and `AsyncConnWithInfo` has no `Any` supertrait, so tropel's
+    // existing `TimingConnectorLayer` cannot downcast to the rustls stream.
+    // Emitting a value derived from the min/max CONFIG instead would be a
+    // guess presented as fact to anything filtering `tls_version:tls1.3`,
+    // so nothing is emitted. The tag stays in the set model because k6
+    // defines it — `systemTags: ['tls_version']` must parse, not warn.
+    if sys.has(SystemTag::Scenario) && !scenario.is_empty() {
         // Refcount bump — the Arc was created once at bridge registration.
         tags.insert(interned("scenario"), scenario.clone());
     }
     // TR-212: `error_code` is a k6 systemTag (0 on success; transport codes on
     // failure; 1000+status for >=400). Sample tags let thresholds/dashboards
     // distinguish "connection refused" from "504" in aggregate.
-    tags.insert(interned("error_code"), Arc::from(error_code.to_string()));
+    if sys.has(SystemTag::ErrorCode) {
+        tags.insert(interned("error_code"), Arc::from(error_code.to_string()));
+    }
     // TR-204: `expected_response` is a k6 systemTag — true for 2xx/3xx, false
     // for 4xx/5xx and transport failures (status 0). k6's `expectedResponse`
     // option can override, but the default is the status-class rule.
-    let expected = (200..400).contains(&status);
-    tags.insert(
-        interned("expected_response"),
-        Arc::from(if expected { "true" } else { "false" }),
-    );
+    if sys.has(SystemTag::ExpectedResponse) {
+        let expected = (200..400).contains(&status);
+        tags.insert(
+            interned("expected_response"),
+            Arc::from(if expected { "true" } else { "false" }),
+        );
+    }
     if let Some(extra) = extra {
         for (k, v) in extra {
             tags.insert(k.clone(), v.clone());
@@ -1034,9 +1184,12 @@ fn http_tags_for(
     // TR-205: k6 overwrites the url tag with the name value at emit time.
     // This is k6's entire cardinality-control mechanism — high-cardinality
     // URLs cannot leak into the series space when name is set.
-    // TR-205: k6 overwrites url with name value — cardinality control.
-    if let Some(name) = tags.get("name") {
-        tags.insert(interned("url"), Arc::from(name.to_string()));
+    // TR-212: only when `url` is enabled — otherwise this would resurrect the
+    // very tag the script asked to drop.
+    if sys.has(SystemTag::Url) {
+        if let Some(name) = tags.get("name") {
+            tags.insert(interned("url"), Arc::from(name.to_string()));
+        }
     }
     tags
 }
@@ -1167,6 +1320,7 @@ fn push_http_samples(
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
     protocol: &str,
+    sys: SystemTagSet,
 ) {
     push_http_samples_for(
         sink,
@@ -1181,6 +1335,7 @@ fn push_http_samples(
         extra_tags,
         group,
         protocol,
+        sys,
     );
 }
 
@@ -1195,6 +1350,7 @@ fn push_redirect_hops(
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
+    sys: SystemTagSet,
 ) {
     for hop in &resp.redirects {
         push_http_samples_for(
@@ -1210,6 +1366,7 @@ fn push_redirect_hops(
             extra_tags,
             group,
             &resp.protocol,
+            sys,
         );
     }
 }
@@ -1266,6 +1423,7 @@ fn push_http_samples_for(
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
     protocol: &str,
+    sys: SystemTagSet,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
     let tags = Arc::new(http_tags_for(
@@ -1277,6 +1435,7 @@ fn push_http_samples_for(
         group,
         protocol,
         k6_http_error_code(status_code),
+        sys,
     ));
 
     let is_failed = !(200..400).contains(&status_code);
@@ -1558,6 +1717,7 @@ fn push_http_failure(
     sent: usize,
     error_msg: &str,
     protocol: &str,
+    sys: SystemTagSet,
 ) {
     let now = tropel_js::clock::monotonic_wall_now();
     let mut tags = http_tags(
@@ -1568,10 +1728,13 @@ fn push_http_failure(
         group,
         protocol,
         k6_error_code_message(error_msg),
+        sys,
     );
     // TR-204: error tag is populated on transport failures (k6 semantics).
     // The error tag is empty on success; error_code is 0 on success.
-    if !error_msg.is_empty() {
+    // TR-212: `error` is itself a systemTag — a script that drops it must not
+    // get it back on the failure path.
+    if sys.has(SystemTag::Error) && !error_msg.is_empty() {
         tags.insert(interned("error"), Arc::from(error_msg));
     }
     let tags = Arc::new(tags);
@@ -1787,7 +1950,10 @@ impl DriverInstance for K6DriverInstance {
         // drain(..) preserves the Vec's capacity — mem::take would replace
         // with Vec::new() and lose it, causing re-growth every iteration.
         let mut bridge_samples: Vec<_> = self.sample_sink.lock().unwrap().drain(..).collect();
-        if !ctx.scenario_name.is_empty() {
+        // TR-212: `scenario` is a system tag — a run that disabled it must not
+        // have it re-added here, on the very path that back-fills the bridges
+        // http_tags_for already handled.
+        if !ctx.scenario_name.is_empty() && self.system_tags.has(SystemTag::Scenario) {
             let scenario = ctx.scenario_name.clone();
             for s in &mut bridge_samples {
                 // Check BEFORE make_mut: the http_req_* samples already carry
@@ -2036,6 +2202,7 @@ impl K6DriverInstance {
                 self.group_stack.clone(),
                 deadline,
                 max_exec,
+                SystemTagsHandle::ready(self.system_tags),
                 batch_limits.clone(),
             );
         });
@@ -2306,6 +2473,10 @@ fn register_http_bridges<'js>(
     group_stack: Arc<Mutex<Vec<String>>>,
     deadline: Arc<AtomicU64>,
     max_exec: Duration,
+    // TR-212: the run's system-tag set. A handle rather than a bare value
+    // because the setup()/teardown() path registers these bridges before the
+    // module (and therefore `options.systemTags`) has been evaluated.
+    sys: SystemTagsHandle,
     batch_limits: Arc<BatchLimitsCell>,
 ) {
     let globals = rq_ctx.globals();
@@ -2326,6 +2497,9 @@ fn register_http_bridges<'js>(
     // deadline after it (backlog line 104).
     let deadline_req = deadline.clone();
     let max_exec_req = max_exec;
+    // One handle per closure — both bridges are 'static.
+    let sys_req = sys.clone();
+    let sys_batch = sys.clone();
     let _ = globals.set(
         "__tropel_k6_http_request",
         Func::from(
@@ -2435,6 +2609,7 @@ fn register_http_bridges<'js>(
                             &scenario_req,
                             Some(&extra_tags),
                             group.as_deref(),
+                            sys_req.get(),
                         );
                         push_http_samples(
                             &sink_req,
@@ -2448,6 +2623,7 @@ fn register_http_bridges<'js>(
                             Some(&extra_tags),
                             group.as_deref(),
                             &resp.protocol,
+                            sys_req.get(),
                         );
                         // W2 parity: k6 sets error_code = 1000 + status for HTTP >= 400,
                         // while keeping error empty. Only transport errors populate the
@@ -2488,6 +2664,7 @@ fn register_http_bridges<'js>(
                             } else {
                                 ""
                             },
+                            sys_req.get(),
                         );
                         build_k6_response_object(
                             &ctx,
@@ -2677,6 +2854,7 @@ fn register_http_bridges<'js>(
                                     &scenario_batch,
                                     Some(&extra_tags),
                                     group.as_deref(),
+                                    sys_batch.get(),
                                 );
                                 push_http_samples(
                                     &batch_sink,
@@ -2690,6 +2868,7 @@ fn register_http_bridges<'js>(
                                     Some(&extra_tags),
                                     group.as_deref(),
                                     &resp.protocol,
+                                    sys_batch.get(),
                                 );
                                 // Same native response builder as the single
                                 // bridge — binary bodies become real
@@ -2732,6 +2911,7 @@ fn register_http_bridges<'js>(
                                     } else {
                                         ""
                                     },
+                                    sys_batch.get(),
                                 );
                                 build_k6_response_object(
                                     &ctx,
@@ -2779,6 +2959,10 @@ impl K6DriverInstance {
             // check() / pm.test() → checks Rate sample
             let sink_test = sink.clone();
             let group_test = self.group_stack.clone();
+            // TR-212: `check` and `group` are both k6 system tags. Without
+            // this, `systemTags: ['url']` still stamped every checks sample
+            // with check+group.
+            let sys_test = self.system_tags;
             let _ = globals.set(
                 "__tropel_trp_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
@@ -2787,12 +2971,16 @@ impl K6DriverInstance {
                         let mut v = sink_test.lock().unwrap();
                         let now = tropel_js::clock::monotonic_wall_now();
                         let mut tags = TagMap::with_capacity(3);
-                        tags.insert("check", name);
+                        if sys_test.has(SystemTag::Check) {
+                            tags.insert("check", name);
+                        }
                         // Backlog line 63: checks carry the current group
                         // path (k6 parity) — nested group() stamps
                         // group=::checkout::payment on the checks sample too.
-                        if let Some(g) = group_test.lock().unwrap().last() {
-                            tags.insert("group", g.clone());
+                        if sys_test.has(SystemTag::Group) {
+                            if let Some(g) = group_test.lock().unwrap().last() {
+                                tags.insert("group", g.clone());
+                            }
                         }
                         if let Some(j) = tags_json {
                             // Backlog line 97: tag values may be non-strings
@@ -2839,6 +3027,10 @@ let _ = globals.set(
     // numeric gRPC code, 0 = OK) because tonic::Code is a private alias in
     // the grpc crate.
     let sink_grpc = sink.clone();
+    // TR-212: grpc samples are built by `tropel_x_grpc::GrpcProtocol` (shared
+    // with the declarative runner, which has no k6 options), so the k6 driver
+    // filters them here rather than teaching the protocol about systemTags.
+    let sys_grpc = self.system_tags;
     let _ = globals.set(
         "__tropel_k6_grpc_invoke",
         Func::from(
@@ -2894,9 +3086,18 @@ let _ = globals.set(
                             .and_then(|s| s.tags.get(&tropel_sdk::tag_keys::STATUS))
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(0);
+                        // TR-212: apply systemTags AFTER `grpc_status` was read
+                        // above — that read is a load-bearing data channel
+                        // (the `status` tag is how invoke() learns the gRPC
+                        // code), so filtering first would make every failed
+                        // call report OK under `systemTags` without `status`.
                         {
+                            let mut samples = outcome.samples;
+                            for sample in &mut samples {
+                                retain_system_tags(&mut sample.tags, sys_grpc);
+                            }
                             let mut s = sink.lock().unwrap();
-                            s.extend(outcome.samples);
+                            s.extend(samples);
                         }
                         let ok = grpc_status == 0;
                         let error = if ok {
@@ -2939,6 +3140,8 @@ let _ = globals.set(
             // W2 line 188: custom metrics recorded inside a group() must
             // carry the full ::a::b path like checks (were untagged).
             let group_metric = self.group_stack.clone();
+            // TR-212: `group` is a system tag here too.
+            let sys_metric = self.system_tags;
             let _ = globals.set(
                 "__tropel_trp_custom_metric_add",
                 Func::from(
@@ -2991,9 +3194,11 @@ let _ = globals.set(
                         }
                         // W2 line 188: stamp the active group path unless the
                         // script supplied its own `group` tag (user wins).
-                        if let Some(g) = group_metric.lock().unwrap().last() {
-                            if tags.get("group").is_none() {
-                                tags.insert("group", g.clone());
+                        if sys_metric.has(SystemTag::Group) {
+                            if let Some(g) = group_metric.lock().unwrap().last() {
+                                if tags.get("group").is_none() {
+                                    tags.insert("group", g.clone());
+                                }
                             }
                         }
                         let sample_type = match metric_type_str.as_str() {
@@ -3076,6 +3281,11 @@ let _ = globals.set(
                 }),
             );
             let group_end = self.group_stack.clone();
+            // TR-212: `group` is a system tag on group_duration too. This was
+            // the one sample builder the first pass missed -- the http, checks,
+            // custom-metric and ws builders were all gated, so a run with
+            // `systemTags: ['url']` still got `group=::checkout` here.
+            let sys_group = self.system_tags;
             let _ = globals.set(
                 "__tropel_trp_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
@@ -3096,7 +3306,9 @@ let _ = globals.set(
                     }
                     let mut v = sink_group.lock().unwrap();
                     let mut tags = TagMap::with_capacity(1);
-                    tags.insert("group", full);
+                    if sys_group.has(SystemTag::Group) {
+                        tags.insert("group", full);
+                    }
                     v.push(Sample {
                         metric: "group_duration".into(),
                         value: duration_ms, // ms — the public unit (k6 semantics)
@@ -3165,6 +3377,8 @@ let _ = globals.set(
             // visible to thresholds instead of vanishing.
             let sink_conn = sink.clone();
             let group_stack_conn = group_stack.clone();
+            // TR-212: ws samples honour systemTags like http ones.
+            let sys_conn = self.system_tags;
             let _ = globals.set(
                 "__tropel_k6_ws_connect",
                 Func::from(
@@ -3208,7 +3422,7 @@ let _ = globals.set(
                         let url_err = url.clone();
                         let connect_result = tropel_http::blocking::execute_blocking(
                             async move {
-                                let (ws, _resp) =
+                                let (ws, resp) =
                                     tokio_tungstenite::connect_async(handshake)
                                         .await
                                         .map_err(|e| {
@@ -3218,6 +3432,17 @@ let _ = globals.set(
                                             ))
                                         })?;
                                 let connecting = connect_start.elapsed();
+                                // TR-212: the handshake response was previously
+                                // bound to `_resp` and dropped on the next line,
+                                // which is why `subproto` could not be emitted.
+                                // The server echoes its selection here; a client
+                                // that offered nothing gets no header back.
+                                let subproto = resp
+                                    .headers()
+                                    .get("sec-websocket-protocol")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
                                 let (sink, stream) = ws.split();
 
                                 tokio::spawn(async move {
@@ -3312,7 +3537,7 @@ let _ = globals.set(
                                 // Open is delivered as the first event once the
                                 // handshake completes (step() returns it).
                                 let _ = events_tx.send(WsEvent::Open);
-                                Ok::<Duration, TropelError>(connecting)
+                                Ok::<(Duration, String), TropelError>((connecting, subproto))
                             },
                         );
 
@@ -3321,7 +3546,7 @@ let _ = globals.set(
                         // interrupt on resume (backlog line 104).
                         tropel_js::rearm_deadline(&deadline_conn, max_exec_conn);
                         match connect_result {
-                            Ok(connecting) => {
+                            Ok((connecting, subproto)) => {
                                 sessions_conn.lock().unwrap().insert(
                                     id,
                                     Arc::new(WsSession {
@@ -3330,6 +3555,7 @@ let _ = globals.set(
                                         url: url.clone(),
                                         start: Instant::now(),
                                         connecting,
+                                        subproto,
                                         msgs_sent: AtomicU64::new(0),
                                         bytes_sent: AtomicU64::new(0),
                                         msgs_received: AtomicU64::new(0),
@@ -3348,21 +3574,35 @@ let _ = globals.set(
                                 let elapsed = connect_start.elapsed();
                                 let now = tropel_js::clock::monotonic_wall_now();
                                 let mut tags = TagMap::with_capacity(5);
-                                tags.insert("url", url.clone());
-                                tags.insert("method", String::from("GET"));
-                                tags.insert("status", String::from("0"));
-                                tags.insert("name", url.clone());
+                                if sys_conn.has(SystemTag::Url) {
+                                    tags.insert("url", url.clone());
+                                }
+                                if sys_conn.has(SystemTag::Method) {
+                                    tags.insert("method", String::from("GET"));
+                                }
+                                if sys_conn.has(SystemTag::Status) {
+                                    tags.insert("status", String::from("0"));
+                                }
+                                if sys_conn.has(SystemTag::Name) {
+                                    tags.insert("name", url.clone());
+                                }
+                                // TR-212: no `subproto` here — the handshake
+                                // failed, so nothing was negotiated. k6 stamps
+                                // the empty string; tropel omits the tag, the
+                                // same rule the success path uses.
                                 // W2 line 188: the active group() path (full
                                 // ::a::b), not a hardcoded "ws".
-                                tags.insert(
-                                    "group",
-                                    group_stack_conn
-                                        .lock()
-                                        .unwrap()
-                                        .last()
-                                        .cloned()
-                                        .unwrap_or_else(|| "ws".to_string()),
-                                );
+                                if sys_conn.has(SystemTag::Group) {
+                                    tags.insert(
+                                        "group",
+                                        group_stack_conn
+                                            .lock()
+                                            .unwrap()
+                                            .last()
+                                            .cloned()
+                                            .unwrap_or_else(|| "ws".to_string()),
+                                    );
+                                }
                                 let tags = Arc::new(tags);
                                 let mut v = sink_conn.lock().unwrap();
                                 v.push(Sample {
@@ -3549,6 +3789,7 @@ let _ = globals.set(
             let sessions_finish = sessions.clone();
             let sink_finish = sink.clone();
             let group_stack_fin = group_stack.clone();
+            let sys_fin = self.system_tags;
             let _ = globals.set(
                 "__tropel_k6_ws_finish",
                 Func::from(
@@ -3559,22 +3800,40 @@ let _ = globals.set(
                         };
                         let duration = session.start.elapsed();
                         let now = tropel_js::clock::monotonic_wall_now();
-                        let mut tags = TagMap::with_capacity(5);
-                        tags.insert("url", session.url.clone());
-                        tags.insert("method", String::from("GET"));
-                        tags.insert("status", String::from("101"));
-                        tags.insert("name", session.url.clone());
+                        let mut tags = TagMap::with_capacity(6);
+                        if sys_fin.has(SystemTag::Url) {
+                            tags.insert("url", session.url.clone());
+                        }
+                        if sys_fin.has(SystemTag::Method) {
+                            tags.insert("method", String::from("GET"));
+                        }
+                        if sys_fin.has(SystemTag::Status) {
+                            tags.insert("status", String::from("101"));
+                        }
+                        if sys_fin.has(SystemTag::Name) {
+                            tags.insert("name", session.url.clone());
+                        }
+                        // TR-212: `subproto` — the subprotocol the server
+                        // actually selected during the handshake. Omitted when
+                        // empty (no subprotocol negotiated), matching the
+                        // `proto` treatment on the http path: an empty tag
+                        // value is a series dimension that means nothing.
+                        if sys_fin.has(SystemTag::Subproto) && !session.subproto.is_empty() {
+                            tags.insert("subproto", session.subproto.clone());
+                        }
                         // W2 line 188: the active group() path (full ::a::b),
                         // not a hardcoded "ws".
-                        tags.insert(
-                            "group",
-                            group_stack_fin
-                                .lock()
-                                .unwrap()
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| "ws".to_string()),
-                        );
+                        if sys_fin.has(SystemTag::Group) {
+                            tags.insert(
+                                "group",
+                                group_stack_fin
+                                    .lock()
+                                    .unwrap()
+                                    .last()
+                                    .cloned()
+                                    .unwrap_or_else(|| "ws".to_string()),
+                            );
+                        }
                         let tags = Arc::new(tags);
 
                         let msgs_sent = session.msgs_sent.load(Ordering::Relaxed);
@@ -4203,12 +4462,18 @@ async fn eval_module_call_export(
         let mut gs = group_stack.lock().unwrap();
         gs.push(format!("::{}", export));
     }
-    // TR-233: setup()/teardown() may call `http.batch()` too, and the bridges
-    // are registered BEFORE the module is evaluated here (module top level may
-    // itself make requests). The cell is therefore filled by the module eval
-    // inside `call_module_export` and read at batch-call time — so a script's
-    // `options.batch` applies in the lifecycle contexts as well, not only in
-    // the VU loop.
+    // TR-212 / TR-233: setup()/teardown() samples land in the run's metrics
+    // and may call `http.batch()`, so both the tag set and the batch limits
+    // must apply there too — otherwise a script that narrows its tag set gets
+    // narrow VU samples and wide setup samples in the same series, and its
+    // `options.batch` silently applies only in the VU loop.
+    //
+    // The bridges are registered BEFORE the module is evaluated (its top level
+    // may itself issue requests), so both get an empty container that
+    // `call_module_export` fills immediately after module evaluation and
+    // before any export can run.
+    let sys_handle = SystemTagsHandle::pending();
+    let sys_for_bridges = sys_handle.clone();
     let batch_limits = Arc::new(BatchLimitsCell::default());
     js_ctx.with_ctx(|rq_ctx| {
         register_http_bridges(
@@ -4219,6 +4484,7 @@ async fn eval_module_call_export(
             group_stack.clone(),
             deadline,
             max_exec,
+            sys_for_bridges,
             batch_limits.clone(),
         );
     });
@@ -4235,7 +4501,9 @@ async fn eval_module_call_export(
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
 
     js_ctx.reset_interrupt();
-    match js_ctx.with_ctx(|ctx| call_module_export(ctx, source, export, arg_json, &batch_limits)) {
+    match js_ctx.with_ctx(|ctx| {
+        call_module_export(ctx, source, export, arg_json, &sys_handle, &batch_limits)
+    }) {
         Ok(Some(s)) => Ok(Some(s)),
         Ok(None) => Ok(None),
         // Do NOT warn here — the callers own the error path: setup() logs a
@@ -4255,11 +4523,16 @@ fn call_module_export(
     source: &str,
     export: &str,
     arg_json: Option<&str>,
+    // TR-212 / TR-233: both filled from the module's `options` the moment it
+    // is evaluated, so HTTP calls made by setup()/teardown() carry the same
+    // tag set and obey the same batch limits as VU iterations.
+    sys: &SystemTagsHandle,
     batch_limits: &BatchLimitsCell,
 ) -> std::result::Result<Option<String>, rquickjs::Error> {
     let module = rquickjs::Module::declare(ctx.clone(), "k6-script", source)?;
     let (module, promise) = module.eval()?;
     promise.finish::<()>()?;
+    sys.fill(k6_system_tags(read_declared_system_tags(&module).as_ref()));
 
     // TR-233: the module is now evaluated, so `options` is readable — fill the
     // cell the already-registered batch bridge reads at call time.
@@ -4407,11 +4680,18 @@ fn read_module_export_string(
 /// `__tropel_iteration` (what `run_iteration` invokes). When `exec` names a
 /// specific exported function (k6 multi-scenario `exec` selection), that
 /// export is installed; otherwise the module's `default` export is used.
+/// Returns the script's declared `options.systemTags` (TR-212), read from the
+/// SAME module evaluation — `declared_options()` runs in a throwaway context
+/// the driver instance never sees, and re-evaluating the module here just to
+/// read one option would double the cost of every `init()`. `None` means the
+/// key was absent (→ k6's default tag set); `Some(vec![])` means the script
+/// wrote `systemTags: []` (→ no system tags), which is a different
+/// instruction.
 fn install_iteration_global(
     js_ctx: &mut JsContext,
     source: &str,
     exec: Option<&str>,
-) -> Result<crate::options::K6BatchLimits> {
+) -> Result<DeclaredFromModule> {
     // Arm the per-eval timeout: this evals the module directly via with_ctx,
     // bypassing the eval-family methods that normally reset the deadline.
     js_ctx.reset_interrupt();
@@ -4424,6 +4704,12 @@ fn install_iteration_global(
         promise
             .finish::<()>()
             .map_err(|e| TropelError::Other(format!("k6 script module resolve error: {}", e)))?;
+
+        // TR-212: pull `options.systemTags` off the evaluated module. A
+        // missing/!array value yields None (default set) rather than an
+        // error — a malformed `options` is already diagnosed loudly by
+        // `declared_options()`, which deserializes the whole object.
+        let declared_system_tags = read_declared_system_tags(&module);
 
         // TR-233: `options.batch` / `options.batchPerHost`, parsed by the SAME
         // serde model `declared_options` uses (one implementation per
@@ -4461,8 +4747,55 @@ fn install_iteration_global(
                 tracing::warn!("k6 script has no default export function: {}", e);
             }
         }
-        Ok(batch_limits)
+        Ok(DeclaredFromModule {
+            system_tags: declared_system_tags,
+            batch_limits,
+        })
     })
+}
+
+/// What one evaluation of the k6 module yields to its callers.
+///
+/// TR-212 and TR-233 each need a different value off the SAME evaluated
+/// module, and both landed independently — each having changed this function's
+/// return type to carry its own. Returning a struct keeps the module evaluated
+/// exactly once: re-evaluating it per feature would run the script's top level
+/// twice, and a top level that issues requests or mutates state would then do
+/// so twice too.
+struct DeclaredFromModule {
+    /// `options.systemTags` — `None` means "not narrowed", i.e. k6's default 14.
+    system_tags: Option<Vec<String>>,
+    /// `options.batch` / `options.batchPerHost`, defaulted to k6's 20 / 6.
+    batch_limits: crate::options::K6BatchLimits,
+}
+
+/// TR-212: read `options.systemTags` off an evaluated k6 module.
+///
+/// Returns `None` when there is no `options` export, no `systemTags` key, or
+/// the value is not an array — all of which mean "the script did not narrow
+/// the set", so the caller falls back to k6's default 14. Non-string array
+/// entries are coerced with `String()` so `systemTags: ['url', 42]` reports
+/// `42` as an unrecognized name rather than silently dropping the whole list
+/// (dropping it would restore all 14 — the exact silent-fallback failure this
+/// task removes).
+fn read_declared_system_tags(
+    module: &rquickjs::Module<'_, rquickjs::module::Evaluated>,
+) -> Option<Vec<String>> {
+    let options: rquickjs::Object = module.get("options").ok()?;
+    let value: rquickjs::Value = options.get("systemTags").ok()?;
+    let array = value.as_array()?;
+    let mut names = Vec::with_capacity(array.len());
+    for item in array.iter::<rquickjs::Value>() {
+        let Ok(item) = item else { continue };
+        if let Some(s) = item.as_string().and_then(|s| s.to_string().ok()) {
+            names.push(s);
+        } else if let Some(n) = item.as_number() {
+            names.push(n.to_string());
+        } else if let Some(b) = item.as_bool() {
+            names.push(b.to_string());
+        }
+    }
+    Some(names)
 }
 
 /// Read `options.batch` / `options.batchPerHost` off an evaluated k6 module.
@@ -8398,6 +8731,116 @@ mod tests {
         assert_eq!(events_s.sum, 1.0);
     }
 
+    /// TR-212: `subproto` — k6's websocket system tag, previously emitted
+    /// nowhere in the tree (the handshake response was bound to `_resp` and
+    /// dropped one line after `connect_async`).
+    ///
+    /// The server here is given TWO offered subprotocols and selects the
+    /// SECOND. Asserting `chat.v2` therefore proves the tag carries the
+    /// NEGOTIATED value rather than the requested one — a version that
+    /// echoed the client's `Sec-WebSocket-Protocol` request header would
+    /// produce `chat.v1, chat.v2` and fail here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The Err type is fixed by tungstenite's handshake callback
+    // signature; boxing it does not typecheck against the trait.
+    #[allow(clippy::result_large_err)]
+    async fn test_ws_samples_carry_negotiated_subproto_tag() {
+        use tokio_tungstenite::tungstenite::handshake::server::{
+            ErrorResponse, Request as HsRequest, Response as HsResponse,
+        };
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let select = |req: &HsRequest,
+                          mut resp: HsResponse|
+             -> std::result::Result<HsResponse, ErrorResponse> {
+                // Sanity: the client must actually have offered both, so the
+                // test cannot pass by the server inventing a value.
+                let offered = req
+                    .headers()
+                    .get("sec-websocket-protocol")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                assert!(
+                    offered.contains("chat.v1") && offered.contains("chat.v2"),
+                    "client must forward params.headers to the handshake; offered: {offered:?}"
+                );
+                resp.headers_mut().insert(
+                    "sec-websocket-protocol",
+                    HeaderValue::from_static("chat.v2"),
+                );
+                Ok(resp)
+            };
+            let _ws = tokio_tungstenite::accept_hdr_async(stream, select).await;
+            // Dropped here — the client sees EOF, closes, and finish() emits.
+        });
+
+        let driver = K6Driver;
+        let script = format!(
+            "export default function () {{ \
+               ws.connect('ws://127.0.0.1:{port}/', \
+                 {{ headers: {{ 'Sec-WebSocket-Protocol': 'chat.v1, chat.v2' }} }}, \
+                 function (socket) {{ socket.on('open', function () {{}}); }}); \
+             }}"
+        );
+        let mut inst = driver.init(script.as_bytes(), None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must complete");
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "ws_sessions")
+            .expect("ws_sessions sample");
+        assert_eq!(
+            sample.tags.get("subproto"),
+            Some("chat.v2"),
+            "ws samples must carry the NEGOTIATED subprotocol; got tags: {:?}",
+            sample.tags
+        );
+    }
+
+    /// TR-212: `subproto` is omitted — not stamped empty — when the server
+    /// negotiates no subprotocol. An empty tag value is a series dimension
+    /// that means nothing, and it is the same rule `proto` already follows on
+    /// the http path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ws_omits_subproto_when_none_negotiated() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = tokio_tungstenite::accept_async(stream).await;
+        });
+
+        let driver = K6Driver;
+        let script = format!(
+            "export default function () {{ ws.connect('ws://127.0.0.1:{port}/', {{}}, \
+             function (socket) {{ socket.on('open', function () {{}}); }}); }}"
+        );
+        let mut inst = driver.init(script.as_bytes(), None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "ws_sessions")
+            .expect("ws_sessions sample");
+        assert!(
+            sample.tags.get("subproto").is_none(),
+            "no subprotocol negotiated → the tag must be absent, not empty; \
+             got: {:?}",
+            sample.tags.get("subproto")
+        );
+    }
+
     /// Backlog line 62: an abnormal closure (server drops without a close
     /// frame → 1006) must mark the session failed, so finish() emits
     /// ws_req_failed=1.0 — previously hardcoded 0.0.
@@ -8703,6 +9146,254 @@ mod tests {
         );
     }
 
+    /// TR-212: a script declaring `systemTags` must CHANGE the emitted tag
+    /// set. This is the test the option's absence made impossible — before
+    /// the fix `systemTags` reached the `unknown` catch-all, was warned
+    /// about, and every sample still carried all 14 tags (`CONTEXT.md`
+    /// invariant 3: a declared-but-ignored option defeats the user's own
+    /// checking).
+    ///
+    /// Asserts the whole tag set, not just the presence of the two requested
+    /// tags — asserting presence alone passes on the pre-fix code, because
+    /// pre-fix samples contain `url` and `status` too.
+    #[tokio::test]
+    async fn test_system_tags_option_narrows_the_emitted_tag_set() {
+        let driver = K6Driver;
+        let script = br#"
+            export const options = { systemTags: ['url', 'status'] };
+            export default function () {
+                http.get('http://example.com/');
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "http_req_duration")
+            .expect("http_req_duration sample");
+
+        let mut keys: Vec<&str> = sample.tags.iter().map(|(k, _)| k).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["status", "url"],
+            "systemTags: ['url','status'] must yield EXACTLY those two \
+             system tags; got {keys:?}"
+        );
+        // The surviving two must still hold their real values — narrowing the
+        // set must not blank the tags it keeps.
+        assert_eq!(sample.tags.get("url"), Some("http://example.com/"));
+        assert_eq!(sample.tags.get("status"), Some("200"));
+        // Each of these is emitted unconditionally pre-fix, on a different
+        // code path (tag builder, drain-time scenario stamping, TR-204).
+        for dropped in [
+            "method",
+            "name",
+            "group",
+            "proto",
+            "error_code",
+            "expected_response",
+            "scenario",
+        ] {
+            assert!(
+                sample.tags.get(dropped).is_none(),
+                "`{dropped}` was not in systemTags and must not be emitted"
+            );
+        }
+    }
+
+    /// TR-212: `systemTags: []` disables system tags — but USER tags are not
+    /// system tags and must survive. k6's option governs only the tags the
+    /// runner adds on the user's behalf; dropping `params.tags` would throw
+    /// away data the script explicitly asked for.
+    #[tokio::test]
+    async fn test_empty_system_tags_keeps_user_tags() {
+        let driver = K6Driver;
+        let script = br#"
+            export const options = { systemTags: [] };
+            export default function () {
+                http.get('http://example.com/', { tags: { team: 'billing' } });
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "http_req_duration")
+            .expect("http_req_duration sample");
+        let keys: Vec<&str> = sample.tags.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            vec!["team"],
+            "systemTags: [] must leave ONLY the user's own tags; got {keys:?}"
+        );
+        assert_eq!(sample.tags.get("team"), Some("billing"));
+    }
+
+    /// TR-212 twin: `systemTags` must apply to the checks path too, not only
+    /// to http_req_*. `check` and `group` are system tags; a fix that covered
+    /// only the http tag builder would leave them stamped — the exact
+    /// partial-fix pattern CONVENTIONS.md warns about.
+    #[tokio::test]
+    async fn test_system_tags_narrows_checks_samples_too() {
+        let driver = K6Driver;
+        let script = br#"
+            export const options = { systemTags: ['url'] };
+            export default function () {
+                group('checkout', function () {
+                    check(null, { 'always true': function () { return true; } });
+                });
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "checks")
+            .expect("checks sample");
+        assert!(
+            sample.tags.get("check").is_none(),
+            "`check` is a system tag and was not requested; got {:?}",
+            sample.tags
+        );
+        assert!(
+            sample.tags.get("group").is_none(),
+            "`group` is a system tag and was not requested"
+        );
+        assert!(
+            sample.tags.get("scenario").is_none(),
+            "the drain must not re-add `scenario` after the bridge dropped it"
+        );
+    }
+
+    /// TR-212 twin: `group_duration` is a FIFTH sample builder, and the one
+    /// the first pass of this task missed. `http_tags_for`, the checks
+    /// bridge, the custom-metric bridge and both ws builders were all gated
+    /// on the system-tag set while `__tropel_pm_group_end` still stamped
+    /// `group` unconditionally — so `systemTags: ['url']` produced narrowed
+    /// http/checks samples and a wide `group_duration` in the same run.
+    #[tokio::test]
+    async fn test_system_tags_narrows_group_duration_sample() {
+        let driver = K6Driver;
+        let script = br#"
+            export const options = { systemTags: ['url'] };
+            export default function () {
+                group('checkout', function () {});
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "group_duration")
+            .expect("group_duration sample");
+        assert!(
+            sample.tags.get("group").is_none(),
+            "`group` is a system tag and was not requested, but \
+             group_duration still carries it; got {:?}",
+            sample.tags
+        );
+    }
+
+    /// The companion to the test above: with no `systemTags` declared,
+    /// `group_duration` must still carry the full `::a::b` group path. Gating
+    /// a tag must not become deleting it — without this, the cheapest way to
+    /// pass the narrowing test is to stop emitting `group` altogether.
+    #[tokio::test]
+    async fn test_group_duration_keeps_group_tag_by_default() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                group('checkout', function () {
+                    group('payment', function () {});
+                });
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let nested = ctx
+            .samples
+            .iter()
+            .find(|s| {
+                s.metric == "group_duration" && s.tags.get("group") == Some("::checkout::payment")
+            })
+            .map(|s| s.tags.get("group").map(|v| v.to_string()));
+        assert_eq!(
+            nested,
+            Some(Some("::checkout::payment".to_string())),
+            "default set → group_duration keeps the full nested path; got {:?}",
+            ctx.samples
+                .iter()
+                .filter(|s| s.metric == "group_duration")
+                .map(|s| s.tags.get("group").map(|v| v.to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// TR-212: the default set is unchanged when the option is absent — this
+    /// pins that adding the option did not silently alter the metric contract
+    /// for the ~100% of scripts that never set `systemTags`.
+    #[tokio::test]
+    async fn test_absent_system_tags_keeps_the_full_default_set() {
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                http.get('http://example.com/');
+            }
+        "#;
+        let (client, _sink) = test_ctx().await;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.http_client = Some(client);
+        inst.run_iteration(&mut ctx).await.unwrap();
+
+        let sample = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "http_req_duration")
+            .expect("http_req_duration sample");
+        for expected in [
+            "url",
+            "method",
+            "status",
+            "name",
+            "group",
+            "proto",
+            "error_code",
+            "expected_response",
+            "scenario",
+        ] {
+            assert!(
+                sample.tags.get(expected).is_some(),
+                "no systemTags declared → `{expected}` must still be emitted"
+            );
+        }
+    }
+
     /// TR-204: the `expected_response` tag is false for 4xx/5xx (and
     /// transport failures), matching k6's status-class rule.
     #[test]
@@ -8717,6 +9408,7 @@ mod tests {
                 None,
                 "HTTP/1.1",
                 k6_http_error_code(status),
+                SystemTagSet::k6_default(),
             );
             assert_eq!(
                 tags.get("expected_response"),
@@ -9233,6 +9925,7 @@ mod tests {
             None,
             None,
             "HTTP/1.1",
+            SystemTagSet::k6_default(),
         );
         let samples = sink.lock().unwrap();
         let names: Vec<&str> = samples.iter().map(|s| s.metric.as_ref()).collect();
@@ -9334,6 +10027,7 @@ mod tests {
             7,
             "connection refused",
             "",
+            SystemTagSet::k6_default(),
         );
         let samples = sink.lock().unwrap();
         let duration = samples

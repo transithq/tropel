@@ -74,6 +74,25 @@ pub struct K6Options {
     /// config. Previously unmodelled, so it was silently dropped.
     #[serde(alias = "insecureSkipTLSVerify")]
     pub insecure_skip_tls_verify: Option<bool>,
+    /// TR-212: k6 `options.systemTags` — which system tags are stamped on
+    /// every sample. `None` = k6's default 14; `Some(list)` REPLACES that set
+    /// (it is not additive); `Some([])` disables system tags entirely.
+    ///
+    /// Modelled but deliberately NOT read. Its only job is to stop
+    /// `systemTags` falling into the `unknown` catch-all below, which warned
+    /// "k6 option 'systemTags' is not recognized by tropel — ignored" on
+    /// every script that set one. The effective set is read straight off the
+    /// evaluated JS module by the driver's `read_declared_system_tags`:
+    /// `init()` already evaluates the module and needs the value there, so
+    /// routing it through here would be a second parse of the same key.
+    ///
+    /// It is therefore not forwarded to `DriverDeclaredOptions` — nothing
+    /// outside the k6 driver builds k6 tags. Note the shape, though: a
+    /// modelled-but-unforwarded option is precisely the bug TR-212 fixes, so
+    /// if you ever need this value, wire it from the driver rather than
+    /// re-deriving it here and letting the two disagree.
+    #[serde(alias = "systemTags")]
+    pub system_tags: Option<Vec<String>>,
     /// Max concurrent requests inside ONE `http.batch()` call (k6
     /// `options.batch`, default 20). TR-233: this used to fall into
     /// `unknown` — warned and dropped — so a script that lowered `batch`
