@@ -355,9 +355,34 @@ pub struct JsContext {
     unhandled_rejections: RejectionMap,
 }
 
-// Safety: each JsContext owns its own rquickjs Runtime, and the thread-per-
-// core architecture ensures it is only ever used from a single thread at a
-// time. `Send` lets the whole VU future move onto its pinned worker thread.
+// Safety: this is sound because VU tasks are THREAD-AFFINE, not because a
+// context is self-contained.
+//
+// That distinction became load-bearing with TR-503. This comment used to read
+// "each JsContext owns its own rquickjs Runtime" — true then, FALSE now: by
+// default a context runs on the worker thread's SHARED runtime
+// (`on_shared_runtime`). Moving such a context to another thread would put
+// two threads on one runtime's non-atomic refcounts → heap corruption, and
+// the old wording would have let a reader conclude the move was fine because
+// the context "owns" its runtime. It does not.
+//
+// What actually holds: `VUWorkerPool::make_worker` builds each worker as
+// `tokio::runtime::Builder::new_current_thread()` on its own pinned OS
+// thread. Current-thread runtimes do not work-steal, so a task spawned onto a
+// worker only ever polls on that worker's thread. `Send` is needed solely to
+// move the VU future ONTO its worker at spawn time — never between workers
+// afterwards.
+//
+// This breaks the moment a VU future is spawned onto a multi-thread runtime,
+// or `SHARED` is reached from a thread other than the one that created it.
+// If either becomes possible, `Send` must be removed (or the runtime made
+// per-context again) — the compiler will not catch it.
+//
+// `REJECTION_ROUTES` carries the same affinity: a context registers its
+// unhandled-rejection map into its creating thread's map and removes it in
+// `Drop`. Polled on another thread, the tracker would find no route and drop
+// the VU's rejections silently; dropped on another thread, it would leak the
+// entry. Both are failures of the same assumption, and both are silent.
 //
 // `Sync` is deliberately NOT implemented: rquickjs is built with
 // `full-async` (no `parallel` feature), so `Runtime`/`Context` are `!Sync`
