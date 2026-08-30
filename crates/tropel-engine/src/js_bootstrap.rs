@@ -241,8 +241,7 @@ impl Default for ShimBundle {
 ///
 /// - **`Shim::Pm` is in every row.** The obvious next win (70,197 B of
 ///   source, the largest single shim) is dropping it from the four
-///   script-free formats, and it was measured — see `TR-501` in
-///   `tropel_plan/tasks/W5-structural-ceilings.md`. It is NOT taken here:
+///   script-free formats, and it was measured (TR-501). It is NOT taken here:
 ///   pm.js also installs the configured canonical namespace from
 ///   `__tropel_sandbox_config` (the `SandboxConfig` preamble in
 ///   [`create_vu_js_context`] is written on the assumption that pm.js
@@ -1049,8 +1048,8 @@ mod tests {
     /// `async function` inside an `if` — which ES2015 block-scopes and Annex B
     /// does not rescue for async functions — so it never reached globalThis
     /// and every collection script calling `sleep(1)` threw ReferenceError.
-    /// TROPEL_MASTER_TODO.md:405 flagged the adjacent comment as asserting
-    /// the opposite of reality; this pins the reality.
+    /// The adjacent comment used to assert the opposite of reality; this
+    /// pins the reality.
     ///
     /// Fails on the pre-fix code: `typeof sleep` evaluated to "undefined".
     #[tokio::test]
@@ -1143,8 +1142,8 @@ mod tests {
         assert_eq!(c2, "true");
     }
 
-    /// TR-503: the per-VU heap number printed in `README.md` and
-    /// `tropel_plan/CONVENTIONS.md` must track the code.
+    /// TR-503: the per-VU heap number printed in `README.md` must track
+    /// the code.
     ///
     /// This is the gate that the 57 KB "shared Runtime" claim needed and did
     /// not have. That figure sat in the README, the budget table, the W5

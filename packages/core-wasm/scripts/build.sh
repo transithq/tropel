@@ -74,7 +74,7 @@ echo "  wasm size: $((SIZE / 1024)) KiB ($SIZE B)"
 # core tier (variables + auth) is hard-gated at 700 KB post-`wasm-opt -Oz
 # --strip-debug`. This gate IS the 700 KB CI assertion (TR-404) — `wasm-size.sh`
 # covers the `tropel-web` slice; THIS script covers the eager `core-wasm` tier.
-# The number is generated into `README.md` (and `tropel_plan/CONVENTIONS.md:97`)
+# The number is generated into `README.md`
 # rather than hand-typed; `scripts/build.sh` rewrites the README's Size line.
 # Re-measure with `twiggy top` after any payload change.
 BUDGET=700000
@@ -98,7 +98,7 @@ if command -v node >/dev/null 2>&1; then
     if(s.includes('raw after \`wasm-opt')) {
       s=s.replace(/\*\*[\d,]+ B\*\* raw after \`wasm-opt[^\\n]*✅MEAS[^\\n]*/, line);
       // Also replace legacy '457 KB' if still present
-      s=s.replace(/457 KB raw after.*?glue\./s, line+' — see \`tropel_plan\/CONVENTIONS.md:97\` and CI (\`scripts\/wasm-size.sh\` + \`packages\/core-wasm\/scripts\/build.sh\` budget check). Measured with \`twiggy top\`: the dominant costs are the \`regex\` engine code + \`unicode-perl\` tables (the full default Unicode property tables were cut — the catalog patterns are ASCII-only), the wasm-bindgen custom section, and chrono\/uuid\/rand glue. Re-measure with \`twiggy top\` after any payload change and re-tighten the gate.');
+      s=s.replace(/457 KB raw after.*?glue\./s, line+' — see CI (\`scripts\/wasm-size.sh\` + \`packages\/core-wasm\/scripts\/build.sh\` budget check). Measured with \`twiggy top\`: the dominant costs are the \`regex\` engine code + \`unicode-perl\` tables (the full default Unicode property tables were cut — the catalog patterns are ASCII-only), the wasm-bindgen custom section, and chrono\/uuid\/rand glue. Re-measure with \`twiggy top\` after any payload change and re-tighten the gate.');
       fs.writeFileSync(path,s);
       console.log('  README.md Size line regenerated: '+size+' B ('+headroom+' B headroom)');
     }
