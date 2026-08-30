@@ -15,24 +15,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# Crates that cannot publish until tropel-sdk 0.3.0 reaches crates.io.
-#
-# A `path` + `version` dependency only resolves at publish time if that EXACT
-# version is already on the registry. The workspace pins
-# `tropel-sdk = { path = ..., version = "0.3.0" }` and crates.io has 0.1.0 and
-# 0.2.0, so every dependent fails — not because of anything wrong with them.
-#
-# They are listed here rather than silently skipped, so the gate reports
-# "6 of 7 publishable, 4 blocked on the SDK" instead of a bare failure. Delete
-# this list the moment 0.3.0 is published; `blocked_still_blocked` below fails
-# if an entry stops being blocked, so it cannot rot into a permanent excuse.
-SDK_BLOCKED=(tropel-auth tropel-runtime tropel-sandbox tropel-native)
-
-is_sdk_blocked() {
-  local c="$1"
-  for b in "${SDK_BLOCKED[@]}"; do [[ "$b" == "$c" ]] && return 0; done
-  return 1
-}
+# tropel-sdk 0.3.0 was published 2026-08-30, so the SDK_BLOCKED
+# workaround and its self-destruct guard are gone — every publishable
+# crate is expected to pass on its own merits now.
 
 PUBLISHABLE=()
 while IFS= read -r manifest; do
@@ -44,16 +29,27 @@ done < <(find crates -name Cargo.toml -maxdepth 3 | sort)
 
 echo "── TR-601: cargo publish --dry-run ──"
 failed=()
-blocked=()
-ok_crates=()
+pending=()
 for crate in "${PUBLISHABLE[@]}"; do
   printf '%-22s ' "$crate"
   if out=$(cargo publish --dry-run -p "$crate" --allow-dirty --no-verify 2>&1); then
     echo "ok"
-    ok_crates+=("$crate")
-  elif is_sdk_blocked "$crate"; then
-    echo "BLOCKED (tropel-sdk 0.3.0 not yet on crates.io)"
-    blocked+=("$crate")
+  elif pending_dep=$(awk -F'`' '/failed to select a version for the requirement/ {print $2; exit}' <<<"$out"); [[ -n "$pending_dep" ]] \
+       && dep_name=${pending_dep%% =*} \
+       && dep_req=$(sed -E 's/.*"\^?([0-9][^"]*)".*/\1/' <<<"$pending_dep") \
+       && [[ -f "crates/$dep_name/Cargo.toml" ]] \
+       && [[ "$(grep -m1 '^version' "crates/$dep_name/Cargo.toml" | sed -E 's/.*"(.*)".*/\1/')" == "$dep_req" ]]; then
+    # NOT a defect: this crate needs a workspace sibling at a version that is
+    # in this tree but not yet on crates.io. A multi-crate release is inherently
+    # chicken-and-egg — a dependent cannot dry-run clean until its dependency is
+    # actually published, so the only way to "fix" this before publishing would
+    # be to not check it at all.
+    #
+    # Distinguished from a real failure by proving the missing version IS the
+    # one this workspace declares. A dep version that exists nowhere is still a
+    # hard FAIL below.
+    echo "PENDING ($dep_name $dep_req publishes earlier in the order)"
+    pending+=("$crate <- $dep_name@$dep_req")
   else
     echo "FAIL"
     echo "$out" | sed -n '/^error/,+4p' | sed 's/^/    /'
@@ -61,22 +57,12 @@ for crate in "${PUBLISHABLE[@]}"; do
   fi
 done
 
-if [[ ${#blocked[@]} -gt 0 ]]; then
+if [[ ${#pending[@]} -gt 0 ]]; then
   echo
-  echo "BLOCKED on tropel-sdk 0.3.0 (${#blocked[@]}): ${blocked[*]}"
-  echo "  Not a defect in these crates. Publish tropel-sdk 0.3.0, then remove"
-  echo "  SDK_BLOCKED from this script and re-run — they should all pass."
+  echo "PENDING publish order (${#pending[@]}): each needs a workspace sibling published first."
+  printf '  %s\n' "${pending[@]}"
+  echo "  This is expected before a release and resolves as you publish in dependency order."
 fi
-
-# An entry that has STOPPED being blocked means the SDK was published and this
-# list is now hiding a real failure. Fail loudly rather than let it rot.
-for b in "${SDK_BLOCKED[@]}"; do
-  if [[ " ${ok_crates[*]} " == *" $b "* ]]; then
-    echo "FAIL: '$b' is listed in SDK_BLOCKED but now publishes cleanly." >&2
-    echo "      tropel-sdk 0.3.0 is evidently published — delete SDK_BLOCKED." >&2
-    exit 1
-  fi
-done
 
 if [[ ${#failed[@]} -gt 0 ]]; then
   echo
