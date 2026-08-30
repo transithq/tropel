@@ -17,6 +17,7 @@ const root = join(here, "..");
 // content parity, not list completeness.
 const DEFAULT_ORDER = [
   ["deep-equal-shim", "shim/deep-equal.js"],
+  ["k6-core-shim", "shim/k6-core.js"],
   ["pm-shim", "shim/pm.js"],
   ["chai-shim", "shim/chai-shim.js"],
   ["lodash-shim", "shim/lodash-shim.js"],
