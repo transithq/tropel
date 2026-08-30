@@ -9,6 +9,7 @@ cd "$(dirname "$0")/.."
 # ── 1. Refresh the shim sources from ../../js/ ────────────────────────────
 mkdir -p shim
 cp ../../js/shared/deep-equal.js shim/deep-equal.js
+cp ../../js/shared/k6-core.js shim/k6-core.js
 cp ../../js/scripting-api/pm.js shim/pm.js
 cp ../../js/scripting-api/bru.js shim/bru.js
 cp ../../js/chai/chai-shim.js shim/chai-shim.js

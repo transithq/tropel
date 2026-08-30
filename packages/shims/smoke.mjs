@@ -17,8 +17,69 @@ const repo = path.join(__dirname, "..", "..");
 // SINGLE AUTHORITY: crates/tropel-engine/src/js_bootstrap.rs
 // (ShimBundle::default()). If that file gains or reorders an entry, update
 // this list AND scripts/render-bundle.mjs's DEFAULT_ORDER together.
+//
+// LIST COMPLETENESS is checked separately, against the Rust source of truth —
+// see assertListMatchesRust() below. Content parity alone is what let
+// `k6-core-shim` be added to `Shim::ALL` and to 35 include_str! sites while
+// packages/shims/ kept shipping the 7-shim bundle: every published
+// @tropel/runtime-wasm embedder lost `check`/`group`/`Counter`/`Gauge`/
+// `Rate`/`Trend`, because those had just moved out of pm.js into k6-core.js.
+// Three hand-maintained copies of one list is the bug; the check has to read
+// the original.
+/**
+ * Assert this file's DEFAULT_ORDER matches `Shim::ALL` in the engine.
+ *
+ * The Rust enum is the single source of truth for which shims a default
+ * bundle contains (js_bootstrap.rs: `Shim::ALL` + `Shim::name()`). Parsing it
+ * is uglier than duplicating the list, and that is exactly the point — a
+ * duplicate silently diverges, a parse fails loudly.
+ */
+function assertListMatchesRust(order) {
+  const src = readFileSync(
+    new URL("../../crates/tropel-engine/src/js_bootstrap.rs", import.meta.url),
+    "utf8",
+  );
+
+  // `pub const ALL: [Shim; N] = [ Shim::DeepEqual, Shim::K6Core, … ];`
+  const allBlock = src.match(/pub const ALL: \[Shim; \d+\] = \[([\s\S]*?)\];/);
+  if (!allBlock) throw new Error("could not find `Shim::ALL` in js_bootstrap.rs");
+  const variants = [...allBlock[1].matchAll(/Shim::(\w+)/g)].map((m) => m[1]);
+
+  // `Shim::DeepEqual => "deep-equal-shim",`
+  const names = new Map(
+    [...src.matchAll(/Shim::(\w+)\s*=>\s*"([a-z0-9-]+)"/g)].map((m) => [m[1], m[2]]),
+  );
+
+  const expected = variants.map((v) => {
+    const n = names.get(v);
+    if (!n) throw new Error(`Shim::${v} is in ALL but has no name() arm`);
+    return n;
+  });
+  const actual = order.map(([name]) => name);
+
+  const missing = expected.filter((n) => !actual.includes(n));
+  const extra = actual.filter((n) => !expected.includes(n));
+  if (missing.length || extra.length) {
+    throw new Error(
+      `shim bundle list has drifted from Shim::ALL\n` +
+        `  missing here: ${missing.join(", ") || "(none)"}\n` +
+        `  not in Rust : ${extra.join(", ") || "(none)"}\n` +
+        `  Rust order  : ${expected.join(", ")}\n` +
+        `  this file   : ${actual.join(", ")}`,
+    );
+  }
+  if (expected.join() !== actual.join()) {
+    throw new Error(
+      `shim ORDER differs from Shim::ALL (load order is load-bearing: ` +
+        `k6-core must precede pm)\n  Rust: ${expected.join(", ")}\n  here: ${actual.join(", ")}`,
+    );
+  }
+  console.log(`  list matches Shim::ALL (${expected.length} shims, same order)`);
+}
+
 const DEFAULT_ORDER = [
   ["deep-equal-shim", "js/shared/deep-equal.js"],
+  ["k6-core-shim", "js/shared/k6-core.js"],
   ["pm-shim", "js/scripting-api/pm.js"],
   ["chai-shim", "js/chai/chai-shim.js"],
   ["lodash-shim", "js/lodash/lodash-shim.js"],
@@ -45,6 +106,10 @@ if (!existsSync(shimDir)) {
 }
 
 const { defaultBundle, k6Bundle, render } = await import("./dist/bundle.js");
+
+// Completeness FIRST: if the list itself has drifted from the engine, every
+// content comparison below is comparing the wrong set and will still pass.
+assertListMatchesRust(DEFAULT_ORDER);
 
 function fail(msg) {
   console.error(`FAIL: ${msg}`);
