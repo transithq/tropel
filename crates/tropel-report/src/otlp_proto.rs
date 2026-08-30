@@ -399,6 +399,21 @@ mod tests {
         tags: &[(&str, &str)],
         nanos: u64,
     ) -> Sample {
+        // Windows `SystemTime` is backed by FILETIME, whose tick is 100 ns —
+        // `UNIX_EPOCH + Duration::from_nanos(1)` silently truncates to 0
+        // there. That made `golden_wire_bytes` and
+        // `round_trip_decodes_under_prost` pass on Linux/macOS and fail only
+        // on Windows, which looked like a CI flake and was actually a
+        // truncated fixture. Enforce representability HERE so a
+        // non-representable test timestamp fails on every platform at
+        // authoring time, not on one platform at CI time.
+        assert!(
+            nanos % 100 == 0,
+            "test timestamp {nanos} ns is not representable on Windows \
+             (SystemTime tick = 100 ns; it would truncate to {}). Use a \
+             multiple of 100.",
+            nanos / 100 * 100
+        );
         let mut map = TagMap::new();
         for (k, v) in tags {
             map.insert(*k, *v);
@@ -653,10 +668,11 @@ mod tests {
     /// the protobuf spec. This is the check that catches a field number that
     /// is wrong in the encoder AND wrong in the same way in a reader.
     ///
-    /// Derivation (a Gauge, one point, no attributes, t = 1 ns, v = 1.0):
+    /// Derivation (a Gauge, one point, no attributes, t = 100 ns — a
+    /// Windows-representable timestamp — v = 1.0):
     ///
     /// ```text
-    /// NumberDataPoint      : `19` + fixed64 t=1                     9 B
+    /// NumberDataPoint      : `19` + fixed64 t=100                   9 B
     ///                        `21` + double 1.0                      9 B
     ///   → payload 18 B, framed `0a 12` inside Gauge                20 B
     /// Gauge                : payload 20 B, framed `2a 14`          22 B
@@ -677,7 +693,7 @@ mod tests {
         let mut metrics: HashMap<String, Vec<Sample>> = HashMap::new();
         metrics.insert(
             "a".into(),
-            vec![sample_at("a", 1.0, SampleType::Trend, &[], 1)],
+            vec![sample_at("a", 1.0, SampleType::Trend, &[], 100)],
         );
         let bytes = build_export_request_protobuf(&metrics);
 
@@ -707,9 +723,9 @@ mod tests {
         expect.extend_from_slice(&[0x2a, 20]);
         //         Gauge.data_points (field 1, len 18)
         expect.extend_from_slice(&[0x0a, 18]);
-        //           time_unix_nano (field 3, fixed64) = 1
+        //           time_unix_nano (field 3, fixed64) = 100
         expect.extend_from_slice(&[0x19]);
-        expect.extend_from_slice(&1u64.to_le_bytes());
+        expect.extend_from_slice(&100u64.to_le_bytes());
         //           as_double (field 4, double) = 1.0
         expect.extend_from_slice(&[0x21]);
         expect.extend_from_slice(&1.0f64.to_bits().to_le_bytes());
@@ -818,14 +834,14 @@ mod tests {
                     1.0,
                     SampleType::Counter,
                     &[("status", "200")],
-                    10,
+                    1000,
                 ),
                 sample_at(
                     "http_reqs",
                     3.0,
                     SampleType::Counter,
                     &[("status", "200")],
-                    20,
+                    2000,
                 ),
             ],
         );
@@ -836,7 +852,7 @@ mod tests {
                 42.25,
                 SampleType::Trend,
                 &[("method", "GET"), ("url", "https://example.test/a")],
-                30,
+                3000,
             )],
         );
 
@@ -869,8 +885,8 @@ mod tests {
         assert!(sum.is_monotonic);
         assert_eq!(sum.data_points.len(), 1, "one tag-set → one delta point");
         assert_eq!(sum.data_points[0].as_double, 4.0, "1.0 + 3.0");
-        assert_eq!(sum.data_points[0].start_time_unix_nano, 10);
-        assert_eq!(sum.data_points[0].time_unix_nano, 20, "newest in window");
+        assert_eq!(sum.data_points[0].start_time_unix_nano, 1000);
+        assert_eq!(sum.data_points[0].time_unix_nano, 2000, "newest in window");
 
         let trend = sm
             .metrics
@@ -881,7 +897,7 @@ mod tests {
         assert!(trend.sum.is_none());
         assert_eq!(gauge.data_points.len(), 1);
         assert_eq!(gauge.data_points[0].as_double, 42.25);
-        assert_eq!(gauge.data_points[0].time_unix_nano, 30);
+        assert_eq!(gauge.data_points[0].time_unix_nano, 3000);
         assert_eq!(
             gauge.data_points[0].start_time_unix_nano, 0,
             "a Gauge carries no start time"
@@ -927,7 +943,7 @@ mod tests {
                 1.0,
                 SampleType::Trend,
                 &[("url", long_url.as_str())],
-                7,
+                700,
             )],
         );
         let bytes = build_export_request_protobuf(&metrics);
