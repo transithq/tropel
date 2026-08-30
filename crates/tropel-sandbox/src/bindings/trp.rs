@@ -316,7 +316,7 @@ fn parse_headers(json: &str) -> HashMap<String, String> {
 }
 
 /// Register all `pm.*` bridge functions as global JS functions in a JsContext.
-/// Functions like `__tropel_pm_test`, `__tropel_pm_environment_get`, etc.
+/// Functions like `__tropel_trp_test`, `__tropel_trp_environment_get`, etc.
 /// are registered so the JS shims in scripting-api/pm.js can call them.
 ///
 /// With rquickjs 0.12+, the following complex types are supported as
@@ -389,7 +389,7 @@ impl TrpBridge {
             // maps directly).
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_environment_get",
+                "__tropel_trp_environment_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.environment
@@ -400,7 +400,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_environment_set",
+                "__tropel_trp_environment_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
                     st.environment.insert(key, decode_json_encoded(&value));
@@ -409,7 +409,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_environment_unset",
+                "__tropel_trp_environment_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     st.environment.remove(&key);
@@ -418,7 +418,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_environment_clear",
+                "__tropel_trp_environment_clear",
                 Func::from(move || {
                     let mut st = state_clone.lock().unwrap();
                     st.environment.clear();
@@ -432,7 +432,7 @@ impl TrpBridge {
             // as the number 123 instead of the string "123".
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_variables_get",
+                "__tropel_trp_variables_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     variables_lookup(
@@ -448,7 +448,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_variables_set",
+                "__tropel_trp_variables_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
                     // Backlog line 137: pm.variables is the LOCAL scope —
@@ -459,7 +459,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_variables_unset",
+                "__tropel_trp_variables_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     st.local_vars.remove(&key);
@@ -471,7 +471,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_variables_to_object",
+                "__tropel_trp_variables_to_object",
                 // W2 line 182: the bru shim's getAllVars used to read the
                 // COLLECTION store while setVar writes LOCAL vars — a runtime
                 // var set via bru.setVar never appeared in getAllVars (the
@@ -492,7 +492,7 @@ impl TrpBridge {
             // toObject() alongside get/set/unset.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_environment_has",
+                "__tropel_trp_environment_has",
                 Func::from(move |key: String| -> bool {
                     let st = state_clone.lock().unwrap();
                     st.environment.contains_key(&key)
@@ -501,7 +501,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_environment_to_object",
+                "__tropel_trp_environment_to_object",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
                     st.environment
@@ -517,7 +517,7 @@ impl TrpBridge {
             // round-tripping, same as variables.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_collection_vars_get",
+                "__tropel_trp_collection_vars_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.collection_vars.get(&key).map(variable_value_to_string)
@@ -526,7 +526,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_collection_vars_set",
+                "__tropel_trp_collection_vars_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
                     Arc::make_mut(&mut st.collection_vars).insert(key, decode_json_value(&value));
@@ -535,7 +535,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_collection_vars_unset",
+                "__tropel_trp_collection_vars_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     Arc::make_mut(&mut st.collection_vars).remove(&key);
@@ -544,7 +544,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_collection_vars_has",
+                "__tropel_trp_collection_vars_has",
                 Func::from(move |key: String| -> bool {
                     let st = state_clone.lock().unwrap();
                     st.collection_vars.contains_key(&key)
@@ -553,7 +553,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_collection_vars_to_object",
+                "__tropel_trp_collection_vars_to_object",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
                     st.collection_vars
@@ -566,7 +566,7 @@ impl TrpBridge {
             // ── Global Variables (pm.globals) ──
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_globals_get",
+                "__tropel_trp_globals_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.globals.get(&key).map(variable_value_to_string)
@@ -575,7 +575,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_globals_set",
+                "__tropel_trp_globals_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
                     Arc::make_mut(&mut st.globals).insert(key, decode_json_value(&value));
@@ -584,7 +584,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_globals_unset",
+                "__tropel_trp_globals_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     Arc::make_mut(&mut st.globals).remove(&key);
@@ -593,7 +593,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_globals_has",
+                "__tropel_trp_globals_has",
                 Func::from(move |key: String| -> bool {
                     let st = state_clone.lock().unwrap();
                     st.globals.contains_key(&key)
@@ -602,7 +602,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_globals_to_object",
+                "__tropel_trp_globals_to_object",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
                     st.globals
@@ -622,7 +622,7 @@ impl TrpBridge {
             // change what goes out on the wire.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_url",
+                "__tropel_trp_request_url",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
                     st.request
@@ -634,7 +634,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_url_set",
+                "__tropel_trp_request_url_set",
                 Func::from(move |url: String| {
                     let mut st = state_clone.lock().unwrap();
                     if let Some(r) = st.request.as_mut() {
@@ -645,7 +645,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_method",
+                "__tropel_trp_request_method",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
                     st.request
@@ -657,7 +657,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_method_set",
+                "__tropel_trp_request_method_set",
                 Func::from(move |method: String| {
                     let mut st = state_clone.lock().unwrap();
                     if let Some(r) = st.request.as_mut() {
@@ -668,7 +668,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_headers",
+                "__tropel_trp_request_headers",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
                     st.request
@@ -686,7 +686,7 @@ impl TrpBridge {
             // Case-insensitive read (Postman's HeaderList.get is case-insensitive).
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_header_get",
+                "__tropel_trp_request_header_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.request.as_ref().and_then(|r| {
@@ -702,7 +702,7 @@ impl TrpBridge {
             // header rather than creating a duplicate (Postman HeaderList.add).
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_header_set",
+                "__tropel_trp_request_header_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
                     if let Some(r) = st.request.as_mut() {
@@ -721,7 +721,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_header_unset",
+                "__tropel_trp_request_header_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     if let Some(r) = st.request.as_mut() {
@@ -733,7 +733,7 @@ impl TrpBridge {
             // Body as raw text (get) / raw text (set).
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_body",
+                "__tropel_trp_request_body",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.request.as_ref().and_then(|r| match &r.body {
@@ -746,7 +746,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_body_set",
+                "__tropel_trp_request_body_set",
                 Func::from(move |body: String| {
                     let mut st = state_clone.lock().unwrap();
                     if let Some(r) = st.request.as_mut() {
@@ -761,7 +761,7 @@ impl TrpBridge {
             // sign the outgoing request (the primary purpose of pm.request).
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_auth_set",
+                "__tropel_trp_request_auth_set",
                 Func::from(move |auth_json: String| {
                     let parsed = serde_json::from_str::<AuthConfig>(&auth_json);
                     let mut st = state_clone.lock().unwrap();
@@ -787,7 +787,7 @@ impl TrpBridge {
             // always per-request — no cross-iteration leakage.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_auth",
+                "__tropel_trp_request_auth",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.request.as_ref().and_then(|r| {
@@ -806,7 +806,7 @@ impl TrpBridge {
             // always describes the actual request — no leakage.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_request_body_mode",
+                "__tropel_trp_request_body_mode",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
                     match st.request.as_ref().and_then(|r| r.body.as_ref()) {
@@ -828,7 +828,7 @@ impl TrpBridge {
             // iteration count.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_info",
+                "__tropel_trp_info",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
                     let request_id = st
@@ -855,7 +855,7 @@ impl TrpBridge {
             // tests are not pass/fail checks, so nothing is recorded.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_test_skip",
+                "__tropel_trp_test_skip",
                 Func::from(move |name: String| {
                     let mut st = state_clone.lock().unwrap();
                     st.assertions.skipped += 1;
@@ -866,7 +866,7 @@ impl TrpBridge {
             // ── Response ──
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_response_code",
+                "__tropel_trp_response_code",
                 Func::from(move || -> u16 {
                     let st = state_clone.lock().unwrap();
                     st.response.as_ref().map(|r| r.status_code).unwrap_or(0)
@@ -875,7 +875,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_response_status",
+                "__tropel_trp_response_status",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
                     st.response
@@ -887,7 +887,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_response_body",
+                "__tropel_trp_response_body",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.response.as_ref().and_then(|r| r.body_text())
@@ -896,7 +896,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_response_time",
+                "__tropel_trp_response_time",
                 Func::from(move || -> f64 {
                     let st = state_clone.lock().unwrap();
                     st.response
@@ -910,7 +910,7 @@ impl TrpBridge {
             // rquickjs 0.12+ supports HashMap<String,String> as IntoJs -> JS object
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_response_headers",
+                "__tropel_trp_response_headers",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
                     st.response
@@ -923,7 +923,7 @@ impl TrpBridge {
             // ── Response Header (individual header access, widely used) ──
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_response_header",
+                "__tropel_trp_response_header",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.response.as_ref().and_then(|r| {
@@ -944,7 +944,7 @@ impl TrpBridge {
             // rquickjs 0.12+ supports HashMap<String,String> as IntoJs -> JS object
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_response_cookies",
+                "__tropel_trp_response_cookies",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
                     st.response
@@ -973,7 +973,7 @@ impl TrpBridge {
             // return the cached clone with zero allocation beyond the Arc bump.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_response_json",
+                "__tropel_trp_response_json",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.response.as_ref().and_then(|r| {
@@ -990,7 +990,7 @@ impl TrpBridge {
             // JSON.parse() to restore the correct type.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_iteration_data_get",
+                "__tropel_trp_iteration_data_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.iteration_data
@@ -1002,7 +1002,7 @@ impl TrpBridge {
             // ── Test ──
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_test",
+                "__tropel_trp_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
                 Func::from(
                     move |name: String, passed: bool, tags_json: Option<String>| {
@@ -1041,7 +1041,7 @@ impl TrpBridge {
             const END_ITERATION: usize = usize::MAX;
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_set_next_request",
+                "__tropel_trp_set_next_request",
                 Func::from(move |request_id: Option<String>| {
                     let mut st = state_clone.lock().unwrap();
 
@@ -1086,7 +1086,7 @@ impl TrpBridge {
             // flag after the prerequest script and skips send + test script.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_skip_request",
+                "__tropel_trp_skip_request",
                 Func::from(move || {
                     let mut st = state_clone.lock().unwrap();
                     st.skip_request = true;
@@ -1102,7 +1102,7 @@ impl TrpBridge {
             // group_stack.last() now sees the full path for group tags.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_group_start",
+                "__tropel_trp_group_start",
                 Func::from(move |name: String| {
                     let mut st = state_clone.lock().unwrap();
                     let full = match st.group_stack.last() {
@@ -1116,7 +1116,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_group_end",
+                "__tropel_trp_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
                     let mut st = state_clone.lock().unwrap();
                     // Pop the FULL ::a::b path (start pushed it) and rebuild
@@ -1164,10 +1164,10 @@ impl TrpBridge {
             // Add a custom metric sample (Postman-style, no tags).
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_metrics_add",
+                "__tropel_trp_metrics_add",
                 Func::from(move |name: String, value: f64, metric_type_str: String| {
                     // TR-102: reserved-name guard — the sibling guard in
-                    // `__tropel_pm_custom_metric_add` below rejects builtin
+                    // `__tropel_trp_custom_metric_add` below rejects builtin
                     // names; `pm.metrics.add('checks', 1)` must be rejected
                     // the same way, or a script forges the checks headline
                     // through the Postman-style bridge.
@@ -1222,7 +1222,7 @@ impl TrpBridge {
 
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_metrics_get",
+                "__tropel_trp_metrics_get",
                 Func::from(move |name: String| -> Option<f64> {
                     let st = state_clone.lock().unwrap();
                     st.custom_metrics.get(&name).copied()
@@ -1234,7 +1234,7 @@ impl TrpBridge {
             // tags_json is a JSON-encoded object like '{"status":"200","method":"GET"}'.
             let state_clone = state.clone();
             set_global!(
-                "__tropel_pm_custom_metric_add",
+                "__tropel_trp_custom_metric_add",
                 Func::from(
                     move |name: String, value: f64, tags_json: String, metric_type_str: String| {
                         // Backlog line 158: reserved-name guard — built-in
@@ -1406,7 +1406,7 @@ impl TrpBridge {
                 let http = self.http_client.clone();
                 let state_for_send = self.state.clone();
                 set_global!(
-                    "__tropel_pm_send_request",
+                    "__tropel_trp_send_request",
                     Func::from(
                         move |method: String,
                               url: String,
@@ -1541,6 +1541,78 @@ impl TrpBridge {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bridge_naming {
+    /// The native bridges are `__tropel_trp_*`, not `__tropel_pm_*`.
+    ///
+    /// `trp` is the canonical namespace (`SandboxConfig` names it, and this
+    /// file is `trp.rs`). `pm`, `bru` and the k6 globals are FROZEN COMPAT
+    /// ALIASES over these same bridges — `bru.js`'s own header says the state
+    /// model is "binding-agnostic". Naming the bridges after one alias
+    /// inverted that: it read as though Postman were the primary API and
+    /// everything else layered on it, which is the opposite of the design and
+    /// is what made "does bru need pm.js?" a confusing question at all.
+    ///
+    /// This walks the source rather than asserting on a call site, because the
+    /// failure mode is a NEW `__tropel_pm_*` being added — which no assertion
+    /// over today's bridges can see.
+    #[test]
+    fn no_source_reintroduces_the_pm_prefixed_bridges() {
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if p.is_dir() {
+                    if !matches!(name, "target" | ".git" | "node_modules") {
+                        walk(&p, hits);
+                    }
+                } else if matches!(
+                    p.extension().and_then(|x| x.to_str()),
+                    Some("rs") | Some("js")
+                ) {
+                    if let Ok(src) = std::fs::read_to_string(&p) {
+                        for (i, line) in src.lines().enumerate() {
+                            // The needle is assembled at compile time so
+                            // this detector does not match its own source.
+                            // Spelling it literally makes the test fail on
+                            // itself — a decorative failure that teaches the
+                            // next person to add an exclusion rather than fix
+                            // a real hit. Doc comments are skipped for the
+                            // same reason: the ones above legitimately name
+                            // the old prefix while explaining it.
+                            let needle = concat!("__tropel", "_pm_");
+                            let is_prose = line.trim_start().starts_with("///")
+                                || line.trim_start().starts_with("//");
+                            if line.contains(needle) && !is_prose && !line.contains("concat!") {
+                                hits.push(format!("{}:{}", p.display(), i + 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let mut hits = Vec::new();
+        for sub in ["crates", "js"] {
+            walk(&root.join(sub), &mut hits);
+        }
+        assert!(
+            hits.is_empty(),
+            "these files use the old `{}*` bridge prefix; the bridges \
+             are `__tropel_trp_*` — pm is an alias, not the primary API: {:#?}",
+            concat!("__tropel", "_pm_"),
+            hits
+        );
     }
 }
 
@@ -1899,8 +1971,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
 
             // Stock install: pm + trp only — no aliases, no tropel.
             let installed: bool = ctx
@@ -1956,7 +2032,7 @@ mod tests {
     }
 
     /// TR-102: `pm.metrics.add('checks', …)` must be dropped by the
-    /// reserved-name guard in `__tropel_pm_metrics_add` — the Postman-style
+    /// reserved-name guard in `__tropel_trp_metrics_add` — the Postman-style
     /// bridge is the sibling the k6 constructor guard was never mirrored to.
     #[tokio::test]
     async fn test_pm_metrics_add_rejects_reserved_names() {
@@ -1969,9 +2045,13 @@ mod tests {
         TrpBridge::new(state.clone())
             .install(&mut ctx)
             .expect("install");
-        ctx.eval(include_str!("../../../../js/scripting-api/pm.js"))
-            .await
-            .expect("pm shim must eval");
+        ctx.eval(concat!(
+            include_str!("../../../../js/shared/k6-core.js"),
+            "\n",
+            include_str!("../../../../js/scripting-api/pm.js")
+        ))
+        .await
+        .expect("pm shim must eval");
 
         // Reserved builtin name through pm.metrics.add — must be dropped.
         ctx.eval(
@@ -2017,9 +2097,13 @@ mod tests {
         TrpBridge::new(state.clone())
             .install(&mut ctx)
             .expect("install");
-        ctx.eval(include_str!("../../../../js/scripting-api/pm.js"))
-            .await
-            .expect("pm shim must eval");
+        ctx.eval(concat!(
+            include_str!("../../../../js/shared/k6-core.js"),
+            "\n",
+            include_str!("../../../../js/scripting-api/pm.js")
+        ))
+        .await
+        .expect("pm shim must eval");
 
         ctx.eval(
             "group('checkout', function () { \
@@ -2074,8 +2158,12 @@ mod tests {
                 .expect("config preamble should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
 
             // Custom canonical installed; aliases are true aliases of it.
             let installed: bool = ctx
@@ -2130,10 +2218,10 @@ mod tests {
     /// `pm.request.auth` / `pm.request.body.mode` were module-scope
     /// singletons — a fresh request on the next iteration (no auth, a
     /// different body) still read the PREVIOUS iteration's values. The shim
-    /// now reads LIVE from the __tropel_pm_* bridges: pm.info fields come
-    /// from __tropel_pm_info, auth from __tropel_pm_request_auth (null when
+    /// now reads LIVE from the __tropel_trp_* bridges: pm.info fields come
+    /// from __tropel_trp_info, auth from __tropel_trp_request_auth (null when
     /// the current request has none), and mode from
-    /// __tropel_pm_request_body_mode. Stub bridges simulate the per-
+    /// __tropel_trp_request_body_mode. Stub bridges simulate the per-
     /// iteration state change; reads must follow the bridge, not a stale
     /// JS-side copy.
     #[test]
@@ -2143,27 +2231,31 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
 
             // Iteration 1: a prerequest script SETS auth and a body mode.
             ctx.eval::<(), _>(
                 r#"
                 // Simulate the sandbox bridges. Per-iteration values change
                 // to prove reads are live, not cached.
-                globalThis.__tropel_pm_info = function () {
+                globalThis.__tropel_trp_info = function () {
                     return JSON.stringify({ eventName: 'test', iteration: 4,
                         iterationCount: 25, requestName: 'get-user', requestId: 'r-9' });
                 };
-                globalThis.__tropel_pm_request_auth = function () {
+                globalThis.__tropel_trp_request_auth = function () {
                     // The CURRENT request has no auth.
                     return null;
                 };
-                globalThis.__tropel_pm_request_body_mode = function () {
+                globalThis.__tropel_trp_request_body_mode = function () {
                     // The CURRENT request's body is urlencoded.
                     return 'urlencoded';
                 };
-                globalThis.__tropel_pm_request_auth_set = function (j) {
+                globalThis.__tropel_trp_request_auth_set = function (j) {
                     globalThis.__auth_set = j;
                 };
 

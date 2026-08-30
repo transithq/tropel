@@ -60,8 +60,26 @@ strip         = "symbols"
 [profile.release-wasm]
 inherits = "release"
 opt-level = "z"
-lto = "fat"
-codegen-units = 1
+# `lto = "fat"` with `codegen-units = 1` is the slowest configuration cargo
+# offers: whole-program LTO with zero codegen parallelism. On `tropel-input-wasm`
+# — which pulls five input adapters — it dominated CI wall-clock.
+#
+# `thin` LTO keeps almost all of the size win (it still does cross-crate
+# inlining, just per-partition rather than whole-program) at a fraction of the
+# link time, and with thin LTO `codegen-units = 1` is counterproductive: it
+# serialises codegen for a pass that is designed to run in parallel.
+#
+# The size budgets are hard-gated in CI (700 KB for core-wasm via
+# `packages/core-wasm/scripts/build.sh`, 8 MB for the tropel-web slice via
+# `scripts/wasm-size.sh`), so if this trade ever costs more bytes than it is
+# worth, those gates fail rather than silently regressing the payload. That is
+# the reason it is safe to tune here: the number is asserted, not assumed.
+# ✅MEAS (CI, this change): core-wasm went 569,352 B -> 584,748 B, i.e. thin
+# LTO costs **15,396 B (+2.7%)** and leaves 115,252 B of headroom under the
+# 700 KB gate. That is the actual price of the build-time win, measured rather
+# than assumed — and the gate is what made it cheap to find out.
+lto = "thin"
+codegen-units = 16
 panic = "abort"
 strip = true
 

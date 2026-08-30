@@ -849,6 +849,30 @@ impl ScenarioRunner {
                                         sample_type: SampleType::Trend,
                                     });
                                 }
+                                // TR-121: data_sent — the metric this path
+                                // kept omitting. The k6 driver's
+                                // push_http_failure emits it; this one did
+                                // not, so `data_sent` undercounted by every
+                                // failed request and the two drivers reported
+                                // different totals for the same run.
+                                //
+                                // The bytes were serialised and handed to the
+                                // transport whether or not a response came
+                                // back, so the honest count is the body size,
+                                // not zero. `Body::wire_size` lives in the SDK
+                                // precisely so this crate can reach it —
+                                // tropel-http is a dev-dependency here, kept
+                                // out of the library graph for the wasm slice.
+                                result.samples.push(tropel_sdk::types::Sample {
+                                    metric: "data_sent".into(),
+                                    value: request
+                                        .body
+                                        .as_ref()
+                                        .map_or(0.0, |b| b.wire_size() as f64),
+                                    tags: err_tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Counter,
+                                });
                             }
                         }
                     }
@@ -1836,7 +1860,11 @@ mod tests {
             .await
             .expect("shared deep-equal should eval");
         js_ctx
-            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .eval(concat!(
+                include_str!("../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../js/scripting-api/pm.js")
+            ))
             .await
             .expect("pm shim should eval");
         let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
@@ -1948,7 +1976,11 @@ mod tests {
             .await
             .expect("shared deep-equal should eval");
         js_ctx
-            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .eval(concat!(
+                include_str!("../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../js/scripting-api/pm.js")
+            ))
             .await
             .expect("pm shim should eval");
         let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
@@ -2050,7 +2082,11 @@ mod tests {
             .await
             .expect("shared deep-equal should eval");
         js_ctx
-            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .eval(concat!(
+                include_str!("../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../js/scripting-api/pm.js")
+            ))
             .await
             .expect("pm shim should eval");
         let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
@@ -2112,7 +2148,11 @@ mod tests {
             .await
             .expect("shared deep-equal should eval");
         js_ctx
-            .eval(include_str!("../../../js/scripting-api/pm.js"))
+            .eval(concat!(
+                include_str!("../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../js/scripting-api/pm.js")
+            ))
             .await
             .expect("pm shim should eval");
         let bridge_client: Arc<dyn DriverHttpClient> = Arc::new(TestHttpClient(
@@ -2507,6 +2547,26 @@ mod tests {
                 "failure path must emit {sub}"
             );
         }
+
+        // TR-121: `data_sent` must be emitted here too. The k6 driver's
+        // push_http_failure emits it; this path did not, so a run's total
+        // undercounted by every failed request and the two drivers disagreed
+        // for the same scenario.
+        //
+        // Fails on pre-fix code: no `data_sent` sample reached this path at
+        // all. The old test COMMENT claimed it was emitted and never asserted
+        // it — which is exactly how it survived TR-121 being marked done.
+        let sent: Vec<_> = samples.iter().filter(|s| s.metric == "data_sent").collect();
+        assert_eq!(
+            sent.len(),
+            2,
+            "each failed request must emit data_sent, as the k6 driver does — got {}",
+            sent.len()
+        );
+        assert!(
+            sent.iter().all(|s| s.sample_type == SampleType::Counter),
+            "data_sent is a Counter, matching the success path"
+        );
 
         // TR-202/TR-203: the identity must hold on the failure path too.
         // `http_req_duration` is DEFINED as sending + waiting + receiving; the

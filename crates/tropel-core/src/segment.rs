@@ -299,7 +299,34 @@ impl ExecutionSegment {
     /// that runs only this node's share of the workload. All scaling is
     /// deterministic — each node derives the same result from the same
     /// segment spec, so N nodes partition the workload with no coordination.
+    ///
+    /// Arrival rates are scaled by the segment fraction
+    /// ([`RateSegmentation::ScaleRate`]) — the fallback for when no full
+    /// `executionSegmentSequence` is available to stripe against. Use
+    /// [`apply_with`](Self::apply_with) with
+    /// [`RateSegmentation::GlobalRate`] on the striped path.
     pub fn apply(&self, exec: &ExecutionConfig) -> ExecutionConfig {
+        self.apply_with(exec, RateSegmentation::ScaleRate)
+    }
+
+    /// [`apply`](Self::apply), choosing how the segment's share of an
+    /// **arrival-rate** workload is expressed (TR-221). VU counts and
+    /// iteration budgets are always telescoped; only the rate handling
+    /// differs — see [`RateSegmentation`].
+    pub fn apply_with(
+        &self,
+        exec: &ExecutionConfig,
+        rate_mode: RateSegmentation,
+    ) -> ExecutionConfig {
+        // TR-221: on the striped path the rate stays GLOBAL — k6 builds
+        // `constant_arrival_rate.go`'s ticker period from the UNSCALED rate
+        // and expresses segmentation purely by skipping the global ticks this
+        // segment doesn't own. Scaling the rate *as well* would divide the
+        // load twice.
+        let rate_share = |r: f64| match rate_mode {
+            RateSegmentation::ScaleRate => self.scale_rate(r),
+            RateSegmentation::GlobalRate => r,
+        };
         match exec {
             ExecutionConfig::ConstantVus {
                 vus,
@@ -340,7 +367,7 @@ impl ExecutionSegment {
                 graceful_stop,
                 think_time,
             } => ExecutionConfig::ConstantArrivalRate {
-                rate: self.scale_rate(*rate),
+                rate: rate_share(*rate),
                 time_unit: time_unit.clone(),
                 duration: duration.clone(),
                 pre_alloc_vus: self.scale_vus(*pre_alloc_vus),
@@ -370,12 +397,12 @@ impl ExecutionSegment {
                 graceful_stop,
                 think_time,
             } => ExecutionConfig::RampingArrivalRate {
-                start_rate: self.scale_rate(*start_rate),
+                start_rate: rate_share(*start_rate),
                 stages: stages
                     .iter()
                     .map(|s| ArrivalRateStage {
                         duration: s.duration.clone(),
-                        target: self.scale_rate(s.target),
+                        target: rate_share(s.target),
                     })
                     .collect(),
                 time_unit: time_unit.clone(),
@@ -412,6 +439,36 @@ impl ExecutionSegment {
             },
         }
     }
+}
+
+/// How a segment expresses its share of an **arrival-rate** workload
+/// (TR-221).
+///
+/// VU counts and iteration budgets are always telescoped
+/// (`floor(n·to) − floor(n·from)`); arrival rates have two possible models
+/// and picking the wrong one is a silent 1/N or N× load error, so the caller
+/// states it explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateSegmentation {
+    /// Multiply the configured rate by the segment's fraction. Each node then
+    /// runs its own **independent** rate from its own `t = 0`, so N nodes'
+    /// arrivals **bunch** instead of interleaving (three nodes at 50/25/25
+    /// all fire together at every 200 ms instead of filling a 50 ms cadence).
+    /// This is the fallback for when no full `executionSegmentSequence` is
+    /// available to stripe against — it delivers the right *total* rate but
+    /// the wrong *shape*.
+    ScaleRate,
+    /// Leave the rate **global** and let striped offsets pick this node's
+    /// ticks out of the global sequence — k6's model
+    /// (`constant_arrival_rate.go` builds its ticker period from the
+    /// *unscaled* rate and skips the ticks the segment doesn't own).
+    ///
+    /// The caller MUST install the matching [`ArrivalStripe`] on the
+    /// executor. Without it, every node runs the full global rate — an N×
+    /// overload. [`ArrivalStripe::full`] is the identity stripe, so a
+    /// scheduler that was never given a stripe is safe only when the rate
+    /// was *not* left global.
+    GlobalRate,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -476,6 +533,19 @@ impl ExecutionSegmentSequence {
             prev = cur;
         }
         Ok(Self(segments))
+    }
+
+    /// Position of the segment whose bounds match `seg`.
+    ///
+    /// Uses the same `1e-9` tolerance [`ExecutionSegment::parse`] uses when
+    /// validating a segment against a sequence: the controller can spell a
+    /// boundary as a decimal (`"0:0.3333333333333333"`) while the sequence
+    /// spells it as a fraction (`"0,1/3,2/3,1"`), and both must resolve to
+    /// the same index or the node would stripe against the wrong slot.
+    pub fn index_of(&self, seg: &ExecutionSegment) -> Option<usize> {
+        self.0
+            .iter()
+            .position(|s| (s.from() - seg.from()).abs() < 1e-9 && (s.to() - seg.to()).abs() < 1e-9)
     }
 }
 
@@ -584,11 +654,19 @@ impl ExecutionSegmentSequenceWrapper {
             unscaled: 0,
         }
     }
+
+    /// The [`ArrivalStripe`] for `segment_index` — the cursor the
+    /// arrival-rate executor walks so this node fires only the global ticks
+    /// it owns.
+    pub fn arrival_stripe(&self, segment_index: usize) -> ArrivalStripe {
+        ArrivalStripe::from_index(self.segmented_index(segment_index))
+    }
 }
 
 /// k6's `SegmentedIndex` — the non-thread-safe striped iterator over the
 /// global tick space. See `ExecutionSegmentSequenceWrapper::segmented_index`.
 #[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct SegmentedIndex {
     start: i64,
     lcd: i64,
@@ -621,6 +699,78 @@ impl Iterator for SegmentedIndex {
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(self.advance())
+    }
+}
+
+/// One node's cursor over the **global** arrival sequence — the piece that
+/// turns [`get_striped_offsets`](ExecutionSegmentSequenceWrapper::get_striped_offsets)
+/// into something an arrival-rate executor can drive (TR-221).
+///
+/// k6's `constant_arrival_rate.go:316-330` walks a global iteration index
+/// `gi` (stepping by this segment's striped offsets) and fires iteration
+/// `gi` at `global_period × gi` measured from the executor's own start. So
+/// N instances *skip* the global ticks they don't own and interleave back
+/// into the exact original global rate.
+///
+/// Tropel's arrival-rate executors are token-bucket shaped: instead of
+/// sleeping to a per-iteration deadline they ask, once per tick, "how many
+/// arrivals do I owe by now?". [`due_by`](Self::due_by) is that question,
+/// expressed against the **global** arrival count — feed it
+/// `floor(elapsed × global_rate)` (constant) or `floor(∫global_rate)`
+/// (ramping) and it returns this node's cumulative share.
+///
+/// Global tick `g` (0-based, k6's `gi`) is the `g+1`-th global arrival, and
+/// [`SegmentedIndex`] already yields that 1-based `unscaled` number — so the
+/// node's `j`-th arrival is due exactly when the global sequence reaches its
+/// `unscaled_j`-th. For the [`full`](Self::full) stripe `unscaled` is
+/// `1, 2, 3, …` and `due_by(n) == n`, i.e. the un-segmented schedule is
+/// unchanged.
+#[derive(Debug, Clone)]
+pub struct ArrivalStripe {
+    index: SegmentedIndex,
+    /// 1-based global arrival number of the next arrival this node owns.
+    next_owned: i64,
+    /// How many arrivals this node has released so far.
+    released: u64,
+}
+
+impl ArrivalStripe {
+    fn from_index(mut index: SegmentedIndex) -> Self {
+        let (_scaled, next_owned) = index.advance();
+        Self {
+            index,
+            next_owned,
+            released: 0,
+        }
+    }
+
+    /// The identity stripe: this node owns **every** global tick, so
+    /// `due_by(n) == n`. This is the single-node (un-segmented) schedule and
+    /// the default for a scheduler that was never given a segment.
+    pub fn full() -> Self {
+        // The `[0,1)` sequence: one segment of length 1, LCD 1, start 0,
+        // offset 1 — spelled directly rather than parsed so this cannot fail.
+        Self::from_index(SegmentedIndex {
+            start: 0,
+            lcd: 1,
+            offsets: vec![1],
+            scaled: 0,
+            unscaled: 0,
+        })
+    }
+
+    /// How many arrivals this node owes once the **global** arrival sequence
+    /// has produced `global_arrivals` of them.
+    ///
+    /// Monotone non-decreasing, and the cursor only ever moves forward — the
+    /// caller must feed a monotone `global_arrivals` (both executors do:
+    /// it is a floor of a non-decreasing integral of the global rate).
+    pub fn due_by(&mut self, global_arrivals: u64) -> u64 {
+        while self.next_owned > 0 && self.next_owned as u64 <= global_arrivals {
+            self.released += 1;
+            self.next_owned = self.index.advance().1;
+        }
+        self.released
     }
 }
 
@@ -858,6 +1008,11 @@ mod tests {
             _ => panic!("wrong variant"),
         }
 
+        // TR-221: `apply()` is the ScaleRate FALLBACK — it divides the rate
+        // by the segment count, which delivers the right total but makes
+        // every node fire its own independent rate from its own t=0 (arrivals
+        // bunch). It is only reached when no full executionSegmentSequence is
+        // available to stripe against; the striped path is asserted below.
         let exec = ExecutionConfig::ConstantArrivalRate {
             rate: 9.0,
             time_unit: "1s".into(),
@@ -876,6 +1031,25 @@ mod tests {
                 ..
             } => {
                 assert!((rate - 3.0).abs() < 1e-9); // 9/3 = 3
+                assert_eq!(pre_alloc_vus, 1);
+                assert_eq!(max_vus, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // TR-221 striped mode: the rate stays GLOBAL (the stripe is the
+        // share), while the VU counts are still telescoped.
+        let striped = third.apply_with(&exec, RateSegmentation::GlobalRate);
+        match striped {
+            ExecutionConfig::ConstantArrivalRate {
+                rate,
+                pre_alloc_vus,
+                max_vus,
+                ..
+            } => {
+                assert!(
+                    (rate - 9.0).abs() < 1e-9,
+                    "striped mode must NOT scale the rate — got {rate}, want the global 9"
+                );
                 assert_eq!(pre_alloc_vus, 1);
                 assert_eq!(max_vus, 3);
             }
@@ -910,6 +1084,39 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+        // TR-221: the whole ramping CURVE stays global in striped mode.
+        let striped = third.apply_with(&exec, RateSegmentation::GlobalRate);
+        match striped {
+            ExecutionConfig::RampingArrivalRate {
+                start_rate,
+                stages,
+                pre_alloc_vus,
+                ..
+            } => {
+                assert!((start_rate - 3.0).abs() < 1e-9);
+                assert!((stages[0].target - 9.0).abs() < 1e-9);
+                assert_eq!(pre_alloc_vus, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // VU-count executors are unaffected by the rate mode (ExecutionConfig
+        // has no PartialEq — compare the scaled VU count, which is the only
+        // field either mode could touch).
+        let vus_exec = ExecutionConfig::ConstantVus {
+            vus: 9,
+            duration: "30s".into(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        };
+        let vus_of = |e: ExecutionConfig| match e {
+            ExecutionConfig::ConstantVus { vus, .. } => vus,
+            _ => panic!("wrong variant"),
+        };
+        assert_eq!(
+            vus_of(third.apply(&vus_exec)),
+            vus_of(third.apply_with(&vus_exec, RateSegmentation::GlobalRate)),
+            "rate mode must not touch VU-count executors"
+        );
 
         let exec = ExecutionConfig::PerVUIterations {
             vus: 9,
@@ -1079,5 +1286,92 @@ mod tests {
         for (gi, c) in covered.iter().enumerate() {
             assert!(c, "global tick {gi} was never claimed");
         }
+    }
+    /// TR-221: the identity stripe owns every global tick, so the
+    /// un-segmented executor schedule is unchanged (`due_by(n) == n`).
+    #[test]
+    fn full_arrival_stripe_owns_every_tick() {
+        let mut stripe = ArrivalStripe::full();
+        for n in 0..50u64 {
+            assert_eq!(stripe.due_by(n), n, "full stripe must owe every arrival");
+        }
+        // Monotone under a jump (the executor's 1 ms tick can skip several
+        // global arrivals at high rates).
+        let mut stripe = ArrivalStripe::full();
+        assert_eq!(stripe.due_by(1000), 1000);
+        assert_eq!(stripe.due_by(1000), 1000, "no double-count on a re-ask");
+    }
+
+    /// TR-221: the three stripes of the k6-doc 50%/25%/25% sequence must
+    /// PARTITION the global arrival sequence — every global arrival owed by
+    /// exactly one node, none owed twice, none dropped. This is the property
+    /// the executor relies on to make N nodes indistinguishable from one.
+    #[test]
+    fn arrival_stripes_partition_the_global_sequence() {
+        let seq = ExecutionSegmentSequence::parse("0,1/2,3/4,1").unwrap();
+        let wrapper = ExecutionSegmentSequenceWrapper::new(&seq).unwrap();
+        let mut stripes: Vec<ArrivalStripe> = (0..3).map(|i| wrapper.arrival_stripe(i)).collect();
+
+        // Walk the global sequence one arrival at a time and record which
+        // node claimed it.
+        let mut owner = vec![usize::MAX; 41];
+        let mut prev = [0u64; 3];
+        for g in 1..=40u64 {
+            let mut claimed = 0;
+            for (i, stripe) in stripes.iter_mut().enumerate() {
+                let now = stripe.due_by(g);
+                if now > prev[i] {
+                    assert_eq!(
+                        now - prev[i],
+                        1,
+                        "node {i} claimed {} arrivals at global tick {g}",
+                        now - prev[i]
+                    );
+                    assert_eq!(owner[g as usize], usize::MAX, "tick {g} claimed twice");
+                    owner[g as usize] = i;
+                    claimed += 1;
+                    prev[i] = now;
+                }
+            }
+            assert_eq!(
+                claimed, 1,
+                "global arrival {g} must be claimed exactly once"
+            );
+        }
+        // 50/25/25 over 40 arrivals → 20/10/10.
+        assert_eq!(prev, [20, 10, 10], "stripe shares must match the segments");
+        // And the ownership pattern is k6's doc example: node 0 takes the odd
+        // arrivals, nodes 1 and 2 alternate on the evens.
+        assert_eq!(&owner[1..9], &[0, 1, 0, 2, 0, 1, 0, 2]);
+    }
+
+    /// TR-221: 100 equal segments — each node must owe exactly 1 of every 100
+    /// global arrivals, and the 100 stripes must cover the sequence with no
+    /// gaps. The f64-scaling bug this sequence exposed for VU counts has an
+    /// arrival-rate twin: `rate/100` per node fires 100 bunched arrivals at
+    /// each 1/rate boundary instead of one every 1/(100·rate).
+    #[test]
+    fn arrival_stripes_partition_hundred_segments() {
+        let tokens: Vec<String> = (0..=100u64).map(|i| format!("{i}/100")).collect();
+        let seq = ExecutionSegmentSequence::parse(&tokens.join(",")).unwrap();
+        let wrapper = ExecutionSegmentSequenceWrapper::new(&seq).unwrap();
+        let mut stripes: Vec<ArrivalStripe> = (0..100).map(|i| wrapper.arrival_stripe(i)).collect();
+        for (i, stripe) in stripes.iter_mut().enumerate() {
+            // Over 1000 global arrivals each node owes exactly 10, and its
+            // first is global arrival i+1.
+            assert_eq!(stripe.due_by(1000), 10, "node {i} share over 1000 arrivals");
+        }
+        let mut firsts: Vec<u64> = (0..100)
+            .map(|i| {
+                let mut s = wrapper.arrival_stripe(i);
+                (1..=100u64).find(|g| s.due_by(*g) == 1).unwrap()
+            })
+            .collect();
+        firsts.sort();
+        assert_eq!(
+            firsts,
+            (1..=100u64).collect::<Vec<_>>(),
+            "the 100 stripes must claim the first 100 global arrivals one each"
+        );
     }
 }

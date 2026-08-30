@@ -11,6 +11,7 @@ pub mod config;
 pub mod dns;
 pub mod rps;
 pub mod subtimings;
+pub mod vu_jar;
 
 pub use client::*;
 pub use config::*;

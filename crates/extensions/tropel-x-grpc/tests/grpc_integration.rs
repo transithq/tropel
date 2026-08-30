@@ -362,7 +362,7 @@ async fn samples_carry_the_grpc_service_tag() {
         .expect("grpc_req_duration sample");
 
     assert_eq!(
-        sample.tags.get("service").map(|v| v.as_ref()),
+        sample.tags.get("service"),
         Some("test.Greeter"),
         "grpc samples must carry k6's `service` system tag = the \
          package-qualified service name; got tags: {:?}",
@@ -378,7 +378,7 @@ async fn samples_carry_the_grpc_service_tag() {
             .find(|s| s.metric == metric)
             .unwrap_or_else(|| panic!("{metric} sample"));
         assert_eq!(
-            s.tags.get("service").map(|v| v.as_ref()),
+            s.tags.get("service"),
             Some("test.Greeter"),
             "{metric} must carry the service tag too"
         );

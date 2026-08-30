@@ -27,3 +27,9 @@ flate2.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+# TR-304: DEV-ONLY. The OTLP protobuf encoder in `src/otlp_proto.rs` is
+# hand-rolled and links no protobuf runtime; `prost` is used solely to decode
+# what it produces in `round_trip_decodes_under_prost`, so the wire bytes are
+# checked against a third-party implementation rather than our own reader.
+# Already in Cargo.lock via tropel-x-grpc — adds no new package to the tree.
+prost.workspace = true

@@ -7,7 +7,7 @@
 //
 // Under the hood it delegates HTTP calls to __tropel_k6_http_request
 // (registered lazily by the K6DriverInstance on first iteration) or
-// to __tropel_pm_send_request (if the PM bridge is available).
+// to __tropel_trp_send_request (if the PM bridge is available).
 //
 // The preprocessor strips `import ... from "k6/..."` lines, so
 // k6 scripts that use module syntax resolve to these globals.
@@ -15,7 +15,7 @@
 
 // ── Globals set by native host (K6DriverInstance) ──
 // __tropel_k6_http_request(method, url, headers_json, body, timeout_ms, response_type) -> native JS object (the PM fallback bridge returns a JSON string)
-// __tropel_pm_send_request(method, url, headers_json, body, timeout_ms, response_type) -> JSON string
+// __tropel_trp_send_request(method, url, headers_json, body, timeout_ms, response_type) -> JSON string
 // __tropel_vu_id, __tropel_iteration_num, __tropel_scenario
 
 // ══════════════════════════════════════════════════════════════════
@@ -60,8 +60,8 @@ function k6HTTPRequest(method, url, body, params) {
                 cookies: canonical.cookies
             })
         );
-    } else if (typeof __tropel_pm_send_request === 'function') {
-        resultJson = __tropel_pm_send_request(
+    } else if (typeof __tropel_trp_send_request === 'function') {
+        resultJson = __tropel_trp_send_request(
             canonical.method,
             canonical.url,
             headersJson,
@@ -72,7 +72,7 @@ function k6HTTPRequest(method, url, body, params) {
     } else {
         throw new Error(
             'k6 http.* requires a native HTTP bridge — neither __tropel_k6_http_request ' +
-            'nor __tropel_pm_send_request is available. Check that the K6Driver or PM bridge ' +
+            'nor __tropel_trp_send_request is available. Check that the K6Driver or PM bridge ' +
             'was properly installed.'
         );
     }
@@ -1117,57 +1117,83 @@ http.batch = function (requests) {
 };
 
 // TR-233: `http.cookieJar()` / `new http.CookieJar()` — k6's per-VU cookie
-// jar with 4 methods. cookiesForURL returns VALUES only (array of strings);
-// set parses `expires` as RFC 1123; clear/delete work by re-setting the
-// cookie with Max-Age=-1. The jar is backed by the per-VU native cookie
-// jar (VuCookieClient) through lazy bridges, like exec.*.
+// jar, backed by the SAME native jar (VuCookieClient) that rides on every
+// request. Four methods, matching js/modules/k6/http/cookiejar.go:
+//
+//   cookiesForURL(url) -> { name: [value, …] }  — VALUES, not cookie objects
+//                                                 (that shape is res.cookies)
+//   set(url, name, value, opts)                 — opts.expires is RFC 1123
+//   delete(url, name)                           — re-set with Max-Age=-1
+//   clear(url)                                  — Max-Age=-1 for every cookie
+//                                                 matching the URL
+//
+// A missing bridge THROWS. It used to silently no-op, which meant a script
+// could call jar.set() and watch the next request go out without the cookie
+// — a declared capability that forwards nothing (CONTEXT invariant 3).
+function __tropelRequireJarBridge(fn, name) {
+    if (typeof fn !== 'function') {
+        throw new Error(
+            'http.cookieJar().' + name + ' is unavailable: the native cookie-jar ' +
+            'bridge is not registered in this context.'
+        );
+    }
+}
+
 function k6CookieJar() {
     var jar = {};
     jar.cookiesForURL = function (url) {
-        if (typeof __tropel_k6_jar_cookies_for_url === 'function') {
-            var json = __tropel_k6_jar_cookies_for_url(String(url));
-            try {
-                var obj = JSON.parse(json);
-                // k6 returns VALUES only: an array of cookie value strings.
-                var values = [];
-                for (var k in obj) {
-                    if (!obj.hasOwnProperty(k)) continue;
-                    var v = obj[k];
-                    values.push(Array.isArray(v) ? v[0] : v);
-                }
-                return values;
-            } catch (e) { return []; }
-        }
-        return [];
+        __tropelRequireJarBridge(
+            typeof __tropel_k6_jar_cookies_for_url !== 'undefined'
+                ? __tropel_k6_jar_cookies_for_url : undefined,
+            'cookiesForURL'
+        );
+        // k6's CookiesForURL returns map[string][]string — one array of value
+        // strings per cookie name, so `cookies.my_cookie[0]` is the documented
+        // access. Returning a flat array of values would break that.
+        return JSON.parse(__tropel_k6_jar_cookies_for_url(String(url)));
     };
     jar.set = function (url, name, value, options) {
-        if (typeof __tropel_k6_jar_set === 'function') {
-            var opts = options || {};
-            // k6: `expires` parses as RFC1123 (new Date(expires)); `max_age`
-            // in seconds. A Date/string expiry becomes seconds since epoch.
-            var maxAge = opts.max_age !== undefined ? opts.max_age : 0;
-            var expiresSec = 0;
-            if (opts.expires) {
-                var exp = new Date(opts.expires);
-                if (!isNaN(exp.getTime())) {
-                    expiresSec = Math.floor(exp.getTime() / 1000);
-                }
-            }
-            __tropel_k6_jar_set(
-                String(url), String(name), String(value),
-                String(opts.path || ''), String(opts.domain || ''),
-                opts.secure === true, opts.http_only === true,
-                maxAge, expiresSec
-            );
+        __tropelRequireJarBridge(
+            typeof __tropel_k6_jar_set !== 'undefined' ? __tropel_k6_jar_set : undefined,
+            'set'
+        );
+        var opts = options || {};
+        // k6 parses `expires` with time.Parse(time.RFC1123, …) — the native
+        // side does the same and REJECTS anything else, so the string is
+        // forwarded verbatim. A Date is rendered with toUTCString(), which is
+        // RFC 1123; ISO-8601 (toISOString()) is not, and is rejected loudly
+        // rather than quietly becoming a session cookie.
+        var expires;
+        if (opts.expires instanceof Date) {
+            expires = opts.expires.toUTCString();
+        } else if (opts.expires !== undefined && opts.expires !== null) {
+            expires = String(opts.expires);
         }
+        __tropel_k6_jar_set(String(url), String(name), String(value), JSON.stringify({
+            domain: opts.domain !== undefined ? String(opts.domain) : undefined,
+            path: opts.path !== undefined ? String(opts.path) : undefined,
+            expires: expires,
+            max_age: opts.max_age !== undefined ? opts.max_age : opts.maxAge,
+            secure: opts.secure === true,
+            http_only: opts.http_only === true || opts.httpOnly === true
+        }));
     };
-    jar.clear = function (url, name) {
-        // k6: clear re-sets the cookie with Max-Age=-1 (deletion).
-        if (typeof __tropel_k6_jar_set === 'function') {
-            __tropel_k6_jar_set(String(url), String(name), '', '', '', false, false, -1, 0);
-        }
+    jar.delete = function (url, name) {
+        __tropelRequireJarBridge(
+            typeof __tropel_k6_jar_delete !== 'undefined' ? __tropel_k6_jar_delete : undefined,
+            'delete'
+        );
+        __tropel_k6_jar_delete(String(url), String(name));
     };
-    jar.delete = function (url, name) { jar.clear(url, name); };
+    jar.clear = function (url) {
+        // k6's clear takes ONLY a url and drops every cookie matching it; the
+        // per-name form is delete(url, name). The old shim aliased the two.
+        __tropelRequireJarBridge(
+            typeof __tropel_k6_jar_clear !== 'undefined' ? __tropel_k6_jar_clear : undefined,
+            'clear'
+        );
+        __tropel_k6_jar_clear(String(url));
+    };
     return jar;
 }
 
@@ -1532,16 +1558,16 @@ if (typeof check !== 'function') {
                 try {
                     passed = !!condition(val);
                 } catch (e) {
-                    if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name, false, tagsJson);
+                    if (typeof __tropel_trp_test === 'function') {
+                        __tropel_trp_test(name, false, tagsJson);
                     }
                     throw e;
                 }
             } else {
                 passed = !!condition;
             }
-            if (typeof __tropel_pm_test === 'function') {
-                __tropel_pm_test(name, passed, tagsJson);
+            if (typeof __tropel_trp_test === 'function') {
+                __tropel_trp_test(name, passed, tagsJson);
             }
             if (!passed) {
                 allPassed = false;
@@ -1558,8 +1584,8 @@ if (typeof group !== 'function') {
         if (typeof fn === 'function' && Object.prototype.toString.call(fn) === '[object AsyncFunction]') {
             throw new TypeError('group() does not support async callbacks (k6 rejects them)');
         }
-        if (typeof __tropel_pm_group_start === 'function') {
-            __tropel_pm_group_start(name);
+        if (typeof __tropel_trp_group_start === 'function') {
+            __tropel_trp_group_start(name);
             var startTime = Date.now();
             try {
                 if (typeof fn === 'function') {
@@ -1567,7 +1593,7 @@ if (typeof group !== 'function') {
                 }
             } finally {
                 var duration = Date.now() - startTime;
-                __tropel_pm_group_end(name, duration);
+                __tropel_trp_group_end(name, duration);
             }
         } else {
             if (typeof fn === 'function') {
@@ -1633,9 +1659,9 @@ if (typeof Counter !== 'function') {
         if (!isFinite(v)) {
             return false;
         }
-        if (typeof __tropel_pm_custom_metric_add === 'function') {
+        if (typeof __tropel_trp_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
+            __tropel_trp_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
         }
         return true;
     };

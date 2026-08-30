@@ -330,7 +330,7 @@ Full register: `TROPEL_PARITY_POSTMAN.md`.
 - [x] `pm.request.body.mode` leaks the previous iteration's value via the module-scope fallback
 - [x] `bru.*` and `pm.*` use **two encoders on one variable store** ✅**EXEC**: `bru.setEnvVar('id','1234')` then `getEnvVar` returns the **number** `1234`; `bru.setVar('o',{a:1})` stores `"[object Object]"`
 - [x] `local_vars` is never cleared — Newman scopes `pm.variables` per request; here it grows for the whole run
-- [x] `__tropel_pm_test_skip` is registered by `TrpBridge`, but the k6 driver never installs `TrpBridge` — k6 driver now registers its own `__tropel_pm_test_skip` (skips logged, no longer a silent no-op)
+- [x] `__tropel_trp_test_skip` is registered by `TrpBridge`, but the k6 driver never installs `TrpBridge` — k6 driver now registers its own `__tropel_trp_test_skip` (skips logged, no longer a silent no-op)
 
 ## TR-263 · Arbitrary local-file read driven by collection content
 **Effort:** S · **Blocked by:** none · **Human sign-off**

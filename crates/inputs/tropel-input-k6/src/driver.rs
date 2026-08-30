@@ -33,7 +33,7 @@
 //! 6. **Run**: each call to `run_iteration()` invokes `__tropel_iteration()`
 //!    and drains metrics/abort state from the `VuContext`.
 
-use crate::options::K6Options;
+use crate::options::{BatchLimitsCell, K6Options};
 use crate::system_tags::{SystemTag, SystemTagSet};
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -304,9 +304,15 @@ impl Driver for K6Driver {
         // otherwise fall back to the module's `default` export. Modules are
         // the only mode where `export const options` (the k6 load profile) and
         // `export default function` survive together.
-        // TR-212: the same eval yields the script's `options.systemTags`.
-        let declared_system_tags = install_iteration_global(&mut js_ctx, &final_source, exec)?;
-        let system_tags = k6_system_tags(declared_system_tags.as_ref());
+        // ONE module evaluation, both declared values. TR-212 wants
+        // `options.systemTags`; TR-233 wants `options.batch` /
+        // `options.batchPerHost`. Both are the only route their values have —
+        // `DriverDeclaredOptions` (the engine's channel) lives in the pinned
+        // published SDK and cannot carry either — and evaluating the module
+        // twice would run a request-issuing top level twice.
+        let declared = install_iteration_global(&mut js_ctx, &final_source, exec)?;
+        let system_tags = k6_system_tags(declared.system_tags.as_ref());
+        let batch_limits = Arc::new(BatchLimitsCell::new(declared.batch_limits));
 
         // Verify __tropel_iteration was defined
         let has_iter = js_ctx
@@ -335,6 +341,7 @@ impl Driver for K6Driver {
             js_ctx,
             _source_path: source_path.map(|p| p.to_path_buf()),
             http_bridge_registered: false,
+            batch_limits,
             script_bridges_registered: false,
             sample_sink: Arc::new(Mutex::new(Vec::new())),
             group_stack: Arc::new(Mutex::new(Vec::new())),
@@ -838,8 +845,14 @@ pub struct K6DriverInstance {
     /// registered. Registration happens on the first run_iteration() call
     /// because the HttpClient isn't available until init() completes.
     http_bridge_registered: bool,
-    /// Whether the script-state bridges (__tropel_pm_test,
-    /// __tropel_pm_custom_metric_add, __tropel_exec_*, __tropel_test_abort)
+    /// TR-233: this script's `options.batch` / `options.batchPerHost`, read
+    /// from the module's own `options` export in init(). The batch bridge
+    /// sizes its two-level semaphore from here, so a script that sets
+    /// `batch: 50` gets 50 — previously the value was warned as an unknown
+    /// option and the hardcoded k6 defaults were used regardless.
+    batch_limits: Arc<BatchLimitsCell>,
+    /// Whether the script-state bridges (__tropel_trp_test,
+    /// __tropel_trp_custom_metric_add, __tropel_exec_*, __tropel_test_abort)
     /// have been registered. Same lazy pattern as the HTTP bridge; these
     /// read the per-VU exec_state / abort flag.
     script_bridges_registered: bool,
@@ -2179,6 +2192,7 @@ impl K6DriverInstance {
         // cannot declare — the registration lives in the generic free fn
         // below. Behavior is identical; only the marshalling changes.
         let (deadline, max_exec) = self.js_ctx.interrupt_deadline_handle();
+        let batch_limits = self.batch_limits.clone();
         self.js_ctx.with_ctx(|rq_ctx| {
             register_http_bridges(
                 rq_ctx,
@@ -2189,6 +2203,7 @@ impl K6DriverInstance {
                 deadline,
                 max_exec,
                 SystemTagsHandle::ready(self.system_tags),
+                batch_limits.clone(),
             );
         });
 
@@ -2339,6 +2354,117 @@ fn build_k6_request(
     (req, params, method_error)
 }
 
+/// Throw a JS `Error` carrying `msg` out of a native bridge.
+fn throw_js(ctx: &rquickjs::Ctx<'_>, msg: String) -> rquickjs::Error {
+    match rquickjs::Exception::from_message(ctx.clone(), &msg) {
+        Ok(exc) => ctx.throw(exc.into_object().into_value()),
+        Err(_) => rquickjs::Error::Exception,
+    }
+}
+
+/// Register the `http.cookieJar()` bridges against **this VU's** cookie jar
+/// — the jar `VuCookieClient` puts on every request (TR-233).
+///
+/// Before this, the shim's four methods existed with nothing behind them:
+/// `jar.set()` changed no subsequent request, and `jar.cookiesForURL()` could
+/// not see a cookie the server had set. A declared capability that forwards
+/// nothing is worse than a missing one (CONTEXT invariant 3), so when the
+/// handle is not jar-backed the bridges are registered anyway and **throw** —
+/// they never silently succeed.
+fn register_cookie_jar_bridges(
+    rq_ctx: &rquickjs::Ctx<'_>,
+    http_client: &Arc<dyn DriverHttpClient + Send + Sync>,
+) {
+    use tropel_http::vu_jar;
+
+    let globals = rq_ctx.globals();
+    let jar = vu_jar::vu_jar_for_client(http_client);
+    if jar.is_none() {
+        tracing::warn!(
+            "k6 http.cookieJar(): this VU's HTTP client exposes no cookie jar — \
+             jar methods will throw rather than silently do nothing"
+        );
+    }
+
+    /// `Some(jar)` or a JS exception naming why the jar is unreachable.
+    macro_rules! jar_or_throw {
+        ($ctx:expr, $jar:expr) => {
+            match $jar.as_ref() {
+                Some(j) => j.clone(),
+                None => {
+                    return Err(throw_js(
+                        &$ctx,
+                        "http.cookieJar() is unavailable: this VU's HTTP client has no \
+                         cookie jar bound. Cookies set here would not reach any request."
+                            .to_string(),
+                    ))
+                }
+            }
+        };
+    }
+
+    let jar_read = jar.clone();
+    let _ = globals.set(
+        "__tropel_k6_jar_cookies_for_url",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>, url: String| -> rquickjs::Result<String> {
+                let jar = jar_or_throw!(ctx, jar_read);
+                let map = vu_jar::cookies_for_url(&jar, &url)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.cookiesForURL: {e}")))?;
+                serde_json::to_string(&map)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.cookiesForURL: {e}")))
+            },
+        ),
+    );
+
+    let jar_set = jar.clone();
+    let _ = globals.set(
+        "__tropel_k6_jar_set",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>,
+                  url: String,
+                  name: String,
+                  value: String,
+                  options_json: String|
+                  -> rquickjs::Result<()> {
+                let jar = jar_or_throw!(ctx, jar_set);
+                // The bridge closure is arity-capped (ctx + 6 script args) and
+                // k6's option bag keeps growing, so the options travel as ONE
+                // JSON string — the same packing the request bridge uses.
+                let opts: vu_jar::K6CookieOptions = serde_json::from_str(&options_json)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.set options: {e}")))?;
+                vu_jar::set_cookie(&jar, &url, &name, &value, &opts)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.set: {e}")))
+            },
+        ),
+    );
+
+    let jar_delete = jar.clone();
+    let _ = globals.set(
+        "__tropel_k6_jar_delete",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>, url: String, name: String| -> rquickjs::Result<()> {
+                let jar = jar_or_throw!(ctx, jar_delete);
+                vu_jar::delete_cookie(&jar, &url, &name)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.delete: {e}")))
+            },
+        ),
+    );
+
+    let jar_clear = jar;
+    let _ = globals.set(
+        "__tropel_k6_jar_clear",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'_>, url: String| -> rquickjs::Result<()> {
+                let jar = jar_or_throw!(ctx, jar_clear);
+                vu_jar::clear_cookies(&jar, &url)
+                    .map_err(|e| throw_js(&ctx, format!("cookieJar.clear: {e}")))
+            },
+        ),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn register_http_bridges<'js>(
     rq_ctx: &rquickjs::Ctx<'js>,
     http_client: Arc<dyn DriverHttpClient + Send + Sync>,
@@ -2351,8 +2477,10 @@ fn register_http_bridges<'js>(
     // because the setup()/teardown() path registers these bridges before the
     // module (and therefore `options.systemTags`) has been evaluated.
     sys: SystemTagsHandle,
+    batch_limits: Arc<BatchLimitsCell>,
 ) {
     let globals = rq_ctx.globals();
+    register_cookie_jar_bridges(rq_ctx, &http_client);
     let http_client_request = http_client.clone();
     let sink_req = sink.clone();
     // The scenario name is constant per VU — capture it once here (as an
@@ -2567,9 +2695,12 @@ fn register_http_bridges<'js>(
     let group_stack_batch = group_stack.clone();
     let deadline_batch = deadline.clone();
     let max_exec_batch = max_exec;
-    // TR-233: batch concurrency limiter — k6 defaults: 20 global, 6 per-host.
-    // TODO: wire `batch`/`batchPerHost` from k6 options; these are placeholders.
-    let batch_limit = Arc::new(tokio::sync::Semaphore::new(20));
+    // TR-233: batch concurrency limiter, sized from the script's own
+    // `options.batch` / `options.batchPerHost` (k6 defaults 20 global / 6
+    // per-host when unset). Read at CALL time from the cell, and the
+    // semaphores are built per `http.batch()` call — the same shape as k6's
+    // `MakeBatchRequests`, which constructs its limiters per call.
+    let batch_limits_bridge = batch_limits.clone();
     let _ = globals.set(
         "__tropel_k6_http_batch",
         Func::from(
@@ -2580,7 +2711,9 @@ fn register_http_bridges<'js>(
                     serde_json::from_str(&requests_json).unwrap_or_default();
 
                 let http_for_io = http_client.clone();
-                let batch_limit = batch_limit.clone();
+                let limits = batch_limits_bridge.get();
+                let batch_limit = Arc::new(tokio::sync::Semaphore::new(limits.batch));
+                let per_host_permits = limits.per_host;
                 // Per-host limiters (lazily created on first request to a host).
                 let per_host_limits: Arc<
                     std::sync::Mutex<
@@ -2648,7 +2781,9 @@ fn register_http_bridges<'js>(
                         let host_limit = {
                             let mut map = per_host_limits.lock().unwrap();
                             map.entry(host.clone())
-                                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(6)))
+                                .or_insert_with(|| {
+                                    Arc::new(tokio::sync::Semaphore::new(per_host_permits))
+                                })
                                 .clone()
                         };
                         let _host = host_limit.acquire().await.ok();
@@ -2808,8 +2943,8 @@ fn register_http_bridges<'js>(
 }
 
 impl K6DriverInstance {
-    /// Lazily register the script-state bridges (`__tropel_pm_test`,
-    /// `__tropel_pm_custom_metric_add`, `__tropel_exec_*`, `__tropel_test_abort`).
+    /// Lazily register the script-state bridges (`__tropel_trp_test`,
+    /// `__tropel_trp_custom_metric_add`, `__tropel_exec_*`, `__tropel_test_abort`).
     /// The k6 driver doesn't depend on tropel-sandbox (which installs these for the
     /// declarative path), so it installs its own equivalents backed by the
     /// per-VU sample_sink / exec_state / abort flag.
@@ -2829,7 +2964,7 @@ impl K6DriverInstance {
             // with check+group.
             let sys_test = self.system_tags;
             let _ = globals.set(
-                "__tropel_pm_test",
+                "__tropel_trp_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
                 Func::from(
                     move |name: String, passed: bool, tags_json: Option<String>| {
@@ -2868,7 +3003,7 @@ impl K6DriverInstance {
             );
 
             // TR-262/327: pm.test.skip() — TrpBridge registers
-            // `__tropel_pm_test_skip` for the declarative path, but the k6
+            // `__tropel_trp_test_skip` for the declarative path, but the k6
             // driver never installed TrpBridge, so `pm.test.skip(name)` was a
             // silent no-op here (pm.js:575 guards on the function's
             // existence). Register the k6 equivalent: skips are not pass/fail
@@ -3008,7 +3143,7 @@ let _ = globals.set(
             // TR-212: `group` is a system tag here too.
             let sys_metric = self.system_tags;
             let _ = globals.set(
-                "__tropel_pm_custom_metric_add",
+                "__tropel_trp_custom_metric_add",
                 Func::from(
                     move |name: String,
                           value: f64,
@@ -3121,7 +3256,7 @@ let _ = globals.set(
             );
 
             // group() → group_duration Trend sample (duration in ms). The
-            // shim's group() wraps fn() between __tropel_pm_group_start/end.
+            // shim's group() wraps fn() between __tropel_trp_group_start/end.
             // Backlog line 154: the START bridge pushes the name onto the
             // per-VU group stack (http bridges read the top when stamping
             // http_req_* tags), and END pops it — the two must balance or
@@ -3130,7 +3265,7 @@ let _ = globals.set(
             let sink_group = sink.clone();
             let group_start = self.group_stack.clone();
             let _ = globals.set(
-                "__tropel_pm_group_start",
+                "__tropel_trp_group_start",
                 Func::from(move |name: String| {
                     // Backlog line 63: push the FULL ::a::b path, not the bare
                     // leaf — every consumer reads group_stack.last() and k6
@@ -3152,7 +3287,7 @@ let _ = globals.set(
             // `systemTags: ['url']` still got `group=::checkout` here.
             let sys_group = self.system_tags;
             let _ = globals.set(
-                "__tropel_pm_group_end",
+                "__tropel_trp_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
                     // Backlog line 63: pop the FULL ::a::b path (start pushed
                     // it) and tag group_duration with it — k6 tags nested
@@ -4327,14 +4462,19 @@ async fn eval_module_call_export(
         let mut gs = group_stack.lock().unwrap();
         gs.push(format!("::{}", export));
     }
-    // TR-212: setup()/teardown() HTTP samples land in the run's metrics, so
-    // they must honour `options.systemTags` too — otherwise a script that
-    // narrows its tag set gets narrow VU samples and wide setup samples in
-    // the same series. The module is not evaluated yet here, so the bridges
-    // get a pending handle that `call_module_export` fills immediately after
-    // module evaluation, before the export can issue a request.
+    // TR-212 / TR-233: setup()/teardown() samples land in the run's metrics
+    // and may call `http.batch()`, so both the tag set and the batch limits
+    // must apply there too — otherwise a script that narrows its tag set gets
+    // narrow VU samples and wide setup samples in the same series, and its
+    // `options.batch` silently applies only in the VU loop.
+    //
+    // The bridges are registered BEFORE the module is evaluated (its top level
+    // may itself issue requests), so both get an empty container that
+    // `call_module_export` fills immediately after module evaluation and
+    // before any export can run.
     let sys_handle = SystemTagsHandle::pending();
     let sys_for_bridges = sys_handle.clone();
+    let batch_limits = Arc::new(BatchLimitsCell::default());
     js_ctx.with_ctx(|rq_ctx| {
         register_http_bridges(
             rq_ctx,
@@ -4345,6 +4485,7 @@ async fn eval_module_call_export(
             deadline,
             max_exec,
             sys_for_bridges,
+            batch_limits.clone(),
         );
     });
 
@@ -4360,7 +4501,9 @@ async fn eval_module_call_export(
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
 
     js_ctx.reset_interrupt();
-    match js_ctx.with_ctx(|ctx| call_module_export(ctx, source, export, arg_json, &sys_handle)) {
+    match js_ctx.with_ctx(|ctx| {
+        call_module_export(ctx, source, export, arg_json, &sys_handle, &batch_limits)
+    }) {
         Ok(Some(s)) => Ok(Some(s)),
         Ok(None) => Ok(None),
         // Do NOT warn here — the callers own the error path: setup() logs a
@@ -4380,15 +4523,20 @@ fn call_module_export(
     source: &str,
     export: &str,
     arg_json: Option<&str>,
-    // TR-212: filled from `options.systemTags` as soon as the module is
-    // evaluated, so HTTP calls made by setup()/teardown() are tagged with the
-    // same set as VU iterations.
+    // TR-212 / TR-233: both filled from the module's `options` the moment it
+    // is evaluated, so HTTP calls made by setup()/teardown() carry the same
+    // tag set and obey the same batch limits as VU iterations.
     sys: &SystemTagsHandle,
+    batch_limits: &BatchLimitsCell,
 ) -> std::result::Result<Option<String>, rquickjs::Error> {
     let module = rquickjs::Module::declare(ctx.clone(), "k6-script", source)?;
     let (module, promise) = module.eval()?;
     promise.finish::<()>()?;
     sys.fill(k6_system_tags(read_declared_system_tags(&module).as_ref()));
+
+    // TR-233: the module is now evaluated, so `options` is readable — fill the
+    // cell the already-registered batch bridge reads at call time.
+    batch_limits.set(read_batch_limits(ctx, &module));
 
     let func: rquickjs::Function = match module.get::<_, rquickjs::Function>(export) {
         Ok(f) => f,
@@ -4543,7 +4691,7 @@ fn install_iteration_global(
     js_ctx: &mut JsContext,
     source: &str,
     exec: Option<&str>,
-) -> Result<Option<Vec<String>>> {
+) -> Result<DeclaredFromModule> {
     // Arm the per-eval timeout: this evals the module directly via with_ctx,
     // bypassing the eval-family methods that normally reset the deadline.
     js_ctx.reset_interrupt();
@@ -4562,6 +4710,12 @@ fn install_iteration_global(
         // error — a malformed `options` is already diagnosed loudly by
         // `declared_options()`, which deserializes the whole object.
         let declared_system_tags = read_declared_system_tags(&module);
+
+        // TR-233: `options.batch` / `options.batchPerHost`, parsed by the SAME
+        // serde model `declared_options` uses (one implementation per
+        // behaviour). Read from the evaluated module rather than re-evaluated
+        // in a throwaway context — the handle is already here.
+        let batch_limits = read_batch_limits(rq_ctx, &module);
 
         // P-E: whitespace-only exec strings (e.g. Postman's exec:["",""]) pass
         // is_empty() but fail the module lookup. Trim first.
@@ -4593,8 +4747,26 @@ fn install_iteration_global(
                 tracing::warn!("k6 script has no default export function: {}", e);
             }
         }
-        Ok(declared_system_tags)
+        Ok(DeclaredFromModule {
+            system_tags: declared_system_tags,
+            batch_limits,
+        })
     })
+}
+
+/// What one evaluation of the k6 module yields to its callers.
+///
+/// TR-212 and TR-233 each need a different value off the SAME evaluated
+/// module, and both landed independently — each having changed this function's
+/// return type to carry its own. Returning a struct keeps the module evaluated
+/// exactly once: re-evaluating it per feature would run the script's top level
+/// twice, and a top level that issues requests or mutates state would then do
+/// so twice too.
+struct DeclaredFromModule {
+    /// `options.systemTags` — `None` means "not narrowed", i.e. k6's default 14.
+    system_tags: Option<Vec<String>>,
+    /// `options.batch` / `options.batchPerHost`, defaulted to k6's 20 / 6.
+    batch_limits: crate::options::K6BatchLimits,
 }
 
 /// TR-212: read `options.systemTags` off an evaluated k6 module.
@@ -4624,6 +4796,30 @@ fn read_declared_system_tags(
         }
     }
     Some(names)
+}
+
+/// Read `options.batch` / `options.batchPerHost` off an evaluated k6 module.
+///
+/// Stringifies the `options` export and hands it to
+/// [`K6Options::batch_limits_from_options_json`], so the k6 field names,
+/// aliases and defaults are defined in exactly one place (`options.rs`).
+/// A missing/unreadable `options` yields k6's defaults — `declared_options`
+/// already reports a malformed `options` fatally, and a second error here
+/// would just compete with it.
+fn read_batch_limits<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    module: &rquickjs::Module<'js, rquickjs::module::Evaluated>,
+) -> crate::options::K6BatchLimits {
+    let json = (|| -> Option<String> {
+        let value: rquickjs::Value = module.get("options").ok()?;
+        if value.is_undefined() || value.is_null() {
+            return None;
+        }
+        let json_obj: rquickjs::Object = ctx.globals().get("JSON").ok()?;
+        let stringify: rquickjs::Function = json_obj.get("stringify").ok()?;
+        stringify.call((value,)).ok()
+    })();
+    K6Options::batch_limits_from_options_json(json.as_deref())
 }
 
 /// Check if a file path has a TypeScript extension (used in tests).
@@ -4669,7 +4865,11 @@ const K6_BASE_SHIM_BUNDLE: &str = concat!(
 /// concatenated at COMPILE TIME into one bundle (see K6_BASE_SHIM_BUNDLE).
 const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: pm-api ====\n",
-    include_str!("../../../../js/scripting-api/pm.js"),
+    concat!(
+        include_str!("../../../../js/shared/k6-core.js"),
+        "\n",
+        include_str!("../../../../js/scripting-api/pm.js")
+    ),
     "\n",
     "// ==== shim: sleep-shim ====\n",
     include_str!("../../../../js/k6-shim/sleep-shim.js"),
@@ -4703,8 +4903,21 @@ const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
 /// One cache exists per bundle (base + native-dependent): the native bundle
 /// can only run AFTER `tropel_native::install_all`, so they are separate
 /// blobs and must never be cross-served.
+///
+/// TR-501 twin check: that "one cache per bundle" pairing was a CONVENTION,
+/// not an invariant — `bootstrap()` takes the bundle as a parameter, so
+/// `K6_BASE_BYTECODE.bootstrap(ctx, K6_NATIVE_SHIM_BUNDLE)` would compile one
+/// bundle and then silently serve its bytecode for the other. The engine's
+/// copy of this shape (`js_bootstrap.rs`) had the same hole and was closed by
+/// keying the cache on bundle identity; here, where there are exactly two
+/// fixed bundles, [`ShimBytecodeCache::compiled_from`] records which one the
+/// blob came from and a mismatch falls back to source eval, loudly, instead
+/// of running the wrong code.
 struct ShimBytecodeCache {
     bytecode: OnceLock<Option<Vec<u8>>>,
+    /// The bundle this cache's bytecode was compiled from. Set once,
+    /// alongside `bytecode`.
+    compiled_from: OnceLock<&'static str>,
     /// True once compilation failed — every context then falls back to the
     /// per-VU source eval path instead of retrying the compile each time.
     compile_failed: AtomicBool,
@@ -4719,6 +4932,7 @@ impl ShimBytecodeCache {
     const fn new() -> Self {
         Self {
             bytecode: OnceLock::new(),
+            compiled_from: OnceLock::new(),
             compile_failed: AtomicBool::new(false),
             run_failed: AtomicBool::new(false),
         }
@@ -4728,6 +4942,27 @@ impl ShimBytecodeCache {
     /// and known-good, otherwise fall back to a source eval (and remember the
     /// failure so the doomed path is not retried per VU).
     async fn bootstrap(&self, ctx: &mut JsContext, bundle: &'static str) {
+        // TR-501 twin check: never serve one bundle's bytecode for another.
+        // The two statics are paired with two bundles by convention only;
+        // if that pairing is ever broken, run the source rather than the
+        // wrong compiled blob.
+        if let Some(seen) = self.compiled_from.get() {
+            if !std::ptr::eq(*seen, bundle) {
+                tracing::error!(
+                    "k6 shim bytecode cache asked for a DIFFERENT bundle than it compiled \
+                     ({} B vs {} B) — falling back to source eval rather than serving the \
+                     wrong bytecode",
+                    seen.len(),
+                    bundle.len()
+                );
+                if let Err(e) = ctx.bootstrap_library(bundle).await {
+                    tracing::warn!("Failed to bootstrap k6 shim bundle: {}", e);
+                }
+                return;
+            }
+        }
+        let _ = self.compiled_from.set(bundle);
+
         let bytecode = self.bytecode.get_or_init(|| {
             if self.compile_failed.load(Ordering::Relaxed) {
                 return None;
@@ -6016,12 +6251,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__pm_captured = [];
-                globalThis.__tropel_pm_send_request = function (method, url, headersJson, body) {
+                globalThis.__tropel_trp_send_request = function (method, url, headersJson, body) {
                     globalThis.__pm_captured.push({ headers: JSON.parse(headersJson), body: body });
                     return JSON.stringify({ code: 200, body: '{}', headers: {}, responseTime: 5 });
                 };
@@ -6075,13 +6310,17 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 // Transport failure — what the real bridge returns on a
                 // connection error (code 0 + error field).
-                globalThis.__tropel_pm_send_request = function () {
+                globalThis.__tropel_trp_send_request = function () {
                     return JSON.stringify({
                         error: 'Request failed: error sending request for url (http://down:9/)',
                         code: 0, statusText: '', body: '', headers: {}, responseTime: 0
@@ -6093,7 +6332,7 @@ mod tests {
                 });
 
                 // A healthy response must still arrive via (null, resp).
-                globalThis.__tropel_pm_send_request = function () {
+                globalThis.__tropel_trp_send_request = function () {
                     return JSON.stringify({ code: 200, statusText: 'OK', body: '{}', headers: {},
                                             responseTime: 5 });
                 };
@@ -6142,11 +6381,15 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_send_request = function () {
+                globalThis.__tropel_trp_send_request = function () {
                     return JSON.stringify({ code: 200, statusText: 'OK', body: '{}',
                                             headers: {}, responseTime: 5 });
                 };
@@ -6200,22 +6443,26 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             // Stub the response bridges with known values.
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
-                globalThis.__tropel_pm_response_time = function () { return 42.5; };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_status = function () { return 'OK'; };
+                globalThis.__tropel_trp_response_time = function () { return 42.5; };
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_header = function (key) {
+                globalThis.__tropel_trp_response_header = function (key) {
                     if (String(key).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_cookies = function () {
+                globalThis.__tropel_trp_response_cookies = function () {
                     return { session: 'abc123' };
                 };
                 globalThis.__type_code = typeof pm.response.code;
@@ -6340,8 +6587,8 @@ mod tests {
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_status = function () { return 'OK'; };
                 globalThis.__status_code = res.getStatus();
                 globalThis.__status_text = res.getStatusText();
                 globalThis.__status_code_type = typeof res.getStatus();
@@ -6351,8 +6598,8 @@ mod tests {
                 })());
                 // Non-200 trial: proves the bridge value is actually read
                 // (a hardcoded 200 constant could not distinguish itself).
-                globalThis.__tropel_pm_response_code = function () { return 404; };
-                globalThis.__tropel_pm_response_status = function () { return 'Not Found'; };
+                globalThis.__tropel_trp_response_code = function () { return 404; };
+                globalThis.__tropel_trp_response_status = function () { return 'Not Found'; };
                 globalThis.__status_404 = res.getStatus();
                 globalThis.__status_404_text = res.getStatusText();
             "#,
@@ -6398,7 +6645,7 @@ mod tests {
         // COLLECTION vars bridges — but Bruno's getVar/setVar are RUNTIME-scope
         // (in-memory, per collection run). The mis-scoping silently broke the
         // core request-chaining idiom (setVar in one request, getVar in the
-        // next). The shim now routes through __tropel_pm_variables_* (the same
+        // next). The shim now routes through __tropel_trp_variables_* (the same
         // fall-through store pm.variables uses), and the family
         // hasVar/deleteVar/getAllVars/deleteAllVars is exposed.
         let rt = rquickjs::Runtime::new().unwrap();
@@ -6410,32 +6657,32 @@ mod tests {
                 r#"
                 // Route-spy: the VARIABLES bridge must be the one called.
                 var __vars_calls = [];
-                globalThis.__tropel_pm_variables_get = function (key) {
+                globalThis.__tropel_trp_variables_get = function (key) {
                     __vars_calls.push('get:' + key);
                     if (key === 'userId') return '42';
                     if (key === 'token') return '"abc"';
                     return null;
                 };
-                globalThis.__tropel_pm_variables_set = function (key, value) {
+                globalThis.__tropel_trp_variables_set = function (key, value) {
                     __vars_calls.push('set:' + key + '=' + value);
                 };
-                globalThis.__tropel_pm_variables_unset = function (key) {
+                globalThis.__tropel_trp_variables_unset = function (key) {
                     __vars_calls.push('unset:' + key);
                 };
                 // The COLLECTION bridge must NOT be touched.
-                globalThis.__tropel_pm_collection_vars_get = function () {
+                globalThis.__tropel_trp_collection_vars_get = function () {
                     throw new Error('getVar must not read collection vars');
                 };
-                globalThis.__tropel_pm_collection_vars_set = function () {
+                globalThis.__tropel_trp_collection_vars_set = function () {
                     throw new Error('setVar must not write collection vars');
                 };
-                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                globalThis.__tropel_trp_collection_vars_to_object = function () {
                     throw new Error('getAllVars must not read collection vars');
                 };
                 // W2 line 182: getAllVars reads the LOCAL store setVar writes
                 // (the old code read collection_vars while setVar wrote
                 // local_vars — a runtime var never appeared in getAllVars).
-                globalThis.__tropel_pm_variables_to_object = function () {
+                globalThis.__tropel_trp_variables_to_object = function () {
                     return { userId: '42', token: '"abc"', flag: 'true' };
                 };
                 var v1 = bru.getVar('userId');
@@ -6504,7 +6751,7 @@ mod tests {
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_environment_get = function (key) {
+                globalThis.__tropel_trp_environment_get = function (key) {
                     if (key === 'baseUrl') return '"https://api.example.com"';
                     if (key === 'port') return '8080';
                     return null;
@@ -6548,7 +6795,7 @@ mod tests {
     #[test]
     fn test_bru_assert_records_via_bool_bridge() {
         // W2 line 182: bru.assert passed an INT (passed ? 1 : 0) where the
-        // __tropel_pm_test bridge takes a BOOL — rquickjs 0.12 has no bool
+        // __tropel_trp_test bridge takes a BOOL — rquickjs 0.12 has no bool
         // coercion, so every call THREW (pm.js:506-508 warns about the rule).
         // It also passed only 2 of the bridge's 3 args. It now passes a real
         // bool + the empty tags string.
@@ -6560,7 +6807,7 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 var __calls = [];
-                globalThis.__tropel_pm_test = function (name, passed, tags) {
+                globalThis.__tropel_trp_test = function (name, passed, tags) {
                     __calls.push(name + '|' + passed + '|' + typeof passed + '|' + tags);
                 };
                 bru.assert('1 === 1', 'one equals one');
@@ -6600,7 +6847,7 @@ mod tests {
         // TROPEL_PARITY_BRUNO.md §2: Bruno exposes the collection scope via
         // getCollectionVar/setCollectionVar/hasCollectionVar/delete* — the
         // shim only had getVar/setVar (aliased to collection). The explicit
-        // family now maps to the __tropel_pm_collection_vars_* bridges.
+        // family now maps to the __tropel_trp_collection_vars_* bridges.
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
@@ -6609,19 +6856,19 @@ mod tests {
             ctx.eval::<(), _>(
                 r#"
                 var __store = { baseUrl: '"https://api.example.com"', retries: '3' };
-                globalThis.__tropel_pm_collection_vars_get = function (key) {
+                globalThis.__tropel_trp_collection_vars_get = function (key) {
                     return Object.prototype.hasOwnProperty.call(__store, key) ? __store[key] : null;
                 };
-                globalThis.__tropel_pm_collection_vars_set = function (key, value) {
+                globalThis.__tropel_trp_collection_vars_set = function (key, value) {
                     __store[key] = value;
                 };
-                globalThis.__tropel_pm_collection_vars_has = function (key) {
+                globalThis.__tropel_trp_collection_vars_has = function (key) {
                     return Object.prototype.hasOwnProperty.call(__store, key);
                 };
-                globalThis.__tropel_pm_collection_vars_unset = function (key) {
+                globalThis.__tropel_trp_collection_vars_unset = function (key) {
                     delete __store[key];
                 };
-                globalThis.__tropel_pm_collection_vars_to_object = function () {
+                globalThis.__tropel_trp_collection_vars_to_object = function () {
                     var out = {};
                     for (var k in __store) out[k] = __store[k];
                     return out;
@@ -6682,7 +6929,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6715,13 +6962,13 @@ mod tests {
                 globalThis.__json_body_ok = String((function () {
                     // to.have.jsonBody must deep-compare too (was key-order
                     // sensitive JSON.stringify comparison).
-                    var saved = globalThis.__tropel_pm_response_json;
-                    globalThis.__tropel_pm_response_json = function () {
+                    var saved = globalThis.__tropel_trp_response_json;
+                    globalThis.__tropel_trp_response_json = function () {
                         return '{"name":"ada","userId":1}';
                     };
                     try { pm.expect({}).to.have.jsonBody({ userId: 1, name: 'ada' }); return true; }
                     catch (e) { return 'threw: ' + e.message; }
-                    finally { globalThis.__tropel_pm_response_json = saved; }
+                    finally { globalThis.__tropel_trp_response_json = saved; }
                 })());
             "#,
             )
@@ -6749,7 +6996,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -6862,7 +7109,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6946,7 +7193,7 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6958,19 +7205,19 @@ mod tests {
                     })());
                 }
                 // Stub the response bridges for the Postman extensions.
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
-                globalThis.__tropel_pm_response_time = function () { return 42.5; };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_status = function () { return 'OK'; };
+                globalThis.__tropel_trp_response_time = function () { return 42.5; };
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_header = function (key) {
+                globalThis.__tropel_trp_response_header = function (key) {
                     if (String(key).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_cookies = function () { return {}; };
-                globalThis.__tropel_pm_response_body = function () { return '{}'; };
-                globalThis.__tropel_pm_response_json = function () { return {}; };
+                globalThis.__tropel_trp_response_cookies = function () { return {}; };
+                globalThis.__tropel_trp_response_body = function () { return '{}'; };
+                globalThis.__tropel_trp_response_json = function () { return {}; };
 
                 // name: 'x' at the TOP LEVEL — chai's deep.include checks the
                 // expected object's keys directly against the target (no
@@ -7105,7 +7352,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -7181,8 +7428,12 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 // Implemented getters must WORK (pass silently is fine — no throw).
@@ -7422,7 +7673,7 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7430,19 +7681,19 @@ mod tests {
                 // "against a 200", i.e. the plain-literal guard path
                 // (pm.response.to.be.*), which wraps a DIFFERENT target kind
                 // than the AssertChain instances pm.expect uses.
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
-                globalThis.__tropel_pm_response_time = function () { return 42.5; };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_status = function () { return 'OK'; };
+                globalThis.__tropel_trp_response_time = function () { return 42.5; };
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_header = function (key) {
+                globalThis.__tropel_trp_response_header = function (key) {
                     if (String(key).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_cookies = function () { return {}; };
-                globalThis.__tropel_pm_response_body = function () { return '{}'; };
-                globalThis.__tropel_pm_response_json = function () { return {}; };
+                globalThis.__tropel_trp_response_cookies = function () { return {}; };
+                globalThis.__tropel_trp_response_body = function () { return '{}'; };
+                globalThis.__tropel_trp_response_json = function () { return {}; };
 
                 globalThis.__r = {};
                 // Install the `.should` getter (chai.should() defines
@@ -7552,7 +7803,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7691,44 +7942,44 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 // Variable-store stubs.
-                globalThis.__tropel_pm_collection_vars_get = function (k) {
+                globalThis.__tropel_trp_collection_vars_get = function (k) {
                     if (k === 'base') return '"https://api.example.com"';
                     return null;
                 };
-                globalThis.__tropel_pm_collection_vars_set = function (k, v) { globalThis.__cv_set = k + '=' + v; };
-                globalThis.__tropel_pm_collection_vars_unset = function (k) { globalThis.__cv_unset = k; };
-                globalThis.__tropel_pm_collection_vars_has = function (k) { return k === 'base'; };
-                globalThis.__tropel_pm_collection_vars_to_object = function () { return { base: '"x"', n: '3' }; };
-                globalThis.__tropel_pm_globals_get = function (k) { return k === 'g' ? '"global"' : null; };
-                globalThis.__tropel_pm_globals_set = function (k, v) { globalThis.__g_set = k + '=' + v; };
-                globalThis.__tropel_pm_globals_unset = function (k) { globalThis.__g_unset = k; };
-                globalThis.__tropel_pm_globals_has = function (k) { return k === 'g'; };
-                globalThis.__tropel_pm_globals_to_object = function () { return { g: '"global"' }; };
-                globalThis.__tropel_pm_environment_has = function (k) { return k === 'env'; };
-                globalThis.__tropel_pm_environment_to_object = function () { return { env: 'e' }; };
+                globalThis.__tropel_trp_collection_vars_set = function (k, v) { globalThis.__cv_set = k + '=' + v; };
+                globalThis.__tropel_trp_collection_vars_unset = function (k) { globalThis.__cv_unset = k; };
+                globalThis.__tropel_trp_collection_vars_has = function (k) { return k === 'base'; };
+                globalThis.__tropel_trp_collection_vars_to_object = function () { return { base: '"x"', n: '3' }; };
+                globalThis.__tropel_trp_globals_get = function (k) { return k === 'g' ? '"global"' : null; };
+                globalThis.__tropel_trp_globals_set = function (k, v) { globalThis.__g_set = k + '=' + v; };
+                globalThis.__tropel_trp_globals_unset = function (k) { globalThis.__g_unset = k; };
+                globalThis.__tropel_trp_globals_has = function (k) { return k === 'g'; };
+                globalThis.__tropel_trp_globals_to_object = function () { return { g: '"global"' }; };
+                globalThis.__tropel_trp_environment_has = function (k) { return k === 'env'; };
+                globalThis.__tropel_trp_environment_to_object = function () { return { env: 'e' }; };
 
                 // pm.request stubs — capture what the shim sends back.
-                globalThis.__tropel_pm_request_url = function () { return 'http://x/old'; };
-                globalThis.__tropel_pm_request_url_set = function (u) { globalThis.__r_url = u; };
-                globalThis.__tropel_pm_request_method = function () { return 'GET'; };
-                globalThis.__tropel_pm_request_method_set = function (m) { globalThis.__r_method = m; };
-                globalThis.__tropel_pm_request_headers = function () { return { Authorization: 'Bearer old' }; };
-                globalThis.__tropel_pm_request_header_get = function (k) { return k.toLowerCase() === 'authorization' ? 'Bearer old' : null; };
-                globalThis.__tropel_pm_request_header_set = function (k, v) { globalThis.__r_hdr = k + '=' + v; };
-                globalThis.__tropel_pm_request_header_unset = function (k) { globalThis.__r_hdr_unset = k; };
-                globalThis.__tropel_pm_request_body = function () { return 'old-body'; };
-                globalThis.__tropel_pm_request_body_set = function (b) { globalThis.__r_body = b; };
-                globalThis.__tropel_pm_request_auth_set = function (a) { globalThis.__r_auth = a; };
+                globalThis.__tropel_trp_request_url = function () { return 'http://x/old'; };
+                globalThis.__tropel_trp_request_url_set = function (u) { globalThis.__r_url = u; };
+                globalThis.__tropel_trp_request_method = function () { return 'GET'; };
+                globalThis.__tropel_trp_request_method_set = function (m) { globalThis.__r_method = m; };
+                globalThis.__tropel_trp_request_headers = function () { return { Authorization: 'Bearer old' }; };
+                globalThis.__tropel_trp_request_header_get = function (k) { return k.toLowerCase() === 'authorization' ? 'Bearer old' : null; };
+                globalThis.__tropel_trp_request_header_set = function (k, v) { globalThis.__r_hdr = k + '=' + v; };
+                globalThis.__tropel_trp_request_header_unset = function (k) { globalThis.__r_hdr_unset = k; };
+                globalThis.__tropel_trp_request_body = function () { return 'old-body'; };
+                globalThis.__tropel_trp_request_body_set = function (b) { globalThis.__r_body = b; };
+                globalThis.__tropel_trp_request_auth_set = function (a) { globalThis.__r_auth = a; };
 
                 // Response cookies + test-skip + setNextRequest stubs.
-                globalThis.__tropel_pm_response_cookies = function () { return { sid: 'abc' }; };
-                globalThis.__tropel_pm_test_skip = function (n) { globalThis.__skipped = n; };
-                globalThis.__tropel_pm_set_next_request = function (n) { globalThis.__next_req = n; };
+                globalThis.__tropel_trp_response_cookies = function () { return { sid: 'abc' }; };
+                globalThis.__tropel_trp_test_skip = function (n) { globalThis.__skipped = n; };
+                globalThis.__tropel_trp_set_next_request = function (n) { globalThis.__next_req = n; };
 
                 // collectionVariables / globals surface.
                 globalThis.__cv_get = pm.collectionVariables.get('base');
@@ -7828,22 +8079,22 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 // Bridge stubs — variables_get returns JSON-encoded strings
                 // (the real bridge JSON-encodes so the shim can restore the
                 // type), set/skipRequest capture what the shim sends.
-                globalThis.__tropel_pm_variables_get = function (k) {
+                globalThis.__tropel_trp_variables_get = function (k) {
                     if (k === 'id') return '"42"';
                     if (k === 'one10') return '"1.10"';
                     return null;
                 };
-                globalThis.__tropel_pm_variables_set = function (k, v) { globalThis.__v_set = k + '=' + v; };
-                globalThis.__tropel_pm_variables_unset = function (k) { globalThis.__v_unset = k; };
-                globalThis.__tropel_pm_skip_request = function () { globalThis.__skipped = true; };
-                globalThis.__tropel_pm_set_next_request = function (n) { globalThis.__next_req = n; };
+                globalThis.__tropel_trp_variables_set = function (k, v) { globalThis.__v_set = k + '=' + v; };
+                globalThis.__tropel_trp_variables_unset = function (k) { globalThis.__v_unset = k; };
+                globalThis.__tropel_trp_skip_request = function () { globalThis.__skipped = true; };
+                globalThis.__tropel_trp_set_next_request = function (n) { globalThis.__next_req = n; };
 
                 // 1) Number value must not throw, must be coerced like the
                 // other stores, and must reach the bridge as a string.
@@ -7911,7 +8162,7 @@ mod tests {
             );
             assert!(
                 ctx.eval::<bool, _>("__skipped_after").unwrap(),
-                "pm.execution.skipRequest must reach the dedicated __tropel_pm_skip_request bridge"
+                "pm.execution.skipRequest must reach the dedicated __tropel_trp_skip_request bridge"
             );
             assert_eq!(
                 ctx.eval::<String, _>("__next_req_after_skip").unwrap(),
@@ -7951,7 +8202,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7967,16 +8218,16 @@ mod tests {
                 }
 
                 var env = {};
-                globalThis.__tropel_pm_environment_set = function (k, v) { env[k] = decodeEnv(v); };
-                globalThis.__tropel_pm_environment_get = function (k) { return k in env ? JSON.stringify(env[k]) : null; };
+                globalThis.__tropel_trp_environment_set = function (k, v) { env[k] = decodeEnv(v); };
+                globalThis.__tropel_trp_environment_get = function (k) { return k in env ? JSON.stringify(env[k]) : null; };
 
                 var col = {};
-                globalThis.__tropel_pm_collection_vars_set = function (k, v) { col[k] = decodeVal(v); };
-                globalThis.__tropel_pm_collection_vars_get = function (k) { return k in col ? JSON.stringify(col[k]) : null; };
+                globalThis.__tropel_trp_collection_vars_set = function (k, v) { col[k] = decodeVal(v); };
+                globalThis.__tropel_trp_collection_vars_get = function (k) { return k in col ? JSON.stringify(col[k]) : null; };
 
                 var gl = {};
-                globalThis.__tropel_pm_globals_set = function (k, v) { gl[k] = decodeVal(v); };
-                globalThis.__tropel_pm_globals_get = function (k) { return k in gl ? JSON.stringify(gl[k]) : null; };
+                globalThis.__tropel_trp_globals_set = function (k, v) { gl[k] = decodeVal(v); };
+                globalThis.__tropel_trp_globals_get = function (k) { return k in gl ? JSON.stringify(gl[k]) : null; };
 
                 // env: '1234' string stays the STRING '1234' (never number).
                 pm.environment.set('s', '1234');
@@ -8328,15 +8579,15 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             // Stub the custom-metric bridge + group bridges.
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_group_start = function (name) {};
-                globalThis.__tropel_pm_group_end = function (name, dur) {};
-                globalThis.__tropel_pm_test = function (name, passed, tags) {};
-                globalThis.__tropel_pm_custom_metric_add = function (name, value, tags, type, isTime) {};
+                globalThis.__tropel_trp_group_start = function (name) {};
+                globalThis.__tropel_trp_group_end = function (name, dur) {};
+                globalThis.__tropel_trp_test = function (name, passed, tags) {};
+                globalThis.__tropel_trp_custom_metric_add = function (name, value, tags, type, isTime) {};
                 var results = {};
                 try {
                     check({a: 1}, {ok: async function () { return true; }});
@@ -8467,6 +8718,9 @@ mod tests {
     /// echoed the client's `Sec-WebSocket-Protocol` request header would
     /// produce `chat.v1, chat.v2` and fail here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The Err type is fixed by tungstenite's handshake callback
+    // signature; boxing it does not typecheck against the trait.
+    #[allow(clippy::result_large_err)]
     async fn test_ws_samples_carry_negotiated_subproto_tag() {
         use tokio_tungstenite::tungstenite::handshake::server::{
             ErrorResponse, Request as HsRequest, Response as HsResponse,
@@ -8522,7 +8776,7 @@ mod tests {
             .find(|s| s.metric == "ws_sessions")
             .expect("ws_sessions sample");
         assert_eq!(
-            sample.tags.get("subproto").map(|v| v.as_ref()),
+            sample.tags.get("subproto"),
             Some("chat.v2"),
             "ws samples must carry the NEGOTIATED subprotocol; got tags: {:?}",
             sample.tags
@@ -8900,7 +9154,7 @@ mod tests {
             .find(|s| s.metric == "http_req_duration")
             .expect("http_req_duration sample");
 
-        let mut keys: Vec<&str> = sample.tags.iter().map(|(k, _)| k.as_ref()).collect();
+        let mut keys: Vec<&str> = sample.tags.iter().map(|(k, _)| k).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
@@ -8910,11 +9164,8 @@ mod tests {
         );
         // The surviving two must still hold their real values — narrowing the
         // set must not blank the tags it keeps.
-        assert_eq!(
-            sample.tags.get("url").map(|v| v.as_ref()),
-            Some("http://example.com/")
-        );
-        assert_eq!(sample.tags.get("status").map(|v| v.as_ref()), Some("200"));
+        assert_eq!(sample.tags.get("url"), Some("http://example.com/"));
+        assert_eq!(sample.tags.get("status"), Some("200"));
         // Each of these is emitted unconditionally pre-fix, on a different
         // code path (tag builder, drain-time scenario stamping, TR-204).
         for dropped in [
@@ -8957,13 +9208,13 @@ mod tests {
             .iter()
             .find(|s| s.metric == "http_req_duration")
             .expect("http_req_duration sample");
-        let keys: Vec<&str> = sample.tags.iter().map(|(k, _)| k.as_ref()).collect();
+        let keys: Vec<&str> = sample.tags.iter().map(|(k, _)| k).collect();
         assert_eq!(
             keys,
             vec!["team"],
             "systemTags: [] must leave ONLY the user's own tags; got {keys:?}"
         );
-        assert_eq!(sample.tags.get("team").map(|v| v.as_ref()), Some("billing"));
+        assert_eq!(sample.tags.get("team"), Some("billing"));
     }
 
     /// TR-212 twin: `systemTags` must apply to the checks path too, not only
@@ -9258,12 +9509,12 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__recorded = [];
-                globalThis.__tropel_pm_test = function (name, passed, tagsJson) {
+                globalThis.__tropel_trp_test = function (name, passed, tagsJson) {
                     globalThis.__recorded.push({
                         name: name,
                         passed: passed,
@@ -9346,7 +9597,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9359,7 +9610,7 @@ mod tests {
                     warn: function () {}
                 };
                 globalThis.__recorded = [];
-                globalThis.__tropel_pm_test = function (name, passed, tagsJson) {
+                globalThis.__tropel_trp_test = function (name, passed, tagsJson) {
                     globalThis.__recorded.push({
                         name: name,
                         passed: passed,
@@ -9862,20 +10113,20 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 404; };
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_code = function () { return 404; };
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
-                globalThis.__tropel_pm_response_body = function () { return 'not found'; };
+                globalThis.__tropel_trp_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_trp_response_body = function () { return 'not found'; };
 
                 globalThis.__be_success = String((function () {
                     try { pm.response.to.be.success; return 'passed'; } catch (e) { return 'threw'; }
@@ -9969,7 +10220,7 @@ mod tests {
             // throw — re-point the json bridge at a throwing body.
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_json = function () { throw new Error('body is not JSON'); };
+                globalThis.__tropel_trp_response_json = function () { throw new Error('body is not JSON'); };
                 globalThis.__be_json_prop_bad = String((function () {
                     try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
                 })());
@@ -10075,7 +10326,7 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
@@ -10083,18 +10334,18 @@ mod tests {
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
                 // Present-NULL body: {a: null} — the key EXISTS with a null
                 // value, so jsonBody('a') must PASS (lodash get parity).
-                globalThis.__tropel_pm_response_json = function () { return '{"a":null}'; };
-                globalThis.__tropel_pm_response_body = function () { return '{"a":null}'; };
+                globalThis.__tropel_trp_response_json = function () { return '{"a":null}'; };
+                globalThis.__tropel_trp_response_body = function () { return '{"a":null}'; };
 
                 // pm.js chain: present-null key passes.
                 globalThis.__jb_null_key_pm = String((function () {
@@ -10136,20 +10387,20 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
+            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 404; };
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_code = function () { return 404; };
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
-                globalThis.__tropel_pm_response_body = function () { return 'not found'; };
+                globalThis.__tropel_trp_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_trp_response_body = function () { return 'not found'; };
 
                 // Exact-status getters: only notFound passes on 404.
                 globalThis.__b_not_found = String((function () {
@@ -10206,7 +10457,7 @@ mod tests {
             // .notFound must now FAIL instead of recording PASS.
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_code = function () { return 200; };
                 globalThis.__b_not_found_200 = String((function () {
                     try { pm.response.to.be.notFound; return 'passed'; } catch (e) { return 'threw'; }
                 })());
@@ -10234,20 +10485,24 @@ mod tests {
         ctx.with(|ctx| {
             ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/pm.js"))
-                .expect("pm shim should eval");
+            ctx.eval::<(), _>(concat!(
+                include_str!("../../../../js/shared/k6-core.js"),
+                "\n",
+                include_str!("../../../../js/scripting-api/pm.js")
+            ))
+            .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
-                globalThis.__tropel_pm_response_code = function () { return 200; };
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_code = function () { return 200; };
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'text/html';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'text/html' };
                 };
-                globalThis.__tropel_pm_response_json = function () { return '<html>'; }; // NOT JSON
-                globalThis.__tropel_pm_response_body = function () { return '<html>'; };
+                globalThis.__tropel_trp_response_json = function () { return '<html>'; }; // NOT JSON
+                globalThis.__tropel_trp_response_body = function () { return '<html>'; };
 
                 // The silent-PASS probe from the backlog: bare property read
                 // on a text/html body must THROW now (was PASS).
@@ -10263,15 +10518,15 @@ mod tests {
                 })());
 
                 // Flip to a valid JSON body: both forms must pass.
-                globalThis.__tropel_pm_response_header = function (k) {
+                globalThis.__tropel_trp_response_header = function (k) {
                     if (String(k).toLowerCase() === 'content-type') return 'application/json';
                     return null;
                 };
-                globalThis.__tropel_pm_response_headers = function () {
+                globalThis.__tropel_trp_response_headers = function () {
                     return { 'Content-Type': 'application/json' };
                 };
-                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
-                globalThis.__tropel_pm_response_body = function () { return '{"a":1}'; };
+                globalThis.__tropel_trp_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_trp_response_body = function () { return '{"a":1}'; };
                 globalThis.__p_json_ok = String((function () {
                     try { pm.response.to.be.json; return 'passed'; } catch (e) { return 'threw'; }
                 })());
@@ -13106,7 +13361,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             .expect("native bridge stubs must eval");
             let bundle = format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n",
-                include_str!("../../../../js/scripting-api/pm.js"),
+                concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")),
                 include_str!("../../../../js/k6-shim/sleep-shim.js"),
                 include_str!("../../../../js/k6-shim/k6-shim.js"),
                 include_str!("../../../../js/k6-shim/jslib-shim.js"),

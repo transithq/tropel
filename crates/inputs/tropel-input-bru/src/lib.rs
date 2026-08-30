@@ -1082,3 +1082,51 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod exporter_spelling_regression {
+    use super::*;
+
+    /// TR-005: Bruno's exporter rewrites `type: "http-request"` to `"http"`
+    /// (`transformItem` in `bruno-app/src/utils/collections/export.js`). The
+    /// adapter originally matched only `"http-request"`, so **no real Bruno
+    /// export parsed** — every test used inline JSON spelling it the internal
+    /// way, and the suite was green.
+    ///
+    /// A committed export fixture is the criterion (still open: nobody with
+    /// Bruno has produced one). This asserts the property that fixture would
+    /// have proved, so the defect itself cannot come back while the fixture
+    /// question is settled separately.
+    ///
+    /// Fails on the pre-fix adapter: the `"http"` collection yields 0 items.
+    #[test]
+    fn both_exporter_spellings_produce_the_same_requests() {
+        let collection = |ty: &str| {
+            format!(
+                r#"{{"name":"c","items":[{{"type":"{ty}","name":"ping",
+                   "request":{{"url":"https://example.test/ping","method":"GET"}}}}]}}"#
+            )
+        };
+        let parse = |ty: &str| {
+            BruInputAdapter
+                .parse(collection(ty).as_bytes())
+                .unwrap_or_else(|e| panic!("`type: {ty}` must parse: {e}"))
+        };
+
+        let exported = parse("http");
+        let internal = parse("http-request");
+
+        assert_eq!(
+            exported.items.len(),
+            1,
+            "Bruno's EXPORTED spelling `type: \"http\"` must yield a request — \
+             matching only \"http-request\" is why no real export parsed"
+        );
+        assert_eq!(
+            exported.items.len(),
+            internal.items.len(),
+            "both spellings describe the same request and must agree"
+        );
+        assert_eq!(exported.items[0].name, internal.items[0].name);
+    }
+}

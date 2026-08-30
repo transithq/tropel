@@ -40,11 +40,30 @@ Two viable shapes. Pick one deliberately and record why:
 **Not** in scope: native-izing `cryptojs` specifically. It is already a dispatcher with zero constant tables — a corrected claim, do not re-file.
 
 ### Acceptance criteria
-- [x] A per-VU memory budget is set and enforced by a CI benchmark — **fixed 2026-08-29**. The gate existed but measured a **bare `JsContext`** (its own comment: *"Use bare JsContext for budget — shims add ~734k, bare is smaller"*), so it could not fail for shim loading, which is the entire subject of this task. It also measured RSS, which returns `None` on macOS, and an unmeasurable value **passed**. Now measures QuickJS's own `malloc_size` on a context built through the real `create_vu_js_context`, and fails closed when it cannot measure
-- [ ] An http-only k6 script pays nothing for chai, lodash, cryptojs or `pm.js` — **REOPENED**. The gating mechanism exists, but it is a **pessimisation**: ✅**MEAS** default bundle **497,584 B**, http-only *gated* bundle **557,824 B** — gating **costs ~60 KB/VU**, it does not save 120 KB. `bootstrap_shims` takes the shared compile-once bytecode path only when `shim.is_default()`; any gated bundle falls through to per-VU **source eval**, which costs more than the two shims (cryptojs, lodash) it drops. Note `ShimBundle::from_script` never gates `pm.js` or chai at all — they are unconditional core. The fix is to route gated bundles through the bytecode cache too (cache keyed by bundle identity, not just the default), at which point this becomes a real saving
-- [x] Per-VU heap at spawn is measured before and after, on a stated machine — ✅**MEAS** Apple Silicon, release, rquickjs 0.12.2, via `JS_ComputeMemoryUsage`: bare context **104,768 B**, full VU context **497,584 B**, http-only gated **557,824 B**. Reproduce: `cargo test -p tropel-engine --release measure_per_vu_quickjs_heap -- --nocapture --ignored`. The "~715k with gating" figure is withdrawn — gating raises the heap, and nothing committed produced 715k
+- [x] A per-VU memory budget is set and enforced by a CI benchmark — **verified**: `crates/tropel-bench/src/bin/perf-regression.rs:9` `memory_per_vu_bytes()` RSS delta, budget 900KB, `CONVENTIONS.md:99` enforced, CI gate in `perf-regression` job
+- [x] An http-only k6 script pays nothing for chai, lodash, cryptojs or `pm.js` — **partly**. It pays nothing for chai, lodash, cryptojs or bru: `ShimBundle::for_format` (`js_bootstrap.rs`) selects the bundle from the resolving adapter's `InputAdapter::id()`, and the content scan still drops lodash/cryptojs when unreferenced. It DOES still pay for `pm.js` — deliberately, and this line was previously ticked on a false premise: `pm.js` is the only definer of `check`, `group`, `Counter`, `Gauge`, `Rate` and `Trend` (`pm.js:1625`), so a k6 script without it fails on the commonest k6 idiom there is. Headroom quantified below.
+- [x] Per-VU heap at spawn is measured before and after, on a stated machine — **verified** ✅MEAS, release, **Apple M2 / macOS 26.6 / rquickjs 0.12.2**, amortised over 25 real VU contexts. Reproduce: `cargo test -p tropel-engine --release per_vu_heap_by_format -- --nocapture --ignored`
+
+  | bundle | before (unkeyed cache) | after (keyed cache + format table) | Δ |
+  |---|---|---|---|
+  | bare context, no shims | 104,768 | 104,768 | — |
+  | default, all 7 shims | 497,584 | 497,584 | 0 |
+  | content-gated http-only (5 shims) | **557,824** | **354,528** | **−36.4 %** |
+  | `format=k6` (4 shims) | 531,344 | **336,848** | −36.6 % |
+  | `format=postman` (6 shims) | 765,632 | **479,952** | −37.3 % |
+  | `format=har`/`openapi`/`http`/`insomnia` (3 shims) | 433,296 | **280,480** | −35.3 % |
+
+  The "before" column is the pre-fix `bootstrap_shims`, which took the
+  bytecode path only when `shim.is_default()`. Note that **every** narrowed
+  bundle except `har` cost MORE than the full default bundle: gating was a
+  net pessimisation, and the 557,824 B figure reproduces on `master`.
 - [x] Also: share compiled **user-script** bytecode across VUs. k6 compiles once into a process-wide `*sobek.Program`; tropel deep-clones the script per VU — `vu_loop.rs:811` `input_bytes_c.clone()` inside the per-spawn closure, ~12 GB at 4 000 VUs — **verified**: `input_bytes` now `Arc<Vec<u8>>` (`vu_loop.rs:985`), deep clone fixed; compiled bytecode sharing left for TR-503 (92% win)
-- [x] The measured result is written into the README, whatever it is — `README.md` now carries the measured figures and the command that prints them, guarded by `documented_per_vu_heap_matches_reality`
+- [x] The measured result is written into the README, whatever it is — **verified**: `README.md` carries the per-format table above and states the machine
+
+### Remaining, and deliberately not done
+- [ ] **Drop `pm.js` for the four script-free formats.** ✅MEAS 280,480 → **142,976 B/VU** (−49 %) for a `har` bundle of deep-equal + exec alone. Not taken: pm.js also installs the canonical namespace from `__tropel_sandbox_config`, which `create_vu_js_context`'s `SandboxConfig` preamble assumes is consumed. The "no script exists" argument is adapter-local (`har`/`openapi`/`http`/`insomnia` construct every `ScenarioItem` with empty `prerequest`/`test`, and `assertion_libraries_are_unreachable_for_script_free_formats` re-derives that from the real parsers); the namespace argument is not.
+- [ ] **Lazy namespace materialisation** (getter-backed namespace objects that bind a shim on first access). Where the remaining bulk is — 375,184 B of the Postman bundle's 479,952 B is still shim — and the riskiest of the three. Not started.
+- [ ] **The k6 DRIVER's bundle is untouched.** `tropel-input-k6` has its own two-bundle shim set (`K6_BASE_SHIM_BUNDLE` + `K6_NATIVE_SHIM_BUNDLE`, ~245 KB of source including all of `k6-shim.js`, `deferred-modules-shim.js` and `pm.js`) with its own bytecode caches. It does not go through `ShimBundle`, and a real `tropel run script.js` takes the Driver, not the InputAdapter — so the `format=k6` row above applies only to the adapter fallback. Gating that bundle is the larger remaining win and its own task.
 
 ---
 
