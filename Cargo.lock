@@ -4272,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.0",
  "chrono",
@@ -4472,7 +4472,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "h2",
@@ -4610,7 +4610,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-js"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rquickjs",
@@ -4640,7 +4640,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-native"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4692,7 +4692,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -4708,7 +4708,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rquickjs",
@@ -4751,7 +4751,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-variables"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "rand",
