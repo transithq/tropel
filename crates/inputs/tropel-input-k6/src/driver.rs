@@ -3600,7 +3600,7 @@ let _ = globals.set(
                                             .unwrap()
                                             .last()
                                             .cloned()
-                                            .unwrap_or_else(|| "ws".to_string()),
+                                            .unwrap_or_default(),
                                     );
                                 }
                                 let tags = Arc::new(tags);
@@ -3831,7 +3831,7 @@ let _ = globals.set(
                                     .unwrap()
                                     .last()
                                     .cloned()
-                                    .unwrap_or_else(|| "ws".to_string()),
+                                    .unwrap_or_default(),
                             );
                         }
                         let tags = Arc::new(tags);
@@ -8477,6 +8477,41 @@ mod tests {
     /// connection must emit ws_connecting (time to failure) AND a
     /// ws_req_failed=1.0 Rate sample, so thresholds see the failure instead
     /// of the request silently vanishing.
+    /// k6's ROOT GROUP IS THE EMPTY STRING, on every protocol.
+    ///
+    /// The ws path defaulted `group` to `"ws"`, inventing a group k6 never
+    /// emits, while the HTTP path already defaulted to `""`
+    /// (`http_tags_for`). So grouping a run by the `group` tag split ws
+    /// traffic into a phantom `"ws"` bucket while http traffic sat in root,
+    /// and a dashboard ported from k6 keyed on `group:""` silently lost the
+    /// ws series entirely.
+    ///
+    /// Fails on the pre-fix code: the default was the literal "ws".
+    #[test]
+    fn ws_group_tag_defaults_to_the_k6_root_group_not_ws() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver.rs"))
+            .expect("read own source");
+        // Needle assembled at compile time so this detector does not match
+        // its own source — spelling it literally makes the test fail on
+        // itself, which teaches the next person to add an exclusion instead
+        // of fixing a real hit.
+        let ws_default = concat!(r#"unwrap_or_else(|| ""#, r#"ws".to_string())"#);
+        assert!(
+            !src.contains(ws_default),
+            "the ws group tag must default to \"\" (k6's root group), matching \
+             http_tags_for — not to a literal \"ws\" that k6 never emits"
+        );
+        // And the http path's default is the thing being matched.
+        let http_default = concat!(
+            r#"group.map(Arc::from).unwrap_or_else(|| Arc::from("#,
+            r#"""))"#
+        );
+        assert!(
+            src.contains(http_default),
+            "http_tags_for must still default group to the empty root group"
+        );
+    }
+
     #[tokio::test]
     async fn test_ws_failed_handshake_emits_failed_metrics() {
         let driver = K6Driver;
