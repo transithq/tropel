@@ -91,7 +91,7 @@ fn variables_lookup(
 
 /// Parse an HTTP method string for the `pm.request.method` setter.
 ///
-/// TROPEL_MASTER_TODO line 187: this file used to carry a SECOND, lenient
+/// This file used to carry a SECOND, lenient
 /// parser (empty→GET, no RFC 7230 tchar validation, uppercased `Custom`)
 /// while `sendRequest` used the canonical [`Method::parse`] — so a token
 /// like `'GE T'` set via `pm.request.method` shipped an INVALID method on
@@ -1784,7 +1784,7 @@ mod tests {
         assert_eq!(got, None, "unknown key resolves to None");
     }
 
-    /// Regression (TROPEL_MASTER_TODO line 187): `pm.request.method` used
+    /// Regression: `pm.request.method` used
     /// a SECOND, lenient parser (empty→GET, no tchar validation, uppercased
     /// `Custom`) while `sendRequest` used the canonical [`Method::parse`] —
     /// so `'GE T'` set via the setter shipped an INVALID HTTP method token

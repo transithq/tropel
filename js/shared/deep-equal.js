@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════════════════════
-// W2 line 190 (TROPEL_MASTER_TODO.md): THE canonical deep-equal.
+// THE canonical deep-equal.
 //
 // pm.js `deepEqual`, chai-shim `jsDeepEqual`/`nativeDeepEqual`, and
 // lodash-shim `isEqualDeep` used to carry three near-identical copies —
