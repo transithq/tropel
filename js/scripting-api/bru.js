@@ -2,7 +2,7 @@
 // Bruno-compat peer view over the shared runtime state.
 // Bruno's API shape: `bru.getEnvVar()`, `req.setHeader()`, `res.getBody()`
 // (three objects rather than one namespace — P4b). Frozen compat: Bruno.
-// Uses the same __tropel_pm_* bridges as the pm binding; the state model
+// Uses the same __tropel_trp_* bridges as the pm binding; the state model
 // is binding-agnostic (P4b core).
 //
 // Frozen compat: this layer reproduces Bruno's documented scripting API
@@ -18,21 +18,21 @@
 
     // Environment
     bru.getEnvVar = function (key) {
-        if (typeof __tropel_pm_environment_get === 'function') {
+        if (typeof __tropel_trp_environment_get === 'function') {
             // W2 line 182: the bridge returns the value JSON-encoded ("..."
             // with literal quotes) so the correct JS type round-trips — the
             // old raw return meant getEnvVar('baseUrl') came back WITH the
             // quotes and every URL built from it was malformed. Parse like
             // pm.environment.get (pm.js:26).
-            var raw = __tropel_pm_environment_get(key);
+            var raw = __tropel_trp_environment_get(key);
             if (raw === null || raw === undefined) return null;
             try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return null;
     };
     bru.setEnvVar = function (key, value) {
-        if (typeof __tropel_pm_environment_set === 'function') {
-            __tropel_pm_environment_set(key, String(value));
+        if (typeof __tropel_trp_environment_set === 'function') {
+            __tropel_trp_environment_set(key, String(value));
         }
     };
 
@@ -41,18 +41,18 @@
     // §2: they used to map to the collection_vars bridges, so a runtime var set
     // by one request could not be read by the next (the core request-chaining
     // idiom silently broke). They now route through the pm.variables store
-    // (__tropel_pm_variables_*, the same fall-through lookup pm.variables uses).
+    // (__tropel_trp_variables_*, the same fall-through lookup pm.variables uses).
     bru.getVar = function (key) {
-        if (typeof __tropel_pm_variables_get === 'function') {
-            var raw = __tropel_pm_variables_get(key);
+        if (typeof __tropel_trp_variables_get === 'function') {
+            var raw = __tropel_trp_variables_get(key);
             if (raw === null || raw === undefined) return undefined;
             try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return undefined;
     };
     bru.setVar = function (key, value) {
-        if (typeof __tropel_pm_variables_set === 'function') {
-            __tropel_pm_variables_set(key, value === undefined ? '' : String(value));
+        if (typeof __tropel_trp_variables_set === 'function') {
+            __tropel_trp_variables_set(key, value === undefined ? '' : String(value));
         }
     };
     bru.hasVar = function (key) {
@@ -61,8 +61,8 @@
         return v !== undefined;
     };
     bru.deleteVar = function (key) {
-        if (typeof __tropel_pm_variables_unset === 'function') {
-            __tropel_pm_variables_unset(key);
+        if (typeof __tropel_trp_variables_unset === 'function') {
+            __tropel_trp_variables_unset(key);
         }
     };
     // NOTE (deleteAllVars cascade): deleteVar → variables_unset removes from
@@ -76,13 +76,13 @@
         }
     };
     // getAllVars: reads the LOCAL runtime store that setVar writes
-    // (__tropel_pm_variables_to_object). W2 line 182: it used to read
+    // (__tropel_trp_variables_to_object). W2 line 182: it used to read
     // collection_vars while setVar wrote local_vars — the aliasing comment
     // claimed the stores alias at the Rust level; they don't, so a runtime
     // var set via setVar never appeared in getAllVars.
     bru.getAllVars = function () {
-        if (typeof __tropel_pm_variables_to_object === 'function') {
-            var map = __tropel_pm_variables_to_object() || {};
+        if (typeof __tropel_trp_variables_to_object === 'function') {
+            var map = __tropel_trp_variables_to_object() || {};
             var out = {};
             for (var k in map) {
                 if (Object.prototype.hasOwnProperty.call(map, k)) {
@@ -98,93 +98,93 @@
     // Explicit collection-scope accessors (TROPEL_PARITY_BRUNO.md §2). Bruno
     // distinguishes bru.getVar/setVar (RUNTIME scope) from the collection
     // scope — getCollectionVar/setCollectionVar/hasCollectionVar/delete* map
-    // to the __tropel_pm_collection_vars_* bridges, independent of the
+    // to the __tropel_trp_collection_vars_* bridges, independent of the
     // runtime store used by getVar/setVar.
     bru.getCollectionVar = function (key) {
-        if (typeof __tropel_pm_collection_vars_get === 'function') {
-            var raw = __tropel_pm_collection_vars_get(key);
+        if (typeof __tropel_trp_collection_vars_get === 'function') {
+            var raw = __tropel_trp_collection_vars_get(key);
             if (raw === null || raw === undefined) return undefined;
             try { return JSON.parse(raw); } catch (e) { return raw; }
         }
         return undefined;
     };
     bru.setCollectionVar = function (key, value) {
-        if (typeof __tropel_pm_collection_vars_set === 'function') {
-            __tropel_pm_collection_vars_set(key, value === undefined ? '' : String(value));
+        if (typeof __tropel_trp_collection_vars_set === 'function') {
+            __tropel_trp_collection_vars_set(key, value === undefined ? '' : String(value));
         }
     };
     bru.hasCollectionVar = function (key) {
-        if (typeof __tropel_pm_collection_vars_has === 'function') {
-            return __tropel_pm_collection_vars_has(key);
+        if (typeof __tropel_trp_collection_vars_has === 'function') {
+            return __tropel_trp_collection_vars_has(key);
         }
         return false;
     };
     bru.deleteCollectionVar = function (key) {
-        if (typeof __tropel_pm_collection_vars_unset === 'function') {
-            __tropel_pm_collection_vars_unset(key);
+        if (typeof __tropel_trp_collection_vars_unset === 'function') {
+            __tropel_trp_collection_vars_unset(key);
         }
     };
     bru.deleteAllCollectionVars = function () {
-        if (typeof __tropel_pm_collection_vars_to_object !== 'function' ||
-            typeof __tropel_pm_collection_vars_unset !== 'function') {
+        if (typeof __tropel_trp_collection_vars_to_object !== 'function' ||
+            typeof __tropel_trp_collection_vars_unset !== 'function') {
             return;
         }
-        var map = __tropel_pm_collection_vars_to_object() || {};
+        var map = __tropel_trp_collection_vars_to_object() || {};
         for (var k in map) {
             if (Object.prototype.hasOwnProperty.call(map, k)) {
-                __tropel_pm_collection_vars_unset(k);
+                __tropel_trp_collection_vars_unset(k);
             }
         }
     };
 
     // Request body
     bru.getReqBody = function () {
-        if (typeof __tropel_pm_request_body === 'function') {
-            return __tropel_pm_request_body();
+        if (typeof __tropel_trp_request_body === 'function') {
+            return __tropel_trp_request_body();
         }
         return null;
     };
     bru.setReqBody = function (body) {
-        if (typeof __tropel_pm_request_body_set === 'function') {
-            __tropel_pm_request_body_set(body === undefined ? '' : String(body));
+        if (typeof __tropel_trp_request_body_set === 'function') {
+            __tropel_trp_request_body_set(body === undefined ? '' : String(body));
         }
     };
 
     // Request headers
     bru.getReqHeader = function (name) {
-        if (typeof __tropel_pm_request_header_get === 'function') {
-            return __tropel_pm_request_header_get(name);
+        if (typeof __tropel_trp_request_header_get === 'function') {
+            return __tropel_trp_request_header_get(name);
         }
         return null;
     };
     bru.setReqHeader = function (name, value) {
-        if (typeof __tropel_pm_request_header_set === 'function') {
-            __tropel_pm_request_header_set(name, String(value));
+        if (typeof __tropel_trp_request_header_set === 'function') {
+            __tropel_trp_request_header_set(name, String(value));
         }
     };
 
     // Response
     bru.getResBody = function () {
-        if (typeof __tropel_pm_response_body === 'function') {
-            return __tropel_pm_response_body();
+        if (typeof __tropel_trp_response_body === 'function') {
+            return __tropel_trp_response_body();
         }
         return null;
     };
     bru.getResHeader = function (name) {
-        if (typeof __tropel_pm_response_header === 'function') {
-            return __tropel_pm_response_header(name);
+        if (typeof __tropel_trp_response_header === 'function') {
+            return __tropel_trp_response_header(name);
         }
         return null;
     };
     bru.getResStatus = function () {
-        if (typeof __tropel_pm_response_code === 'function') {
-            return __tropel_pm_response_code();
+        if (typeof __tropel_trp_response_code === 'function') {
+            return __tropel_trp_response_code();
         }
         return 0;
     };
     bru.getResTime = function () {
-        if (typeof __tropel_pm_response_time === 'function') {
-            return __tropel_pm_response_time();
+        if (typeof __tropel_trp_response_time === 'function') {
+            return __tropel_trp_response_time();
         }
         return 0;
     };
@@ -205,12 +205,12 @@
         } else {
             passed = !!expr;
         }
-        if (typeof __tropel_pm_test === 'function') {
+        if (typeof __tropel_trp_test === 'function') {
             // W2 line 182: the bridge takes (name, passed: BOOL, tags) — an
             // int 1/0 has NO bool coercion in rquickjs (pm.js:506-508 warns
             // about exactly this rule), so `passed ? 1 : 0` threw on EVERY
             // call. Pass a real bool + the empty tags string like pm.test.
-            __tropel_pm_test(
+            __tropel_trp_test(
                 'bru.assert: ' + (errorMessage || String(expr)),
                 passed ? true : false,
                 ''
@@ -236,42 +236,42 @@
 
     // Flow control — Bruno's bru.next() maps to setNextRequest
     bru.next = function (requestName) {
-        if (typeof __tropel_pm_set_next_request === 'function') {
-            __tropel_pm_set_next_request(requestName);
+        if (typeof __tropel_trp_set_next_request === 'function') {
+            __tropel_trp_set_next_request(requestName);
         }
     };
 
     // ── req object (pre-request scripts) ───────────────────────────────────
     var req = {};
     req.setHeader = function (name, value) {
-        if (typeof __tropel_pm_request_header_set === 'function') {
-            __tropel_pm_request_header_set(name, String(value));
+        if (typeof __tropel_trp_request_header_set === 'function') {
+            __tropel_trp_request_header_set(name, String(value));
         }
     };
     req.setMethod = function (method) {
-        if (typeof __tropel_pm_request_method_set === 'function') {
-            __tropel_pm_request_method_set(method);
+        if (typeof __tropel_trp_request_method_set === 'function') {
+            __tropel_trp_request_method_set(method);
         }
     };
     req.setUrl = function (url) {
-        if (typeof __tropel_pm_request_url_set === 'function') {
-            __tropel_pm_request_url_set(url);
+        if (typeof __tropel_trp_request_url_set === 'function') {
+            __tropel_trp_request_url_set(url);
         }
     };
     req.setBody = function (body) {
-        if (typeof __tropel_pm_request_body_set === 'function') {
-            __tropel_pm_request_body_set(body === undefined ? '' : String(body));
+        if (typeof __tropel_trp_request_body_set === 'function') {
+            __tropel_trp_request_body_set(body === undefined ? '' : String(body));
         }
     };
     req.getHeader = function (name) {
-        if (typeof __tropel_pm_request_header_get === 'function') {
-            return __tropel_pm_request_header_get(name);
+        if (typeof __tropel_trp_request_header_get === 'function') {
+            return __tropel_trp_request_header_get(name);
         }
         return null;
     };
     req.getBody = function () {
-        if (typeof __tropel_pm_request_body === 'function') {
-            return __tropel_pm_request_body();
+        if (typeof __tropel_trp_request_body === 'function') {
+            return __tropel_trp_request_body();
         }
         return null;
     };
@@ -279,14 +279,14 @@
     // ── res object (test scripts) ──────────────────────────────────────────
     var res = {};
     res.getBody = function () {
-        if (typeof __tropel_pm_response_body === 'function') {
-            return __tropel_pm_response_body();
+        if (typeof __tropel_trp_response_body === 'function') {
+            return __tropel_trp_response_body();
         }
         return null;
     };
     res.getHeader = function (name) {
-        if (typeof __tropel_pm_response_header === 'function') {
-            return __tropel_pm_response_header(name);
+        if (typeof __tropel_trp_response_header === 'function') {
+            return __tropel_trp_response_header(name);
         }
         return null;
     };
@@ -295,20 +295,20 @@
     // implementation returned the text from getStatus() (a silent failure for
     // the canonical `expect(res.getStatus()).to.equal(200)` idiom).
     res.getStatus = function () {
-        if (typeof __tropel_pm_response_code === 'function') {
-            return __tropel_pm_response_code();
+        if (typeof __tropel_trp_response_code === 'function') {
+            return __tropel_trp_response_code();
         }
         return 0;
     };
     res.getStatusText = function () {
-        if (typeof __tropel_pm_response_status === 'function') {
-            return __tropel_pm_response_status();
+        if (typeof __tropel_trp_response_status === 'function') {
+            return __tropel_trp_response_status();
         }
         return '';
     };
     res.getResponseTime = function () {
-        if (typeof __tropel_pm_response_time === 'function') {
-            return __tropel_pm_response_time();
+        if (typeof __tropel_trp_response_time === 'function') {
+            return __tropel_trp_response_time();
         }
         return 0;
     };

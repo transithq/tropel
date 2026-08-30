@@ -7,7 +7,7 @@
 //
 // Under the hood it delegates HTTP calls to __tropel_k6_http_request
 // (registered lazily by the K6DriverInstance on first iteration) or
-// to __tropel_pm_send_request (if the PM bridge is available).
+// to __tropel_trp_send_request (if the PM bridge is available).
 //
 // The preprocessor strips `import ... from "k6/..."` lines, so
 // k6 scripts that use module syntax resolve to these globals.
@@ -15,7 +15,7 @@
 
 // ── Globals set by native host (K6DriverInstance) ──
 // __tropel_k6_http_request(method, url, headers_json, body, timeout_ms, response_type) -> native JS object (the PM fallback bridge returns a JSON string)
-// __tropel_pm_send_request(method, url, headers_json, body, timeout_ms, response_type) -> JSON string
+// __tropel_trp_send_request(method, url, headers_json, body, timeout_ms, response_type) -> JSON string
 // __tropel_vu_id, __tropel_iteration_num, __tropel_scenario
 
 // ══════════════════════════════════════════════════════════════════
@@ -60,8 +60,8 @@ function k6HTTPRequest(method, url, body, params) {
                 cookies: canonical.cookies
             })
         );
-    } else if (typeof __tropel_pm_send_request === 'function') {
-        resultJson = __tropel_pm_send_request(
+    } else if (typeof __tropel_trp_send_request === 'function') {
+        resultJson = __tropel_trp_send_request(
             canonical.method,
             canonical.url,
             headersJson,
@@ -72,7 +72,7 @@ function k6HTTPRequest(method, url, body, params) {
     } else {
         throw new Error(
             'k6 http.* requires a native HTTP bridge — neither __tropel_k6_http_request ' +
-            'nor __tropel_pm_send_request is available. Check that the K6Driver or PM bridge ' +
+            'nor __tropel_trp_send_request is available. Check that the K6Driver or PM bridge ' +
             'was properly installed.'
         );
     }
@@ -1558,16 +1558,16 @@ if (typeof check !== 'function') {
                 try {
                     passed = !!condition(val);
                 } catch (e) {
-                    if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name, false, tagsJson);
+                    if (typeof __tropel_trp_test === 'function') {
+                        __tropel_trp_test(name, false, tagsJson);
                     }
                     throw e;
                 }
             } else {
                 passed = !!condition;
             }
-            if (typeof __tropel_pm_test === 'function') {
-                __tropel_pm_test(name, passed, tagsJson);
+            if (typeof __tropel_trp_test === 'function') {
+                __tropel_trp_test(name, passed, tagsJson);
             }
             if (!passed) {
                 allPassed = false;
@@ -1584,8 +1584,8 @@ if (typeof group !== 'function') {
         if (typeof fn === 'function' && Object.prototype.toString.call(fn) === '[object AsyncFunction]') {
             throw new TypeError('group() does not support async callbacks (k6 rejects them)');
         }
-        if (typeof __tropel_pm_group_start === 'function') {
-            __tropel_pm_group_start(name);
+        if (typeof __tropel_trp_group_start === 'function') {
+            __tropel_trp_group_start(name);
             var startTime = Date.now();
             try {
                 if (typeof fn === 'function') {
@@ -1593,7 +1593,7 @@ if (typeof group !== 'function') {
                 }
             } finally {
                 var duration = Date.now() - startTime;
-                __tropel_pm_group_end(name, duration);
+                __tropel_trp_group_end(name, duration);
             }
         } else {
             if (typeof fn === 'function') {
@@ -1659,9 +1659,9 @@ if (typeof Counter !== 'function') {
         if (!isFinite(v)) {
             return false;
         }
-        if (typeof __tropel_pm_custom_metric_add === 'function') {
+        if (typeof __tropel_trp_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
+            __tropel_trp_custom_metric_add(this._name, v, tagsStr, this._type, this._isTime);
         }
         return true;
     };
