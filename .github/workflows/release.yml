@@ -1,0 +1,297 @@
+# Release binaries.
+#
+# Fires on a `v*` tag, which `scripts/release.sh --publish` pushes as its last
+# step. Cross-compiles the CLI for five targets, builds the wasm artifacts,
+# checksums everything, and creates the GitHub release with all of it attached.
+#
+# WHY THIS EXISTS: before it, `release.sh` ran `gh release create` directly and
+# the release page carried no downloadable binary at all — tropel was
+# installable only by people who already had a Rust toolchain. For a load
+# generator competing with k6, which ships prebuilt binaries everywhere, that
+# is the difference between a release and a source tag.
+#
+# WHY LINUX IS musl: a statically-linked binary runs unmodified in Alpine,
+# distroless and scratch containers, which is where a load generator actually
+# gets deployed. The usual musl objection — a slower allocator under heavy
+# threading — is already answered here: `alloc-mimalloc` is a default feature.
+#
+# WHY `--locked` EVERYWHERE: the release must build the exact dependency graph
+# CI tested. A resolver update between CI and release day would otherwise ship
+# something no test ever ran against.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build artifacts for"
+        required: true
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release binaries must not carry a panic=abort assumption; the VU pool
+  # depends on unwinding (see the comment in the root Cargo.toml).
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Guard ───────────────────────────────────────────────────────────────────
+  # The tag must match the version the tree actually declares. A tag typo would
+  # otherwise produce `tropel v0.2.0` binaries that report 0.1.0 on --version.
+  verify:
+    name: tag matches declared version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - id: v
+        # TAG goes through env, never straight into the script body: a
+        # workflow_dispatch input is attacker-controlled text, and inlining it
+        # as `${{ }}` splices it into the shell before bash ever parses it.
+        # Write access is needed to dispatch this, but "the caller is trusted"
+        # is not a property worth depending on in a job holding contents:write.
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::refusing tag '$TAG' — must look like v1.2.3"; exit 1 ;;
+          esac
+          declared=$(awk '/^\[package\]/{p=1} p&&/^version = /{gsub(/[",]/,""); print $3; exit}' \
+                     crates/tropel/Cargo.toml)
+          echo "tag=$TAG  declared=$declared"
+          if [[ "$TAG" != "v$declared" ]]; then
+            echo "::error::tag $TAG does not match declared version $declared"
+            exit 1
+          fi
+          echo "version=$declared" >> "$GITHUB_OUTPUT"
+      - name: version surfaces agree
+        run: bash scripts/version-lockstep.sh
+
+  # ── Native binaries ─────────────────────────────────────────────────────────
+  binaries:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # `cross` runs the build in a target-matched container, which is what
+      # makes aarch64-musl work from an x86 runner without a local sysroot.
+      - name: install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: build
+        shell: bash
+        env:
+          T: ${{ matrix.target }}
+          CROSS: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          tool=$([[ "$CROSS" == "true" ]] && echo cross || echo cargo)
+          $tool build --release --locked --target "$T" \
+            -p tropel -p tropel-distributed
+
+      # Ship the distributed binaries too: a load generator that cannot be run
+      # in controller/agent mode is only half the product.
+      - name: stage artifacts
+        shell: bash
+        env:
+          V: ${{ needs.verify.outputs.version }}
+          T: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          v="$V"
+          t="$T"
+          out="tropel-v$v-$t"
+          mkdir -p "dist/$out"
+          ext=""
+          [[ "$t" == *windows* ]] && ext=".exe"
+          for b in tropel tropel-controller tropel-agent; do
+            src="target/$t/release/$b$ext"
+            if [[ -f "$src" ]]; then
+              cp "$src" "dist/$out/"
+            else
+              echo "::error::expected binary missing: $src"; exit 1
+            fi
+          done
+          cp README.md LICENSE-APACHE "dist/$out/" 2>/dev/null || true
+          cd dist
+          if [[ "$t" == *windows* ]]; then
+            7z a -tzip "$out.zip" "$out" >/dev/null
+          else
+            tar czf "$out.tar.gz" "$out"
+          fi
+          rm -rf "$out"
+          ls -la
+
+      # Prove the thing we are about to ship actually runs, on every target we
+      # can execute natively. A binary that builds but does not start is the
+      # failure mode a release must not have.
+      - name: smoke the built binary
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          V: ${{ needs.verify.outputs.version }}
+          T: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ext=""
+          [[ "$T" == *windows* ]] && ext=".exe"
+          got=$("target/$T/release/tropel$ext" --version)
+          echo "$got"
+          echo "$got" | grep -q "$V" \
+            || { echo "::error::--version disagrees with the tag"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ── wasm ────────────────────────────────────────────────────────────────────
+  # The browser/edge tier. Built with the same pinned wasm-bindgen the lockfile
+  # names — a mismatch fails with a confusing schema error, not a version one.
+  wasm:
+    name: wasm artifacts
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-wasm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: install wasm toolchain
+        run: |
+          set -euo pipefail
+          wb=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/[",]/,""); print $3; exit}' Cargo.lock)
+          echo "pinning wasm-bindgen-cli to $wb (from Cargo.lock)"
+          cargo install wasm-bindgen-cli --version "$wb" --locked
+          sudo apt-get update -qq && sudo apt-get install -y binaryen
+
+      # These are the same scripts release.sh runs, and they carry the
+      # 700 KB / 8 MB size gates plus the README Size-line regeneration.
+      - name: build npm packages
+        run: |
+          set -euo pipefail
+          for p in core-wasm input-wasm runtime-wasm shims; do
+            echo "── $p"
+            bash "packages/$p/scripts/build.sh"
+          done
+
+      # If a build.sh rewrote a README Size line, the tag was cut from a tree
+      # whose committed sizes are stale — CI fails on that, so catch it here
+      # rather than after the release is public.
+      - name: size lines are committed
+        run: |
+          if [[ -n "$(git status --porcelain -- packages/)" ]]; then
+            echo "::error::a build.sh regenerated a README Size line; commit it and re-tag"
+            git status --porcelain -- packages/
+            exit 1
+          fi
+
+      - name: stage wasm bundle
+        env:
+          V: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          v="$V"
+          out="tropel-wasm-v$v"
+          mkdir -p "dist/$out"
+          for p in core-wasm input-wasm runtime-wasm shims; do
+            mkdir -p "dist/$out/$p"
+            cp -r "packages/$p"/{pkg,dist,shim,*.js,*.json,*.md} "dist/$out/$p/" 2>/dev/null || true
+          done
+          cd dist && tar czf "$out.tar.gz" "$out" && rm -rf "$out" && ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wasm
+          path: dist/*
+          if-no-files-found: error
+
+  # ── Publish ─────────────────────────────────────────────────────────────────
+  release:
+    name: create GitHub release
+    needs: [verify, binaries, wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          pattern: dist-*
+          merge-multiple: true
+
+      # One checksum file over everything, generated where the files finally
+      # sit — checksums computed per-job would not cover the assembled set.
+      - name: checksums
+        run: |
+          set -euo pipefail
+          cd staged
+          ls -la
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: tropel v${{ needs.verify.outputs.version }}
+          body_path: CHANGELOG.md
+          files: staged/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(needs.verify.outputs.version, '-') }}
