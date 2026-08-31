@@ -36,9 +36,32 @@ fi
 # artifact. QuickJS alone is ~1–1.5 MB; the shim bundle no longer rides along.
 # --strip-debug also drops the ~372 KB "function names" subsection twiggy
 # measured (API_CLIENT_WEB_PAYLOAD.md §2.4).
+# `--all-features` is required, not cosmetic. rustc emits bulk-memory
+# (`memory.copy`) for wasm32 by default, and binaryen refuses it unless the
+# feature is enabled explicitly:
+#
+#   [wasm-validator error in function 39] unexpected false: memory.copy
+#   operations require bulk memory operations [--enable-bulk-memory-opt]
+#
+# Enabling that one alone then trips "all used features should be allowed" on a
+# later function, so enable the set rather than chase them individually as
+# rustc adopts more. Verified on binaryen 132 + rustc 1.98:
+# 2,715,624 B raw -> 2,268,765 B optimized.
+#
+# And a wasm-opt failure must NOT abort the run. `set -e` is on, so a binaryen
+# too old for the compiler's output used to kill the whole script — which, via
+# release.sh, meant a version skew in an OPTIONAL optimizer blocked a release.
+# The budget below is anchored to the RAW artifact precisely so this is safe:
+# fall back to measuring raw, which is the larger, more conservative number.
 if command -v wasm-opt >/dev/null 2>&1; then
-  wasm-opt -Oz --strip-debug -o /tmp/tropel_web_opt.wasm "$WASM"
-  WASM=/tmp/tropel_web_opt.wasm
+  if wasm-opt -Oz --strip-debug --all-features \
+       -o /tmp/tropel_web_opt.wasm "$WASM" 2>/tmp/wasm_opt_err.txt; then
+    WASM=/tmp/tropel_web_opt.wasm
+  else
+    echo "warning: wasm-opt failed ($(wasm-opt --version 2>/dev/null)) — measuring the RAW artifact instead." >&2
+    echo "         The budget is anchored to raw, so the gate below still holds." >&2
+    head -3 /tmp/wasm_opt_err.txt >&2 || true
+  fi
 fi
 
 # Portable size read: stat's format flags differ between BSD (macOS, -f%z)

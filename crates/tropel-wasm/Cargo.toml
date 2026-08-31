@@ -26,7 +26,17 @@ tokio.workspace = true
 # /GS stack-cookie check (STATUS_STACK_BUFFER_OVERRUN). wasmtime 47
 # rewrote trap unwinding with a dedicated unwinder crate, which traps
 # cleanly on Windows (verified by the infinite-loop test).
-wasmtime = { version = "47.0.3", default-features = false, features = [
+#
+# The .4 PATCH FLOOR IS A SECURITY FLOOR — do not relax it to "47" or
+# "47.0". Two advisories land on 47.0.0–47.0.3, both fixed in 47.0.4:
+#
+#   RUSTSEC-2026-0269 (CVSS 8.8 HIGH) — filesystem sandbox escape when
+#     paths or symlinks contain trailing slashes. This crate IS the
+#     sandbox for third-party plugin input adapters, so an escape here
+#     defeats the boundary the WASM tier exists to provide.
+#   RUSTSEC-2026-0268 (CVSS 6.9) — guest-controlled host heap allocation
+#     via WASIp3 streams.
+wasmtime = { version = "47.0.4", default-features = false, features = [
     "anyhow",
     "cranelift",
     "wat",

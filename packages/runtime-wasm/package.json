@@ -1,6 +1,6 @@
 {
   "name": "@tropel/runtime-wasm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browser/Node host for the tropel load-testing runtime compiled to wasm32-wasip1: postcard C ABI driver, WASI preview1 wiring, and the HTTP bridge that answers each request the runtime makes.",
   "license": "Apache-2.0",
   "type": "module",
@@ -45,7 +45,7 @@
     "tropel"
   ],
   "dependencies": {
-    "@tropel/shims": "^0.1.0"
+    "@tropel/shims": "^0.2.0"
   },
   "devDependencies": {
     "typescript": "^5.0.0"
