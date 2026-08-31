@@ -2,8 +2,9 @@
 
 ## [0.2.0] - 2026-08-31
 
-First tagged release. Versioned 0.2.0 rather than 0.1.0 across all six
-surfaces (binary, `tropel-web`, and the four `@tropel/*` npm packages) because
+First tagged release. Versioned 0.2.0 rather than 0.1.0 across all seven
+surfaces (binary, `tropel-engine`, `tropel-web`, and the four `@tropel/*` npm
+packages — `tropel-engine` is what `--version` prints) because
 `@tropel/shims@0.1.0` and `@tropel/runtime-wasm@0.1.0` were published on
 2026-08-10 and npm versions are immutable: those artifacts still call the
 `__tropel_pm_*` bridges this tree renamed to `__tropel_trp_*`, so they cannot

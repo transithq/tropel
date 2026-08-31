@@ -288,7 +288,12 @@ jobs:
     needs: [verify, binaries, wasm]
     runs-on: ubuntu-latest
     steps:
+      # Same ref as the binaries/wasm jobs. Without this, a workflow_dispatch
+      # re-run would read scripts/release-notes.sh and CHANGELOG.md from the
+      # default branch while the artifacts came from the tag.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -306,11 +311,27 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
+      # Generate the release body instead of pasting the whole CHANGELOG.
+      #
+      # `body_path: CHANGELOG.md` put EVERY historical version on every release
+      # page — burying the release being announced, and re-publishing old
+      # entries' withdrawn measurements as though they were current. The script
+      # emits what a release page is for (what it is, per-platform install,
+      # checksum verification, asset contents, this version's highlights) and
+      # links the full changelog rather than inlining it. Highlights are
+      # extracted from CHANGELOG.md's own `## [x.y.z]` section, so the two
+      # cannot drift, and a missing section is a hard error rather than a
+      # silently empty release body.
+      - name: generate release notes
+        env:
+          V: ${{ needs.verify.outputs.version }}
+        run: bash scripts/release-notes.sh "$V" > "$RUNNER_TEMP/RELEASE_NOTES.md"
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: tropel v${{ needs.verify.outputs.version }}
-          body_path: CHANGELOG.md
+          body_path: ${{ runner.temp }}/RELEASE_NOTES.md
           files: staged/*
           fail_on_unmatched_files: true
           draft: false
