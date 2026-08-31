@@ -19,9 +19,9 @@ to every [release](https://github.com/transithq/tropel/releases), with
 
 ```bash
 # Linux x86_64 — adjust the tag and target as needed
-curl -fsSL https://github.com/transithq/tropel/releases/latest/download/tropel-v0.1.0-x86_64-unknown-linux-musl.tar.gz \
+curl -fsSL https://github.com/transithq/tropel/releases/latest/download/tropel-v0.2.0-x86_64-unknown-linux-musl.tar.gz \
   | tar xz
-sudo mv tropel-v0.1.0-x86_64-unknown-linux-musl/tropel /usr/local/bin/
+sudo mv tropel-v0.2.0-x86_64-unknown-linux-musl/tropel /usr/local/bin/
 tropel --version
 ```
 

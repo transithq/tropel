@@ -27,6 +27,14 @@ cd "$(dirname "$0")/.."
 
 bin_ver=$(grep -m1 '^version' crates/tropel/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
 web_ver=$(grep -m1 '^version' crates/tropel-web/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+# tropel-engine is a SEVENTH surface, and it is the one users actually see.
+# `#[command(name = "tropel", version, ...)]` is derived in tropel-engine, and
+# `print_version()` uses env!("CARGO_PKG_VERSION") there too — so BOTH
+# `tropel --version` and `tropel version` report the ENGINE's version, not the
+# binary's. Bumping the binary to 0.2.0 while the engine sat at 0.1.0 produced
+# a `tropel 0.2.0` build that printed "tropel 0.1.0". Caught by release.yml's
+# --version smoke check; guarded here so it cannot recur silently.
+eng_ver=$(grep -m1 '^version' crates/tropel-engine/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
 sdk_ver=$(grep -m1 '^version' crates/tropel-sdk/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/' 2>/dev/null || echo "UNREADABLE")
 core_ver=$(node -p "require('./packages/core-wasm/package.json').version")
 input_ver=$(node -p "require('./packages/input-wasm/package.json').version")
@@ -36,6 +44,7 @@ shims_ver=$(node -p "require('./packages/shims/package.json').version")
 echo "lockstep versions:"
 echo "  binary (tropel)        = $bin_ver"
 echo "  wasm runtime (tropel-web) = $web_ver"
+echo "  engine (tropel-engine) = $eng_ver  <- what --version prints"
 echo "  tropel-sdk (submodule) = $sdk_ver (WARNING-only — see below)"
 echo "  @tropel/core-wasm      = $core_ver"
 echo "  @tropel/input-wasm     = $input_ver"
@@ -45,12 +54,12 @@ echo "  @tropel/shims          = $shims_ver"
 # Hard lockstep: binary + web + all four npm packages. The SDK is a separate
 # published crate with its own version history; its version is WARNING-only
 # below, and its PIN is the real guard (TR-407).
-if [[ "$bin_ver" != "$web_ver" || "$web_ver" != "$core_ver" ||
+if [[ "$bin_ver" != "$web_ver" || "$web_ver" != "$eng_ver" || "$eng_ver" != "$core_ver" ||
       "$core_ver" != "$input_ver" || "$input_ver" != "$exec_ver" || "$exec_ver" != "$shims_ver" ]]; then
   echo "FAIL: versions are out of lockstep — bump them together (the wasm must be rebuilt after)" >&2
   exit 1
 fi
-echo "ok: all six version surfaces agree at $bin_ver"
+echo "ok: all seven version surfaces agree at $bin_ver"
 
 # TR-406/TR-407: the SDK submodule version and pin. The SDK is published to
 # crates.io with its own version; it must be realigned to the parent repo's

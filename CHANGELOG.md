@@ -1,9 +1,56 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-08-31
+
+First tagged release. Versioned 0.2.0 rather than 0.1.0 across all six
+surfaces (binary, `tropel-web`, and the four `@tropel/*` npm packages) because
+`@tropel/shims@0.1.0` and `@tropel/runtime-wasm@0.1.0` were published on
+2026-08-10 and npm versions are immutable: those artifacts still call the
+`__tropel_pm_*` bridges this tree renamed to `__tropel_trp_*`, so they cannot
+be paired with this runtime. 0.2.0 is the first npm set that matches the
+binary.
+
+**The API is unstable pre-1.0.** k6 parity is actively expanding and the
+`tropel-sdk` surface still moves between minor versions.
+
+### Fixed — correctness
+
+- **`sleep()` was non-functional on every declarative format** (Postman, HAR,
+  OpenAPI, `.http`, Insomnia, Bruno). `__tropel_native_sleep` was registered as
+  an async host function on an rquickjs `Runtime` with no spawner, so the first
+  call panicked with *"tried to use async function in non async runtime"*;
+  rquickjs stashed that panic and re-raised it on whichever VU next threw — a
+  different VU on a shared runtime. Now a blocking sleep with an absolute
+  deadline. This also fixes `bru.sleep(ms)`.
+- **Headline `http_req_duration` / `iteration_duration` were computed from one
+  metrics shard.** `shard_for_key` hashed the metric name *and* its tags,
+  against its own documented contract, so `{url:/a}` and `{url:/b}` landed on
+  different shards and the merge kept only the largest-count partial. Count,
+  avg, min, max and p95 were derived from a fraction of the population.
+- **`http_req_failed` was the maximum of per-shard rates** — 10 failures across
+  400 requests reported `0.10` instead of `0.025`. Now merges numerator and
+  denominator.
+- **`output_samples_dropped` / `aggregator_samples_dropped` were multiplied by
+  `SHARD_COUNT`** — process-global atomics read once per shard and summed, so
+  one output dropping 1,000 samples reported 4,000.
+- **`absorb_snapshot` discarded over-cap series without counting them**, so a
+  controller merge that lost series still reported `"unverified": false`.
+- **The QuickJS promise-rejection tracker was overwritten by every new VU.**
+  It is a property of the runtime, not the context, so on a shared runtime one
+  VU's unhandled rejection was recorded into another's map — the first VU
+  passed silently, the second failed with an error it never raised.
+- **`bru.setVar` / `setEnvVar` / `setCollectionVar` were not inverses of their
+  getters** — they wrote with `String(value)` while the getters used
+  `JSON.parse`, so `setVar('id','1234')` read back as the number `1234` and an
+  object read back as `"[object Object]"`.
+- **`@tropel/shims` shipped without `k6-core.js`**, leaving every
+  `@tropel/runtime-wasm` embedder without `check`/`group`/`Counter`/`Gauge`/
+  `Rate`/`Trend`. The npm bundle list is now derived from `Shim::ALL` in the
+  Rust source, so the two cannot diverge silently.
+- **`ws_*` samples carried `group:"ws"`** where k6's root group is `""`.
 
 ### Changed
-- **Per-VU JS shims are now selected by input format, and the bytecode cache is keyed by bundle (TR-501).** The compiled-shim-bytecode cache was a single `OnceLock` keyed on nothing, so only the full default bundle could use it and every narrowed bundle paid a per-VU source parse+compile — which made shim gating a *pessimisation*: an http-only script measured **557,824 B/VU** against the full bundle's **497,584 B/VU**. The cache is now keyed by bundle identity, and `ShimBundle::for_format` picks the shim set from the resolving `InputAdapter::id()`. ✅MEAS (Apple M2, release, N=25): har/openapi/http/insomnia **280,480 B/VU**, k6 **336,848**, postman **479,952**, unknown format **497,584** (bare context 104,768). Behaviour change: a context created by `create_vu_js_context` no longer necessarily has all of `pm`/`chai`/`_`/`CryptoJS`/`bru` — `bru` is dropped for every format except `bru`, and the assertion/utility libraries are dropped for the four formats whose adapters cannot emit a script. `pm.js` is still loaded for every format. The k6 *Driver*'s own shim bundle (`tropel-input-k6`) is unchanged.
+- **Per-VU JS shims are now selected by input format, and the bytecode cache is keyed by bundle (TR-501).** The compiled-shim-bytecode cache was a single `OnceLock` keyed on nothing, so only the full default bundle could use it and every narrowed bundle paid a per-VU source parse+compile — which made shim gating a *pessimisation*: an http-only script measured **557,824 B/VU** against the full bundle's **497,584 B/VU**. The cache is now keyed by bundle identity, and `ShimBundle::for_format` picks the shim set from the resolving `InputAdapter::id()`. ✅MEAS (Apple M2, release, N=25, contexts sharing one worker-thread `Runtime`): har/openapi/http/insomnia **203,400 B/VU**, content-gated http-only **261,878**, postman **369,424**, k6/unknown format **385,324**. (An earlier revision of this entry quoted 280,480 / 336,848 / 479,952 / 497,584 — those came from a harness that summed a *shared* runtime's heap once per context and divided by N, reporting the whole 25-context total as a per-VU figure. Withdrawn; do not cite them.) Behaviour change: a context created by `create_vu_js_context` no longer necessarily has all of `pm`/`chai`/`_`/`CryptoJS`/`bru` — `bru` is dropped for every format except `bru`, and the assertion/utility libraries are dropped for the four formats whose adapters cannot emit a script. `pm.js` is still loaded for every format. The k6 *Driver*'s own shim bundle (`tropel-input-k6`) is unchanged.
 - **License: dual MIT OR Apache-2.0 → Apache-2.0 only.** `LICENSE-MIT` removed; `LICENSE-APACHE` now carries the full canonical text (previously a placeholder stub) and is copied into `crates/tropel-sdk/` so published artifacts include it. `deny.toml` keeps `MIT` on the *dependency* allowlist (third-party crates only).
 
 ## [runtime set 0.1.0] - 2026-08-10
