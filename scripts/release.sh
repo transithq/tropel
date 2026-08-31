@@ -129,13 +129,21 @@ if command -v wasm-bindgen >/dev/null 2>&1; then
     missing=1
   fi
 fi
-if ! rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
-  red "  wasm32-unknown-unknown target — MISSING"
-  echo "      rustup target add wasm32-unknown-unknown"
-  missing=1
-else
-  grn "  wasm32-unknown-unknown"
-fi
+# BOTH wasm targets. `wasm32-unknown-unknown` builds the core-wasm/input-wasm
+# npm packages; `wasm32-wasip1` builds tropel-web, whose artifact
+# @tropel/runtime-wasm copies in. Only the first used to be checked, so a
+# missing wasip1 target surfaced four steps later as a runtime-wasm build
+# failure instead of here.
+INSTALLED_TARGETS=$(rustup target list --installed 2>/dev/null)
+for t in wasm32-unknown-unknown wasm32-wasip1; do
+  if grep -qx "$t" <<<"$INSTALLED_TARGETS"; then
+    grn "  $t"
+  else
+    red "  $t target — MISSING"
+    echo "      rustup target add $t"
+    missing=1
+  fi
+done
 (( missing == 0 )) || die "install the tools above, then re-run"
 
 # Disk headroom. A full --locked workspace build plus clippy --all-targets adds
@@ -256,6 +264,70 @@ for c in "${CRATES[@]}"; do
 done
 
 # ── 2 · npm packages ─────────────────────────────────────────────────────────
+# @tropel/runtime-wasm does not COMPILE tropel-web — it copies the prebuilt
+# `target/wasm32-wasip1/release-wasm/tropel_web.wasm` into its package. That
+# artifact is produced by scripts/wasm-size.sh (which also asserts the 2.9 MB
+# budget), and CI happens to run it earlier in the same job. This script never
+# did, so the npm loop reached runtime-wasm and died with
+#
+#   error: tropel_web.wasm not found — run the wasm job / scripts/wasm-size.sh
+#          first, or set TROPEL_WASM_PATH
+#   FAIL: runtime-wasm build failed (size gate?)
+#
+# after @tropel/core-wasm and @tropel/input-wasm had already gone public. Build
+# it up front so the whole npm step either can proceed or fails before any
+# publish, rather than half-way through.
+# macOS rustup layout: `rust-lld` (the wasm linker) has an @rpath pointing at
+# <toolchain>/lib/rustlib/<host>/lib/libLLVM.dylib, but some installs ship the
+# dylib at <toolchain>/lib/libLLVM.dylib instead. Linking any wasm target then
+# dies with
+#
+#   dyld: Library not loaded: @rpath/libLLVM.dylib
+#   error: could not compile `tropel-web` (lib)
+#
+# The file is present, just not where the rpath looks. Point DYLD at the real
+# location rather than modifying the toolchain — no filesystem surgery, and it
+# is inert on installs that are already correct.
+if [[ "$(uname -s)" == "Darwin" ]] && command -v rustc >/dev/null 2>&1; then
+  RUST_SYSROOT=$(rustc --print sysroot 2>/dev/null || true)
+  if [[ -n "$RUST_SYSROOT" && -f "$RUST_SYSROOT/lib/libLLVM.dylib" ]]; then
+    export DYLD_FALLBACK_LIBRARY_PATH="$RUST_SYSROOT/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
+  fi
+fi
+
+step "tropel-web wasm artifact"
+WEB_WASM="target/wasm32-wasip1/release-wasm/tropel_web.wasm"
+if [[ -f "$WEB_WASM" ]]; then
+  grn "  already built: $WEB_WASM"
+else
+  printf '  building via scripts/wasm-size.sh…\n'
+  if ! bash scripts/wasm-size.sh > "$LOG_DIR/wasm-size.log" 2>&1; then
+    red "  wasm-size.sh failed"
+    tail -20 "$LOG_DIR/wasm-size.log" | sed 's/^/      /'
+    echo "      full log: $LOG_DIR/wasm-size.log"
+    die "could not build $WEB_WASM"
+  fi
+  grep -E '^(PASS|FAIL)' "$LOG_DIR/wasm-size.log" | sed 's/^/  /'
+  [[ -f "$WEB_WASM" ]] || die "wasm-size.sh reported success but $WEB_WASM is absent"
+  grn "  built: $WEB_WASM"
+fi
+
+# The package build scripts need the workspace's devDependencies (typescript
+# for @tropel/runtime-wasm). CI does `npm install` at the root before building
+# these; this script did not, so runtime-wasm's `npx tsc` fell through to the
+# registry. There is no root package-lock.json, so `npm install` — matching CI
+# exactly — not `npm ci`.
+step "npm workspace deps"
+if [[ -x node_modules/.bin/tsc ]]; then
+  grn "  already installed"
+else
+  printf '  npm install (workspace root)…\n'
+  npm install --no-audit --no-fund > "$LOG_DIR/npm-install.log" 2>&1 \
+    || { tail -20 "$LOG_DIR/npm-install.log" | sed 's/^/      /'; die "npm install failed"; }
+  [[ -x node_modules/.bin/tsc ]] || die "npm install completed but node_modules/.bin/tsc is absent"
+  grn "  installed"
+fi
+
 step "npm packages"
 for pkg in core-wasm input-wasm runtime-wasm shims; do
   d="packages/$pkg"
