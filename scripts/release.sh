@@ -329,7 +329,7 @@ else
 fi
 
 step "npm packages"
-for pkg in core-wasm input-wasm runtime-wasm shims; do
+for pkg in core-wasm input-wasm shims runtime-wasm; do
   d="packages/$pkg"
   [[ -d "$d" ]] || { ylw "  $pkg — missing, skipping"; continue; }
 
@@ -372,6 +372,10 @@ for pkg in core-wasm input-wasm runtime-wasm shims; do
     continue
   fi
 
+  # ORDER IS LOAD-BEARING: shims BEFORE runtime-wasm. runtime-wasm imports
+  # `@tropel/shims`, whose `types` points at the GENERATED dist/bundle.d.ts.
+  # With shims last, tsc fails with "Cannot find module '@tropel/shims'".
+  #
   # The size gates live in these build scripts and are load-bearing: they
   # regenerate the README Size line, and CI fails on a stale one.
   if [[ -f "$d/scripts/build.sh" ]]; then
