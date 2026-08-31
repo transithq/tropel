@@ -138,16 +138,53 @@ else
 fi
 (( missing == 0 )) || die "install the tools above, then re-run"
 
+# Disk headroom. A full --locked workspace build plus clippy --all-targets adds
+# several GB to target/, and when the disk fills mid-build cargo dies with
+# ENOSPC — which this script's next step reports as "tests failed". That has
+# already cost one misdiagnosis (a linker failure read as a code defect), so
+# check it up front where the message can name the real cause.
+AVAIL_KB=$(df -k . | awk 'NR==2 {print $4}')
+AVAIL_GB=$(( AVAIL_KB / 1024 / 1024 ))
+if (( AVAIL_GB < 5 )); then
+  red "  free disk: ${AVAIL_GB} GB"
+  echo "      A release build needs headroom. Reclaim it with:"
+  echo "        cargo clean            # this repo's target/ (rebuilds afterwards)"
+  echo "      Source edits survive cargo clean; only target/ is removed."
+  die "not enough free disk (${AVAIL_GB} GB) — see above"
+elif (( AVAIL_GB < 15 )); then
+  ylw "  free disk: ${AVAIL_GB} GB — tight; a mid-build ENOSPC will look like a test failure"
+else
+  grn "  free disk: ${AVAIL_GB} GB"
+fi
+
 bash scripts/version-lockstep.sh || die "version surfaces disagree"
 bash scripts/sdk-guard.sh        || die "sdk guard failed"
 
+# Output goes to a log, not /dev/null. `2>&1 >/dev/null` on a release gate is
+# actively hostile: it turns "one test failed" into "tests failed" with no name,
+# no assertion and no panic, so the operator cannot tell a real regression from
+# a flake without re-running the whole suite by hand.
 step "Test suite"
-cargo test --workspace --locked -- --nocapture >/dev/null 2>&1 \
-  || die "tests failed — do not release a red tree"
+LOG_DIR="${TMPDIR:-/tmp}/tropel-release-$$"
+mkdir -p "$LOG_DIR"
+if ! cargo test --workspace --locked > "$LOG_DIR/test.log" 2>&1; then
+  red "  tests failed — do not release a red tree"
+  echo
+  grep -E '^test .*FAILED|^failures:|panicked at|^test result: FAILED' "$LOG_DIR/test.log" \
+    | head -30 | sed 's/^/      /'
+  echo
+  echo "      full log: $LOG_DIR/test.log"
+  die "tests failed"
+fi
 grn "  workspace tests pass"
 
-cargo clippy --workspace --all-targets --locked -- -D warnings >/dev/null 2>&1 \
-  || die "clippy failed"
+if ! cargo clippy --workspace --all-targets --locked -- -D warnings \
+     > "$LOG_DIR/clippy.log" 2>&1; then
+  red "  clippy failed"
+  grep -E '^error' "$LOG_DIR/clippy.log" | head -20 | sed 's/^/      /'
+  echo "      full log: $LOG_DIR/clippy.log"
+  die "clippy failed"
+fi
 grn "  clippy clean"
 
 # ── 1 · Crates ───────────────────────────────────────────────────────────────
