@@ -203,7 +203,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          # BOTH targets. wasm32-unknown-unknown builds core-wasm/input-wasm;
+          # wasm32-wasip1 builds tropel-web, whose artifact runtime-wasm copies.
+          targets: wasm32-unknown-unknown, wasm32-wasip1
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -223,6 +225,24 @@ jobs:
 
       # These are the same scripts release.sh runs, and they carry the
       # 700 KB / 8 MB size gates plus the README Size-line regeneration.
+      # @tropel/runtime-wasm does NOT compile tropel-web — it copies the
+      # prebuilt target/wasm32-wasip1/release-wasm/tropel_web.wasm produced by
+      # scripts/wasm-size.sh (which also asserts the 2.9 MB budget). Without
+      # this step the v0.2.0 tag failed here with
+      #
+      #   ── runtime-wasm
+      #   error: tropel_web.wasm not found — run the wasm job /
+      #          scripts/wasm-size.sh first, or set TROPEL_WASM_PATH
+      #
+      # after all five binary targets had already built successfully — and
+      # because `create GitHub release` needs this job, the release was skipped
+      # and 20 minutes of binaries were discarded.
+      #
+      # ci.yml runs wasm-size.sh in its own wasm job, and release.sh was fixed
+      # to run it too; this workflow was the sibling that got missed.
+      - name: build the tropel-web wasm artifact
+        run: bash scripts/wasm-size.sh
+
       - name: build npm packages
         run: |
           set -euo pipefail
