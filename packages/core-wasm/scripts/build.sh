@@ -95,7 +95,28 @@ if command -v node >/dev/null 2>&1; then
     const line='**'+size.toLocaleString('en-US')+' B** raw after \`wasm-opt -Oz --strip-debug\` (≈140 KB brotli, **'+headroom.toLocaleString('en-US')+' B headroom** under the **700 KB** gate). ✅MEAS';
     // Replace the generated block between the HTML comment and the next heading or EOF
     // The README has a comment line then the size line; replace the first occurrence of '**... B** raw after'
-    if(s.includes('raw after \`wasm-opt')) {
+    // TOLERANCE — do not rewrite for sub-1% drift.
+    //
+    // The wasm byte count is NOT reproducible across host platforms: the same
+    // source built on macOS/aarch64 and on CI's Linux/x86_64 differs by ~1 KB
+    // (0.18% observed). Because CI's gate is
+    //   bash build.sh && git diff --exit-code -- README.md
+    // an unconditional rewrite made the gate unsatisfiable off-CI: a developer
+    // ran the script, it wrote their host's number, CI rebuilt, got its own
+    // number, and failed as \"stale\". It also dirtied the tree on every local
+    // release run, tripping release.sh's dirty-tree preflight.
+    //
+    // The invariant TR-404 actually protects is (a) the payload stays under
+    // 700 KB — asserted unconditionally above, and platform-independent at this
+    // margin — and (b) the number is generated, not hand-typed. Both survive a
+    // tolerance. A real payload change is orders of magnitude bigger than 1%.
+    const prevMatch=s.match(/\*\*([\d,]+) B\*\* raw after \`wasm-opt/);
+    const prev=prevMatch?Number(prevMatch[1].replace(/,/g,'')):0;
+    const drift=prev?Math.abs(size-prev)/prev:1;
+    if(prev && drift<0.01) {
+      console.log('  README.md Size line kept at '+prev+' B (this host measured '
+        +size+' B, '+(drift*100).toFixed(2)+'% drift — under the 1% rewrite threshold)');
+    } else if(s.includes('raw after \`wasm-opt')) {
       s=s.replace(/\*\*[\d,]+ B\*\* raw after \`wasm-opt[^\\n]*✅MEAS[^\\n]*/, line);
       // Also replace legacy '457 KB' if still present
       s=s.replace(/457 KB raw after.*?glue\./s, line+' — see CI (\`scripts\/wasm-size.sh\` + \`packages\/core-wasm\/scripts\/build.sh\` budget check). Measured with \`twiggy top\`: the dominant costs are the \`regex\` engine code + \`unicode-perl\` tables (the full default Unicode property tables were cut — the catalog patterns are ASCII-only), the wasm-bindgen custom section, and chrono\/uuid\/rand glue. Re-measure with \`twiggy top\` after any payload change and re-tighten the gate.');
