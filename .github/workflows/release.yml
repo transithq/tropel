@@ -254,10 +254,24 @@ jobs:
       - name: install workspace deps
         run: npm install --no-audit --no-fund
 
+      # ORDER IS LOAD-BEARING: shims BEFORE runtime-wasm.
+      #
+      # runtime-wasm's src/index.ts imports `@tropel/shims`, whose package.json
+      # points `types` at ./dist/bundle.d.ts — a GENERATED file that only
+      # exists after shims' own build.sh runs. With shims last, the v0.2.0 tag
+      # failed here with
+      #
+      #   src/index.ts(16,55): error TS2307: Cannot find module '@tropel/shims'
+      #     or its corresponding type declarations.
+      #
+      # It passed locally only because a previous run had left packages/shims/
+      # dist/ on disk. release.sh's crate loop carries a "do not reorder it
+      # casually" warning for exactly this reason; the npm loop had no such
+      # note and was in fact already wrong.
       - name: build npm packages
         run: |
           set -euo pipefail
-          for p in core-wasm input-wasm runtime-wasm shims; do
+          for p in core-wasm input-wasm shims runtime-wasm; do
             echo "── $p"
             bash "packages/$p/scripts/build.sh"
           done
@@ -281,7 +295,7 @@ jobs:
           v="$V"
           out="tropel-wasm-v$v"
           mkdir -p "dist/$out"
-          for p in core-wasm input-wasm runtime-wasm shims; do
+          for p in core-wasm input-wasm shims runtime-wasm; do
             mkdir -p "dist/$out/$p"
             cp -r "packages/$p"/{pkg,dist,shim,*.js,*.json,*.md} "dist/$out/$p/" 2>/dev/null || true
           done
