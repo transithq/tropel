@@ -157,6 +157,48 @@ else
   grn "  free disk: ${AVAIL_GB} GB"
 fi
 
+# File descriptors. THIS is what failed the release, twice.
+#
+# tropel is one-OS-thread-per-VU and the behavior_parity suite stands up real
+# local HTTP servers, so `cargo test --workspace` opens a lot of descriptors —
+# and libtest runs those tests in parallel. Under a low `ulimit -n` the tokio
+# runtimes fail to build with
+#
+#   Os { code: 24, kind: TooManyOpenFiles, message: "Too many open files" }
+#
+# and every downstream assertion fails for a reason that looks like a product
+# bug: "connection refused -> http_req_failed == 0", "all 12 batch requests
+# must be served: 0", "all checks passed, got 11285 failed of 11285". None of
+# those are real. macOS ships a 256-descriptor default in some shells, while
+# others inherit a much larger value — which is exactly why this reproduced
+# for the operator and not for a shell with a high limit.
+#
+# The soft limit is raised here rather than merely reported: it costs nothing,
+# needs no privileges while below the hard limit, and applies to the cargo
+# child processes that need it.
+FD_WANT=16384
+FD_HAVE=$(ulimit -n)
+if [[ "$FD_HAVE" != "unlimited" ]] && (( FD_HAVE < FD_WANT )); then
+  # macOS clamps a process to kern.maxfilesperproc; don't ask for more.
+  FD_CAP=$(sysctl -n kern.maxfilesperproc 2>/dev/null || echo "$FD_WANT")
+  FD_TARGET=$(( FD_WANT < FD_CAP ? FD_WANT : FD_CAP ))
+  # `-S`, not bare `-n`: bare `ulimit -n N` sets the soft AND hard limits, so
+  # it permanently lowers the ceiling if N is below the current hard limit —
+  # after which raising back is EPERM for an unprivileged process. Only the
+  # soft limit needs to move, and raising it is always allowed up to the hard
+  # limit.
+  if ulimit -S -n "$FD_TARGET" 2>/dev/null; then
+    grn "  file descriptors: raised $FD_HAVE -> $(ulimit -n)"
+  else
+    red "  file descriptors: $FD_HAVE (could not raise; hard limit $(ulimit -Hn))"
+    echo "      The test suite needs ~$FD_WANT. Raise it and re-run:"
+    echo "        ulimit -S -n $FD_TARGET && bash scripts/release.sh $MODE"
+    die "ulimit -n too low ($FD_HAVE) — behavior_parity will fail with EMFILE"
+  fi
+else
+  grn "  file descriptors: $FD_HAVE"
+fi
+
 bash scripts/version-lockstep.sh || die "version surfaces disagree"
 bash scripts/sdk-guard.sh        || die "sdk guard failed"
 
