@@ -333,6 +333,45 @@ for pkg in core-wasm input-wasm runtime-wasm shims; do
   d="packages/$pkg"
   [[ -d "$d" ]] || { ylw "  $pkg — missing, skipping"; continue; }
 
+  # Name and version come from the manifest, never assumed from the directory
+  # name — a mismatch would make the skip check silently test the wrong package
+  # and republish.
+  PKG_NAME=$(node -p "require('./$d/package.json').name" 2>/dev/null || echo "")
+  PKG_VER=$(node -p "require('./$d/package.json').version" 2>/dev/null || echo "")
+  [[ -n "$PKG_NAME" && -n "$PKG_VER" ]] \
+    || die "$pkg: could not read name/version from $d/package.json"
+
+  # IDEMPOTENCE, matching the crates step. An npm version is immutable, so
+  # republishing one is a hard 403:
+  #
+  #   npm error 403 You cannot publish over the previously published versions
+  #
+  # The first release run got @tropel/core-wasm and @tropel/input-wasm out
+  # before failing on runtime-wasm, so every subsequent run hit that 403 and
+  # could never reach the two packages that still needed publishing. Skip what
+  # is already live and the step resumes instead of restarting.
+  #
+  # Checked BEFORE the build: an already-published package needs no rebuild,
+  # which is what makes a resume fast. Its size gate cannot matter
+  # retroactively — that artifact is already on the registry.
+  #
+  # `npm view <name>@<version>` exits non-zero for both "no such version" and
+  # "no such package", which is the answer we want in either case. A network
+  # failure also reads as "not published" and falls through to the publish
+  # attempt, where the 403 is caught below rather than silently passing.
+  if npm view "$PKG_NAME@$PKG_VER" version >/dev/null 2>&1; then
+    # Report WHEN it was published. Skipping is correct — the version is
+    # immutable — but "already published" silently means "the registry keeps
+    # whatever content was uploaded then, not what is in this tree". If that
+    # date is old, the published artifact predates the fixes being released
+    # and the version must be BUMPED for them to reach consumers. Republishing
+    # is not an option, so the date is the only signal that anything is wrong.
+    PKG_WHEN=$(npm view "$PKG_NAME" time --json 2>/dev/null \
+      | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log((JSON.parse(s)['$PKG_VER']||'?').slice(0,10))}catch{console.log('?')}})" 2>/dev/null)
+    grn "  $PKG_NAME@$PKG_VER — already published ${PKG_WHEN:-?}, skipping"
+    continue
+  fi
+
   # The size gates live in these build scripts and are load-bearing: they
   # regenerate the README Size line, and CI fails on a stale one.
   if [[ -f "$d/scripts/build.sh" ]]; then
@@ -341,10 +380,19 @@ for pkg in core-wasm input-wasm runtime-wasm shims; do
   fi
 
   if (( DRY )); then
-    ylw "  @tropel/$pkg — WOULD PUBLISH"
+    ylw "  $PKG_NAME@$PKG_VER — WOULD PUBLISH"
   else
-    (cd "$d" && npm publish --access public) || die "npm publish $pkg failed"
-    grn "  @tropel/$pkg published"
+    if (cd "$d" && npm publish --access public); then
+      grn "  $PKG_NAME@$PKG_VER published"
+    else
+      # Lost a race, or the skip check was wrong. Re-check before dying: a 403
+      # because the version is already live is not a release failure.
+      if npm view "$PKG_NAME@$PKG_VER" version >/dev/null 2>&1; then
+        ylw "  $PKG_NAME@$PKG_VER — already on the registry, treating as done"
+      else
+        die "npm publish $pkg failed"
+      fi
+    fi
   fi
 done
 
