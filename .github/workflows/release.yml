@@ -243,6 +243,17 @@ jobs:
       - name: build the tropel-web wasm artifact
         run: bash scripts/wasm-size.sh
 
+      # @tropel/runtime-wasm compiles TS with the workspace's own `typescript`
+      # devDependency, so the root install must happen first. ci.yml does this;
+      # release.sh does this; this job did not, so the v0.2.0 tag failed at
+      # runtime-wasm with "typescript not installed" AFTER the wasm artifact
+      # had already been built and copied.
+      #
+      # There is no root package-lock.json, so `npm install` — matching ci.yml
+      # exactly — not `npm ci`.
+      - name: install workspace deps
+        run: npm install --no-audit --no-fund
+
       - name: build npm packages
         run: |
           set -euo pipefail

@@ -50,12 +50,34 @@ echo "  copied wasm: $(du -h wasm/tropel_web.wasm | cut -f1)"
 # a release build will silently download and EXECUTE an arbitrary registry
 # package under a name the project never vendored. Resolve the local binary
 # explicitly and fail loudly if it is absent.
-TSC=""
-for candidate in ./node_modules/.bin/tsc ../../node_modules/.bin/tsc; do
-  if [[ -x "$candidate" ]]; then TSC="$candidate"; break; fi
-done
+find_tsc() {
+  local candidate
+  for candidate in ./node_modules/.bin/tsc ../../node_modules/.bin/tsc; do
+    if [[ -x "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+# SELF-SUFFICIENT, deliberately. Requiring every caller to remember a prior
+# `npm install` has now cost two failed releases: ci.yml runs it, release.sh
+# was fixed to run it, and release.yml — the third caller — was missed, so the
+# v0.2.0 tag failed here with the error below AFTER the wasm artifact had been
+# built and copied. Installing the workspace's own declared devDependency is a
+# precondition of this script, so this script owns it rather than each caller
+# re-implementing it.
+#
+# This does NOT weaken the registry protection: it installs the pinned
+# workspace devDependency and re-resolves the LOCAL binary. If that still
+# fails it errors out; it never falls back to `npx`, which would fetch and
+# execute a package this project never vendored.
+TSC=$(find_tsc || true)
 if [[ -z "$TSC" ]]; then
-  echo "error: typescript not installed — run 'npm install' at the repo root" >&2
+  echo "  typescript not resolved locally — running 'npm install' at the repo root" >&2
+  ( cd ../.. && npm install --no-audit --no-fund ) >/dev/null 2>&1 || true
+  TSC=$(find_tsc || true)
+fi
+if [[ -z "$TSC" ]]; then
+  echo "error: typescript still not installed after 'npm install' at the repo root" >&2
   echo "       (typescript is a devDependency of this workspace package)." >&2
   echo "       Refusing to 'npx tsc', which would fetch an unrelated registry package." >&2
   exit 1
