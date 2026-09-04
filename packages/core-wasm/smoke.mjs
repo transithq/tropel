@@ -19,6 +19,9 @@ import {
   oauth2JwtExpiresAt,
   oauth2SignJwt,
   wsseSign,
+  resolveTemplate,
+  resolveTemplateDetailed,
+  maxVariableResolutionPasses,
 } from "./src/index.js";
 
 // Metadata comes from pkg/meta.js (build-time extraction from the compiled
@@ -217,4 +220,85 @@ if (wsse.authorization !==
 const wsseGen = wsseSign({ username: "user", password: "passwd" });
 if (!wsseGen.nonce || !wsseGen.created.endsWith("Z")) throw new Error("wsse generation");
 
-console.log(`core-wasm smoke OK — catalog: ${meta.length} variables · oauth2 flows verified`);
+// ── resolveTemplate — the two divergences, through the REAL wasm ───────────
+// Native unit tests cover the semantics; this proves the facade actually
+// reaches them (a wasm_bindgen signature mismatch is invisible to cargo test).
+const vars = { "base-url": "https://api.test", greeting: 'He said "hi"', a: "{{b}}", b: "done" };
+
+// Hyphens: a `[\w.:]+` grammar cannot match one — the divergence that put
+// literal {{base-url}} on the wire.
+if (resolveTemplate("{{base-url}}/v1", vars, "plain") !== "https://api.test/v1") {
+  throw new Error("hyphenated variable must resolve");
+}
+// JSON escaping: a quote-bearing value must leave the body parseable.
+const body = resolveTemplate('{"msg":"{{greeting}}"}', vars, "json");
+JSON.parse(body); // throws if the escaper did not run
+// URL mode inserts raw (Postman does no percent-encoding).
+if (resolveTemplate("{{base-url}}", vars, "url") !== "https://api.test") {
+  throw new Error("url mode");
+}
+// Chains resolve when deep; unknown names stay visible.
+if (resolveTemplate("{{a}}", vars, "plain") !== "done") throw new Error("chain");
+if (resolveTemplate("{{nope}}", vars, "plain") !== "{{nope}}") throw new Error("unknown must stay literal");
+// An unknown mode throws rather than falling back to plain.
+try {
+  resolveTemplate("x", vars, "jsonn");
+  throw new Error("unknown mode must throw");
+} catch (e) {
+  if (!String(e.message ?? e).includes("unknown mode")) throw e;
+}
+// A cycle and an unknown name both leave a literal {{…}} — hitCap is what
+// separates "fail loudly, name the chain" from "send it, the name is visible".
+const cyc = resolveTemplateDetailed("{{a}}", { a: "{{b}}", b: "{{a}}" }, "plain");
+if (cyc.hitCap !== true || cyc.unresolved.length === 0) {
+  throw new Error(`cycle must report hitCap: ${JSON.stringify(cyc)}`);
+}
+const unk = resolveTemplateDetailed("{{nope}}", {}, "plain");
+if (unk.hitCap !== false || unk.unresolved[0] !== "nope" || unk.value !== "{{nope}}") {
+  throw new Error(`unknown name must settle: ${JSON.stringify(unk)}`);
+}
+
+// ── The shared conformance corpus, through the REAL wasm ──────────────────
+// The same file the Rust tests walk. Running it here proves the JS facade
+// reaches the same semantics — a wasm_bindgen signature mismatch or a facade
+// bug is invisible to `cargo test`.
+const corpus = JSON.parse(
+  readFileSync(new URL("./fixtures/resolve-corpus.json", import.meta.url), "utf8"),
+);
+let corpusRun = 0;
+for (const c of corpus.cases) {
+  let vars = c.vars;
+  if (c.vars_generated === "chain_longer_than_cap") {
+    vars = {};
+    const cap = maxVariableResolutionPasses();
+    for (let i = 0; i <= cap; i++) vars[`v${i}`] = `{{v${i + 1}}}`;
+    vars[`v${cap + 1}`] = "end";
+  }
+  const got = resolveTemplateDetailed(c.template, vars, c.mode);
+  if (c.expect !== undefined && got.value !== c.expect) {
+    throw new Error(`corpus "${c.name}": expected ${JSON.stringify(c.expect)}, got ${JSON.stringify(got.value)}`);
+  }
+  if (c.parses_as_json === true) JSON.parse(got.value);
+  if (c.expect_hit_cap !== undefined && got.hitCap !== c.expect_hit_cap) {
+    throw new Error(`corpus "${c.name}": hitCap expected ${c.expect_hit_cap}, got ${got.hitCap}`);
+  }
+  if (c.expect_unresolved !== undefined &&
+      JSON.stringify(got.unresolved) !== JSON.stringify(c.expect_unresolved)) {
+    throw new Error(`corpus "${c.name}": unresolved ${JSON.stringify(got.unresolved)}`);
+  }
+  for (const n of c.expect_unresolved_contains ?? []) {
+    if (!got.unresolved.includes(n)) {
+      throw new Error(`corpus "${c.name}": unresolved must contain ${n}, got ${JSON.stringify(got.unresolved)}`);
+    }
+  }
+  corpusRun++;
+}
+if (corpusRun === 0) throw new Error("the corpus ran zero cases — it asserts nothing");
+
+if (maxVariableResolutionPasses() !== 20) {
+  throw new Error(`pass cap: ${maxVariableResolutionPasses()}`);
+}
+
+console.log(
+  `core-wasm smoke OK — catalog: ${meta.length} variables · oauth2 flows verified · resolveTemplate verified (grammar, 3 escape modes, chains, pass cap ${maxVariableResolutionPasses()}) · corpus ${corpusRun}/${corpus.cases.length} cases`,
+);

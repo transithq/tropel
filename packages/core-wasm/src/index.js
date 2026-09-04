@@ -97,6 +97,71 @@ export function resolveDynamicVariables(template) {
 }
 
 /**
+ * Resolve plain `{{var}}` references against a flat variable map.
+ *
+ * @param {string} template
+ * @param {Record<string, string>} vars  flat map; scope layering is the
+ *   embedder's job (data-merging over its own model, not execution)
+ * @param {"plain"|"json"|"url"} mode  the escaper — pick PER FIELD: "json" for
+ *   a JSON body, "url" for a URL, "plain" elsewhere. Getting this wrong is how
+ *   a quote-bearing value corrupts a body, so an unknown mode throws.
+ * @param {boolean} [deep=true]  multi-pass, so `{{a}}`→`{{b}}` chains and
+ *   `{{host_{{suffix}}}}` resolve. Capped at maxVariableResolutionPasses().
+ * @returns {string}
+ *
+ * Unlike `resolveDynamicVariables`, this **throws** when the tier is not
+ * ready. It does not degrade to a passthrough: an unresolved `{{base-url}}`
+ * reaching the wire is exactly the silent corruption this export was added to
+ * remove, so the caller must see the failure and decide.
+ */
+export function resolveTemplate(template, vars, mode, deep = true) {
+  if (glue === null) {
+    throw new Error(
+      "resolveTemplate: core wasm is not initialized — call initCoreWasm() first. " +
+        "This does NOT fall back to a passthrough: an unresolved {{var}} on the wire is silent corruption.",
+    );
+  }
+  return glue.resolveTemplate(template, JSON.stringify(vars ?? {}), mode, deep);
+}
+
+/**
+ * {@link resolveTemplate}, plus WHY resolution stopped.
+ *
+ * @param {string} template
+ * @param {Record<string, string>} vars
+ * @param {"plain"|"json"|"url"} mode
+ * @returns {{ value: string, hitCap: boolean, unresolved: string[] }}
+ *
+ * A never-settling chain (`a`→`b`→`a`) and an unknown name both leave a
+ * literal `{{…}}` in `value`, but deserve opposite treatment: the first is a
+ * config error worth failing loudly with the chain named, the second must
+ * stay visible and send. `hitCap` is the difference — it means the pass
+ * budget ran out while the text was still changing, which an unknown name
+ * never does.
+ *
+ * Use this instead of re-deriving a cycle detector: a second detector is how
+ * the grammar diverged in the first place.
+ */
+export function resolveTemplateDetailed(template, vars, mode) {
+  if (glue === null) {
+    throw new Error("resolveTemplateDetailed: core wasm is not initialized — call initCoreWasm() first");
+  }
+  return JSON.parse(glue.resolveTemplateDetailed(template, JSON.stringify(vars ?? {}), mode));
+}
+
+/**
+ * The `{{a}}`→`{{b}}` chain cap the multi-pass resolver enforces (Postman
+ * documents 20). Read it rather than hard-coding a second ceiling.
+ * @returns {number}
+ */
+export function maxVariableResolutionPasses() {
+  if (glue === null) {
+    throw new Error("maxVariableResolutionPasses: core wasm is not initialized");
+  }
+  return glue.maxVariableResolutionPasses();
+}
+
+/**
  * Catalog metadata `[{"name":"$guid","description":…}]` for editor UIs.
  * Async and init-free: extracted from the compiled catalog at package build
  * time (single source of truth — the Rust PREDEFINED_VARIABLE_META table in

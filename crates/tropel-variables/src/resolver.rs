@@ -215,24 +215,112 @@ impl VariableResolver {
         max_passes: usize,
         mode: EscapeMode,
     ) -> String {
-        // Fast path: no {{ means no variable reference — return unchanged
-        // without allocating.
+        self.resolve_deep_reporting(input, scope, max_passes, mode)
+            .value
+    }
+
+    /// `resolve_deep_with`, plus WHY it stopped.
+    ///
+    /// The loop already distinguishes the two outcomes; it just threw the
+    /// distinction away. An embedder needs it: a chain that never settles
+    /// (`a → b → a`) deserves a loud error naming the chain, while an unknown
+    /// name must stay a visible literal. Both look identical in the output
+    /// string, so only the loop can tell them apart — reporting it here keeps
+    /// that ONE loop instead of an embedder growing a second cycle detector.
+    ///
+    /// - `hit_cap` — the pass budget ran out while the text was STILL
+    ///   CHANGING. That is a cycle (or a chain deeper than the cap), never a
+    ///   merely-unknown name, because an unknown name stabilizes immediately.
+    /// - `unresolved` — placeholder names still present after the last pass,
+    ///   in first-occurrence order, deduplicated. Read with the SAME regex
+    ///   that drives resolution, so an embedder cannot disagree about what
+    ///   counts as a placeholder.
+    fn resolve_deep_reporting(
+        &self,
+        input: &str,
+        scope: &VariableScope,
+        max_passes: usize,
+        mode: EscapeMode,
+    ) -> DeepOutcome {
         if !input.contains("{{") {
-            return input.to_string();
+            return DeepOutcome {
+                value: input.to_string(),
+                hit_cap: false,
+                unresolved: Vec::new(),
+            };
         }
         let mut result = input.to_string();
+        let mut settled = false;
+        // Names are accumulated ACROSS passes, not read off the final value.
+        // A two-variable cycle alternates `{{a}}` → `{{b}}` → `{{a}}`, so the
+        // last value holds only ONE of them and a final-value read would
+        // report "a" for a loop through "b" — losing exactly the part that
+        // makes the error actionable. Walking the passes reports `a, b`.
+        let mut unresolved: Vec<String> = Vec::new();
+        let collect = |text: &str, out: &mut Vec<String>| {
+            for caps in var_re().captures_iter(text) {
+                let name = caps[1].trim().to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        };
         for _ in 0..max_passes {
             if !result.contains("{{") {
+                settled = true;
                 break;
             }
+            collect(&result, &mut unresolved);
             let resolved = self.resolve_with(&result, scope, mode);
             if resolved == result {
+                settled = true;
                 break;
             }
             result = resolved;
         }
-        result
+        collect(&result, &mut unresolved);
+        // A settled result reports only what is STILL unresolved: names that
+        // resolved along the way are not the user's problem.
+        if settled {
+            unresolved.retain(|n| result.contains(&format!("{{{{{n}}}}}")));
+        }
+        DeepOutcome {
+            value: result,
+            hit_cap: !settled,
+            unresolved,
+        }
     }
+
+    /// Public, mode-selecting form of [`Self::resolve_deep_reporting`].
+    pub fn resolve_reporting(
+        &self,
+        input: &str,
+        scope: &VariableScope,
+        max_passes: usize,
+        mode: &str,
+    ) -> Result<DeepOutcome, String> {
+        let escape = match mode {
+            "plain" => EscapeMode::None,
+            "json" => EscapeMode::Json,
+            "url" => EscapeMode::Url,
+            other => {
+                return Err(format!(
+                    "unknown mode {other:?} — expected \"plain\", \"json\" or \"url\""
+                ))
+            }
+        };
+        Ok(self.resolve_deep_reporting(input, scope, max_passes, escape))
+    }
+}
+
+/// What a deep resolution produced, and why it stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepOutcome {
+    pub value: String,
+    /// The pass budget ran out while the text was still changing — a cycle.
+    pub hit_cap: bool,
+    /// Placeholder names still present, first-occurrence order, deduplicated.
+    pub unresolved: Vec<String>,
 }
 
 /// How a substituted variable VALUE is escaped for its destination context.

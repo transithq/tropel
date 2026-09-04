@@ -17,7 +17,10 @@ use tropel_auth::oauth::{
     parse_token_response, sign_jwt, sign_wsse, AuthorizeParams, JwtAlgorithm, StoredToken,
     TokenPlacement, TokenRequestParams, WsseParams,
 };
-use tropel_variables::{DynamicCatalog, PREDEFINED_VARIABLE_META};
+use tropel_variables::{
+    DynamicCatalog, VariableResolver, VariableScope, MAX_VARIABLE_RESOLUTION_PASSES,
+    PREDEFINED_VARIABLE_META,
+};
 use wasm_bindgen::prelude::*;
 
 static CATALOG: OnceLock<DynamicCatalog> = OnceLock::new();
@@ -40,6 +43,171 @@ pub fn resolve_variables(input: &str) -> Result<String, wasm_bindgen::JsValue> {
     catalog()
         .resolve(input)
         .map_err(|msg| wasm_bindgen::JsValue::from_str(&msg))
+}
+
+/// Resolve plain `{{var}}` references against the embedder's variable map.
+///
+/// ## Why this exists
+///
+/// `resolveVariables` above deliberately leaves plain `{{var}}` alone, and its
+/// doc comment told embedders to "resolve those against its own
+/// environment/collection maps". KnockPort did exactly that — and its
+/// TypeScript resolver diverged from this one in two ways that reach the wire
+/// silently:
+///
+/// 1. **Grammar.** It matched `[\w.:]+` where this resolver matches `[^{}]+`,
+///    so `{{base-url}}`, `{{x-api-key}}` and `{{user-id}}` — the commonest
+///    naming convention in imported Postman collections — resolved in a load
+///    run and went out as LITERAL TEXT from the app.
+/// 2. **Escaping.** It had one raw-substitution mode for every field. This
+///    resolver has three, and the runner uses `resolve_json_deep` for bodies
+///    and `resolve_url_deep` for URLs. A value containing `"` therefore
+///    produced invalid JSON from the app and correct JSON from a run — a bug
+///    already fixed here once (backlog line 135) and independently
+///    reintroduced there.
+///
+/// The implementation already existed in `tropel-variables` (whose `lib.rs`
+/// does `pub use resolver::*`); only the facade was missing.
+///
+/// **Cost, measured — not zero.** `lto = "thin"` strips unreachable code, and
+/// nothing called `resolve_json`/`resolve_url`/`resolve_deep`, so the linker
+/// had removed them from the shipped artifact. Making them reachable costs
+/// **+17,515 B raw / +11,949 B gzip** (583,680 → 601,195 B, ~2 % of the tier,
+/// still 98,805 B under the 700,000 B budget). Most of it is the
+/// `serde_json` deserializer for the variable map, which was also unreachable
+/// before. Worth stating plainly because the first write-up of this task
+/// claimed "already in the bytes, zero payload" — true of the crate, false of
+/// the artifact.
+///
+/// ## Contract
+///
+/// - `vars_json` is a FLAT `{"name": "value"}` object. Scope layering
+///   (globals < collection < env < folder < request < runtime) stays the
+///   embedder's job — that is data-merging over its own scope model, not
+///   execution. The map lands in `VariableScope::env`, whose values are
+///   returned verbatim with no JSON round-trip.
+/// - `mode` selects the escaper, and callers MUST pick per field:
+///   `"json"` for a JSON body, `"url"` for a URL, `"plain"` elsewhere.
+/// - `deep` runs the multi-pass resolver so `{{host_{{suffix}}}}` and
+///   `{{a}}`→`{{b}}` chains resolve, capped at
+///   [`maxVariableResolutionPasses`].
+/// - An unknown name survives as a literal `{{name}}` — visible, never
+///   silently emptied.
+/// - An unparseable `vars_json` is a JS `Error`, never a silent passthrough:
+///   a template reaching the wire unresolved is the failure this whole export
+///   exists to prevent.
+#[wasm_bindgen(js_name = "resolveTemplate")]
+pub fn resolve_template(
+    input: &str,
+    vars_json: &str,
+    mode: &str,
+    deep: bool,
+) -> Result<String, wasm_bindgen::JsValue> {
+    resolve_template_inner(input, vars_json, mode, deep)
+        .map_err(|msg| wasm_bindgen::JsValue::from_str(&msg))
+}
+
+/// The whole of `resolveTemplate`, minus the `JsValue` conversion.
+///
+/// Split out so the semantics are testable in a NATIVE build: `JsValue` cannot
+/// be constructed off wasm32, which is why the oauth adapters below are only
+/// covered by the JS smoke test. These semantics are the two things that
+/// already diverged once in a TypeScript re-implementation, so they get real
+/// unit tests rather than a note explaining why they have none.
+fn resolve_template_inner(
+    input: &str,
+    vars_json: &str,
+    mode: &str,
+    deep: bool,
+) -> Result<String, String> {
+    let env: std::collections::HashMap<String, String> =
+        serde_json::from_str(vars_json).map_err(|e| {
+            format!("resolveTemplate: vars must be a flat JSON object of string values ({e})")
+        })?;
+
+    let scope = VariableScope {
+        env,
+        ..Default::default()
+    };
+    let resolver = VariableResolver::new();
+
+    Ok(match (mode, deep) {
+        ("plain", false) => resolver.resolve(input, &scope),
+        ("plain", true) => resolver.resolve_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES),
+        ("json", false) => resolver.resolve_json(input, &scope),
+        ("json", true) => resolver.resolve_json_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES),
+        ("url", false) => resolver.resolve_url(input, &scope),
+        ("url", true) => resolver.resolve_url_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES),
+        // Named refusal rather than a silent fallback to "plain": picking the
+        // wrong escaper is exactly how a quote-bearing value corrupts a JSON
+        // body, so a typo in the mode must fail loudly.
+        (other, _) => {
+            return Err(format!(
+                "resolveTemplate: unknown mode {other:?} — expected \"plain\", \"json\" or \"url\""
+            ))
+        }
+    })
+}
+
+/// `resolveTemplate`, plus WHY resolution stopped — as a JSON string:
+/// `{"value": "...", "hitCap": bool, "unresolved": ["name", …]}`.
+///
+/// The distinction matters and only the resolver's loop can make it. A chain
+/// that never settles (`a` → `b` → `a`) and an unknown name BOTH leave a
+/// literal `{{…}}` in the output, but they deserve opposite treatment: the
+/// first is a config error worth failing loudly with the chain named, the
+/// second must stay a visible literal and send.
+///
+/// - `hitCap` — the pass budget ran out while the text was still CHANGING.
+///   That is a cycle; an unknown name stabilizes on the first pass.
+/// - `unresolved` — placeholder names still present, first-occurrence order,
+///   read with the SAME regex that drives resolution, so an embedder cannot
+///   disagree about what counts as a placeholder.
+///
+/// Exists so an embedder keeps its loud, chain-naming error WITHOUT growing a
+/// second cycle detector — which is how the grammar diverged the first time.
+#[wasm_bindgen(js_name = "resolveTemplateDetailed")]
+pub fn resolve_template_detailed(
+    input: &str,
+    vars_json: &str,
+    mode: &str,
+) -> Result<String, wasm_bindgen::JsValue> {
+    resolve_template_detailed_inner(input, vars_json, mode)
+        .map_err(|msg| wasm_bindgen::JsValue::from_str(&msg))
+}
+
+fn resolve_template_detailed_inner(
+    input: &str,
+    vars_json: &str,
+    mode: &str,
+) -> Result<String, String> {
+    let env: std::collections::HashMap<String, String> =
+        serde_json::from_str(vars_json).map_err(|e| {
+            format!(
+                "resolveTemplateDetailed: vars must be a flat JSON object of string values ({e})"
+            )
+        })?;
+    let scope = VariableScope {
+        env,
+        ..Default::default()
+    };
+    let outcome = VariableResolver::new()
+        .resolve_reporting(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES, mode)
+        .map_err(|e| format!("resolveTemplateDetailed: {e}"))?;
+    Ok(serde_json::json!({
+        "value": outcome.value,
+        "hitCap": outcome.hit_cap,
+        "unresolved": outcome.unresolved,
+    })
+    .to_string())
+}
+
+/// The `{{a}}`→`{{b}}` chain cap the multi-pass resolver enforces (Postman
+/// documents 20). Exported so an embedder reports the SAME ceiling instead of
+/// inventing a second one.
+#[wasm_bindgen(js_name = "maxVariableResolutionPasses")]
+pub fn max_variable_resolution_passes() -> usize {
+    MAX_VARIABLE_RESOLUTION_PASSES
 }
 
 /// Catalog metadata as a JSON string: `[{"name":"$guid","description":…},…]`.
@@ -293,4 +461,286 @@ mod tests {
     // by packages/core-wasm/smoke.mjs — JsValue cannot be constructed in
     // native test builds, so it is covered here only via tropel-oauth's own
     // unit tests (the adapters are serde pass-throughs).
+
+    // ── resolveTemplate ──────────────────────────────────────────────────
+    // These pin the two behaviours a TypeScript re-implementation already got
+    // wrong once. Both were silent: the wrong bytes reached the wire and
+    // nothing failed.
+
+    fn resolve(input: &str, vars: &str, mode: &str) -> String {
+        resolve_template_inner(input, vars, mode, true).expect("resolves")
+    }
+
+    #[test]
+    fn hyphenated_names_resolve() {
+        // The divergence: a `[\w.:]+` grammar cannot match a hyphen, so
+        // `{{base-url}}` went out as literal text while a load run resolved
+        // it. Hyphens are the commonest convention in imported collections.
+        let vars = r#"{"base-url":"https://api.test","x-api-key":"k","user-id":"7"}"#;
+        assert_eq!(
+            resolve("{{base-url}}/v1", vars, "plain"),
+            "https://api.test/v1"
+        );
+        assert_eq!(resolve("{{x-api-key}}", vars, "plain"), "k");
+        assert_eq!(resolve("{{user-id}}", vars, "plain"), "7");
+    }
+
+    #[test]
+    fn json_mode_escapes_quotes_and_control_chars() {
+        // The divergence: one raw-substitution mode for every field, so a
+        // value containing a quote produced INVALID JSON from the app and
+        // valid JSON from a run.
+        let vars = r#"{"greeting":"He said \"hi\"","multi":"a\nb"}"#;
+        let out = resolve(r#"{"msg":"{{greeting}}"}"#, vars, "json");
+        assert_eq!(out, r#"{"msg":"He said \"hi\""}"#);
+        serde_json::from_str::<serde_json::Value>(&out).expect("stays parseable");
+
+        let nl = resolve(r#"{"m":"{{multi}}"}"#, vars, "json");
+        serde_json::from_str::<serde_json::Value>(&nl).expect("newline stays parseable");
+    }
+
+    #[test]
+    fn json_mode_leaves_a_bare_fragment_raw() {
+        // Quote-parity: a placeholder INSIDE a string literal is escaped, one
+        // standing alone as a value is not — that is what lets a variable
+        // carry a JSON object into a body.
+        let vars = r#"{"filter":"{\"a\":1}"}"#;
+        let out = resolve(r#"{"filter": {{filter}}}"#, vars, "json");
+        assert_eq!(out, r#"{"filter": {"a":1}}"#);
+        serde_json::from_str::<serde_json::Value>(&out).expect("fragment stays parseable");
+    }
+
+    #[test]
+    fn url_mode_inserts_raw() {
+        // Postman does no percent-encoding here, so a structural URL inside a
+        // value survives resolution.
+        let vars = r#"{"endpoint":"https://api.test/a b?x=1&y=2"}"#;
+        assert_eq!(
+            resolve("{{endpoint}}", vars, "url"),
+            "https://api.test/a b?x=1&y=2"
+        );
+    }
+
+    #[test]
+    fn unknown_names_stay_literal() {
+        // Visible, never silently emptied.
+        assert_eq!(resolve("{{nope}}", "{}", "plain"), "{{nope}}");
+    }
+
+    #[test]
+    fn deep_resolves_chains_and_nested_names() {
+        let vars = r#"{"a":"{{b}}","b":"done","suffix":"dev","host_dev":"h"}"#;
+        assert_eq!(resolve("{{a}}", vars, "plain"), "done");
+        assert_eq!(resolve("{{host_{{suffix}}}}", vars, "plain"), "h");
+        // Shallow does NOT chase the chain — the two modes stay distinct.
+        assert_eq!(
+            resolve_template_inner("{{a}}", vars, "plain", false).unwrap(),
+            "{{b}}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_terminates_at_the_pass_cap() {
+        // Never a hang: the cap is the ceiling and it is the SAME number the
+        // embedder reads from maxVariableResolutionPasses().
+        let vars = r#"{"a":"{{b}}","b":"{{a}}"}"#;
+        let out = resolve("{{a}}", vars, "plain");
+        assert!(
+            out.contains("{{"),
+            "an unresolvable cycle stays visible: {out}"
+        );
+        assert_eq!(
+            max_variable_resolution_passes(),
+            MAX_VARIABLE_RESOLUTION_PASSES
+        );
+    }
+
+    #[test]
+    fn detailed_separates_a_cycle_from_an_unknown_name() {
+        // Both leave a literal {{…}} in the output; only the loop can tell
+        // them apart, and an embedder needs the difference to decide between
+        // "fail loudly naming the chain" and "send it, the name is visible".
+        let cyc = resolve_template_detailed_inner("{{a}}", r#"{"a":"{{b}}","b":"{{a}}"}"#, "plain")
+            .unwrap();
+        let cyc: serde_json::Value = serde_json::from_str(&cyc).unwrap();
+        assert_eq!(cyc["hitCap"], true, "a cycle exhausts the budget: {cyc}");
+        // BOTH names, not just the one left in the final value. An `a` → `b`
+        // cycle alternates, so a final-value read reports whichever happens to
+        // be last — losing the half that makes the error actionable.
+        let names = cyc["unresolved"].as_array().unwrap();
+        assert!(
+            names.contains(&serde_json::json!("a")) && names.contains(&serde_json::json!("b")),
+            "a cycle must name every variable in the loop: {cyc}"
+        );
+
+        let unk = resolve_template_detailed_inner("{{nope}}", "{}", "plain").unwrap();
+        let unk: serde_json::Value = serde_json::from_str(&unk).unwrap();
+        assert_eq!(
+            unk["hitCap"], false,
+            "an unknown name settles at once: {unk}"
+        );
+        assert_eq!(unk["unresolved"], serde_json::json!(["nope"]));
+        assert_eq!(unk["value"], "{{nope}}");
+
+        // A chain that DOES settle reports neither.
+        let ok = resolve_template_detailed_inner("{{a}}", r#"{"a":"{{b}}","b":"done"}"#, "plain")
+            .unwrap();
+        let ok: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(ok["value"], "done");
+        assert_eq!(ok["hitCap"], false);
+        assert_eq!(ok["unresolved"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn detailed_reports_a_chain_deeper_than_the_cap() {
+        // v0 → v1 → … → v21: deeper than the 20-pass budget, so it is
+        // reported the same way a cycle is — the embedder's ceiling and this
+        // one are the same number by construction.
+        let mut vars = serde_json::Map::new();
+        for i in 0..=MAX_VARIABLE_RESOLUTION_PASSES {
+            vars.insert(
+                format!("v{i}"),
+                serde_json::json!(format!("{{{{v{}}}}}", i + 1)),
+            );
+        }
+        vars.insert(
+            format!("v{}", MAX_VARIABLE_RESOLUTION_PASSES + 1),
+            serde_json::json!("end"),
+        );
+        let out = resolve_template_detailed_inner(
+            "{{v0}}",
+            &serde_json::Value::Object(vars).to_string(),
+            "plain",
+        )
+        .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["hitCap"], true, "{out}");
+    }
+
+    // ── The shared conformance corpus ────────────────────────────────────
+    // ONE file, walked here AND by every embedder that hosts a second
+    // implementation on this path. A corpus is what makes a second host a
+    // PORT rather than a FORK — the two behaviours below already diverged
+    // once in a TypeScript re-implementation, silently, and nothing failed.
+    //
+    // Shipped in the npm package so an embedder reads the same bytes instead
+    // of copying cases into its own suite, where they would drift exactly
+    // like the code did.
+    const CORPUS: &str = include_str!("../../../packages/core-wasm/fixtures/resolve-corpus.json");
+
+    /// The generated `vars` for a case that needs more than a literal map.
+    fn generated_vars(kind: &str) -> serde_json::Value {
+        match kind {
+            // v0 → v1 → … → v{cap+1}: one link deeper than the budget, so it
+            // is reported like a cycle. Generated from the cap rather than
+            // written out, so the fixture cannot drift from the constant.
+            "chain_longer_than_cap" => {
+                let mut m = serde_json::Map::new();
+                for i in 0..=MAX_VARIABLE_RESOLUTION_PASSES {
+                    m.insert(
+                        format!("v{i}"),
+                        serde_json::json!(format!("{{{{v{}}}}}", i + 1)),
+                    );
+                }
+                m.insert(
+                    format!("v{}", MAX_VARIABLE_RESOLUTION_PASSES + 1),
+                    serde_json::json!("end"),
+                );
+                serde_json::Value::Object(m)
+            }
+            other => panic!("unknown vars_generated kind: {other}"),
+        }
+    }
+
+    #[test]
+    fn conformance_corpus() {
+        let doc: serde_json::Value = serde_json::from_str(CORPUS).expect("corpus is valid JSON");
+        let cases = doc["cases"].as_array().expect("cases array");
+        assert!(!cases.is_empty(), "an empty corpus asserts nothing");
+
+        for case in cases {
+            let name = case["name"].as_str().expect("every case is named");
+            let template = case["template"].as_str().expect("template");
+            let mode = case["mode"].as_str().expect("mode");
+            let vars = match case.get("vars_generated") {
+                Some(kind) => generated_vars(kind.as_str().unwrap()),
+                None => case["vars"].clone(),
+            };
+            let vars_json = vars.to_string();
+
+            let detailed = resolve_template_detailed_inner(template, &vars_json, mode)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let out: serde_json::Value = serde_json::from_str(&detailed).unwrap();
+            let value = out["value"].as_str().unwrap();
+
+            if let Some(expected) = case.get("expect").and_then(|v| v.as_str()) {
+                assert_eq!(value, expected, "{name}");
+            }
+            if case.get("parses_as_json").and_then(|v| v.as_bool()) == Some(true) {
+                serde_json::from_str::<serde_json::Value>(value).unwrap_or_else(|e| {
+                    panic!("{name}: result must stay parseable JSON: {e} — {value}")
+                });
+            }
+            if let Some(expected) = case.get("expect_hit_cap").and_then(|v| v.as_bool()) {
+                assert_eq!(out["hitCap"], expected, "{name}: hitCap");
+            }
+            if let Some(expected) = case.get("expect_unresolved") {
+                assert_eq!(&out["unresolved"], expected, "{name}: unresolved");
+            }
+            if let Some(required) = case
+                .get("expect_unresolved_contains")
+                .and_then(|v| v.as_array())
+            {
+                let got = out["unresolved"].as_array().unwrap();
+                for n in required {
+                    assert!(
+                        got.contains(n),
+                        "{name}: unresolved must contain {n} — got {got:?}"
+                    );
+                }
+            }
+
+            // The shallow and deep entry points must agree wherever the case
+            // does not exercise chaining, so an embedder picking either one
+            // cannot land on different bytes.
+            if case.get("vars_generated").is_none() && !template.contains("{{$") {
+                let deep = resolve_template_inner(template, &vars_json, mode, true).unwrap();
+                assert_eq!(
+                    deep, value,
+                    "{name}: resolveTemplate(deep) must match detailed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corpus_cases_explain_the_risk_they_pin() {
+        // A case nobody can explain the risk of is a case nobody maintains.
+        let doc: serde_json::Value = serde_json::from_str(CORPUS).unwrap();
+        for case in doc["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let why = case.get("why").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                why.len() > 40,
+                "{name}: `why` must state the failure it prevents"
+            );
+            assert!(
+                case.get("expect").is_some()
+                    || case.get("expect_hit_cap").is_some()
+                    || case.get("parses_as_json").is_some(),
+                "{name}: a case with no expectation asserts nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_input_fails_loudly() {
+        // A typo'd mode must not fall back to "plain" — that is precisely how
+        // a quote-bearing value would corrupt a JSON body.
+        let err = resolve_template_inner("x", "{}", "jsonn", true).unwrap_err();
+        assert!(err.contains("unknown mode"), "{err}");
+        // And a malformed map is an error, never a silent passthrough.
+        let err = resolve_template_inner("x", "[]", "plain", true).unwrap_err();
+        assert!(err.contains("flat JSON object"), "{err}");
+    }
 }

@@ -1,0 +1,161 @@
+{
+  "$comment": [
+    "The variable-resolution conformance corpus — ONE file, asserted by BOTH",
+    "the Rust tests (crates/tropel-core-wasm) and every embedder that hosts a",
+    "second implementation of anything on this path.",
+    "",
+    "It exists because a TypeScript re-implementation of this resolver drifted",
+    "in two ways that reached the wire silently: a grammar that could not match",
+    "a hyphen, and a single raw escape mode where there are three. Both are",
+    "pinned below. A corpus is what makes a second host a PORT rather than a",
+    "FORK — browsers all implement JavaScript independently and nobody calls",
+    "that a fork, because test262 exists.",
+    "",
+    "Shipped in the npm package (see package.json `files`) so an embedder reads",
+    "the same bytes rather than copying cases into its own suite, where they",
+    "would drift exactly like the code did.",
+    "",
+    "Adding a case: state `why` in terms of the failure it prevents, not what",
+    "it does. A case nobody can explain the risk of is a case nobody will",
+    "maintain."
+  ],
+  "cases": [
+    {
+      "name": "hyphenated names resolve",
+      "template": "{{base-url}}/v1",
+      "vars": { "base-url": "https://api.test" },
+      "mode": "plain",
+      "expect": "https://api.test/v1",
+      "why": "A `[\\w.:]+` grammar cannot match `-`. This is THE divergence: `{{base-url}}` resolved in a load run and went out as literal text from the embedder."
+    },
+    {
+      "name": "header-style and id-style hyphenated names resolve",
+      "template": "{{x-api-key}}|{{user-id}}",
+      "vars": { "x-api-key": "k", "user-id": "7" },
+      "mode": "plain",
+      "expect": "k|7",
+      "why": "The two commonest hyphenated shapes in imported Postman collections."
+    },
+    {
+      "name": "names with spaces resolve",
+      "template": "{{my var}}",
+      "vars": { "my var": "v" },
+      "mode": "plain",
+      "expect": "v",
+      "why": "The grammar is `[^{}]+` — anything but a brace is a name. A charset-based grammar silently excludes shapes like this."
+    },
+    {
+      "name": "dotted and colon-bearing names resolve",
+      "template": "{{a.b}}|{{secret.env.TOKEN}}|{{oauth2.request:req_1.token}}",
+      "vars": { "a.b": "1", "secret.env.TOKEN": "t", "oauth2.request:req_1.token": "c" },
+      "mode": "plain",
+      "expect": "1|t|c",
+      "why": "Colon-bearing keys are how a cached-token reference is spelled; a grammar without `:` left every one of them literal on the wire."
+    },
+    {
+      "name": "json mode escapes quotes so the body stays parseable",
+      "template": "{\"msg\":\"{{greeting}}\"}",
+      "vars": { "greeting": "He said \"hi\"" },
+      "mode": "json",
+      "expect": "{\"msg\":\"He said \\\"hi\\\"\"}",
+      "parses_as_json": true,
+      "why": "One raw substitution mode produced INVALID JSON from the embedder and correct JSON from a run of the same collection."
+    },
+    {
+      "name": "json mode escapes newlines and control characters",
+      "template": "{\"m\":\"{{multi}}\"}",
+      "vars": { "multi": "a\nb\tc" },
+      "mode": "json",
+      "parses_as_json": true,
+      "why": "A CSV column carrying a newline is the realistic source; unescaped it truncates the body at the newline."
+    },
+    {
+      "name": "json mode leaves a BARE fragment raw",
+      "template": "{\"filter\": {{frag}}}",
+      "vars": { "frag": "{\"a\":1}" },
+      "mode": "json",
+      "expect": "{\"filter\": {\"a\":1}}",
+      "parses_as_json": true,
+      "why": "Quote parity: a placeholder inside a string literal is escaped, one standing alone as a value is not. Escaping both would make it impossible to carry a JSON object in a variable."
+    },
+    {
+      "name": "url mode inserts raw",
+      "template": "{{endpoint}}",
+      "vars": { "endpoint": "https://api.test/a b?x=1&y=2" },
+      "mode": "url",
+      "expect": "https://api.test/a b?x=1&y=2",
+      "why": "Postman does no percent-encoding. Encoding here would mangle a structural URL carried in a variable into one escaped path segment."
+    },
+    {
+      "name": "plain mode does not escape",
+      "template": "{{v}}",
+      "vars": { "v": "a\"b\\c" },
+      "mode": "plain",
+      "expect": "a\"b\\c",
+      "why": "Headers and auth fields want the literal value; JSON-escaping them would corrupt a signature input."
+    },
+    {
+      "name": "an unknown name stays a visible literal",
+      "template": "{{nope}}",
+      "vars": {},
+      "mode": "plain",
+      "expect": "{{nope}}",
+      "expect_hit_cap": false,
+      "expect_unresolved": ["nope"],
+      "why": "Visible, never silently emptied — the user's typo to see. It must NOT be reported as a cycle: an unknown name settles on the first pass."
+    },
+    {
+      "name": "a chain resolves through its links",
+      "template": "{{a}}",
+      "vars": { "a": "{{b}}", "b": "done" },
+      "mode": "plain",
+      "expect": "done",
+      "expect_hit_cap": false,
+      "expect_unresolved": [],
+      "why": "Multi-pass resolution. A single-pass resolver leaves `{{b}}` on the wire."
+    },
+    {
+      "name": "a nested NAME resolves inner-first",
+      "template": "{{host_{{suffix}}}}",
+      "vars": { "suffix": "dev", "host_dev": "h" },
+      "mode": "plain",
+      "expect": "h",
+      "why": "`[^{}]+` matches only the innermost placeholder. A greedy `[^}]+` matched the OUTER span and could never resolve this."
+    },
+    {
+      "name": "a two-variable cycle is reported, not hung",
+      "template": "{{a}}",
+      "vars": { "a": "{{b}}", "b": "{{a}}" },
+      "mode": "plain",
+      "expect_hit_cap": true,
+      "expect_unresolved_contains": ["a", "b"],
+      "why": "hitCap distinguishes a cycle from an unknown name — both leave a literal `{{…}}`. BOTH names must be reported: the value alternates, so reading names off the final value alone names only one and loses the half that makes the error actionable."
+    },
+    {
+      "name": "a chain deeper than the cap is reported like a cycle",
+      "template": "{{v0}}",
+      "vars_generated": "chain_longer_than_cap",
+      "mode": "plain",
+      "expect_hit_cap": true,
+      "why": "The ceiling is one number, read from the resolver — not two constants that happen to agree."
+    },
+    {
+      "name": "a template with no placeholder is returned unchanged",
+      "template": "https://api.test/v1",
+      "vars": {},
+      "mode": "plain",
+      "expect": "https://api.test/v1",
+      "expect_hit_cap": false,
+      "expect_unresolved": [],
+      "why": "The fast path stays fast, and nothing is asked of the resolver when there is nothing to resolve."
+    },
+    {
+      "name": "a value that itself looks like a placeholder is not re-expanded past its own resolution",
+      "template": "{{a}}",
+      "vars": { "a": "{{b}}", "b": "{{c}}", "c": "end" },
+      "mode": "plain",
+      "expect": "end",
+      "why": "Three links, well inside the cap — pins that the multi-pass loop keeps going rather than stopping after one substitution."
+    }
+  ]
+}
