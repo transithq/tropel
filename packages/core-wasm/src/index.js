@@ -97,6 +97,46 @@ export function resolveDynamicVariables(template) {
 }
 
 /**
+ * Resolve plain `{{var}}` references against a flat variable map.
+ *
+ * @param {string} template
+ * @param {Record<string, string>} vars  flat map; scope layering is the
+ *   embedder's job (data-merging over its own model, not execution)
+ * @param {"plain"|"json"|"url"} mode  the escaper — pick PER FIELD: "json" for
+ *   a JSON body, "url" for a URL, "plain" elsewhere. Getting this wrong is how
+ *   a quote-bearing value corrupts a body, so an unknown mode throws.
+ * @param {boolean} [deep=true]  multi-pass, so `{{a}}`→`{{b}}` chains and
+ *   `{{host_{{suffix}}}}` resolve. Capped at maxVariableResolutionPasses().
+ * @returns {string}
+ *
+ * Unlike `resolveDynamicVariables`, this **throws** when the tier is not
+ * ready. It does not degrade to a passthrough: an unresolved `{{base-url}}`
+ * reaching the wire is exactly the silent corruption this export was added to
+ * remove, so the caller must see the failure and decide.
+ */
+export function resolveTemplate(template, vars, mode, deep = true) {
+  if (glue === null) {
+    throw new Error(
+      "resolveTemplate: core wasm is not initialized — call initCoreWasm() first. " +
+        "This does NOT fall back to a passthrough: an unresolved {{var}} on the wire is silent corruption.",
+    );
+  }
+  return glue.resolveTemplate(template, JSON.stringify(vars ?? {}), mode, deep);
+}
+
+/**
+ * The `{{a}}`→`{{b}}` chain cap the multi-pass resolver enforces (Postman
+ * documents 20). Read it rather than hard-coding a second ceiling.
+ * @returns {number}
+ */
+export function maxVariableResolutionPasses() {
+  if (glue === null) {
+    throw new Error("maxVariableResolutionPasses: core wasm is not initialized");
+  }
+  return glue.maxVariableResolutionPasses();
+}
+
+/**
  * Catalog metadata `[{"name":"$guid","description":…}]` for editor UIs.
  * Async and init-free: extracted from the compiled catalog at package build
  * time (single source of truth — the Rust PREDEFINED_VARIABLE_META table in

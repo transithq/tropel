@@ -28,6 +28,33 @@ export function isCoreWasmReady(): boolean;
  */
 export function resolveDynamicVariables(template: string): string;
 
+/** Escaper for {@link resolveTemplate}. Pick per FIELD, not per request. */
+export type ResolveMode = "plain" | "json" | "url";
+
+/**
+ * Resolve plain `{{var}}` references against a flat variable map.
+ *
+ * `mode` selects the escaper and must match the field: `"json"` for a JSON
+ * body (quotes/newlines escaped, a bare `"k": {{frag}}` left raw), `"url"` for
+ * a URL (raw, Postman-compatible), `"plain"` elsewhere. An unknown mode
+ * throws rather than falling back.
+ *
+ * `deep` (default true) resolves `{{a}}`→`{{b}}` chains and nested names like
+ * `{{host_{{suffix}}}}`, capped at {@link maxVariableResolutionPasses}.
+ *
+ * Unknown names survive as literal `{{name}}`. **Throws when the tier is not
+ * ready** — it never degrades to a passthrough.
+ */
+export function resolveTemplate(
+  template: string,
+  vars: Record<string, string>,
+  mode: ResolveMode,
+  deep?: boolean,
+): string;
+
+/** The `{{a}}`→`{{b}}` chain cap (Postman documents 20). */
+export function maxVariableResolutionPasses(): number;
+
 /**
  * Catalog metadata `[{"name":"$guid","description":…}]` for editor UIs.
  * Async: `pkg/meta.js` is generated at package build time and is loaded lazily
