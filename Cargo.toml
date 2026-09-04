@@ -225,7 +225,7 @@ csv = "1.4.0"
 # ── Internal workspace crate paths ────────────────────
 tropel-core = { path = "crates/tropel-core", version = "0.1.0" }
 tropel-collection = { path = "crates/tropel-collection" }
-tropel-variables = { path = "crates/tropel-variables", version = "0.2.0" }
+tropel-variables = { path = "crates/tropel-variables", version = "0.3.0" }
 tropel-js = { path = "crates/tropel-js", version = "0.2.0" }
 tropel-native = { path = "crates/tropel-native", version = "0.2.0" }
 # P5b (TROPEL_WASM_BUILD.md): default-features must be declared at the
