@@ -251,11 +251,26 @@ impl VariableResolver {
         }
         let mut result = input.to_string();
         let mut settled = false;
+        // Names are accumulated ACROSS passes, not read off the final value.
+        // A two-variable cycle alternates `{{a}}` → `{{b}}` → `{{a}}`, so the
+        // last value holds only ONE of them and a final-value read would
+        // report "a" for a loop through "b" — losing exactly the part that
+        // makes the error actionable. Walking the passes reports `a, b`.
+        let mut unresolved: Vec<String> = Vec::new();
+        let collect = |text: &str, out: &mut Vec<String>| {
+            for caps in var_re().captures_iter(text) {
+                let name = caps[1].trim().to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        };
         for _ in 0..max_passes {
             if !result.contains("{{") {
                 settled = true;
                 break;
             }
+            collect(&result, &mut unresolved);
             let resolved = self.resolve_with(&result, scope, mode);
             if resolved == result {
                 settled = true;
@@ -263,12 +278,11 @@ impl VariableResolver {
             }
             result = resolved;
         }
-        let mut unresolved = Vec::new();
-        for caps in var_re().captures_iter(&result) {
-            let name = caps[1].trim().to_string();
-            if !unresolved.contains(&name) {
-                unresolved.push(name);
-            }
+        collect(&result, &mut unresolved);
+        // A settled result reports only what is STILL unresolved: names that
+        // resolved along the way are not the user's problem.
+        if settled {
+            unresolved.retain(|n| result.contains(&format!("{{{{{n}}}}}")));
         }
         DeepOutcome {
             value: result,

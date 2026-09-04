@@ -564,7 +564,14 @@ mod tests {
             .unwrap();
         let cyc: serde_json::Value = serde_json::from_str(&cyc).unwrap();
         assert_eq!(cyc["hitCap"], true, "a cycle exhausts the budget: {cyc}");
-        assert!(!cyc["unresolved"].as_array().unwrap().is_empty());
+        // BOTH names, not just the one left in the final value. An `a` → `b`
+        // cycle alternates, so a final-value read reports whichever happens to
+        // be last — losing the half that makes the error actionable.
+        let names = cyc["unresolved"].as_array().unwrap();
+        assert!(
+            names.contains(&serde_json::json!("a")) && names.contains(&serde_json::json!("b")),
+            "a cycle must name every variable in the loop: {cyc}"
+        );
 
         let unk = resolve_template_detailed_inner("{{nope}}", "{}", "plain").unwrap();
         let unk: serde_json::Value = serde_json::from_str(&unk).unwrap();
@@ -608,6 +615,122 @@ mod tests {
         .unwrap();
         let out: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(out["hitCap"], true, "{out}");
+    }
+
+    // ── The shared conformance corpus ────────────────────────────────────
+    // ONE file, walked here AND by every embedder that hosts a second
+    // implementation on this path. A corpus is what makes a second host a
+    // PORT rather than a FORK — the two behaviours below already diverged
+    // once in a TypeScript re-implementation, silently, and nothing failed.
+    //
+    // Shipped in the npm package so an embedder reads the same bytes instead
+    // of copying cases into its own suite, where they would drift exactly
+    // like the code did.
+    const CORPUS: &str = include_str!("../../../packages/core-wasm/fixtures/resolve-corpus.json");
+
+    /// The generated `vars` for a case that needs more than a literal map.
+    fn generated_vars(kind: &str) -> serde_json::Value {
+        match kind {
+            // v0 → v1 → … → v{cap+1}: one link deeper than the budget, so it
+            // is reported like a cycle. Generated from the cap rather than
+            // written out, so the fixture cannot drift from the constant.
+            "chain_longer_than_cap" => {
+                let mut m = serde_json::Map::new();
+                for i in 0..=MAX_VARIABLE_RESOLUTION_PASSES {
+                    m.insert(
+                        format!("v{i}"),
+                        serde_json::json!(format!("{{{{v{}}}}}", i + 1)),
+                    );
+                }
+                m.insert(
+                    format!("v{}", MAX_VARIABLE_RESOLUTION_PASSES + 1),
+                    serde_json::json!("end"),
+                );
+                serde_json::Value::Object(m)
+            }
+            other => panic!("unknown vars_generated kind: {other}"),
+        }
+    }
+
+    #[test]
+    fn conformance_corpus() {
+        let doc: serde_json::Value = serde_json::from_str(CORPUS).expect("corpus is valid JSON");
+        let cases = doc["cases"].as_array().expect("cases array");
+        assert!(!cases.is_empty(), "an empty corpus asserts nothing");
+
+        for case in cases {
+            let name = case["name"].as_str().expect("every case is named");
+            let template = case["template"].as_str().expect("template");
+            let mode = case["mode"].as_str().expect("mode");
+            let vars = match case.get("vars_generated") {
+                Some(kind) => generated_vars(kind.as_str().unwrap()),
+                None => case["vars"].clone(),
+            };
+            let vars_json = vars.to_string();
+
+            let detailed = resolve_template_detailed_inner(template, &vars_json, mode)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let out: serde_json::Value = serde_json::from_str(&detailed).unwrap();
+            let value = out["value"].as_str().unwrap();
+
+            if let Some(expected) = case.get("expect").and_then(|v| v.as_str()) {
+                assert_eq!(value, expected, "{name}");
+            }
+            if case.get("parses_as_json").and_then(|v| v.as_bool()) == Some(true) {
+                serde_json::from_str::<serde_json::Value>(value).unwrap_or_else(|e| {
+                    panic!("{name}: result must stay parseable JSON: {e} — {value}")
+                });
+            }
+            if let Some(expected) = case.get("expect_hit_cap").and_then(|v| v.as_bool()) {
+                assert_eq!(out["hitCap"], expected, "{name}: hitCap");
+            }
+            if let Some(expected) = case.get("expect_unresolved") {
+                assert_eq!(&out["unresolved"], expected, "{name}: unresolved");
+            }
+            if let Some(required) = case
+                .get("expect_unresolved_contains")
+                .and_then(|v| v.as_array())
+            {
+                let got = out["unresolved"].as_array().unwrap();
+                for n in required {
+                    assert!(
+                        got.contains(n),
+                        "{name}: unresolved must contain {n} — got {got:?}"
+                    );
+                }
+            }
+
+            // The shallow and deep entry points must agree wherever the case
+            // does not exercise chaining, so an embedder picking either one
+            // cannot land on different bytes.
+            if case.get("vars_generated").is_none() && !template.contains("{{$") {
+                let deep = resolve_template_inner(template, &vars_json, mode, true).unwrap();
+                assert_eq!(
+                    deep, value,
+                    "{name}: resolveTemplate(deep) must match detailed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corpus_cases_explain_the_risk_they_pin() {
+        // A case nobody can explain the risk of is a case nobody maintains.
+        let doc: serde_json::Value = serde_json::from_str(CORPUS).unwrap();
+        for case in doc["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let why = case.get("why").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                why.len() > 40,
+                "{name}: `why` must state the failure it prevents"
+            );
+            assert!(
+                case.get("expect").is_some()
+                    || case.get("expect_hit_cap").is_some()
+                    || case.get("parses_as_json").is_some(),
+                "{name}: a case with no expectation asserts nothing"
+            );
+        }
     }
 
     #[test]
