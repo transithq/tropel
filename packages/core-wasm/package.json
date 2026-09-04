@@ -1,6 +1,6 @@
 {
   "name": "@tropel/core-wasm",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Tropel core tier for browser embedders (KnockPort): the dynamic-variable catalog (and later auth signing / import parse) compiled to wasm32-unknown-unknown. No QuickJS \u2014 see API_CLIENT_WEB_PAYLOAD.md \u00a72.3 two-tier split.",
   "license": "Apache-2.0",
   "type": "module",
