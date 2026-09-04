@@ -1545,6 +1545,91 @@ impl TrpBridge {
 }
 
 #[cfg(test)]
+mod bridge_contract {
+    //! Keeps `BRIDGE.md` honest.
+    //!
+    //! The bridge is implemented twice — here in Rust for QuickJS hosts, and
+    //! in TypeScript for browser hosts, which cannot reuse this file because
+    //! it registers `rquickjs::Func` values into a QuickJS context. Two
+    //! implementations is fine; two UNSPECIFIED implementations is a fork, so
+    //! the contract is written down.
+    //!
+    //! A contract that lags its reference implementation is worse than no
+    //! contract, because it is believed. This test is what stops that: add a
+    //! bridge here without documenting it and the build fails, naming it.
+
+    const CONTRACT: &str = include_str!("../../BRIDGE.md");
+    const SOURCE: &str = include_str!("trp.rs");
+
+    /// Every `set_global!("__tropel_trp_…")` registration in this file.
+    fn registered() -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for (i, _) in SOURCE.match_indices("\"__tropel_trp_") {
+            let rest = &SOURCE[i + 1..];
+            if let Some(end) = rest.find('"') {
+                let name = rest[..end].to_string();
+                // Identifier characters only. This scans its own source, so a
+                // doc comment mentioning `__tropel_trp_…` would otherwise be
+                // extracted as a bridge — it was, on this test's first run.
+                if !name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    continue;
+                }
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn every_bridge_is_documented() {
+        let names = registered();
+        assert!(
+            names.len() > 40,
+            "extraction found only {} bridges — the scan is broken, not the contract",
+            names.len()
+        );
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|n| !CONTRACT.contains(n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these bridges are registered but absent from BRIDGE.md: {missing:?}\n\
+             A host reads that file to know what it must implement; an undocumented \
+             bridge is one a second host will not know to provide."
+        );
+    }
+
+    #[test]
+    fn the_contract_documents_nothing_that_does_not_exist() {
+        // The inverse rot: a bridge is removed here and the row is left
+        // behind, so a host implements something nothing calls.
+        let names = registered();
+        let mut stale = Vec::new();
+        for line in CONTRACT.lines() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("| `__tropel_trp_") {
+                continue;
+            }
+            let documented: String = trimmed
+                .trim_start_matches("| `")
+                .chars()
+                .take_while(|c| *c != '`')
+                .collect();
+            if !names.contains(&documented) {
+                stale.push(documented);
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "BRIDGE.md documents bridges that no longer exist: {stale:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod bridge_naming {
     /// The native bridges are `__tropel_trp_*`, not `__tropel_pm_*`.
     ///
