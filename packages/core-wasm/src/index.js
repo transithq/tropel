@@ -125,6 +125,31 @@ export function resolveTemplate(template, vars, mode, deep = true) {
 }
 
 /**
+ * {@link resolveTemplate}, plus WHY resolution stopped.
+ *
+ * @param {string} template
+ * @param {Record<string, string>} vars
+ * @param {"plain"|"json"|"url"} mode
+ * @returns {{ value: string, hitCap: boolean, unresolved: string[] }}
+ *
+ * A never-settling chain (`a`→`b`→`a`) and an unknown name both leave a
+ * literal `{{…}}` in `value`, but deserve opposite treatment: the first is a
+ * config error worth failing loudly with the chain named, the second must
+ * stay visible and send. `hitCap` is the difference — it means the pass
+ * budget ran out while the text was still changing, which an unknown name
+ * never does.
+ *
+ * Use this instead of re-deriving a cycle detector: a second detector is how
+ * the grammar diverged in the first place.
+ */
+export function resolveTemplateDetailed(template, vars, mode) {
+  if (glue === null) {
+    throw new Error("resolveTemplateDetailed: core wasm is not initialized — call initCoreWasm() first");
+  }
+  return JSON.parse(glue.resolveTemplateDetailed(template, JSON.stringify(vars ?? {}), mode));
+}
+
+/**
  * The `{{a}}`→`{{b}}` chain cap the multi-pass resolver enforces (Postman
  * documents 20). Read it rather than hard-coding a second ceiling.
  * @returns {number}

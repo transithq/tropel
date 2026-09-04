@@ -20,6 +20,7 @@ import {
   oauth2SignJwt,
   wsseSign,
   resolveTemplate,
+  resolveTemplateDetailed,
   maxVariableResolutionPasses,
 } from "./src/index.js";
 
@@ -246,6 +247,17 @@ try {
 } catch (e) {
   if (!String(e.message ?? e).includes("unknown mode")) throw e;
 }
+// A cycle and an unknown name both leave a literal {{…}} — hitCap is what
+// separates "fail loudly, name the chain" from "send it, the name is visible".
+const cyc = resolveTemplateDetailed("{{a}}", { a: "{{b}}", b: "{{a}}" }, "plain");
+if (cyc.hitCap !== true || cyc.unresolved.length === 0) {
+  throw new Error(`cycle must report hitCap: ${JSON.stringify(cyc)}`);
+}
+const unk = resolveTemplateDetailed("{{nope}}", {}, "plain");
+if (unk.hitCap !== false || unk.unresolved[0] !== "nope" || unk.value !== "{{nope}}") {
+  throw new Error(`unknown name must settle: ${JSON.stringify(unk)}`);
+}
+
 if (maxVariableResolutionPasses() !== 20) {
   throw new Error(`pass cap: ${maxVariableResolutionPasses()}`);
 }

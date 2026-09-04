@@ -52,6 +52,31 @@ export function resolveTemplate(
   deep?: boolean,
 ): string;
 
+/** What {@link resolveTemplateDetailed} reports. */
+export interface ResolveOutcome {
+  value: string;
+  /**
+   * The pass budget ran out while the text was still CHANGING — a cycle, or a
+   * chain deeper than the cap. An unknown name never sets this: it stabilizes
+   * on the first pass.
+   */
+  hitCap: boolean;
+  /** Placeholder names still present, first-occurrence order, deduplicated. */
+  unresolved: string[];
+}
+
+/**
+ * {@link resolveTemplate}, plus why resolution stopped. Use it to tell a
+ * never-settling chain (fail loudly, name the chain) from an unknown name
+ * (stays a visible literal, still sends) — the two are indistinguishable in
+ * the output string alone.
+ */
+export function resolveTemplateDetailed(
+  template: string,
+  vars: Record<string, string>,
+  mode: ResolveMode,
+): ResolveOutcome;
+
 /** The `{{a}}`→`{{b}}` chain cap (Postman documents 20). */
 export function maxVariableResolutionPasses(): number;
 

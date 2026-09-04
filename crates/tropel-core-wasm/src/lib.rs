@@ -149,6 +149,59 @@ fn resolve_template_inner(
     })
 }
 
+/// `resolveTemplate`, plus WHY resolution stopped — as a JSON string:
+/// `{"value": "...", "hitCap": bool, "unresolved": ["name", …]}`.
+///
+/// The distinction matters and only the resolver's loop can make it. A chain
+/// that never settles (`a` → `b` → `a`) and an unknown name BOTH leave a
+/// literal `{{…}}` in the output, but they deserve opposite treatment: the
+/// first is a config error worth failing loudly with the chain named, the
+/// second must stay a visible literal and send.
+///
+/// - `hitCap` — the pass budget ran out while the text was still CHANGING.
+///   That is a cycle; an unknown name stabilizes on the first pass.
+/// - `unresolved` — placeholder names still present, first-occurrence order,
+///   read with the SAME regex that drives resolution, so an embedder cannot
+///   disagree about what counts as a placeholder.
+///
+/// Exists so an embedder keeps its loud, chain-naming error WITHOUT growing a
+/// second cycle detector — which is how the grammar diverged the first time.
+#[wasm_bindgen(js_name = "resolveTemplateDetailed")]
+pub fn resolve_template_detailed(
+    input: &str,
+    vars_json: &str,
+    mode: &str,
+) -> Result<String, wasm_bindgen::JsValue> {
+    resolve_template_detailed_inner(input, vars_json, mode)
+        .map_err(|msg| wasm_bindgen::JsValue::from_str(&msg))
+}
+
+fn resolve_template_detailed_inner(
+    input: &str,
+    vars_json: &str,
+    mode: &str,
+) -> Result<String, String> {
+    let env: std::collections::HashMap<String, String> =
+        serde_json::from_str(vars_json).map_err(|e| {
+            format!(
+                "resolveTemplateDetailed: vars must be a flat JSON object of string values ({e})"
+            )
+        })?;
+    let scope = VariableScope {
+        env,
+        ..Default::default()
+    };
+    let outcome = VariableResolver::new()
+        .resolve_reporting(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES, mode)
+        .map_err(|e| format!("resolveTemplateDetailed: {e}"))?;
+    Ok(serde_json::json!({
+        "value": outcome.value,
+        "hitCap": outcome.hit_cap,
+        "unresolved": outcome.unresolved,
+    })
+    .to_string())
+}
+
 /// The `{{a}}`→`{{b}}` chain cap the multi-pass resolver enforces (Postman
 /// documents 20). Exported so an embedder reports the SAME ceiling instead of
 /// inventing a second one.
@@ -500,6 +553,61 @@ mod tests {
             max_variable_resolution_passes(),
             MAX_VARIABLE_RESOLUTION_PASSES
         );
+    }
+
+    #[test]
+    fn detailed_separates_a_cycle_from_an_unknown_name() {
+        // Both leave a literal {{…}} in the output; only the loop can tell
+        // them apart, and an embedder needs the difference to decide between
+        // "fail loudly naming the chain" and "send it, the name is visible".
+        let cyc = resolve_template_detailed_inner("{{a}}", r#"{"a":"{{b}}","b":"{{a}}"}"#, "plain")
+            .unwrap();
+        let cyc: serde_json::Value = serde_json::from_str(&cyc).unwrap();
+        assert_eq!(cyc["hitCap"], true, "a cycle exhausts the budget: {cyc}");
+        assert!(!cyc["unresolved"].as_array().unwrap().is_empty());
+
+        let unk = resolve_template_detailed_inner("{{nope}}", "{}", "plain").unwrap();
+        let unk: serde_json::Value = serde_json::from_str(&unk).unwrap();
+        assert_eq!(
+            unk["hitCap"], false,
+            "an unknown name settles at once: {unk}"
+        );
+        assert_eq!(unk["unresolved"], serde_json::json!(["nope"]));
+        assert_eq!(unk["value"], "{{nope}}");
+
+        // A chain that DOES settle reports neither.
+        let ok = resolve_template_detailed_inner("{{a}}", r#"{"a":"{{b}}","b":"done"}"#, "plain")
+            .unwrap();
+        let ok: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(ok["value"], "done");
+        assert_eq!(ok["hitCap"], false);
+        assert_eq!(ok["unresolved"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn detailed_reports_a_chain_deeper_than_the_cap() {
+        // v0 → v1 → … → v21: deeper than the 20-pass budget, so it is
+        // reported the same way a cycle is — the embedder's ceiling and this
+        // one are the same number by construction.
+        let mut vars = serde_json::Map::new();
+        for i in 0..=MAX_VARIABLE_RESOLUTION_PASSES {
+            vars.insert(
+                format!("v{i}"),
+                serde_json::json!(format!("{{{{v{}}}}}", i + 1)),
+            );
+        }
+        vars.insert(
+            format!("v{}", MAX_VARIABLE_RESOLUTION_PASSES + 1),
+            serde_json::json!("end"),
+        );
+        let out = resolve_template_detailed_inner(
+            "{{v0}}",
+            &serde_json::Value::Object(vars).to_string(),
+            "plain",
+        )
+        .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["hitCap"], true, "{out}");
     }
 
     #[test]
