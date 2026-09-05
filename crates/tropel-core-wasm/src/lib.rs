@@ -131,6 +131,29 @@ fn resolve_template_inner(
     tropel_variables::resolve_template_for_host(input, &env, mode, deep)
 }
 
+/// `resolveTemplate`, plus WHY resolution stopped — the cycle-vs-unknown-name
+/// distinction KnockPort turns into "failed send" vs "the user's typo".
+///
+/// TR-451: this wrapper was deleted by TR-445, which split the body into
+/// `_inner` so the Rust tests could call it and then dropped the exported
+/// half. Nothing caught it: every Rust test calls `_inner` DIRECTLY, so they
+/// all passed against a function JavaScript could no longer reach. The only
+/// caller that crosses the real boundary is `smoke.mjs`, and the `wasm slice`
+/// job aborts on the lockstep check before it runs. The published 0.5.3 was
+/// cut before the removal and is unaffected; the next publish would not have
+/// been. `packages/core-wasm/src/index.js` has been calling
+/// `glue.resolveTemplateDetailed` the whole time — an undefined method, on
+/// the send path of every template containing a `{{var}}`.
+#[wasm_bindgen(js_name = "resolveTemplateDetailed")]
+pub fn resolve_template_detailed(
+    input: &str,
+    vars_json: &str,
+    mode: &str,
+) -> Result<String, wasm_bindgen::JsValue> {
+    resolve_template_detailed_inner(input, vars_json, mode)
+        .map_err(|msg| wasm_bindgen::JsValue::from_str(&msg))
+}
+
 fn resolve_template_detailed_inner(
     input: &str,
     vars_json: &str,
@@ -918,5 +941,127 @@ mod tests {
             .unwrap()
             .iter()
             .any(|r| r["arity"] == "unary"));
+    }
+    /// Every wasm method the JS facade calls MUST be an exported `js_name`
+    /// somewhere in this crate.
+    ///
+    /// TR-451: this exists because TR-445 deleted the `resolveTemplateDetailed`
+    /// export while `packages/core-wasm/src/index.js` went on calling it, and
+    /// NOTHING failed. The Rust tests all call the private `_inner` helpers
+    /// directly, so they kept passing against a function JavaScript could no
+    /// longer reach; `smoke.mjs` is the only caller that crosses the real
+    /// boundary, and the `wasm slice` job aborts on the lockstep check before
+    /// it runs. The gap showed up only as a `dead_code` warning, on a branch
+    /// whose CI was already red.
+    ///
+    /// A static cross-check is deliberate: it needs no wasm build, so it runs
+    /// in the same `cargo test` that would otherwise give false confidence.
+    #[test]
+    fn every_glue_call_in_the_js_facade_has_a_wasm_export() {
+        /// The identifier at the head of `s`, empty if it does not start with one.
+        fn ident_at(s: &str) -> &str {
+            let end = s
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(s.len());
+            &s[..end]
+        }
+
+        let facade = include_str!("../../../packages/core-wasm/src/index.js");
+
+        // The facade reaches the wasm through NAMED HANDLES: the module-level
+        // `glue`, and any local alias bound from `requireGlue(...)` (today
+        // `const g = requireGlue("generatePkcePair")`). Discovering aliases
+        // rather than hard-coding them means a new one is covered on sight
+        // instead of silently escaping the guard.
+        let mut handles: Vec<&str> = vec!["glue"];
+        for (idx, _) in facade.match_indices("= requireGlue(") {
+            let before = facade[..idx].trim_end();
+            let name_end = before.len();
+            let name_start = before
+                .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .map_or(0, |i| i + 1);
+            let name = &before[name_start..name_end];
+            if !name.is_empty() && !handles.contains(&name) {
+                handles.push(name);
+            }
+        }
+
+        let mut called: Vec<&str> = Vec::new();
+        for handle in &handles {
+            let needle = format!("{handle}.");
+            for (idx, _) in facade.match_indices(&needle) {
+                // A word boundary, or `config.` matches the handle `g`.
+                if idx > 0
+                    && facade[..idx]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let after = &facade[idx + needle.len()..];
+                let name = ident_at(after);
+                if !name.is_empty()
+                    && after[name.len()..].starts_with('(')
+                    && !called.contains(&name)
+                {
+                    called.push(name);
+                }
+            }
+        }
+
+        // And the inline `requireGlue("x").method(` form. Bounded to the
+        // call's own closing paren: an unbounded search runs past a plain
+        // `const g = requireGlue(...)` and picks up whatever `.method(`
+        // appears next in the file.
+        for (idx, _) in facade.match_indices("requireGlue(") {
+            let after = &facade[idx + "requireGlue(".len()..];
+            let Some(close) = after.find(')') else {
+                continue;
+            };
+            let tail = after[close + 1..].trim_start();
+            let Some(rest) = tail.strip_prefix('.') else {
+                continue;
+            };
+            let name = ident_at(rest);
+            if !name.is_empty() && !called.contains(&name) {
+                called.push(name);
+            }
+        }
+
+        // A scanner that stopped matching the facade's shape would pass by
+        // finding nothing — the failure mode a guard like this dies of.
+        assert!(
+            called.len() > 10,
+            "the scanner found only {} glue calls ({called:?}) via handles {handles:?} — it has stopped matching the facade's shape, which makes this guard vacuous",
+            called.len()
+        );
+
+        // Exports live in lib.rs AND signers.rs.
+        let mut exported: Vec<&str> = Vec::new();
+        for src in [include_str!("lib.rs"), include_str!("signers.rs")] {
+            for (idx, _) in src.match_indices("js_name = \"") {
+                let rest = &src[idx + "js_name = \"".len()..];
+                if let Some(end) = rest.find('"') {
+                    exported.push(&rest[..end]);
+                }
+            }
+        }
+
+        // `default` is wasm-bindgen's GENERATED init function on the module
+        // namespace — not a `#[wasm_bindgen]` item, so it has no `js_name` by
+        // construction. `initCoreWasm` is the only caller.
+        const GENERATED_BY_WASM_BINDGEN: &[&str] = &["default"];
+
+        let missing: Vec<&str> = called
+            .iter()
+            .copied()
+            .filter(|n| !exported.contains(n) && !GENERATED_BY_WASM_BINDGEN.contains(n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the JS facade calls {missing:?}, which no #[wasm_bindgen(js_name = ...)] exports — \
+             each one is a TypeError at runtime, on the send path of every template that has a variable"
+        );
     }
 }
