@@ -25,6 +25,8 @@
 // from a clean clone without a Rust toolchain, and a static top-level import
 // here would break module resolution with ENOENT before any consumer code
 // runs. The first call memoizes the result; subsequent calls are sync.
+import ASSERTION_OPERATORS_FIXTURE from "./assertion-operators.js";
+
 let catalogMetaPromise = null;
 async function loadCatalogMeta() {
   if (!catalogMetaPromise) {
@@ -433,11 +435,23 @@ export function assertEvaluate(response, assertions, regexMatches) {
 
 /**
  * The 28-operator vocabulary.
+ *
+ * TR-442: served from a BUNDLED FIXTURE, not the wasm. The vocabulary is
+ * static crate data, and its consumers — KnockPort's assertion-expression
+ * parser and its editor dropdown — run before, or entirely without, the wasm
+ * tier being live. Routing it through a wasm export made the parser throw
+ * "no tropel core provider is registered" in every unit test and on the
+ * editor's first render.
+ *
+ * The fixture is GENERATED from the Rust table by a test that rewrites it and
+ * fails when it is stale, so this cannot drift from what `assertEvaluate`
+ * dispatches on. The wasm export stays available for callers that already
+ * have the tier up.
  * @returns {Array<{name:string, arity:"unary"|"binary", summary:string}>} in
  *   declaration order — an editor dropdown renders it directly, so the order
  *   is part of the contract. Read this rather than keeping a second list: a
  *   copy is how an operator ends up offered but unevaluated.
  */
 export function assertionOperators() {
-  return JSON.parse(requireGlue("assertionOperators").assertionOperators());
+  return ASSERTION_OPERATORS_FIXTURE;
 }

@@ -383,9 +383,19 @@ if (digestSign({ wwwAuthenticate: 'Basic realm="b"', username: "u", password: "p
 // 0.4.0 shipped signer exports the facade never surfaced. Importing is not
 // enough to catch that — an unexported name is `undefined` and only fails
 // when CALLED — so each is invoked.
+// TR-442: the vocabulary must be readable WITHOUT the wasm — KnockPort's
+// assertion parser and its editor dropdown both need it before the tier is
+// live. This runs before any init call in this file, so if it ever starts
+// requiring the wasm this throws here rather than in the editor's first render.
 const ops = assertionOperators();
 if (!Array.isArray(ops) || ops.length !== 28) {
   throw new Error(`assertionOperators: expected 28, got ${ops && ops.length}`);
+}
+if (ops[0].name !== "eq" || ops[ops.length - 1].name !== "isArray") {
+  throw new Error(`assertionOperators: order changed — the editor renders it directly`);
+}
+if (!ops.every((o) => o.summary && (o.arity === "unary" || o.arity === "binary"))) {
+  throw new Error("assertionOperators: a row is missing arity or summary");
 }
 const assertResponse = {
   status: 200,
