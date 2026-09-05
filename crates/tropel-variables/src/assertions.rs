@@ -418,6 +418,279 @@ pub fn assert_evaluate(
     }
 }
 
+// ── Target resolution ───────────────────────────────────────────────────────
+//
+// The documented vocabulary, ported from KnockPort's `resolveAssertionTarget`:
+//
+//   status / statusText / responseTime / size / body   response members
+//   response.<member>                                  same, explicit
+//   json / json.path.to.field / json.items.0.name      dotted JSON descent
+//   header("Name") / headers.Name / headers["Name"]    case-insensitive header
+//   cookie("name")                                     response cookie value
+//   jsonpath("$.store.bicycle.color")                  bounded JSONPath subset
+//
+// Anything else is an ERROR NAMING THE TARGET. Never a silent value: a typo'd
+// target that resolved to null would make `isEmpty` pass and read as a green
+// assertion about a field that does not exist.
+//
+// Parsed by hand rather than with `regex`. TR-434 removed that dependency —
+// it was 152 KB of the eager wasm tier — and these forms are fixed shapes, the
+// same argument that retired the 37 catalogue patterns.
+
+/// The response members an assertion can target.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssertionTarget {
+    pub status: i64,
+    pub status_text: String,
+    /// As received. Lookup is case-insensitive, so the case here is preserved
+    /// for messages rather than normalised away.
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+    pub response_time: f64,
+    pub size: i64,
+    pub cookies: Vec<(String, String)>,
+}
+
+impl AssertionTarget {
+    /// The parsed body, or `None` when it is not JSON.
+    ///
+    /// Parsed ON DEMAND rather than stored: in a load run this struct is built
+    /// per request, and most assertions never touch the body — parsing every
+    /// response eagerly would be work done per-VU for nothing.
+    fn json(&self) -> Option<Value> {
+        serde_json::from_str(&self.body).ok()
+    }
+
+    fn header(&self, name: &str) -> Result<Value, String> {
+        let want = name.trim().to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == want)
+            .map(|(_, v)| Value::String(v.clone()))
+            .ok_or_else(|| format!("header \"{name}\" was not present on the response"))
+    }
+
+    fn cookie(&self, name: &str) -> Result<Value, String> {
+        self.cookies
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| Value::String(v.clone()))
+            .ok_or_else(|| format!("cookie \"{name}\" was not set by this response"))
+    }
+}
+
+/// `name("arg")` / `name('arg')` → the argument, if `raw` has exactly that
+/// shape for one of `names`.
+fn call_arg<'a>(raw: &'a str, names: &[&str]) -> Option<(&'a str, &'a str)> {
+    let open = raw.find('(')?;
+    if !raw.ends_with(')') {
+        return None;
+    }
+    let head = raw[..open].trim();
+    if !names.contains(&head) {
+        return None;
+    }
+    let inner = raw[open + 1..raw.len() - 1].trim();
+    let quote = inner.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    if inner.len() < 2 || !inner.ends_with(quote) {
+        return None;
+    }
+    Some((head, &inner[1..inner.len() - 1]))
+}
+
+/// One step of the bounded JSONPath subset.
+enum Step<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// Lex `$.a.b[0]['c']` into steps.
+///
+/// Bounded ON PURPOSE: no filters, wildcards or recursive descent. Those are
+/// reported as unsupported rather than guessed at — a wildcard that silently
+/// matched the first element would make an assertion pass on the wrong item.
+fn lex_json_path(path: &str) -> Result<Vec<Step<'_>>, String> {
+    let mut steps = Vec::new();
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    if bytes.first() == Some(&b'$') {
+        i = 1;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' => {
+                if bytes.get(i + 1) == Some(&b'.') {
+                    return Err(format!(
+                        "path \"{path}\": recursive descent (..) is not supported"
+                    ));
+                }
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && bytes[j] != b'.' && bytes[j] != b'[' {
+                    j += 1;
+                }
+                if j == start {
+                    return Err(format!("path \"{path}\": empty step after '.'"));
+                }
+                let key = &path[start..j];
+                if key == "*" {
+                    return Err(format!("path \"{path}\": wildcards are not supported"));
+                }
+                steps.push(Step::Key(key));
+                i = j;
+            }
+            b'[' => {
+                let close = path[i..]
+                    .find(']')
+                    .ok_or_else(|| format!("path \"{path}\": unclosed '['"))?
+                    + i;
+                let inner = path[i + 1..close].trim();
+                if inner == "*" {
+                    return Err(format!("path \"{path}\": wildcards are not supported"));
+                }
+                let first = inner.chars().next();
+                if first == Some('\'') || first == Some('"') {
+                    let q = first.unwrap();
+                    if inner.len() < 2 || !inner.ends_with(q) {
+                        return Err(format!("path \"{path}\": unterminated quoted key"));
+                    }
+                    steps.push(Step::Key(&inner[1..inner.len() - 1]));
+                } else {
+                    let idx: usize = inner
+                        .parse()
+                        .map_err(|_| format!("path \"{path}\": \"{inner}\" is not an index"))?;
+                    steps.push(Step::Index(idx));
+                }
+                i = close + 1;
+            }
+            _ => return Err(format!("path \"{path}\": unexpected character at {i}")),
+        }
+    }
+    Ok(steps)
+}
+
+fn json_path_lookup(root: &Value, path: &str) -> Result<Value, String> {
+    let mut current = root;
+    for step in lex_json_path(path)? {
+        match step {
+            Step::Index(idx) => {
+                let arr = current
+                    .as_array()
+                    .ok_or_else(|| format!("path \"{path}\": expected an array at [{idx}]"))?;
+                current = arr
+                    .get(idx)
+                    .ok_or_else(|| format!("path \"{path}\": index {idx} is outside the array"))?;
+            }
+            Step::Key(key) => {
+                // `json.items.0.name` reaches here as a KEY step, because
+                // KnockPort's lexer emits a key for every dot-segment. It
+                // works there because a JS array is an object whose keys are
+                // numeric strings — `"0" in arr` is true. Ported exactly:
+                // a numeric key against an array indexes it.
+                if let Some(arr) = current.as_array() {
+                    if let Ok(idx) = key.parse::<usize>() {
+                        current = arr.get(idx).ok_or_else(|| {
+                            format!("path \"{path}\": index {idx} is outside the array")
+                        })?;
+                        continue;
+                    }
+                }
+                let obj = current
+                    .as_object()
+                    .ok_or_else(|| format!("path \"{path}\": expected an object at \"{key}\""))?;
+                current = obj
+                    .get(key)
+                    .ok_or_else(|| format!("path \"{path}\": key \"{key}\" is absent"))?;
+            }
+        }
+    }
+    Ok(current.clone())
+}
+
+/// Resolve a target expression against the response.
+///
+/// `Err` names the target. It is deliberately NOT `Ok(Null)`: a typo'd target
+/// resolving to null would make `isEmpty` pass and read as a green assertion
+/// about a field that does not exist.
+pub fn resolve_assertion_target(target: &str, ctx: &AssertionTarget) -> Result<Value, String> {
+    let raw = target.trim();
+
+    if let Some((_, path)) = call_arg(raw, &["jsonpath"]) {
+        let json = ctx
+            .json()
+            .ok_or_else(|| format!("jsonpath target \"{path}\": the response body is not JSON"))?;
+        return json_path_lookup(&json, path);
+    }
+    if let Some((_, name)) = call_arg(raw, &["header", "headers"]) {
+        return ctx.header(name);
+    }
+    if let Some((_, name)) = call_arg(raw, &["cookie"]) {
+        return ctx.cookie(name);
+    }
+
+    let expr = raw.strip_prefix("response.").unwrap_or(raw);
+    match expr {
+        "status" => return Ok(Value::from(ctx.status)),
+        "statusText" => return Ok(Value::String(ctx.status_text.clone())),
+        "responseTime" => return Ok(Value::from(ctx.response_time)),
+        "size" => return Ok(Value::from(ctx.size)),
+        "body" => return Ok(Value::String(ctx.body.clone())),
+        "json" => return Ok(ctx.json().unwrap_or(Value::Null)),
+        _ => {}
+    }
+
+    if let Some(rest) = expr
+        .strip_prefix("json.")
+        .map(|r| format!(".{r}"))
+        .or_else(|| expr.strip_prefix("json[").map(|r| format!("[{r}")))
+    {
+        let json = ctx
+            .json()
+            .ok_or_else(|| format!("target \"{raw}\": the response body is not JSON"))?;
+        return json_path_lookup(&json, &rest);
+    }
+
+    // `headers.Name` / `headers["Name"]`
+    for prefix in ["headers", "header"] {
+        if let Some(rest) = expr.strip_prefix(prefix) {
+            if let Some(name) = rest.strip_prefix('.') {
+                if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                {
+                    return ctx.header(name);
+                }
+            }
+            if rest.starts_with('[') && rest.ends_with(']') {
+                let inner = rest[1..rest.len() - 1].trim();
+                let q = inner.chars().next();
+                if (q == Some('"') || q == Some('\'')) && inner.len() >= 2 {
+                    return ctx.header(&inner[1..inner.len() - 1]);
+                }
+            }
+        }
+    }
+
+    // A bare word that is not a response member is most likely a header name.
+    if !expr.is_empty()
+        && expr
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && expr
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return ctx.header(expr);
+    }
+
+    Err(format!(
+        "unparseable target \"{raw}\" — expected status, statusText, responseTime, size, body, \
+         json, json.<path>, header(\"Name\"), cookie(\"name\") or jsonpath(\"$...\")"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +1030,196 @@ mod tests {
                 }
             }
         }
+    }
+    fn ctx() -> AssertionTarget {
+        AssertionTarget {
+            status: 200,
+            status_text: "OK".into(),
+            headers: vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("X-Request-Id".into(), "abc-123".into()),
+            ],
+            body: r#"{"items":[{"name":"first"},{"name":"second"}],"count":2,"ok":true}"#.into(),
+            response_time: 12.5,
+            size: 64,
+            cookies: vec![("session".into(), "s1".into())],
+        }
+    }
+
+    #[test]
+    fn response_members_resolve_with_and_without_the_prefix() {
+        let c = ctx();
+        for (t, want) in [
+            ("status", json!(200)),
+            ("response.status", json!(200)),
+            ("statusText", json!("OK")),
+            ("responseTime", json!(12.5)),
+            ("size", json!(64)),
+        ] {
+            assert_eq!(resolve_assertion_target(t, &c).unwrap(), want, "{t}");
+        }
+        assert_eq!(resolve_assertion_target("body", &c).unwrap(), json!(c.body));
+        // Whitespace around a target is tolerated — YAML scalars carry it.
+        assert_eq!(
+            resolve_assertion_target("  status  ", &c).unwrap(),
+            json!(200)
+        );
+    }
+
+    #[test]
+    fn header_lookup_is_case_insensitive_in_every_form() {
+        let c = ctx();
+        for t in [
+            "header(\"content-type\")",
+            "headers('Content-Type')",
+            "headers.Content-Type",
+            "headers[\"CONTENT-TYPE\"]",
+            "Content-Type",
+        ] {
+            assert_eq!(
+                resolve_assertion_target(t, &c).unwrap(),
+                json!("application/json"),
+                "{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_header_is_an_error_not_an_empty_value() {
+        // The whole point: resolving to null would make `isEmpty` PASS and
+        // read as a green assertion about a header that was never sent.
+        let c = ctx();
+        let e = resolve_assertion_target("header(\"X-Missing\")", &c).unwrap_err();
+        assert!(e.contains("X-Missing"), "{e}");
+        assert!(e.contains("not present"), "{e}");
+    }
+
+    #[test]
+    fn json_descent_by_dot_and_index_and_jsonpath() {
+        let c = ctx();
+        assert_eq!(
+            resolve_assertion_target("json.count", &c).unwrap(),
+            json!(2)
+        );
+        assert_eq!(
+            resolve_assertion_target("json.items.0.name", &c).unwrap(),
+            json!("first")
+        );
+        assert_eq!(
+            resolve_assertion_target("json[\"count\"]", &c).unwrap(),
+            json!(2)
+        );
+        assert_eq!(
+            resolve_assertion_target("jsonpath(\"$.items[1].name\")", &c).unwrap(),
+            json!("second")
+        );
+        // A bare `json` yields the whole parsed body.
+        assert!(resolve_assertion_target("json", &c).unwrap().is_object());
+    }
+
+    #[test]
+    fn a_missing_key_or_out_of_range_index_names_the_step() {
+        let c = ctx();
+        let e = resolve_assertion_target("json.nope", &c).unwrap_err();
+        assert!(e.contains("\"nope\" is absent"), "{e}");
+        let e = resolve_assertion_target("json.items.9.name", &c).unwrap_err();
+        assert!(e.contains("index 9 is outside"), "{e}");
+        let e = resolve_assertion_target("json.count.deeper", &c).unwrap_err();
+        assert!(e.contains("expected an object"), "{e}");
+    }
+
+    #[test]
+    fn unsupported_jsonpath_features_are_refused_not_guessed() {
+        // A wildcard that silently matched the FIRST element would make an
+        // assertion pass on the wrong item — worse than refusing.
+        let c = ctx();
+        for (path, needle) in [
+            ("jsonpath(\"$.items[*].name\")", "wildcard"),
+            ("jsonpath(\"$..name\")", "recursive descent"),
+        ] {
+            let e = resolve_assertion_target(path, &c).unwrap_err();
+            assert!(e.contains(needle), "{path}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_non_json_body_is_an_error_naming_the_target() {
+        let mut c = ctx();
+        c.body = "plain text".into();
+        let e = resolve_assertion_target("json.count", &c).unwrap_err();
+        assert!(e.contains("not JSON"), "{e}");
+        // …but `body` and the members still resolve.
+        assert_eq!(
+            resolve_assertion_target("body", &c).unwrap(),
+            json!("plain text")
+        );
+        // and a bare `json` is Null rather than an error, matching KnockPort.
+        assert_eq!(resolve_assertion_target("json", &c).unwrap(), json!(null));
+    }
+
+    #[test]
+    fn cookies_resolve_by_exact_name_and_absence_is_an_error() {
+        let c = ctx();
+        assert_eq!(
+            resolve_assertion_target("cookie(\"session\")", &c).unwrap(),
+            json!("s1")
+        );
+        let e = resolve_assertion_target("cookie(\"nope\")", &c).unwrap_err();
+        assert!(e.contains("was not set by this response"), "{e}");
+    }
+
+    #[test]
+    fn an_unparseable_target_lists_the_vocabulary() {
+        let c = ctx();
+        for bad in ["", "1abc", "json..x", "header(unquoted)", "!!"] {
+            let e = resolve_assertion_target(bad, &c).unwrap_err();
+            assert!(!e.is_empty(), "{bad}");
+        }
+        let e = resolve_assertion_target("!!", &c).unwrap_err();
+        assert!(e.contains("unparseable target"), "{e}");
+        assert!(e.contains("jsonpath"), "it names the alternatives: {e}");
+    }
+
+    #[test]
+    fn resolution_never_panics_on_hostile_targets() {
+        // Targets come from a collection file, which is untrusted input, and
+        // in a load run this runs per request per VU.
+        let c = ctx();
+        for bad in [
+            "json[",
+            "json[]",
+            "json['",
+            "jsonpath(",
+            "jsonpath(\"",
+            "header(\"",
+            "json[999999999999999999999]",
+            "json.",
+            ".",
+            "[",
+            "]",
+            "$$$",
+            "json[-1]",
+        ] {
+            let _ = resolve_assertion_target(bad, &c);
+        }
+    }
+
+    #[test]
+    fn target_and_evaluator_compose_end_to_end() {
+        // The pair as a caller uses them: resolve, then evaluate.
+        let c = ctx();
+        let actual = resolve_assertion_target("json.items.0.name", &c).unwrap();
+        let o = assert_evaluate("first item", &actual, "eq", &json!("first"), None);
+        assert!(o.passed && o.unsupported.is_none());
+
+        let status = resolve_assertion_target("status", &c).unwrap();
+        assert!(assert_evaluate("2xx", &status, "between", &json!([200, 299]), None).passed);
+
+        // A header compared numerically — the reason numeric coercion crosses
+        // string/number at all.
+        let mut c2 = ctx();
+        c2.headers.push(("Content-Length".into(), "1024".into()));
+        let len = resolve_assertion_target("Content-Length", &c2).unwrap();
+        assert!(assert_evaluate("big", &len, "gt", &json!(1000), None).passed);
     }
 }
