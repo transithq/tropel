@@ -327,3 +327,78 @@ export function oauth2SignJwt(payload, header, algorithm, secret) {
 export function wsseSign(params) {
   return JSON.parse(requireGlue("wsseSign").wsseSign(JSON.stringify(params)));
 }
+
+// ── Per-request signing (TR-432) ────────────────────────────────────────────
+// TR-436: the Rust exports landed in 0.4.0 but this facade did not surface
+// them, so the signers were present in the wasm and unreachable from JS. The
+// wasm export names are the source of truth; `requireGlue` fails loudly when
+// one is missing rather than returning undefined.
+//
+// Every one of these takes RAW request components and returns finished
+// headers. That is deliberate: assembling them here would put the AWS service
+// derivation, the S3 double-encoding rule, the RFC 5849 base-string URI and
+// the digest challenge parse into JavaScript, which is the divergence the
+// Rust side exists to prevent (tropel TR-428..TR-431).
+
+/**
+ * Answer a digest challenge (RFC 7616).
+ * @param {object} params `{wwwAuthenticate, username, password, method, uri, nc, cnonce}`
+ *   — `wwwAuthenticate` is the server's RAW header value, parsed here
+ *   (multi-scheme and quoted-pair rules included). `nc` is the caller's
+ *   per-(host, realm, nonce) counter, starting at 1; a repeated value is a
+ *   replay. `cnonce` is caller-generated (`crypto.getRandomValues`).
+ * @returns {{name:string, value:string}|null} `null` when the header carries
+ *   no Digest challenge — a server may legitimately offer only Basic, and the
+ *   caller should fall through rather than attach a bogus header.
+ */
+export function digestSign(params) {
+  return JSON.parse(requireGlue("digestSign").digestSign(JSON.stringify(params)));
+}
+
+/**
+ * Build a Hawk `Authorization` header.
+ * @param {object} params `{method, resource, host, port, id, key, algorithm?, ts, nonce, ext?}`
+ * @returns {{name:string, value:string}}
+ */
+export function hawkSign(params) {
+  return JSON.parse(requireGlue("hawkSign").hawkSign(JSON.stringify(params)));
+}
+
+/**
+ * Sign a request with AWS Signature Version 4.
+ * @param {object} params `{method, host, path, query?, headers?, bodyBase64?,
+ *   accessKey, secretKey, sessionToken?, region?, service?, amzDate, dateStamp}`
+ *   — `host` is `URL.hostname` (IPv6 brackets are re-added by the Rust);
+ *   `service` omitted derives from the host. `bodyBase64` is base64 because
+ *   the payload hash is over exact bytes; an undecodable value THROWS rather
+ *   than signing an empty body.
+ * @returns {Array<{name:string, value:string}>} every header that must reach
+ *   the wire, `Authorization` first.
+ */
+export function awsSigV4Sign(params) {
+  return JSON.parse(requireGlue("awsSigV4Sign").awsSigV4Sign(JSON.stringify(params)));
+}
+
+/**
+ * Sign a request with OAuth 1.0a (RFC 5849).
+ * @param {object} params `{method, scheme, host, port?, path, queryParams?,
+ *   formBody?, consumerKey, consumerSecret, token?, tokenSecret?,
+ *   signatureMethod, nonce, timestamp}` — `formBody` is the raw body when it
+ *   is `application/x-www-form-urlencoded`, decoded here so the `+`-is-a-space
+ *   rule stays in Rust.
+ * @returns {{name:string, value:string}}
+ * @throws when `signatureMethod` is not one of {@link oauth1SignatureMethods}
+ *   — never a silent downgrade to HMAC-SHA1.
+ */
+export function oauth1Sign(params) {
+  return JSON.parse(requireGlue("oauth1Sign").oauth1Sign(JSON.stringify(params)));
+}
+
+/**
+ * The OAuth1 signature methods {@link oauth1Sign} accepts.
+ * @returns {string[]} use this to populate a picker, so a UI cannot offer a
+ *   method the signer refuses.
+ */
+export function oauth1SignatureMethods() {
+  return JSON.parse(requireGlue("oauth1SignatureMethods").oauth1SignatureMethods());
+}

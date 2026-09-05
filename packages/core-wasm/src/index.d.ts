@@ -242,3 +242,78 @@ export function wsseSign(params: {
   nonce?: string;
   created?: string;
 }): { authorization: string; nonce: string; created: string };
+
+/** One header the signer says must reach the wire. */
+export interface SignedHeader {
+  name: string;
+  value: string;
+}
+
+/** Answer a digest challenge (RFC 7616). `wwwAuthenticate` is the server's RAW
+ *  header value; `nc` is the caller's per-(host, realm, nonce) counter starting
+ *  at 1; `cnonce` is caller-generated. Returns `null` when the header carries
+ *  no Digest challenge. */
+export function digestSign(params: {
+  wwwAuthenticate: string;
+  username: string;
+  password: string;
+  method: string;
+  uri: string;
+  nc: number;
+  cnonce: string;
+}): SignedHeader | null;
+
+/** Build a Hawk `Authorization` header. */
+export function hawkSign(params: {
+  method: string;
+  resource: string;
+  host: string;
+  port: number;
+  id: string;
+  key: string;
+  algorithm?: string;
+  ts: string;
+  nonce: string;
+  ext?: string;
+}): SignedHeader;
+
+/** Sign a request with AWS SigV4. `host` is `URL.hostname` (IPv6 brackets are
+ *  re-added by the Rust); omit `service` to derive it from the host.
+ *  `bodyBase64` throws if undecodable rather than signing an empty body. */
+export function awsSigV4Sign(params: {
+  method: string;
+  host: string;
+  path: string;
+  query?: string;
+  headers?: readonly (readonly [string, string])[];
+  bodyBase64?: string;
+  accessKey: string;
+  secretKey: string;
+  sessionToken?: string;
+  region?: string;
+  service?: string;
+  amzDate: string;
+  dateStamp: string;
+}): SignedHeader[];
+
+/** Sign a request with OAuth 1.0a (RFC 5849). Throws when `signatureMethod`
+ *  is not one of `oauth1SignatureMethods()` — never a silent downgrade. */
+export function oauth1Sign(params: {
+  method: string;
+  scheme: string;
+  host: string;
+  port?: number;
+  path: string;
+  queryParams?: readonly (readonly [string, string])[];
+  formBody?: string;
+  consumerKey: string;
+  consumerSecret: string;
+  token?: string;
+  tokenSecret?: string;
+  signatureMethod: string;
+  nonce: string;
+  timestamp: string;
+}): SignedHeader;
+
+/** The signature methods `oauth1Sign` accepts. */
+export function oauth1SignatureMethods(): string[];
