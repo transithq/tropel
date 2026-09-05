@@ -28,6 +28,54 @@ use tropel_sdk::TropelError;
 const RATE_LIMIT_PER_SEC: u64 = 200;
 
 /// Shared agent state: the auth token and the engine's HTTP client.
+/// One script→host call parked until the caller answers it (TR-474).
+#[derive(Clone, serde::Serialize)]
+struct PendingHostCall {
+    #[serde(rename = "callId")]
+    call_id: u64,
+    kind: &'static str,
+    path: String,
+}
+
+/// The bidirectional half of `/script`.
+///
+/// TR-474. `pm.sendRequest` and `fetch` are servable by the agent's own HTTP
+/// client (TR-472) — on desktop the agent IS the local transport. But
+/// `bru.runRequest` resolves a request BY NAME out of a collection the agent
+/// has never seen, and re-enters the caller's own pipeline (auth, variables,
+/// its recursion guard). No widening of the request body can carry that: the
+/// script has to be able to call BACK, mid-execution.
+///
+/// `POST /script` is one request and one reply, so the call-back rides two
+/// extra endpoints instead: the caller parks on `/script/callback/next` for
+/// work, and answers on `/script/callback/reply`.
+///
+/// The two halves deliberately use different primitives. The JS host function
+/// is SYNCHRONOUS — QuickJS gives it no way to suspend — so it blocks on a
+/// std channel. The long-poll is async and waits on a tokio `Notify`. Mixing
+/// them is the point: each side blocks in the way its own runtime allows.
+#[derive(Default)]
+struct RunCallbacks {
+    pending: std::sync::Mutex<std::collections::VecDeque<PendingHostCall>>,
+    ready: tokio::sync::Notify,
+    replies: std::sync::Mutex<HashMap<u64, std::sync::mpsc::Sender<String>>>,
+    next_id: std::sync::atomic::AtomicU64,
+    /// The script finished. Parks the long-poll on 204 instead of hanging
+    /// until its timeout — a caller that keeps polling a finished run would
+    /// otherwise look like a stalled agent.
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl RunCallbacks {
+    /// Mark finished and wake every parked poller. Called on EVERY exit path
+    /// of a run, success or failure — a run that ended by erroring must not
+    /// leave its caller parked.
+    fn finish(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.ready.notify_waiters();
+    }
+}
+
 struct AgentState {
     token: Option<String>,
     client: tropel_http::HttpClient,
@@ -40,6 +88,9 @@ struct AgentState {
     /// is not a substitute: a browser attaches it automatically once CORS
     /// permits the call.
     allowed_origins: Vec<String>,
+    /// TR-474: in-flight `/script` runs that opted into host callbacks,
+    /// keyed by the caller's `runId`. Empty for every run that did not.
+    runs: std::sync::Mutex<HashMap<String, Arc<RunCallbacks>>>,
 }
 
 /// CORS headers for a request carrying `origin`, or `None` when the browser
@@ -170,6 +221,7 @@ pub async fn run_agent(
         token: token.map(str::to_string),
         client,
         allowed_origins: allowed_origins.to_vec(),
+        runs: std::sync::Mutex::new(HashMap::new()),
     });
 
     loop {
@@ -754,19 +806,192 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let script_response: Option<tropel_sdk::types::Response> = payload
                 .get("response")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
-            match run_script_once(
+            // TR-474: opt-in host callbacks. The CALLER supplies the id, so
+            // it can start polling before this request returns — the agent
+            // cannot hand one back in a reply that only arrives at the end.
+            let run_id = payload
+                .get("runId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let callbacks = run_id.as_ref().map(|id| {
+                let cb = Arc::new(RunCallbacks::default());
+                let mut runs = match state.runs.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                runs.insert(id.clone(), cb.clone());
+                cb
+            });
+
+            let outcome = run_script_once(
                 code,
                 scopes,
                 script_request,
                 script_response,
                 sandbox_cfg,
                 state.client.clone(),
+                callbacks.clone(),
             )
-            .await
-            {
+            .await;
+
+            // Deregister on EVERY exit path. A run that ended by erroring
+            // must still wake its poller, or the caller waits out the full
+            // long-poll on a run that is already gone.
+            if let (Some(id), Some(cb)) = (run_id, callbacks) {
+                cb.finish();
+                let mut runs = match state.runs.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                runs.remove(&id);
+            }
+
+            match outcome {
                 Ok(out) => respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await,
                 Err(why) => respond_raw_cors(sock, cors.as_deref(), 500, &error_body(&why)).await,
             }
+        }
+
+        // ── TR-474 · the host-callback channel ───────────────────────────
+        //
+        // Two endpoints rather than a path parameter, because this dispatch
+        // is exact-match on (method, path) and a `/script/{id}/…` route would
+        // be the only prefix match in it. The run id rides the body.
+        ("POST", "/script/callback/next") => {
+            // Park until this run has work, the run ends, or the poll ages
+            // out. The caller re-polls on 204; that is the normal idle path,
+            // not an error.
+            let Some(payload) =
+                read_json_body(sock, content_length, 64 * 1024, &prefetched_body).await?
+            else {
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
+            };
+            let Some(run_id) = payload.get("runId").and_then(|v| v.as_str()) else {
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"`runId` is required"}"#,
+                )
+                .await;
+            };
+            let cb = {
+                let runs = match state.runs.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                runs.get(run_id).cloned()
+            };
+            // An unknown run is 204, not 404: the run may have finished
+            // between the script returning and this poll arriving, and that
+            // race is ordinary rather than an error.
+            let Some(cb) = cb else {
+                return respond_raw_cors(sock, cors.as_deref(), 204, "").await;
+            };
+
+            let deadline = std::time::Duration::from_secs(20);
+            let started = std::time::Instant::now();
+            loop {
+                // The waiter is created BEFORE the check. Reversed, a call
+                // enqueued in between would be missed and the poll would park
+                // until it aged out, with work already waiting.
+                let waiting = cb.ready.notified();
+                if let Some(call) = {
+                    let mut pending = match cb.pending.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    pending.pop_front()
+                } {
+                    let body = serde_json::to_string(&call).unwrap_or_default();
+                    return respond_raw_cors(sock, cors.as_deref(), 200, &body).await;
+                }
+                if cb.done.load(std::sync::atomic::Ordering::SeqCst) {
+                    return respond_raw_cors(sock, cors.as_deref(), 204, "").await;
+                }
+                let left = deadline.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return respond_raw_cors(sock, cors.as_deref(), 204, "").await;
+                }
+                tokio::select! {
+                    _ = waiting => {}
+                    _ = tokio::time::sleep(left) => {}
+                }
+            }
+        }
+
+        ("POST", "/script/callback/reply") => {
+            // Deliver one answer. The parked host function is holding the
+            // realm's thread, so this must never block on it.
+            let Some(payload) =
+                read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
+            else {
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
+            };
+            let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+            let call_id = payload.get("callId").and_then(|v| v.as_u64());
+            let Some(call_id) = call_id else {
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"`callId` is required and must be a number"}"#,
+                )
+                .await;
+            };
+            let cb = {
+                let runs = match state.runs.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                runs.get(run_id).cloned()
+            };
+            let Some(cb) = cb else {
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    404,
+                    r#"{"error":"no such run — it may have already finished"}"#,
+                )
+                .await;
+            };
+            let tx = {
+                let mut replies = match cb.replies.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                replies.remove(&call_id)
+            };
+            // Answering twice, or answering a call that timed out, is a
+            // NAMED 404 rather than a silent success — the caller would
+            // otherwise believe the script received something it never did.
+            let Some(tx) = tx else {
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    404,
+                    r#"{"error":"no such callId — already answered, or it timed out"}"#,
+                )
+                .await;
+            };
+            let result = payload
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let _ = tx.send(result.to_string());
+            respond_raw_cors(sock, cors.as_deref(), 200, r#"{"delivered":true}"#).await
         }
 
         ("POST", "/auth/oauth2") => {
@@ -1495,6 +1720,7 @@ async fn run_script_once(
     response: Option<tropel_sdk::types::Response>,
     sandbox: tropel_sandbox::config::SandboxConfig,
     http: tropel_http::HttpClient,
+    callbacks: Option<Arc<RunCallbacks>>,
 ) -> Result<serde_json::Value, String> {
     let mut ctx = tropel_js::JsContext::new(None, Some(std::time::Duration::from_secs(10)))
         .await
@@ -1574,6 +1800,87 @@ async fn run_script_once(
     tropel_sandbox::bindings::trp::TrpBridge::with_http_client(state.clone(), driver_client)
         .install(&mut ctx)
         .map_err(|e| format!("bridge install: {e:?}"))?;
+
+    // TR-474: `bru.runRequest`'s host half, installed ONLY when the caller
+    // opted in with a `runId`. Absent, `__tropel_trp_run_request` stays
+    // undefined and the shim refuses by name — the agent never pretends to
+    // offer a callback nobody is listening for (invariant 4).
+    if let Some(cb) = callbacks.clone() {
+        let installed: Result<(), String> = ctx.with_ctx(|rq| {
+            rq.globals()
+                .set(
+                    "__tropel_trp_run_request",
+                    rquickjs::function::Func::from(move |path: String| -> String {
+                        // SYNCHRONOUS on purpose: QuickJS gives a host
+                        // function no way to suspend, so the realm's thread
+                        // parks here until the caller answers. The reply
+                        // arrives on a DIFFERENT connection, hence a
+                        // different tokio task — blocking this one does not
+                        // stop it being served.
+                        let call_id = cb
+                            .next_id
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let (tx, rx) = std::sync::mpsc::channel::<String>();
+                        {
+                            let mut replies = match cb.replies.lock() {
+                                Ok(g) => g,
+                                Err(e) => e.into_inner(),
+                            };
+                            replies.insert(call_id, tx);
+                        }
+                        {
+                            let mut pending = match cb.pending.lock() {
+                                Ok(g) => g,
+                                Err(e) => e.into_inner(),
+                            };
+                            pending.push_back(PendingHostCall {
+                                call_id,
+                                kind: "runRequest",
+                                path,
+                            });
+                        }
+                        cb.ready.notify_waiters();
+
+                        // `block_in_place`, not a bare blocking recv.
+                        //
+                        // QuickJS gives a host function no way to suspend, so
+                        // this thread MUST block. Blocking it silently would
+                        // hold a tokio worker for the whole round trip — and
+                        // the answer arrives on another connection, i.e.
+                        // another task, which then needs a worker to be
+                        // served. Enough concurrent scripts and every worker
+                        // is parked waiting for replies that cannot be
+                        // delivered. `block_in_place` tells the runtime to
+                        // move the rest of this worker's queue elsewhere
+                        // first, so the reply path always has somewhere to run.
+                        //
+                        // It requires a MULTI-THREADED runtime: it panics on a
+                        // current-thread one. The agent builds a multi-thread
+                        // runtime (4 workers by default), and the tests below
+                        // ask for one explicitly.
+                        match tokio::task::block_in_place(|| {
+                            rx.recv_timeout(std::time::Duration::from_secs(30))
+                        }) {
+                            Ok(json) => json,
+                            Err(_) => {
+                                // Drop the slot so a late reply cannot land on
+                                // a call nobody is waiting for any more.
+                                if let Ok(mut r) = cb.replies.lock() {
+                                    r.remove(&call_id);
+                                }
+                                // A REFUSAL, not a fabricated response: the
+                                // script must not read a timeout as a request
+                                // that ran and returned nothing (invariant 8).
+                                r#"{"error":"runRequest timed out: the host did not answer within 30s"}"#
+                                    .to_string()
+                            }
+                        }
+                    }),
+                )
+                .map_err(|e| e.to_string())
+        });
+        installed.map_err(|e| format!("run_request bridge: {e}"))?;
+    }
 
     // A THROWING script is not an agent error — it is a result. The caller
     // needs the message and whatever ran before the throw, exactly as the
@@ -2034,6 +2341,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+                runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -2288,6 +2596,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+                runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -2389,6 +2698,7 @@ mod tests {
                 token: Some("s3cret".into()),
                 client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                     .expect("http client"),
+                    runs: std::sync::Mutex::new(HashMap::new()),
                 allowed_origins: origins,
             });
             tokio::spawn(async move {
@@ -2485,6 +2795,7 @@ mod tests {
             token: Some("s3cret".into()),
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+                runs: std::sync::Mutex::new(HashMap::new()),
             allowed_origins: vec!["https://app.knockport.dev".into()],
         });
         tokio::spawn(async move {
@@ -2561,6 +2872,7 @@ mod tests {
             Some(response),
             tropel_sandbox::config::SandboxConfig::default(),
             test_http_client(),
+            None,
         )
         .await
         .expect("the realm runs");
@@ -2615,6 +2927,7 @@ mod tests {
             None,
             tropel_sandbox::config::SandboxConfig::default(),
             test_http_client(),
+            None,
         )
         .await
         .expect("the realm runs");
@@ -2678,6 +2991,7 @@ mod tests {
                 aliases: Vec::new(),
             },
             test_http_client(),
+            None,
         )
         .await
         .expect("the realm runs");
@@ -2701,6 +3015,7 @@ mod tests {
             None,
             tropel_sandbox::config::SandboxConfig::default(),
             test_http_client(),
+            None,
         )
         .await
         .expect("the realm runs");
@@ -2712,6 +3027,109 @@ mod tests {
             err.contains("kp is not defined"),
             "the stock install must NOT bind kp — if it does, this test no \
              longer proves the preamble is what carries the namespace: {stock}"
+        );
+    }
+
+    /// TR-474: a script calls OUT of the realm and resumes with the answer.
+    ///
+    /// This is the one thing no amount of payload widening could do:
+    /// `bru.runRequest` resolves a name out of a collection the agent has
+    /// never seen. The realm parks mid-script, the host answers, the script
+    /// carries on with the value.
+    ///
+    /// Driven at the channel rather than over HTTP so it is hermetic and
+    /// fast; the two endpoints on top of it are exercised end to end in the
+    /// PR description against a live agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_script_calls_back_into_the_host_and_resumes() {
+        let cb = Arc::new(RunCallbacks::default());
+
+        // The host half: wait for the parked call, answer it.
+        let host = {
+            let cb = cb.clone();
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    let call = {
+                        let mut p = cb.pending.lock().unwrap();
+                        p.pop_front()
+                    };
+                    if let Some(call) = call {
+                        let tx = cb.replies.lock().unwrap().remove(&call.call_id);
+                        if let Some(tx) = tx {
+                            let _ = tx.send(
+                                serde_json::json!({ "status": 201, "body": call.path }).to_string(),
+                            );
+                        }
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                false
+            })
+        };
+
+        let out = run_script_once(
+            "var r = bru.runRequest('Login');\
+             kp.environment.set('status', String(r.status));\
+             kp.environment.set('echoed', String(r.body));",
+            ScriptScopes::default(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            },
+            test_http_client(),
+            Some(cb.clone()),
+        )
+        .await
+        .expect("the realm runs");
+
+        assert!(host.await.unwrap_or(false), "the host never saw the call");
+        assert!(
+            out.get("scriptError").map(|e| e.is_null()).unwrap_or(false),
+            "the script must not error: {out}"
+        );
+        let env = out.get("environment").expect("environment comes back");
+        assert_eq!(
+            env.get("status").and_then(|v| v.as_str()),
+            Some("201"),
+            "the script must resume with the HOST's answer, not a placeholder: {out}"
+        );
+        assert_eq!(
+            env.get("echoed").and_then(|v| v.as_str()),
+            Some("Login"),
+            "the path the script asked for must reach the host verbatim: {out}"
+        );
+    }
+
+    /// TR-474: without a channel, `bru.runRequest` REFUSES BY NAME.
+    ///
+    /// A load run has no collection to re-enter. Returning undefined there
+    /// would read as "the request ran and gave nothing back" — the silent
+    /// failure invariant 8 forbids — and the binding must not exist at all
+    /// when nothing is listening for it (invariant 4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_request_refuses_when_no_channel_is_open() {
+        let out = run_script_once(
+            "bru.runRequest('Login');",
+            ScriptScopes::default(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig::default(),
+            test_http_client(),
+            None, // no channel
+        )
+        .await
+        .expect("the realm runs");
+
+        let err = out
+            .get("scriptError")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        assert!(
+            err.contains("not available here"),
+            "it must refuse by name rather than return undefined: {out}"
         );
     }
 
@@ -2751,6 +3169,7 @@ mod tests {
                 aliases: Vec::new(),
             },
             test_http_client(),
+            None,
         )
         .await
         .expect("the realm runs");
@@ -2807,6 +3226,7 @@ mod tests {
                 aliases: Vec::new(),
             },
             test_http_client(),
+            None,
         )
         .await
         .expect("the realm runs");
@@ -2858,7 +3278,7 @@ mod tests {
                      kp.environment.set('fetch', typeof fetch);\
                      kp.environment.set('module', typeof module);\
                      kp.environment.set('viaFn', typeof Function('return this')().process);";
-        let out = run_script_once(probe, ScriptScopes::default(), None, None, kp(), test_http_client())
+        let out = run_script_once(probe, ScriptScopes::default(), None, None, kp(), test_http_client(), None)
             .await
             .expect("the realm runs");
         let env = out.get("environment").expect("the environment comes back");
@@ -2876,7 +3296,7 @@ mod tests {
             ("direct", "import('fs');"),
             ("indirect eval", "var e = eval; e(\"import\" + \"('fs')\");"),
         ] {
-            let result = run_script_once(code, ScriptScopes::default(), None, None, kp(), test_http_client()).await;
+            let result = run_script_once(code, ScriptScopes::default(), None, None, kp(), test_http_client(), None).await;
             let refused = match &result {
                 Err(why) => why.contains("module"),
                 Ok(out) => out
@@ -2931,6 +3351,7 @@ mod tests {
             None,
             tropel_sandbox::config::SandboxConfig::default(),
             test_http_client(),
+            None,
         )
             .await
             .expect("the realm runs");
@@ -3117,6 +3538,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+                runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -3254,6 +3676,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+                runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -3357,6 +3780,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+                runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -3456,6 +3880,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+                runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
