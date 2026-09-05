@@ -4250,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "tropel"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -4392,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-engine"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4791,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-web"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "async-trait",
  "postcard",
