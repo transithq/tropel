@@ -4491,6 +4491,7 @@ dependencies = [
  "tracing",
  "tropel-auth",
  "tropel-sdk",
+ "tropel-variables",
 ]
 
 [[package]]

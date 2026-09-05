@@ -5,6 +5,7 @@
 
 pub mod assertions;
 pub mod catalog;
+pub mod cookies;
 pub mod headers;
 pub mod resolver;
 

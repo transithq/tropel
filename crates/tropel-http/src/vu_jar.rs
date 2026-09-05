@@ -153,7 +153,26 @@ pub fn set_cookie(
     opts: &K6CookieOptions,
 ) -> Result<()> {
     let parsed = parse_url(url)?;
-    jar.add_cookie_str(&build_set_cookie(name, value, opts)?, &parsed);
+    let line = build_set_cookie(name, value, opts)?;
+    // TR-457: the same public-suffix rule the response path applies. A script
+    // calling `jar.set(url, name, value, {domain: "com"})` must not be able to
+    // put a cookie in the jar that a Set-Cookie header could not — the two
+    // doors into the jar have to agree, or the rule is only half a rule.
+    //
+    // A REFUSAL, not a silent drop: the script asked for something specific
+    // and getting no error back would read as "stored" (invariant #8).
+    if !tropel_variables::cookies::set_cookie_is_acceptable(
+        &line,
+        parsed.host_str().unwrap_or_default(),
+    ) {
+        return Err(TropelError::Other(format!(
+            "cookie {name:?} was refused: Domain is a public suffix, so the cookie would be \
+             scoped across every site under it (RFC 6265 5.3 step 5). Drop the domain option to \
+             scope it to {:?}.",
+            parsed.host_str().unwrap_or_default()
+        )));
+    }
+    jar.add_cookie_str(&line, &parsed);
     Ok(())
 }
 
@@ -485,6 +504,77 @@ mod tests {
                 .is_empty(),
             "a past Expires must evict the cookie, not store a dead one"
         );
+    }
+
+    /// TR-457 — a public-suffix `Domain` must not put a cookie in the jar.
+    ///
+    /// Through the REAL jar, because that is where the bug was: the rule's own
+    /// unit tests live in `tropel-variables::cookies`, and they would have
+    /// passed just as happily while nothing called them. Before this change
+    /// the probe below printed `Some("sid=leaked")` for bank.com.
+    #[test]
+    fn a_public_suffix_domain_cannot_scope_a_cookie_across_sites() {
+        let jar = Jar::default();
+        // The k6 `jar.set()` door: REFUSED by name, not silently dropped —
+        // the script asked for something specific and silence reads as
+        // "stored".
+        let err = set_cookie(
+            &jar,
+            "https://evil.com/",
+            "sid",
+            "leaked",
+            &K6CookieOptions {
+                domain: Some("com".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("public suffix") && msg.contains("sid"),
+            "the refusal must name the reason AND the cookie: {msg}"
+        );
+        assert!(
+            cookies_for_url(&jar, "https://bank.com/account")
+                .unwrap()
+                .is_empty(),
+            "nothing may have reached the jar"
+        );
+
+        // The control: an ordinary parent domain still works through the same
+        // door. A fix that broke this would be worse than the bug.
+        set_cookie(
+            &jar,
+            "https://api.example.com/",
+            "ok",
+            "1",
+            &K6CookieOptions {
+                domain: Some("example.com".into()),
+                ..Default::default()
+            },
+        )
+        .expect("parent-domain scoping must keep working");
+        assert_eq!(
+            cookies_for_url(&jar, "https://www.example.com/")
+                .unwrap()
+                .get("ok")
+                .map(|v| v.as_slice()),
+            Some(&["1".to_string()][..]),
+        );
+
+        // And `Domain=localhost` on localhost survives, or every local dev
+        // server stops keeping its session.
+        set_cookie(
+            &jar,
+            "http://localhost:3000/",
+            "dev",
+            "1",
+            &K6CookieOptions {
+                domain: Some("localhost".into()),
+                ..Default::default()
+            },
+        )
+        .expect("Domain=localhost on localhost is identical-to-host, not a rejection");
     }
 
     #[test]

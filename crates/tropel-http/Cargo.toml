@@ -14,6 +14,9 @@ description = "HTTP protocol implementation for Tropel: reqwest client, connecti
 [dependencies]
 tropel-sdk.workspace = true
 tropel-auth = { workspace = true, features = ["reqwest"] }
+# TR-457: the cookie-scope rule (public-suffix Domain rejection). A leaf crate
+# with no tropel dependencies and no regex since TR-434, so this is cheap.
+tropel-variables.workspace = true
 serde.workspace = true
 reqwest.workspace = true
 h2.workspace = true
