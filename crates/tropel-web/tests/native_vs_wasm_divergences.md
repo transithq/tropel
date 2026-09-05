@@ -34,3 +34,29 @@ If a future divergence appears, add it here with the reason it is unavoidable
 timestamp) AND mark the corresponding corpus item `#[ignore]` with a link to
 this file. A divergence that is NOT listed here is a bug in the one-engine
 claim and must be fixed, not waived.
+
+## The resolution corpus, and its third leg (KT-202)
+
+`packages/core-wasm/fixtures/resolve-corpus.json` is a separate, narrower
+differential: the 16 cases that motivated moving the `{{var}}` resolver into
+Rust in the first place. It now runs through **three** paths, all reading the
+same bytes rather than restating the cases:
+
+| leg | where | serves |
+|---|---|---|
+| native Rust | `tropel-core-wasm`'s `conformance_corpus` | the engine |
+| real wasm | `packages/core-wasm/smoke.mjs` | KnockPort's **browser** tier |
+| the agent, over a socket | `tropel-engine`'s `the_resolution_corpus_agrees_over_the_socket` | KnockPort's **desktop** tier (KP-209) |
+
+The third leg exists because since KP-209 the desktop tier resolves through
+the agent, so an agent that handled `{{base-url}}` differently would put
+literal text on the wire **for desktop users only** — the exact divergence
+this corpus was written to catch, in the one tier it was not yet checked in.
+
+It deviates from KT-202's literal wording ("run the corpus through the
+TypeScript host"). Driving KnockPort's TypeScript from a Rust test would need
+Node and a second checkout inside tropel's CI; the agent leg covers what that
+was for with no cross-repo dependency, and `smoke.mjs` already **is** the
+TypeScript leg for the browser tier.
+
+Current state: **no divergences.** All 16 cases agree across all three.
