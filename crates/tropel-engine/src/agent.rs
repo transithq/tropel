@@ -1293,6 +1293,13 @@ fn sign_with_scheme(
     }
 }
 
+/// Base64 encode, beside the decoder — the same engine, so a round trip
+/// through the agent cannot disagree with itself.
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 /// Base64 decode without pulling a new dependency into this crate.
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     use base64::Engine as _;
@@ -1600,11 +1607,30 @@ async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_js
                 .as_ref()
                 .map(|t| t.receiving.as_millis() as f64)
                 .unwrap_or(0.0);
+            // TR-462: a response body that is not valid UTF-8 comes back as
+            // base64, and says so.
+            //
+            // This used to be `String::from_utf8_lossy`, which replaces every
+            // invalid byte with U+FFFD and reports nothing. A PNG, a protobuf
+            // or a gzip payload fetched through the agent arrived CORRUPTED,
+            // and no field on the reply said so — the silent data loss
+            // invariant #7 forbids, on the single-request path a desktop or
+            // website transport uses for every send.
+            //
+            // `bodyEncoding` is always present so a caller never has to guess,
+            // and a caller that ignores it now sees obvious base64 rather than
+            // subtle mojibake — a failure that is visible instead of one that
+            // looks like a server bug.
+            let (body, body_encoding) = match std::str::from_utf8(&resp.body) {
+                Ok(text) => (text.to_string(), "utf8"),
+                Err(_) => (base64_encode(&resp.body), "base64"),
+            };
             serde_json::json!({
                 "status": resp.status_code,
                 "status_text": resp.status_text,
                 "headers": resp.headers,
-                "body": String::from_utf8_lossy(&resp.body),
+                "body": body,
+                "bodyEncoding": body_encoding,
                 "timings": {
                     "blocked": 0.0, "dns": 0.0, "connecting": 0.0, "tls_handshaking": 0.0,
                     "sending": 0.0, "waiting": waiting, "receiving": receiving,
@@ -2213,6 +2239,69 @@ mod tests {
         s.read_to_end(&mut out).await.expect("read");
         let raw = String::from_utf8_lossy(&out).to_string();
         assert!(raw.starts_with("HTTP/1.1 401"), "{raw}");
+    }
+
+    /// TR-462 — a non-UTF-8 response body survives, and says how.
+    ///
+    /// Not a socket test: `/execute` needs a live upstream, and what is under
+    /// test is the ENCODING DECISION, not the HTTP plumbing. Driving the same
+    /// bytes through the same branch is the honest way to pin it — and the
+    /// round trip through `base64_decode` proves the two halves of this file
+    /// agree, which is the property that actually matters to a caller.
+    #[test]
+    fn a_binary_response_body_is_base64_not_mojibake() {
+        // A PNG header: valid bytes, invalid UTF-8. `from_utf8_lossy` turns
+        // every one of the high bytes into U+FFFD and reports nothing, so the
+        // caller receives a corrupted image that looks like a server bug.
+        //
+        // Built through a function rather than as a literal: clippy
+        // const-folds `from_utf8` on a literal and warns that it "always
+        // returns an error", which is the very property under test.
+        fn png_header() -> Vec<u8> {
+            vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xD8]
+        }
+        let png = png_header();
+        assert!(
+            std::str::from_utf8(&png).is_err(),
+            "the fixture must actually be invalid UTF-8 or this test proves nothing"
+        );
+
+        let (body, encoding) = match std::str::from_utf8(&png) {
+            Ok(text) => (text.to_string(), "utf8"),
+            Err(_) => (base64_encode(&png), "base64"),
+        };
+        assert_eq!(encoding, "base64");
+        assert_eq!(
+            base64_decode(&body).expect("round trips"),
+            png,
+            "the bytes must come back EXACTLY — lossy is the bug"
+        );
+
+        // What the old code did, pinned so the difference is visible rather
+        // than asserted: every high byte became the replacement character.
+        let lossy = String::from_utf8_lossy(&png);
+        assert!(
+            lossy.contains('\u{FFFD}'),
+            "the old path really did corrupt these bytes: {lossy:?}"
+        );
+        assert_ne!(
+            lossy.as_bytes(),
+            png,
+            "and the corruption was unrecoverable — no field said so"
+        );
+
+        // Text is untouched: the common case must not start arriving as
+        // base64, which would break every existing caller.
+        fn json_body() -> Vec<u8> {
+            br#"{"ok":true}"#.to_vec()
+        }
+        let text = json_body();
+        let (body, encoding) = match std::str::from_utf8(&text) {
+            Ok(t) => (t.to_string(), "utf8"),
+            Err(_) => (base64_encode(&text), "base64"),
+        };
+        assert_eq!(encoding, "utf8");
+        assert_eq!(body, "{\"ok\":true}");
     }
 
     /// TR-445: `/auth/sign`, over the socket.
