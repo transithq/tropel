@@ -420,6 +420,16 @@ const [bad] = assertEvaluate(assertResponse, [
   { target: 'header("X-Nope")', operator: "eq", expected: "x" },
 ]);
 if (bad.passed || !bad.unsupported) throw new Error(`unresolvable target: ${JSON.stringify(bad)}`);
+// TR-443: a FAILING row explains itself; a passing one carries no message.
+const [failing] = assertEvaluate(assertResponse, [
+  { name: "status", target: "status", operator: "eq", expected: 500 },
+]);
+if (failing.passed || failing.message !== "expected target status equals 500; actual 200") {
+  throw new Error(`failure message: ${JSON.stringify(failing)}`);
+}
+if (outcomes.some((o) => o.message !== undefined)) {
+  throw new Error("a passing assertion must carry no message");
+}
 // The host RegExp is injected; without it `matches` says so by name.
 const [noMatcher] = assertEvaluate(assertResponse, [
   { target: "body", operator: "matches", expected: "^\\{" },

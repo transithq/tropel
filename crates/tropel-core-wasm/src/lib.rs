@@ -510,6 +510,8 @@ fn assert_evaluate_batch_inner(
                     name,
                     passed: false,
                     unsupported: Some(why),
+                    // An unresolvable target has no comparison to describe.
+                    message: None,
                 },
             }
         })

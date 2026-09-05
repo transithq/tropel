@@ -418,8 +418,9 @@ export function oauth1SignatureMethods() {
  *   rather than linked because a Rust regex would put back the 152 KB TR-434
  *   removed from this tier, AND would be unfaithful — JS RegExp has
  *   backreferences and lookaround that Rust's engine deliberately lacks.
- * @returns {Array<{name:string, passed:boolean, unsupported?:string}>} one
- *   outcome per assertion, in order. `unsupported` means it could not be
+ * @returns {Array<{name:string, passed:boolean, message?:string, unsupported?:string}>}
+ *   one outcome per assertion, in order. `message` explains a FAILING row and
+ *   is absent on a passing one. `unsupported` means it could not be
  *   evaluated at all (unknown operator, unresolvable target, missing matcher)
  *   — distinct from `passed:false`, which means the predicate ran and said no.
  */
