@@ -15,8 +15,7 @@ use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
-use sha1::Sha1;
-use sha2::{Sha256, Sha512};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -44,8 +43,6 @@ const UNRESERVED: AsciiSet = NON_ALPHANUMERIC
     .remove(b'~');
 
 type HmacSha256 = Hmac<Sha256>;
-type HmacSha1 = Hmac<Sha1>;
-type HmacSha512 = Hmac<Sha512>;
 
 /// Auth signer trait — signs/modifies a request before sending.
 ///
@@ -582,66 +579,37 @@ impl OAuth1Auth {
             .as_deref()
             .unwrap_or("HMAC-SHA1")
             .to_ascii_uppercase();
-        // TR-409: only HMAC-SHA1 and HMAC-SHA256 are implemented; every other
-        // picker value (RSA-SHA1/256/512, PLAINTEXT, HMAC-SHA512, etc.) is
-        // reported as unsupported rather than silently downgraded to HMAC-SHA1
-        // (the TR-004 / TR-409 failure shape).
-        if !matches!(
-            method_str.as_str(),
-            "HMAC-SHA1" | "HMAC-SHA256" | "HMAC-SHA512"
-        ) {
+        // TR-409: every picker value outside the supported set (RSA-SHA1/256/512,
+        // PLAINTEXT, …) is reported as unsupported rather than silently
+        // downgraded to HMAC-SHA1 (the TR-004 / TR-409 failure shape). The list
+        // comes from the builder so the guard and the dispatch cannot disagree.
+        if !crate::builders::oauth1_is_supported_signature_method(&method_str) {
             return Err(TropelError::Other(format!(
-                "unsupported OAuth1 signature_method '{}' — supported: HMAC-SHA1, HMAC-SHA256, HMAC-SHA512",
-                method_str
+                "unsupported OAuth1 signature_method '{}' — supported: {}",
+                method_str,
+                crate::builders::OAUTH1_SIGNATURE_METHODS.join(", ")
             )));
         }
-        let mut oauth: Vec<(String, String)> = vec![
-            ("oauth_consumer_key".to_string(), self.consumer_key.clone()),
-            ("oauth_nonce".to_string(), nonce.to_string()),
-            ("oauth_signature_method".to_string(), method_str.clone()),
-            ("oauth_timestamp".to_string(), timestamp.to_string()),
-            ("oauth_version".to_string(), "1.0".to_string()),
-        ];
-        if let Some(token) = &self.token {
-            oauth.push(("oauth_token".to_string(), token.clone()));
-        }
-        params.extend(oauth.clone());
 
-        // RFC 5849 §3.4.1.1: signature base string = HTTPMethod & "&" &
-        // baseURI & "&" & normalizedParams — the separators are literal `&`
-        // characters (ASCII 38), NOT newlines. Verified against the oauth.net
-        // canonical test vector (see tests).
         let base_uri = base_url(url);
-        let base_string = oauth1_base_string(method, &base_uri, &params);
-        let signature = match method_str.as_str() {
-            "HMAC-SHA1" => oauth1_hmac_sha1(
-                &base_string,
-                &self.consumer_secret,
-                self.token_secret.as_deref().unwrap_or(""),
-            ),
-            "HMAC-SHA256" => oauth1_hmac_sha256(
-                &base_string,
-                &self.consumer_secret,
-                self.token_secret.as_deref().unwrap_or(""),
-            ),
-            "HMAC-SHA512" => oauth1_hmac_sha512(
-                &base_string,
-                &self.consumer_secret,
-                self.token_secret.as_deref().unwrap_or(""),
-            ),
-            _ => unreachable!(),
-        };
-
-        // Header params are quoted, nonce/signature included.
-        let mut header_params = oauth;
-        header_params.push(("oauth_signature".to_string(), signature));
-        header_params.sort();
-        let header_value = header_params
-            .iter()
-            .map(|(k, v)| format!("{}=\"{}\"", enc(k), enc(v)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        set_auth_header(request, &format!("OAuth {header_value}"))
+        let out = crate::builders::oauth1_build_header(&crate::builders::OAuth1BuildParams {
+            method,
+            base_uri: &base_uri,
+            request_params: &params,
+            consumer_key: &self.consumer_key,
+            consumer_secret: &self.consumer_secret,
+            token: self.token.as_deref(),
+            token_secret: self.token_secret.as_deref(),
+            signature_method: &method_str,
+            nonce,
+            timestamp,
+        })
+        .ok_or_else(|| {
+            TropelError::Other(format!(
+                "unsupported OAuth1 signature_method '{method_str}'"
+            ))
+        })?;
+        set_auth_header(request, &out.header.value)
     }
 }
 
@@ -659,60 +627,6 @@ impl AuthSigner for OAuth1Auth {
             .to_string();
         self.sign_with_nonce_timestamp(request, &nonce, &timestamp)
     }
-}
-
-/// RFC 5849 §3.4.1.1 signature base string.
-///
-/// `HTTPMethod & "&" & baseURI & "&" & normalizedParams` where the
-/// separators are literal `&` characters (ASCII 38), NOT newlines. Each
-/// component is percent-encoded per RFC 3986 (unreserved chars pass
-/// through); the params are sorted by encoded name (then value).
-fn oauth1_base_string(method: &str, base_uri: &str, params: &[(String, String)]) -> String {
-    let mut encoded: Vec<(String, String)> = params.iter().map(|(k, v)| (enc(k), enc(v))).collect();
-    encoded.sort();
-    let param_string = encoded
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!(
-        "{}&{}&{}",
-        method.to_uppercase(),
-        enc(base_uri),
-        enc(&param_string)
-    )
-}
-
-/// RFC 5849 §3.4.2 HMAC-SHA1 signature over the base string.
-///
-/// Signing key = `enc(consumer_secret) & enc(token_secret)`. HMAC accepts
-/// any key length, so `new_from_slice` cannot fail here.
-fn oauth1_hmac_sha1(base_string: &str, consumer_secret: &str, token_secret: &str) -> String {
-    let key = format!("{}&{}", enc(consumer_secret), enc(token_secret));
-    let mut mac = <HmacSha1 as KeyInit>::new_from_slice(key.as_bytes())
-        .expect("HMAC-SHA1 accepts any key length");
-    mac.update(base_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-}
-
-/// HMAC-SHA256 variant (TR-409: picker offers HMAC-SHA256; Bruno parity).
-fn oauth1_hmac_sha256(base_string: &str, consumer_secret: &str, token_secret: &str) -> String {
-    let key = format!("{}&{}", enc(consumer_secret), enc(token_secret));
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
-    mac.update(base_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-}
-
-/// HMAC-SHA512 variant (TR-409: picker offers RSA-SHA512 / HMAC-SHA512 family;
-/// we implement HMAC-SHA512; RSA variants remain unsupported and are reported
-/// as such before reaching this function).
-fn oauth1_hmac_sha512(base_string: &str, consumer_secret: &str, token_secret: &str) -> String {
-    let key = format!("{}&{}", enc(consumer_secret), enc(token_secret));
-    let mut mac = <HmacSha512 as KeyInit>::new_from_slice(key.as_bytes())
-        .expect("HMAC-SHA512 accepts any key length");
-    mac.update(base_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
 fn is_form_urlencoded(request: &reqwest::Request) -> bool {
@@ -1768,7 +1682,7 @@ mod tests {
         // RFC 5849 §3.4.1.1: the three components are joined with literal `&`
         // characters (ASCII 38), never `\n` — the old implementation used
         // newlines, producing a signature any OAuth1 server rejects.
-        let base = oauth1_base_string(
+        let base = crate::builders::oauth1_base_string(
             "POST",
             "http://example.com/request",
             &[("a".to_string(), "1".to_string())],
@@ -1792,12 +1706,19 @@ mod tests {
             ("oauth_version".into(), "1.0".into()),
             ("size".into(), "original".into()),
         ];
-        let base = oauth1_base_string("GET", "http://photos.example.net/photos", &params);
+        let base =
+            crate::builders::oauth1_base_string("GET", "http://photos.example.net/photos", &params);
         assert_eq!(
             base,
             "GET&http%3A%2F%2Fphotos.example.net%2Fphotos&file%3Dvacation.jpg%26oauth_consumer_key%3Ddpf43f3p2l4k3l03%26oauth_nonce%3Dkllo9940pd9333jh%26oauth_signature_method%3DHMAC-SHA1%26oauth_timestamp%3D1191242096%26oauth_token%3Dnnch734d00sl2jdk%26oauth_version%3D1.0%26size%3Doriginal"
         );
-        let sig = oauth1_hmac_sha1(&base, "kd94hf93k423kf44", "pfkkdhi9sl3r4s00");
+        let sig = crate::builders::oauth1_signature(
+            &base,
+            "kd94hf93k423kf44",
+            "pfkkdhi9sl3r4s00",
+            "HMAC-SHA1",
+        )
+        .expect("HMAC-SHA1 is a supported signature method");
         assert_eq!(sig, "tR3+Ty81lMeYAr/Fid0kMTYa/WM=");
     }
 
