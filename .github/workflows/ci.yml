@@ -680,6 +680,28 @@ jobs:
           git diff --exit-code -- packages/core-wasm/README.md || { echo "FAIL: packages/core-wasm/README.md Size line is stale — run 'bash packages/core-wasm/scripts/build.sh' locally and commit the generated Size line (TR-404: generated, not typed)" >&2; exit 1; }
           echo "ok: core-wasm 700 KB gate + README generation check passed"
 
+      # KT-205: run @tropel/core-wasm's OWN smoke — the only thing in CI that
+      # calls the eager tier through the REAL wasm boundary.
+      #
+      # It was never wired. The job above builds `pkg/` for the size gate and
+      # stopped there, so nothing executed a single wasm export; the other two
+      # `node smoke.mjs` steps in this job belong to @tropel/shims and
+      # @tropel/runtime-wasm, which are different packages. That gap is how
+      # TR-445 deleted the `resolveTemplateDetailed` export and shipped: every
+      # Rust test called the private `_inner` helper directly, and the one
+      # caller that crossed the boundary never ran.
+      #
+      # It is also the SECOND leg of the resolution corpus (KT-202) — the one
+      # that stands in for KnockPort's browser tier. The native leg runs in
+      # `cargo test` and the agent leg runs in `cargo test -p tropel-engine`;
+      # with this, all three are merge gates.
+      #
+      # No extra toolchain: `pkg/` already exists from the step above.
+      - name: KT-205 core-wasm smoke (the real wasm boundary + corpus leg)
+        run: |
+          cd packages/core-wasm
+          node smoke.mjs
+
       # TR-407: the SDK inversion (contract at the bottom of the graph) rots
       # if adapters start depending on tropel-core, or if the SDK needs a full
       # checkout to use. Guard 1 asserts no in-tree adapter pulls tropel-core;
