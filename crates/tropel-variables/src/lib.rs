@@ -3,6 +3,7 @@
 //!
 //! {{var}} resolution with scope precedence and dynamic-variable catalog.
 
+pub mod assertions;
 pub mod catalog;
 pub mod resolver;
 
