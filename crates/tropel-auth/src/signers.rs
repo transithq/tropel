@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512, Sha512_256};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -1121,51 +1121,6 @@ impl AuthSigner for DigestAuth {
 /// `H(H(A1):nonce:nc:cnonce:auth:H(A2))`; any other combination falls back
 /// to the no-qop form `H(H(A1):nonce:H(A2))` (with `-sess` folding the
 /// nonce+cnonce into HA1 first).
-#[allow(clippy::too_many_arguments)] // all 8 params are RFC-specified digest inputs
-fn digest_response_value(
-    base_ha1: &str,
-    is_sess: bool,
-    nonce: &str,
-    nc: &str,
-    cnonce: &str,
-    qop: Option<&str>,
-    ha2: &str,
-    base_algorithm: &str,
-) -> String {
-    if let Some(qop) = qop {
-        if qop.split(',').any(|q| q.trim() == "auth") {
-            let ha1 = sess_fold_ha1(base_ha1, is_sess, nonce, cnonce, base_algorithm);
-            return digest_with(
-                &format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"),
-                base_algorithm,
-            );
-        }
-    }
-    // No qop (or qop without `auth`) — the no-qop form; nc/cnonce unused.
-    if is_sess {
-        let ha1 = sess_fold_ha1(base_ha1, true, nonce, cnonce, base_algorithm);
-        digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
-    } else {
-        digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
-    }
-}
-
-/// RFC 7616 §3.4.4: the `-sess` HA1 folds nonce + cnonce into the base HA1
-/// (`H(base_ha1:nonce:cnonce)`); non-sess algorithms use the base HA1 as-is.
-fn sess_fold_ha1(
-    base_ha1: &str,
-    is_sess: bool,
-    nonce: &str,
-    cnonce: &str,
-    base_algorithm: &str,
-) -> String {
-    if is_sess {
-        digest_with(&format!("{base_ha1}:{nonce}:{cnonce}"), base_algorithm)
-    } else {
-        base_ha1.to_string()
-    }
-}
-
 /// Cache key for a digest session: `host[:port]` from the request URL.
 fn digest_session_key(url: &reqwest::Url) -> String {
     let host = url.host_str().unwrap_or("");
@@ -1184,135 +1139,42 @@ fn build_digest_authorization(
     sess: &DigestSession,
     request: &reqwest::Request,
 ) -> String {
-    let realm = &sess.realm;
-    let nonce = &sess.nonce;
-    // RFC 7616 defaults to MD5 when the server omits `algorithm`; only
-    // emit the field when the challenge actually specified it (some
-    // strict servers reject an explicit `algorithm=MD5`).
-    let server_algorithm = sess.algorithm.as_ref().map(|s| s.to_ascii_uppercase());
-    let algorithm = server_algorithm
-        .clone()
-        .unwrap_or_else(|| "MD5".to_string());
-    // RFC 7616 §3.4.4: the "-sess" variants (MD5-sess / SHA-256-sess /
-    // SHA-512-256-sess) only change how HA1 is derived (nonce + cnonce are
-    // folded in); the hash function itself is always the base algorithm.
-    let base_algorithm = if algorithm.starts_with("SHA-512-256") {
-        "SHA-512-256"
-    } else if algorithm.starts_with("SHA-256") {
-        "SHA-256"
-    } else {
-        "MD5"
-    };
-    let is_sess = algorithm.ends_with("-SESS");
-    let qop = sess.qop.as_deref();
-
+    // Delegates to `crate::builders`, which is NOT behind the `reqwest`
+    // feature — that is what lets a browser embedder reach the same bytes
+    // (TR-422/TR-424). This function is now only the adapter: it reads the two
+    // fields digest actually needs off the request and hands them over.
+    //
+    // Deliberately NOT a parallel copy. Two Rust implementations of a signer
+    // would be D4's own warning one layer down, and the `native_vs_wasm`
+    // differential only covers what the signers call — so a second copy here
+    // would be the UNCOVERED one.
+    //
+    // The cnonce is generated unconditionally rather than per-branch as the
+    // old code did. That is not observable: the builder emits it only when qop
+    // or `-sess` makes it load-bearing, which are exactly the branches that
+    // used to generate it.
     let method = request.method().as_str();
-    // The digest `uri` is the request-target: path + query (RFC 7616).
+    // RFC 7616's `uri` is the request-target — path + query, origin-form.
     let url = request.url();
     let uri = match url.query() {
         Some(q) => format!("{}?{}", url.path(), q),
         None => url.path().to_string(),
     };
-
-    // Base HA1 = H(username:realm:password)
-    let ha1_input = format!("{username}:{realm}:{password}");
-    let base_ha1 = digest_with(&ha1_input, base_algorithm);
-    // HA2 = H(method:uri)
-    let ha2_input = format!("{method}:{uri}");
-    let ha2 = digest_with(&ha2_input, base_algorithm);
-
-    let mut fields: Vec<(String, String)> = vec![
-        ("username".into(), username.to_string()),
-        ("realm".into(), realm.clone()),
-        ("nonce".into(), nonce.clone()),
-        ("uri".into(), uri),
-    ];
-
-    // RFC 7616 §3.4.1: `nc` is an 8-digit hex counter of requests sent with
-    // this nonce (00000001, 00000002, …) — NOT hardcoded (backlog line 176).
-    let nc = format!("{:08x}", sess.nc);
-    // -sess requires a cnonce even when qop is absent (RFC 7616 §3.4.4).
-    let response = if let Some(qop) = qop {
-        if qop.split(',').any(|q| q.trim() == "auth") {
-            let c = generate_crypto_nonce();
-            let response = digest_response_value(
-                &base_ha1,
-                is_sess,
-                nonce,
-                &nc,
-                &c,
-                Some(qop),
-                &ha2,
-                base_algorithm,
-            );
-            fields.push(("qop".into(), "auth".into()));
-            fields.push(("nc".into(), nc));
-            fields.push(("cnonce".into(), c));
-            response
-        } else {
-            // qop present but no 'auth' — fall back to the no-qop form.
-            if is_sess {
-                let c = generate_crypto_nonce();
-                fields.push(("cnonce".into(), c.clone()));
-                digest_response_value(&base_ha1, true, nonce, &nc, &c, None, &ha2, base_algorithm)
-            } else {
-                digest_response_value(&base_ha1, false, nonce, &nc, "", None, &ha2, base_algorithm)
-            }
-        }
-    } else if is_sess {
-        let c = generate_crypto_nonce();
-        fields.push(("cnonce".into(), c.clone()));
-        digest_response_value(&base_ha1, true, nonce, &nc, &c, None, &ha2, base_algorithm)
-    } else {
-        digest_response_value(&base_ha1, false, nonce, &nc, "", None, &ha2, base_algorithm)
-    };
-    fields.push(("response".into(), response));
-    if let Some(alg) = server_algorithm {
-        fields.push(("algorithm".into(), alg));
-    }
-    if let Some(opaque) = &sess.opaque {
-        fields.push(("opaque".into(), opaque.clone()));
-    }
-
-    // RFC 7616 §3.4.1: `qop`, `nc` and `algorithm` are `token` productions
-    // and MUST NOT be quoted (strict servers reject `qop=\"auth\"` — the
-    // old code quoted every field, so `nc`/`algorithm`/`qop` were wrong).
-    // All other directives (username, realm, nonce, uri, response,
-    // cnonce, opaque) are `quoted-string` and MUST be quoted.
-    let header = fields
-        .iter()
-        .map(|(k, v)| match k.as_str() {
-            "qop" | "nc" | "algorithm" => format!("{k}={v}"),
-            // P2 line 180: escape quotes with backslash instead of
-            // stripping them. Stripping produced wrong values for usernames
-            // containing quotes (ab"c → abc instead of ab\"c), and a
-            // backslash-terminated username (a\) produced a quoted-pair
-            // breakout enabling directive injection from CSV data files.
-            _ => format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("Digest {header}")
-}
-
-/// Digest a string with the algorithm chosen by the server's challenge.
-fn digest_with(input: &str, algorithm: &str) -> String {
-    match algorithm {
-        "SHA-256" | "SHA-256-SESS" => hex_sha256(input.as_bytes()),
-        "SHA-512-256" | "SHA-512-256-SESS" => hex_sha512_256(input.as_bytes()),
-        _ => hex_md5(input.as_bytes()),
-    }
-}
-
-fn hex_sha512_256(bytes: &[u8]) -> String {
-    // SHA-512/256 is a separate hash with a different IV than SHA-512,
-    // NOT the first 256 bits of SHA-512. The old code truncated SHA-512,
-    // producing wrong HA1 values for RFC 7616 3.9.2 compliance.
-    hex::encode(Sha512_256::digest(bytes))
-}
-
-fn hex_md5(bytes: &[u8]) -> String {
-    hex::encode(md5::Md5::digest(bytes))
+    let cnonce = generate_crypto_nonce();
+    crate::builders::digest_build_authorization(&crate::builders::DigestBuildParams {
+        username,
+        password,
+        method,
+        uri: &uri,
+        realm: &sess.realm,
+        nonce: &sess.nonce,
+        nc: sess.nc,
+        cnonce: &cnonce,
+        qop: sess.qop.as_deref(),
+        algorithm: sess.algorithm.as_deref(),
+        opaque: sess.opaque.as_deref(),
+    })
+    .value
 }
 
 /// Parse a `WWW-Authenticate` header value into a list of `(scheme, params)`
@@ -2204,79 +2066,6 @@ mod tests {
         assert!(response.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    /// Backlog line 210: the RFC 2617 §3.5 reference vector (reproduced in
-    /// RFC 7616 §3.9.1). Username Mufasa / realm testrealm@host.com /
-    /// password "Circle Of Life", nonce dcd98b7102dd2f0e8b11d0f600bfb0c093,
-    /// uri /dir/index.html, qop=auth, nc=00000001, cnonce 0a4f113b. The
-    /// published response `6629fae4…` was re-derived with openssl and the
-    /// test now compares the ANSWER instead of just its length.
-    #[test]
-    fn digest_matches_rfc2617_md5_reference_vector() {
-        let base_ha1 = digest_with("Mufasa:testrealm@host.com:Circle Of Life", "MD5");
-        assert_eq!(base_ha1, "939e7578ed9e3c518a452acee763bce9");
-        let ha2 = digest_with("GET:/dir/index.html", "MD5");
-        assert_eq!(ha2, "39aff3a2bab6126f332b942af96d3366");
-        let response = digest_response_value(
-            &base_ha1,
-            false,
-            "dcd98b7102dd2f0e8b11d0f600bfb0c093",
-            "00000001",
-            "0a4f113b",
-            Some("auth"),
-            &ha2,
-            "MD5",
-        );
-        assert_eq!(
-            response, "6629fae49393a05397450978507c4ef1",
-            "RFC 2617 §3.5 published response"
-        );
-    }
-
-    /// Backlog line 210: RFC 7616 §3.9.1 reference vectors (MD5 + SHA-256).
-    /// Realm http-auth@example.org, password "Circle of Life", nonce
-    /// 7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v, uri /dir/index.html,
-    /// nc=00000001, cnonce f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ.
-    /// Both published responses were re-derived with openssl.
-    #[test]
-    fn digest_matches_rfc7616_reference_vectors() {
-        // NOTE: RFC 7616 spells the password "Circle of Life" (lowercase o)
-        // while RFC 2617 uses "Circle Of Life" — the two RFCs genuinely
-        // differ; keep each test faithful to its own source.
-        let base_ha1 = digest_with("Mufasa:http-auth@example.org:Circle of Life", "MD5");
-        let ha2 = digest_with("GET:/dir/index.html", "MD5");
-        assert_eq!(
-            digest_response_value(
-                &base_ha1,
-                false,
-                "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
-                "00000001",
-                "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
-                Some("auth"),
-                &ha2,
-                "MD5",
-            ),
-            "8ca523f5e9506fed4657c9700eebdbec",
-            "RFC 7616 §3.9.1 published MD5 response"
-        );
-
-        let base_ha1 = digest_with("Mufasa:http-auth@example.org:Circle of Life", "SHA-256");
-        let ha2 = digest_with("GET:/dir/index.html", "SHA-256");
-        assert_eq!(
-            digest_response_value(
-                &base_ha1,
-                false,
-                "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
-                "00000001",
-                "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
-                Some("auth"),
-                &ha2,
-                "SHA-256",
-            ),
-            "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1",
-            "RFC 7616 §3.9.1 published SHA-256 response"
-        );
-    }
-
     #[test]
     fn digest_no_qop_form() {
         let www = r#"Digest realm="x", nonce="abc123", algorithm=MD5"#;
@@ -2667,55 +2456,5 @@ mod tests {
             .unwrap();
         assert!(h3.contains("nonce=\"nonce-b\""));
         assert!(h3.contains("nc=00000001"), "rotated nonce resets nc: {h3}");
-    }
-
-    #[test]
-    fn rfc_7616_a2_sha256_published_vector() {
-        // TR-409: RFC 7616 Appendix A.2 — the SHA-256 example with known
-        // inputs and a published response. This test verifies that the digest
-        // signer's response computation matches the RFC's published value.
-        //
-        // The cnonce is random in the signer, but `digest_response_value`
-        // accepts it as a parameter — inject the RFC's cnonce to reproduce
-        // the exact published response.
-        let base_ha1 = digest_with("Mufasa:http-auth@example.org:Circle of Life", "SHA-256");
-        assert!(!base_ha1.is_empty(), "HA1 must compute");
-
-        let ha2 = digest_with("GET:/dir/index.html", "SHA-256");
-        assert!(!ha2.is_empty(), "HA2 must compute");
-
-        let response = digest_response_value(
-            &base_ha1,
-            false,
-            "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
-            "00000001",
-            "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
-            Some("auth"),
-            &ha2,
-            "SHA-256",
-        );
-
-        // RFC 7616 A.2 published response value (SHA-256, qop=auth).
-        let expected = "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1";
-        assert_eq!(response, expected, "RFC 7616 A.2 SHA-256 vector mismatch");
-
-        // RFC 7616 A.2 also lists the MD5 response for the SAME inputs
-        // (the server offered both SHA-256 and MD5 challenges).
-        let md5_ha1 = digest_with("Mufasa:http-auth@example.org:Circle of Life", "MD5");
-        let md5_ha2 = digest_with("GET:/dir/index.html", "MD5");
-        let md5_response = digest_response_value(
-            &md5_ha1,
-            false,
-            "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
-            "00000001",
-            "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
-            Some("auth"),
-            &md5_ha2,
-            "MD5",
-        );
-        assert_eq!(
-            md5_response, "8ca523f5e9506fed4657c9700eebdbec",
-            "RFC 7616 A.2 MD5 vector mismatch"
-        );
     }
 }

@@ -152,6 +152,27 @@ fn qop_offers_auth(qop: Option<&str>) -> bool {
     qop.is_some_and(|q| q.split(',').any(|part| part.trim() == "auth"))
 }
 
+/// RFC 7616 §3.4.1 field quoting.
+///
+/// `qop`, `nc` and `algorithm` are `token` productions and MUST NOT be quoted
+/// — strict servers reject `qop="auth"`. Everything else is a `quoted-string`
+/// and MUST be.
+///
+/// The escaping is a SECURITY fix, not cosmetic: a username containing `"`, or
+/// one ending in `\`, otherwise breaks out of the quoted string and injects
+/// directives — reachable from a CSV data file driving a run. Stripping the
+/// quotes instead (the older behaviour) silently corrupted the credential:
+/// `ab"c` was signed as `abc`.
+fn digest_field(key: &str, value: &str) -> String {
+    match key {
+        "qop" | "nc" | "algorithm" => format!("{key}={value}"),
+        _ => format!(
+            "{key}=\"{}\"",
+            value.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+    }
+}
+
 /// Build the `Authorization: Digest …` header for a challenge.
 ///
 /// Covers MD5, SHA-256 and SHA-512-256, each with and without `-sess`. Bruno
@@ -167,6 +188,9 @@ fn qop_offers_auth(qop: Option<&str>) -> bool {
 ///   3. no usable `qop` but a `-sess` algorithm — RFC 7616 §3.4.4 still
 ///      requires a cnonce (it is folded into HA1), so it is emitted even
 ///      though `nc` is not.
+///
+/// Field ORDER matches `signers.rs`'s long-standing output byte for byte, so
+/// that delegating to this function is not observable on the wire.
 pub fn digest_build_authorization(p: &DigestBuildParams<'_>) -> HeaderOut {
     let algorithm = p
         .algorithm
@@ -183,31 +207,39 @@ pub fn digest_build_authorization(p: &DigestBuildParams<'_>) -> HeaderOut {
     };
     let response = digest_response_value(&effective, &algorithm);
 
-    let mut parts = vec![
-        format!("username=\"{}\"", p.username),
-        format!("realm=\"{}\"", p.realm),
-        format!("nonce=\"{}\"", p.nonce),
-        format!("uri=\"{}\"", p.uri),
-        format!("response=\"{}\"", response),
+    let mut fields: Vec<(&str, String)> = vec![
+        ("username", p.username.to_string()),
+        ("realm", p.realm.to_string()),
+        ("nonce", p.nonce.to_string()),
+        ("uri", p.uri.to_string()),
     ];
-    // Only echo `algorithm` when the server named one (see DigestBuildParams).
-    if p.algorithm.is_some() {
-        parts.push(format!("algorithm={algorithm}"));
-    }
     if use_qop {
-        parts.push("qop=auth".to_string());
-        parts.push(format!("nc={:08x}", p.nc));
-        parts.push(format!("cnonce=\"{}\"", p.cnonce));
+        fields.push(("qop", "auth".to_string()));
+        fields.push(("nc", format!("{:08x}", p.nc)));
+        fields.push(("cnonce", p.cnonce.to_string()));
     } else if is_sess {
         // Case 3: no nc, but the cnonce is load-bearing for HA1.
-        parts.push(format!("cnonce=\"{}\"", p.cnonce));
+        fields.push(("cnonce", p.cnonce.to_string()));
+    }
+    fields.push(("response", response));
+    // Only echo `algorithm` when the server named one (see DigestBuildParams).
+    if p.algorithm.is_some() {
+        fields.push(("algorithm", algorithm));
     }
     if let Some(opaque) = p.opaque {
-        parts.push(format!("opaque=\"{opaque}\""));
+        fields.push(("opaque", opaque.to_string()));
     }
+
     HeaderOut {
         name: "Authorization".to_string(),
-        value: format!("Digest {}", parts.join(", ")),
+        value: format!(
+            "Digest {}",
+            fields
+                .iter()
+                .map(|(k, v)| digest_field(k, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -335,6 +367,123 @@ mod tests {
                 .to_string()
         };
         assert_eq!(resp(&auth_int), resp(&no_qop));
+    }
+
+    #[test]
+    fn rfc_7616_published_vectors_md5_and_sha256() {
+        // Moved here from `signers.rs` with the delegation (TR-424): the
+        // computation lives here now, so its published vectors do too.
+        //
+        // NOTE: RFC 7616 spells the password "Circle of Life" (lowercase o)
+        // while RFC 2617 uses "Circle Of Life". The two RFCs genuinely
+        // differ — keep each test faithful to its own source.
+        let vector = |algorithm: &'static str| DigestBuildParams {
+            username: "Mufasa",
+            password: "Circle of Life",
+            method: "GET",
+            uri: "/dir/index.html",
+            realm: "http-auth@example.org",
+            nonce: "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
+            nc: 1,
+            cnonce: "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+            qop: Some("auth"),
+            algorithm: Some(algorithm),
+            opaque: None,
+        };
+
+        assert_eq!(
+            digest_response_value(&vector("MD5"), "MD5"),
+            "8ca523f5e9506fed4657c9700eebdbec",
+            "RFC 7616 §3.9.1 published MD5 response"
+        );
+        assert_eq!(
+            digest_response_value(&vector("SHA-256"), "SHA-256"),
+            "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1",
+            "RFC 7616 §3.9.1 published SHA-256 response"
+        );
+    }
+
+    #[test]
+    fn ha1_and_ha2_match_the_published_intermediates() {
+        // The RFC publishes the intermediates too. Asserting them separately
+        // means a failure says WHICH half is wrong, instead of only that the
+        // final response differs.
+        assert_eq!(
+            digest_with("Mufasa:testrealm@host.com:Circle Of Life", "MD5"),
+            "939e7578ed9e3c518a452acee763bce9",
+            "RFC 2617 §3.5 HA1"
+        );
+        assert_eq!(
+            digest_with("GET:/dir/index.html", "MD5"),
+            "39aff3a2bab6126f332b942af96d3366",
+            "RFC 2617 §3.5 HA2"
+        );
+    }
+
+    #[test]
+    fn quoted_string_values_are_escaped_not_stripped() {
+        // SECURITY, not cosmetics. A username ending in a backslash otherwise
+        // terminates the quoted-string early and the rest of the header is
+        // read as directives — reachable from a CSV data file driving a run.
+        // Stripping the quotes instead (the behaviour before P2 line 180)
+        // silently signed a DIFFERENT credential: `ab"c` became `abc`.
+        let mut p = params(Some("MD5"), Some("auth"));
+        p.username = r#"ab"c"#;
+        let out = digest_build_authorization(&p);
+        assert!(
+            out.value.contains(r#"username="ab\"c""#),
+            "quote must be escaped, not stripped: {}",
+            out.value
+        );
+
+        p.username = r"trailing\";
+        let out = digest_build_authorization(&p);
+        assert!(
+            out.value.contains(r#"username="trailing\\""#),
+            "backslash must be escaped so it cannot break out: {}",
+            out.value
+        );
+    }
+
+    #[test]
+    fn token_fields_are_unquoted_and_the_rest_are_quoted() {
+        // RFC 7616 §3.4.1: qop/nc/algorithm are `token`, and strict servers
+        // reject `qop="auth"`. Everything else is `quoted-string`.
+        let out = digest_build_authorization(&params(Some("MD5"), Some("auth"))).value;
+        assert!(out.contains("qop=auth,"), "{out}");
+        assert!(out.contains("nc=00000001,"), "{out}");
+        assert!(out.contains("algorithm=MD5"), "{out}");
+        assert!(out.contains(r#"realm="testrealm@host.com""#), "{out}");
+        assert!(out.contains(r#"cnonce="0a4f113b""#), "{out}");
+    }
+
+    #[test]
+    fn field_order_is_the_wire_order() {
+        // Pinned because `signers.rs` delegates here: a reordering would be
+        // observable on the wire even though every field is still present.
+        let out = digest_build_authorization(&params(Some("MD5"), Some("auth"))).value;
+        let order: Vec<&str> = [
+            "username",
+            "realm",
+            "nonce",
+            "uri",
+            "qop",
+            "nc",
+            "cnonce",
+            "response",
+            "algorithm",
+            "opaque",
+        ]
+        .into_iter()
+        .filter(|k| out.contains(&format!("{k}=")))
+        .collect();
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|k| out.find(&format!("{k}=")).unwrap())
+            .collect();
+        let mut sorted = positions.clone();
+        sorted.sort_unstable();
+        assert_eq!(positions, sorted, "fields out of wire order: {out}");
     }
 
     #[test]
