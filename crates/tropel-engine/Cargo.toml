@@ -20,6 +20,10 @@ tropel-metrics.workspace = true
 tropel-ext.workspace = true
 tropel-http.workspace = true
 tropel-variables.workspace = true
+# TR-445: the agent exposes the AUTH BUILDERS so the desktop tier does not
+# have to re-implement signing in TypeScript (knockport invariant #3).
+tropel-auth = { workspace = true, default-features = false }
+base64.workspace = true
 tropel-collection.workspace = true
 tropel-js.workspace = true
 # P5b: sandbox's send-request is no longer a default feature (workspace

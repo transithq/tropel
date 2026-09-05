@@ -124,56 +124,11 @@ fn resolve_template_inner(
         serde_json::from_str(vars_json).map_err(|e| {
             format!("resolveTemplate: vars must be a flat JSON object of string values ({e})")
         })?;
-
-    let scope = VariableScope {
-        env,
-        ..Default::default()
-    };
-    let resolver = VariableResolver::new();
-
-    Ok(match (mode, deep) {
-        ("plain", false) => resolver.resolve(input, &scope),
-        ("plain", true) => resolver.resolve_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES),
-        ("json", false) => resolver.resolve_json(input, &scope),
-        ("json", true) => resolver.resolve_json_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES),
-        ("url", false) => resolver.resolve_url(input, &scope),
-        ("url", true) => resolver.resolve_url_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES),
-        // Named refusal rather than a silent fallback to "plain": picking the
-        // wrong escaper is exactly how a quote-bearing value corrupts a JSON
-        // body, so a typo in the mode must fail loudly.
-        (other, _) => {
-            return Err(format!(
-                "resolveTemplate: unknown mode {other:?} — expected \"plain\", \"json\" or \"url\""
-            ))
-        }
-    })
-}
-
-/// `resolveTemplate`, plus WHY resolution stopped — as a JSON string:
-/// `{"value": "...", "hitCap": bool, "unresolved": ["name", …]}`.
-///
-/// The distinction matters and only the resolver's loop can make it. A chain
-/// that never settles (`a` → `b` → `a`) and an unknown name BOTH leave a
-/// literal `{{…}}` in the output, but they deserve opposite treatment: the
-/// first is a config error worth failing loudly with the chain named, the
-/// second must stay a visible literal and send.
-///
-/// - `hitCap` — the pass budget ran out while the text was still CHANGING.
-///   That is a cycle; an unknown name stabilizes on the first pass.
-/// - `unresolved` — placeholder names still present, first-occurrence order,
-///   read with the SAME regex that drives resolution, so an embedder cannot
-///   disagree about what counts as a placeholder.
-///
-/// Exists so an embedder keeps its loud, chain-naming error WITHOUT growing a
-/// second cycle detector — which is how the grammar diverged the first time.
-#[wasm_bindgen(js_name = "resolveTemplateDetailed")]
-pub fn resolve_template_detailed(
-    input: &str,
-    vars_json: &str,
-    mode: &str,
-) -> Result<String, wasm_bindgen::JsValue> {
-    resolve_template_detailed_inner(input, vars_json, mode)
-        .map_err(|msg| wasm_bindgen::JsValue::from_str(&msg))
+    // TR-445: the mode/deep matrix moved to `tropel-variables` so the loopback
+    // agent can apply the SAME escaping choice. Picking the wrong escaper is
+    // how a quote-bearing value corrupts a JSON body, so a second copy of this
+    // dispatch would be a data-corruption bug waiting to happen.
+    tropel_variables::resolve_template_for_host(input, &env, mode, deep)
 }
 
 fn resolve_template_detailed_inner(
