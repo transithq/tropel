@@ -1967,7 +1967,10 @@ mod tests {
         let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
         let item = &parsed["items"][0];
-        assert!(item["value"].is_null(), "a refused item carries no value: {body}");
+        assert!(
+            item["value"].is_null(),
+            "a refused item carries no value: {body}"
+        );
         assert!(
             item["error"]
                 .as_str()
