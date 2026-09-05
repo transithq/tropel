@@ -289,6 +289,18 @@ pub enum Commands {
         /// Bind address (default 127.0.0.1). Anything non-loopback is refused.
         #[arg(long = "bind", default_value = "127.0.0.1")]
         bind: String,
+
+        /// Browser origin allowed to reach this agent, e.g.
+        /// `--allow-origin https://app.knockport.dev`. Repeatable.
+        ///
+        /// TR-459: an ALLOWLIST, and empty by default, so a browser cannot
+        /// reach the agent at all unless a human names the page. The agent
+        /// holds collection variables and OAuth client secrets and will
+        /// execute any request handed to it — `*` would let any tab the user
+        /// has open drive it, and the token is no defence because a browser
+        /// attaches it automatically once CORS permits the call.
+        #[arg(long = "allow-origin")]
+        allow_origin: Vec<String>,
     },
 }
 
@@ -375,9 +387,12 @@ pub async fn run_cli() -> Result<()> {
         }
         Commands::Version => print_version(),
         Commands::New { output } => crate::cli_commands::new_command(&output),
-        Commands::Agent { port, token, bind } => {
-            crate::agent::run_agent(port, bind.as_str(), token.as_deref()).await
-        }
+        Commands::Agent {
+            port,
+            token,
+            bind,
+            allow_origin,
+        } => crate::agent::run_agent(port, bind.as_str(), token.as_deref(), &allow_origin).await,
     }
 }
 

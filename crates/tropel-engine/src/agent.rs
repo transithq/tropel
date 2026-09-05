@@ -31,12 +31,58 @@ const RATE_LIMIT_PER_SEC: u64 = 200;
 struct AgentState {
     token: Option<String>,
     client: tropel_http::HttpClient,
+    /// Origins allowed to reach this agent from a browser (TR-459).
+    ///
+    /// An ALLOWLIST, never `*`, and empty by default. The agent holds
+    /// collection variables and OAuth client secrets and will execute any
+    /// request it is handed — so echoing an arbitrary `Origin` would let any
+    /// page the user happens to have open drive their local agent. The token
+    /// is not a substitute: a browser attaches it automatically once CORS
+    /// permits the call.
+    allowed_origins: Vec<String>,
+}
+
+/// CORS headers for a request carrying `origin`, or `None` when the browser
+/// must not be told it may proceed.
+///
+/// TR-459: KT-402 (the website talking to a local agent) needs two things that
+/// are easy to get almost-right:
+///
+///   1. `http://localhost` is a *potentially trustworthy* origin per W3C
+///      secure-contexts, so an HTTPS page may fetch it without mixed-content
+///      blocking. That part is the browser's doing and needs nothing here.
+///   2. Chrome additionally requires PRIVATE NETWORK ACCESS: a preflight
+///      carrying `Access-Control-Request-Private-Network: true` must be
+///      answered with `Access-Control-Allow-Private-Network: true`. Omit it
+///      and this works everywhere except Chrome — the horrible-to-find-late
+///      bug the plan calls out by name.
+fn cors_headers(state: &AgentState, origin: Option<&str>, is_preflight: bool) -> Option<String> {
+    let origin = origin?;
+    if !state.allowed_origins.iter().any(|o| o == origin) {
+        return None;
+    }
+    let mut h = format!("Access-Control-Allow-Origin: {origin}\r\n");
+    // The allowlist is per-origin, so caches must key on it.
+    h.push_str("Vary: Origin\r\n");
+    // The token rides as a header, not a cookie, so credentials stay off —
+    // turning them on would let a page reuse the user's ambient session.
+    if is_preflight {
+        h.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+        h.push_str("Access-Control-Allow-Headers: Authorization, Content-Type\r\n");
+        h.push_str("Access-Control-Max-Age: 600\r\n");
+    }
+    Some(h)
 }
 
 /// Start the agent server. Refuses a non-loopback bind address (the register:
 /// "Refuses to start with an obviously-wrong bind address rather than exposing
 /// an execution endpoint to the network").
-pub async fn run_agent(port: u16, bind: &str, token: Option<&str>) -> tropel_sdk::Result<()> {
+pub async fn run_agent(
+    port: u16,
+    bind: &str,
+    token: Option<&str>,
+    allowed_origins: &[String],
+) -> tropel_sdk::Result<()> {
     let ip: IpAddr = bind
         .parse()
         .map_err(|_| TropelError::Other(format!("invalid bind address: {bind}")))?;
@@ -59,6 +105,7 @@ pub async fn run_agent(port: u16, bind: &str, token: Option<&str>) -> tropel_sdk
     let state = Arc::new(AgentState {
         token: token.map(str::to_string),
         client,
+        allowed_origins: allowed_origins.to_vec(),
     });
 
     loop {
@@ -111,6 +158,8 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
     let path = parts.next().unwrap_or("/");
     let mut content_length = 0usize;
     let mut auth_header = String::new();
+    let mut origin: Option<String> = None;
+    let mut wants_private_network = false;
     for line in lines {
         if line.is_empty() {
             break;
@@ -121,8 +170,44 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 content_length = v.trim().parse().unwrap_or(0);
             } else if key == "authorization" {
                 auth_header = v.trim().to_string();
+            } else if key == "origin" {
+                origin = Some(v.trim().to_string());
+            } else if key == "access-control-request-private-network" {
+                wants_private_network = v.trim().eq_ignore_ascii_case("true");
             }
         }
+    }
+
+    let cors = cors_headers(&state, origin.as_deref(), false);
+
+    // TR-459: the CORS preflight, answered BEFORE the auth check — a browser
+    // never sends `Authorization` on a preflight, so requiring the token here
+    // would refuse every cross-origin call the allowlist was meant to permit.
+    if method == "OPTIONS" {
+        let Some(mut headers) = cors_headers(&state, origin.as_deref(), true) else {
+            // Named, not a bare 403. "The agent is not running" and "the agent
+            // is running and does not trust this page" are different problems
+            // and the page can only tell them apart if we say so.
+            return respond(
+                sock,
+                403,
+                &error_body(&format!(
+                    "origin {:?} is not allowed to reach this agent \u{2014} start it with --allow-origin {}",
+                    origin.as_deref().unwrap_or("(none)"),
+                    origin.as_deref().unwrap_or("<origin>")
+                )),
+            )
+            .await;
+        };
+        // Chrome's Private Network Access. A public page reaching 127.0.0.1
+        // gets a preflight carrying `Access-Control-Request-Private-Network`,
+        // and it must be answered explicitly. Answered only when ASKED, so
+        // the header never appears on a same-origin or non-Chrome preflight
+        // that did not request it.
+        if wants_private_network {
+            headers.push_str("Access-Control-Allow-Private-Network: true\r\n");
+        }
+        return respond_raw(sock, 204, "", Some(&headers)).await;
     }
 
     if let Some(expected) = &state.token {
@@ -849,16 +934,33 @@ fn threshold_verdict(
 }
 
 async fn respond(sock: &mut TcpStream, status: u16, body: &str) -> tropel_sdk::Result<()> {
+    respond_raw(sock, status, body, None).await
+}
+
+/// `respond`, plus any extra headers the caller needs on the wire.
+///
+/// TR-459: the CORS headers have to go on the ACTUAL response, not only on the
+/// preflight — a browser that gets a clean preflight and then a reply with no
+/// `Access-Control-Allow-Origin` still refuses to hand the body to the page.
+async fn respond_raw(
+    sock: &mut TcpStream,
+    status: u16,
+    body: &str,
+    extra_headers: Option<&str>,
+) -> tropel_sdk::Result<()> {
     let status_text = match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         429 => "Too Many Requests",
         _ => "Error",
     };
+    let extra = extra_headers.unwrap_or("");
     let resp = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
         body.len()
     );
     sock.write_all(resp.as_bytes())
@@ -1503,6 +1605,9 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+            // No browser origin: these drive the socket directly, and an
+            // empty allowlist is the default a real agent starts with.
+            allowed_origins: vec![],
         });
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -1754,6 +1859,9 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+            // No browser origin: these drive the socket directly, and an
+            // empty allowlist is the default a real agent starts with.
+            allowed_origins: vec![],
         });
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -1838,6 +1946,160 @@ mod tests {
         }
     }
 
+    /// TR-459 — the CORS + Private Network Access preflight (KT-402).
+    ///
+    /// Driven over a real socket because the failure this guards is a HEADER
+    /// that is absent, and a unit test on the builder would pass while the
+    /// router never called it.
+    #[tokio::test]
+    async fn the_preflight_answers_cors_and_private_network_for_allowed_origins() {
+        async fn agent_with(origins: Vec<String>) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let state = Arc::new(AgentState {
+                token: Some("s3cret".into()),
+                client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
+                    .expect("http client"),
+                allowed_origins: origins,
+            });
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_connection(&mut sock, st).await;
+                    });
+                }
+            });
+            port
+        }
+
+        async fn preflight(port: u16, origin: &str, ask_pna: bool) -> String {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let pna = if ask_pna {
+                "Access-Control-Request-Private-Network: true\r\n"
+            } else {
+                ""
+            };
+            let req = format!(
+                "OPTIONS /resolve/batch HTTP/1.1\r\nHost: localhost\r\nOrigin: {origin}\r\n\
+                 Access-Control-Request-Method: POST\r\n{pna}\r\n"
+            );
+            s.write_all(req.as_bytes()).await.expect("write");
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.expect("read");
+            String::from_utf8_lossy(&out).to_string()
+        }
+
+        let allowed = "https://app.knockport.dev";
+        let port = agent_with(vec![allowed.to_string()]).await;
+
+        // THE Chrome-only bug this exists to prevent. Everything works in
+        // Firefox and Safari without this header; Chrome refuses a public
+        // page's request to 127.0.0.1 unless the preflight says so.
+        let raw = preflight(port, allowed, true).await;
+        assert!(raw.starts_with("HTTP/1.1 204"), "{raw}");
+        assert!(
+            raw.contains("Access-Control-Allow-Private-Network: true"),
+            "Chrome's PNA preflight must be answered or this breaks in Chrome ONLY: {raw}"
+        );
+        assert!(
+            raw.contains(&format!("Access-Control-Allow-Origin: {allowed}")),
+            "{raw}"
+        );
+        // Cached per-origin, so a proxy cannot serve one origin's answer to
+        // another.
+        assert!(raw.contains("Vary: Origin"), "{raw}");
+
+        // The PNA header appears only when ASKED — a browser that did not
+        // request private-network access should not be handed the grant.
+        let raw = preflight(port, allowed, false).await;
+        assert!(raw.starts_with("HTTP/1.1 204"), "{raw}");
+        assert!(
+            !raw.contains("Access-Control-Allow-Private-Network"),
+            "the grant must not be volunteered: {raw}"
+        );
+
+        // An origin nobody allowed is REFUSED BY NAME. "The agent is not
+        // running" and "the agent is running and does not trust this page"
+        // are different problems, and a page can only tell them apart if the
+        // reply says which.
+        let raw = preflight(port, "https://evil.test", true).await;
+        assert!(raw.starts_with("HTTP/1.1 403"), "{raw}");
+        assert!(
+            raw.contains("--allow-origin"),
+            "the refusal must say how to fix it: {raw}"
+        );
+        assert!(
+            !raw.contains("Access-Control-Allow-Origin"),
+            "a refused origin must NOT be handed a grant: {raw}"
+        );
+
+        // Default is deny: an agent started without --allow-origin is not
+        // reachable from any page at all.
+        let closed = agent_with(vec![]).await;
+        let raw = preflight(closed, allowed, true).await;
+        assert!(raw.starts_with("HTTP/1.1 403"), "{raw}");
+    }
+
+    /// TR-459 — the preflight is answered BEFORE the token check.
+    ///
+    /// A browser never sends `Authorization` on a preflight. Requiring the
+    /// token there would 401 every cross-origin call, and the page would see
+    /// a CORS error rather than an auth one — the wrong problem to debug.
+    #[tokio::test]
+    async fn the_preflight_does_not_require_the_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state = Arc::new(AgentState {
+            token: Some("s3cret".into()),
+            client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client"),
+            allowed_origins: vec!["https://app.knockport.dev".into()],
+        });
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(&mut sock, st).await;
+                });
+            }
+        });
+
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // No Authorization header, exactly as a browser sends it.
+        s.write_all(
+            b"OPTIONS /resolve HTTP/1.1\r\nHost: localhost\r\nOrigin: https://app.knockport.dev\r\n\r\n",
+        )
+        .await
+        .expect("write");
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.expect("read");
+        let raw = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            raw.starts_with("HTTP/1.1 204"),
+            "a preflight must not be 401'd: {raw}"
+        );
+
+        // But a REAL request still needs the token — the preflight carve-out
+        // must not become an auth hole.
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        s.write_all(
+            b"GET /version HTTP/1.1\r\nHost: localhost\r\nOrigin: https://app.knockport.dev\r\n\r\n",
+        )
+        .await
+        .expect("write");
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.expect("read");
+        let raw = String::from_utf8_lossy(&out).to_string();
+        assert!(raw.starts_with("HTTP/1.1 401"), "{raw}");
+    }
+
     /// TR-445: `/auth/sign`, over the socket.
     ///
     /// This is the endpoint that lets knockport's DESKTOP tier stop throwing
@@ -1853,6 +2115,9 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+            // No browser origin: these drive the socket directly, and an
+            // empty allowlist is the default a real agent starts with.
+            allowed_origins: vec![],
         });
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -1987,6 +2252,9 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+            // No browser origin: these drive the socket directly, and an
+            // empty allowlist is the default a real agent starts with.
+            allowed_origins: vec![],
         });
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -2087,6 +2355,9 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+            // No browser origin: these drive the socket directly, and an
+            // empty allowlist is the default a real agent starts with.
+            allowed_origins: vec![],
         });
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -2183,6 +2454,9 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
+            // No browser origin: these drive the socket directly, and an
+            // empty allowlist is the default a real agent starts with.
+            allowed_origins: vec![],
         });
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
