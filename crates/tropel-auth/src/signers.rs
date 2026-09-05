@@ -13,7 +13,6 @@
 use base64::Engine;
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -34,13 +33,6 @@ static SIGNING_KEY_CACHE: std::sync::OnceLock<
 fn signing_key_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>> {
     SIGNING_KEY_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
-
-/// RFC 3986 unreserved characters: `A-Z a-z 0-9 - . _ ~` stay unencoded.
-const UNRESERVED: AsciiSet = NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -257,7 +249,7 @@ impl AwsSigV4Auth {
         let service = self
             .service
             .clone()
-            .unwrap_or_else(|| default_service(url.host_str().unwrap_or("")));
+            .unwrap_or_else(|| crate::builders::default_service(url.host_str().unwrap_or("")));
 
         // Payload hash — body is always buffered by tropel, but fall back to
         // UNSIGNED-PAYLOAD for streaming bodies (body is None or not
@@ -270,10 +262,10 @@ impl AwsSigV4Auth {
         // …), which sign the single-encoded path exactly as sent. The rule is
         // service-dependent, so it stays here with the service derivation and
         // the builder takes the result.
-        let canonical_uri = sigv4_canonical_uri(url.path(), &service);
+        let canonical_uri = crate::builders::sigv4_canonical_uri(url.path(), &service);
         // Backlog line 240: s3-control's signing name is "s3", not
         // "s3-control" — botocore's own model says signingName = "s3".
-        let sn = signing_name(&service);
+        let sn = crate::builders::signing_name(&service);
         // Cached HERE, not in the builder: the key changes only at UTC
         // midnight so this saves four chained HMACs per request, and a browser
         // embedder signing one request at a time gains nothing from a global
@@ -344,62 +336,6 @@ impl AuthSigner for AwsSigV4Auth {
 /// (S3 bucket, API Gateway ID, OpenSearch domain, …) precedes the service
 /// label. For these, `host.split('.').next()` returns the TENANT — the
 /// signing service is a later label (examplebucket.s3.amazonaws.com → s3).
-const VIRTUAL_HOSTED_SERVICE_LABELS: &[&str] = &[
-    "s3",
-    "s3-control",
-    "s3-object-lambda",
-    "s3-outposts",
-    "s3express",
-    "execute-api",
-    "es",
-    "aoss",
-    "cloudsearch",
-];
-
-fn default_service(host: &str) -> String {
-    // Virtual-hosted AWS endpoints put the tenant BEFORE the service label
-    // (examplebucket.s3.amazonaws.com, {api-id}.execute-api.{region}.
-    // amazonaws.com, {domain}.{region}.es.amazonaws.com), so the first DNS
-    // label is NOT the signing service (backlog line 60: the old code derived
-    // `examplebucket` / `abc` / `search-x`, breaking the scope, the signing
-    // key, and is_s3_family → double-encoded S3 path → 403 on everything).
-    // For *.amazonaws.com hosts, scan labels RIGHT-TO-LEFT for a known
-    // virtual-hosted service: the service label sits closest to the
-    // amazonaws suffix, so this is also collision-robust when a tenant
-    // happens to BE a service name (es.s3.amazonaws.com → s3, not es). The
-    // S3 website/fips endpoints (bucket.s3-website-{region}…,
-    // s3-fips…amazonaws.com) still sign as s3. Everything else keeps the
-    // first-label rule (s3.us-west-2.amazonaws.com → s3; non-AWS hosts keep
-    // their first label).
-    let is_aws = host.ends_with(".amazonaws.com")
-        || host.ends_with(".amazonaws.com.cn")
-        || host == "amazonaws.com";
-    if is_aws {
-        for label in host.split('.').rev() {
-            if label == "amazonaws" || label == "com" || label == "cn" {
-                continue;
-            }
-            if VIRTUAL_HOSTED_SERVICE_LABELS.contains(&label) {
-                return label.to_string();
-            }
-            if label.starts_with("s3-website-") || label == "s3-fips" {
-                return "s3".to_string();
-            }
-        }
-    }
-    host.split('.').next().unwrap_or(host).to_string()
-}
-
-/// Map a service name to its SigV4 signing name. Most services sign with
-/// their own name, but AWS S3 Control uses `s3` as the signing name despite
-/// the endpoint prefix being `s3-control` (backlog line 240).
-fn signing_name(service: &str) -> &str {
-    match service {
-        "s3-control" | "s3control" => "s3",
-        other => other,
-    }
-}
-
 fn canonical_host(url: &reqwest::Url) -> String {
     let host = bracket_host(url.host_str().unwrap_or(""));
     match url.port() {
@@ -449,57 +385,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
         <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
-}
-
-/// RFC 3986 percent-encode (unreserved chars pass through).
-fn enc(s: &str) -> String {
-    utf8_percent_encode(s, &UNRESERVED).to_string()
-}
-
-/// Canonical URI for SigV4.
-///
-/// AWS requires DOUBLE URI-encoding of the absolute path for every service
-/// EXCEPT the S3 family (s3, s3control, s3-object-lambda, s3-outposts,
-/// s3express), which sign the single-encoded path exactly as sent. The `url`
-/// crate already single-encodes `Url::path()` with the RFC 3986 unreserved
-/// rules, so re-encoding each segment yields the required second encoding
-/// for non-S3 services (`%` is not unreserved → `%25`). Empty segments
-/// (leading/trailing slash, `//`) are preserved; an empty path becomes `/`.
-fn sigv4_canonical_uri(path: &str, service: &str) -> String {
-    if is_s3_family(service) {
-        return if path.is_empty() {
-            "/".to_string()
-        } else {
-            path.to_string()
-        };
-    }
-    if path.is_empty() {
-        return "/".to_string();
-    }
-    // Backlog line 240: normalize consecutive slashes — AWS's official
-    // test suite expects //prod/users → /prod/users. Without this, the
-    // classic base-URL-ends-in-/ join produces a double-slash that fails
-    // signature verification with a 403.
-    // TR-603: single replace("//","/") only handles pairs; use a loop
-    // for runs of 3+ consecutive slashes.
-    let mut normalized = path.to_string();
-    while normalized.contains("//") {
-        normalized = normalized.replace("//", "/");
-    }
-    let encoded: Vec<String> = normalized.split('/').map(enc).collect();
-    encoded.join("/")
-}
-
-/// True for the S3 family of services, which sign the single-encoded path.
-///
-/// Matches both spellings of S3 Control's signing name ("s3-control" is what
-/// `default_service` derives from `s3-control.<region>.amazonaws.com`; some
-/// tools emit the un-hyphenated "s3control").
-fn is_s3_family(service: &str) -> bool {
-    matches!(
-        service,
-        "s3" | "s3control" | "s3-control" | "s3-object-lambda" | "s3-outposts" | "s3express"
-    )
 }
 
 // ─────────────────────────── OAuth1 (RFC 5849) ───────────────────────────
@@ -1246,41 +1131,6 @@ mod tests {
     }
 
     #[test]
-    fn sigv4_default_service_derives_virtual_hosted_endpoints() {
-        // Regression (backlog line 60): default_service took the FIRST DNS
-        // label, so virtual-hosted endpoints derived the TENANT as the
-        // signing service (examplebucket / abc / search-x) — wrong scope,
-        // wrong signing key, and for S3 a false is_s3_family → double-encoded
-        // path (403 on every virtual-hosted-S3 and API-Gateway request).
-        assert_eq!(default_service("s3.us-west-2.amazonaws.com"), "s3");
-        assert_eq!(default_service("examplebucket.s3.amazonaws.com"), "s3");
-        assert_eq!(
-            default_service("examplebucket.s3.us-west-2.amazonaws.com"),
-            "s3"
-        );
-        assert_eq!(
-            default_service("mybucket.s3-website-us-west-2.amazonaws.com"),
-            "s3"
-        );
-        assert_eq!(default_service("s3-fips.us-west-2.amazonaws.com"), "s3");
-        // Collision-robustness: a tenant that IS a service name must not win
-        // over the real (suffix-closest) service label.
-        assert_eq!(default_service("es.s3.amazonaws.com"), "s3");
-        assert_eq!(
-            default_service("abc123.execute-api.us-east-1.amazonaws.com"),
-            "execute-api"
-        );
-        assert_eq!(default_service("search-x.us-east-1.es.amazonaws.com"), "es");
-        // Non-virtual-hosted service: first label IS the service.
-        assert_eq!(
-            default_service("dynamodb.us-east-1.amazonaws.com"),
-            "dynamodb"
-        );
-        // Non-AWS host: first label preserved (unchanged behavior).
-        assert_eq!(default_service("api.example.com"), "api");
-    }
-
-    #[test]
     fn basic_base64s_credentials() {
         let mut req = build_request("GET", "http://example.com/", None);
         BasicAuth::new("user", "pass").sign(&mut req).unwrap();
@@ -1443,31 +1293,40 @@ mod tests {
         // Non-S3 services double URI-encode the path (AWS SigV4 spec); the
         // url crate already single-encodes `path()`, so the canonical URI
         // must re-encode each segment (e.g. `%20` → `%2520`).
-        let canonical = sigv4_canonical_uri("/my%20file%2Fname", "execute-api");
+        let canonical = crate::builders::sigv4_canonical_uri("/my%20file%2Fname", "execute-api");
         assert_eq!(canonical, "/my%2520file%252Fname");
         // The S3 family signs the single-encoded path exactly as sent.
         assert_eq!(
-            sigv4_canonical_uri("/my%20file%2Fname", "s3"),
+            crate::builders::sigv4_canonical_uri("/my%20file%2Fname", "s3"),
             "/my%20file%2Fname"
         );
         assert_eq!(
-            sigv4_canonical_uri("/my%20file%2Fname", "s3-object-lambda"),
+            crate::builders::sigv4_canonical_uri("/my%20file%2Fname", "s3-object-lambda"),
             "/my%20file%2Fname"
         );
         // S3 Control's signing name is hyphenated ("s3-control") — must not
         // double-encode either.
         assert_eq!(
-            sigv4_canonical_uri("/my%20file%2Fname", "s3-control"),
+            crate::builders::sigv4_canonical_uri("/my%20file%2Fname", "s3-control"),
             "/my%20file%2Fname"
         );
         // Empty path → "/".
-        assert_eq!(sigv4_canonical_uri("", "execute-api"), "/");
+        assert_eq!(crate::builders::sigv4_canonical_uri("", "execute-api"), "/");
         // Backlog line 240: consecutive slashes are normalized for non-S3
         // services (AWS test suite expects //prod/users → /prod/users).
-        assert_eq!(sigv4_canonical_uri("/a//b/", "execute-api"), "/a/b/");
+        assert_eq!(
+            crate::builders::sigv4_canonical_uri("/a//b/", "execute-api"),
+            "/a/b/"
+        );
         // TR-603: 3+ consecutive slashes must also be normalized.
-        assert_eq!(sigv4_canonical_uri("/a///b/", "execute-api"), "/a/b/");
-        assert_eq!(sigv4_canonical_uri("/a////b/", "execute-api"), "/a/b/");
+        assert_eq!(
+            crate::builders::sigv4_canonical_uri("/a///b/", "execute-api"),
+            "/a/b/"
+        );
+        assert_eq!(
+            crate::builders::sigv4_canonical_uri("/a////b/", "execute-api"),
+            "/a/b/"
+        );
     }
 
     #[test]
