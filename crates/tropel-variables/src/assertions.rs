@@ -515,10 +515,13 @@ impl AssertionTarget {
     }
 
     fn header(&self, name: &str) -> Result<Value, String> {
-        let want = name.trim().to_ascii_lowercase();
+        // TR-455: the same fold the sandbox bridge uses, so `headers.X-Key` in
+        // an assertion and `pm.response.header("X-Key")` in a script cannot
+        // answer differently about the same name.
+        let want = name.trim();
         self.headers
             .iter()
-            .find(|(k, _)| k.to_ascii_lowercase() == want)
+            .find(|(k, _)| crate::headers::header_name_eq(k, want))
             .map(|(_, v)| Value::String(v.clone()))
             .ok_or_else(|| format!("header \"{name}\" was not present on the response"))
     }
