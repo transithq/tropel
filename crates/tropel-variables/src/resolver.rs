@@ -420,6 +420,48 @@ fn next_placeholder(s: &str, from: usize) -> Option<(std::ops::Range<usize>, &st
     None
 }
 
+/// Resolve a template for a HOST embedder — the wasm tier and the loopback
+/// agent both call this.
+///
+/// TR-445: the mode/deep matrix used to live privately in
+/// `tropel-core-wasm`. The agent needed the same behaviour, and copying the
+/// dispatch would have been a second implementation of the ESCAPING choice —
+/// picking the wrong escaper is exactly how a quote-bearing value corrupts a
+/// JSON body, so two copies drifting is a data-corruption bug, not a style
+/// problem. One function, two callers.
+///
+/// An unknown mode is a NAMED error, never a silent fallback to plain.
+pub fn resolve_template_for_host(
+    input: &str,
+    vars: &std::collections::HashMap<String, String>,
+    mode: &str,
+    deep: bool,
+) -> Result<String, String> {
+    let scope = VariableScope {
+        env: vars.clone(),
+        ..Default::default()
+    };
+    let resolver = VariableResolver::new();
+    Ok(match (mode, deep) {
+        ("plain", false) | ("none", false) => resolver.resolve(input, &scope),
+        ("plain", true) | ("none", true) => {
+            resolver.resolve_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES)
+        }
+        ("json", false) => resolver.resolve_json(input, &scope),
+        ("json", true) => resolver.resolve_json_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES),
+        ("url", false) => resolver.resolve_url(input, &scope),
+        ("url", true) => resolver.resolve_url_deep(input, &scope, MAX_VARIABLE_RESOLUTION_PASSES),
+        (other, _) => {
+            // Wording preserved from the wasm export this was lifted out of:
+            // a consumer may be matching on it, and rewording every existing
+            // error is not a refactor.
+            return Err(format!(
+                "resolveTemplate: unknown mode {other:?} — expected \"plain\", \"json\" or \"url\""
+            ));
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

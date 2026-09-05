@@ -80,6 +80,20 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
     let n = sock.read(&mut buf).await.map_err(TropelError::Io)?;
     let raw = String::from_utf8_lossy(&buf[..n]);
 
+    // TR-445: any body bytes that arrived in the SAME read as the head.
+    //
+    // This single `read` routinely returns head AND body together — a small
+    // JSON POST is one TCP segment, which is the normal case, not an edge
+    // one. Every handler below then called `read_exact(content_length)` and
+    // waited for bytes that had already been delivered, so the connection
+    // hung until the client gave up. It was masked because clients that write
+    // the head and body in separate calls (curl, reqwest) happen to split the
+    // segments.
+    let prefetched_body: Vec<u8> = raw
+        .find("\r\n\r\n")
+        .map(|i| buf[i + 4..n].to_vec())
+        .unwrap_or_default();
+
     // Rate limit + auth on every request (a fresh limiter per connection —
     // good enough for the localhost boundary).
     {
@@ -122,13 +136,156 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let body = format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION"));
             respond(sock, 200, &body).await
         }
-        ("POST", "/execute") => {
-            let mut body_buf = vec![0u8; content_length.min(64 * 1024)];
-            if content_length > 0 {
-                sock.read_exact(&mut body_buf)
+        // ── TR-445 · the RULES endpoints ─────────────────────────────────────
+        //
+        // The agent exposed request EXECUTION only, which is why every
+        // core-tier method in knockport's `native-agent.ts` throws
+        // `TropelCoreUnavailableError` naming this gap. Desktop ships no wasm,
+        // so without these the only way to resolve a variable or sign a
+        // request there is a TypeScript re-implementation — invariant #3, and
+        // the most expensive recurring bug class in both repos.
+        //
+        // These are pure functions over JSON: same Rust the wasm tier calls,
+        // reached over the loopback socket instead of a wasm boundary.
+        ("POST", "/resolve") => {
+            let Some(payload) =
+                read_json_body(sock, content_length, 1024 * 1024, &prefetched_body).await?
+            else {
+                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+            };
+            let template = payload
+                .get("template")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let vars: HashMap<String, String> = payload
+                .get("variables")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let mode = payload
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .unwrap_or("none");
+            let deep = payload
+                .get("deep")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(true);
+            match tropel_variables::resolve_template_for_host(template, &vars, mode, deep) {
+                Ok(resolved) => {
+                    respond(
+                        sock,
+                        200,
+                        &serde_json::json!({ "resolved": resolved }).to_string(),
+                    )
                     .await
-                    .map_err(TropelError::Io)?;
+                }
+                // A typo'd mode is a NAMED 400, never a silent fallback to
+                // plain — that is how a quote-bearing value corrupts a body.
+                Err(why) => respond(sock, 400, &error_body(&why)).await,
             }
+        }
+
+        ("POST", "/assert") => {
+            let Some(payload) =
+                read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
+            else {
+                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+            };
+            let target: tropel_variables::assertions::AssertionTarget = match serde_json::from_value(
+                payload.get("response").cloned().unwrap_or_default(),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    return respond(sock, 400, &error_body(&format!("invalid response: {e}"))).await
+                }
+            };
+            let specs: Vec<AgentAssertionSpec> = match serde_json::from_value(
+                payload.get("assertions").cloned().unwrap_or_default(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(sock, 400, &error_body(&format!("invalid assertions: {e}")))
+                        .await
+                }
+            };
+            // A native agent CAN link a regex engine — unlike the wasm tier,
+            // where TR-434 removed it and the host's RegExp is injected. Using
+            // Rust's `regex` here would make `matches` behave differently on
+            // desktop than in the browser, which is precisely the divergence
+            // this endpoint exists to prevent. So it is left unwired and the
+            // outcome says so BY NAME.
+            let outcomes: Vec<_> = specs
+                .iter()
+                .map(|spec| {
+                    let name = spec
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{} {}", spec.target, spec.operator));
+                    match tropel_variables::assertions::resolve_assertion_target(
+                        &spec.target,
+                        &target,
+                    ) {
+                        Ok(actual) => tropel_variables::assertions::assert_evaluate(
+                            &name,
+                            &spec.target,
+                            &actual,
+                            &spec.operator,
+                            &spec.expected,
+                            None,
+                        ),
+                        Err(why) => tropel_variables::assertions::AssertionOutcome {
+                            name,
+                            passed: false,
+                            unsupported: Some(why),
+                            message: None,
+                        },
+                    }
+                })
+                .collect();
+            respond(
+                sock,
+                200,
+                &serde_json::to_string(&outcomes).unwrap_or_default(),
+            )
+            .await
+        }
+
+        ("GET", "/operators") => {
+            // The assertion vocabulary, so a desktop editor renders the SAME
+            // dropdown the evaluator dispatches on.
+            let body = serde_json::to_string(tropel_variables::assertions::ASSERTION_OPERATORS)
+                .unwrap_or_default();
+            respond(sock, 200, &body).await
+        }
+
+        ("POST", "/auth/sign") => {
+            // TR-445: the four request signers, so the desktop tier does not
+            // re-implement them in TypeScript. Same shape as `core-wasm`'s
+            // exports — RAW request components in, finished headers out — so
+            // the AWS service derivation, the S3 double-encoding rule, the
+            // RFC 5849 base-string URI and the digest challenge parse all stay
+            // on this side (TR-428..TR-431).
+            let Some(payload) =
+                read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
+            else {
+                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+            };
+            let scheme = payload.get("scheme").and_then(|s| s.as_str()).unwrap_or("");
+            let params = payload.get("params").cloned().unwrap_or_default();
+            match sign_with_scheme(scheme, &params) {
+                Ok(headers) => {
+                    respond(
+                        sock,
+                        200,
+                        &serde_json::to_string(&headers).unwrap_or_default(),
+                    )
+                    .await
+                }
+                Err(why) => respond(sock, 400, &error_body(&why)).await,
+            }
+        }
+
+        ("POST", "/execute") => {
+            let body_buf = read_body(sock, content_length, 64 * 1024, &prefetched_body).await?;
             let req: serde_json::Value = match serde_json::from_slice(&body_buf) {
                 Ok(v) => v,
                 Err(_) => return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await,
@@ -163,12 +320,8 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             // client, bounded by `iterations`, and returns the aggregated
             // raw samples. NO percentiles (TR-411 — the browser tier cannot
             // report them; this endpoint matches that contract).
-            let mut body_buf = vec![0u8; content_length.min(4 * 1024 * 1024)];
-            if content_length > 0 {
-                sock.read_exact(&mut body_buf)
-                    .await
-                    .map_err(TropelError::Io)?;
-            }
+            let body_buf =
+                read_body(sock, content_length, 4 * 1024 * 1024, &prefetched_body).await?;
             let payload: serde_json::Value = match serde_json::from_slice(&body_buf) {
                 Ok(v) => v,
                 Err(_) => return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await,
@@ -500,6 +653,212 @@ async fn respond(sock: &mut TcpStream, status: u16, body: &str) -> tropel_sdk::R
 
 /// Execute a single request with full sub-timings — the SAME engine code path
 /// a request under load takes. Returns a JSON response payload.
+/// One assertion as the desktop tier sends it.
+#[derive(serde::Deserialize)]
+struct AgentAssertionSpec {
+    #[serde(default)]
+    name: Option<String>,
+    target: String,
+    operator: String,
+    #[serde(default)]
+    expected: serde_json::Value,
+}
+
+/// Read and parse a JSON request body, bounded.
+///
+/// Returns `Ok(None)` for malformed JSON so the caller answers 400 rather
+/// than dropping the connection — a desktop shell debugging its own payload
+/// needs the status code, not a closed socket.
+async fn read_json_body(
+    sock: &mut TcpStream,
+    content_length: usize,
+    max: usize,
+    prefetched: &[u8],
+) -> Result<Option<serde_json::Value>, TropelError> {
+    Ok(serde_json::from_slice(&read_body(sock, content_length, max, prefetched).await?).ok())
+}
+
+/// Read a request body, using whatever already arrived with the head.
+///
+/// TR-445: the fix for the hang described in `handle_connection`. Reads only
+/// the REMAINDER, and returns immediately when the body was fully prefetched.
+async fn read_body(
+    sock: &mut TcpStream,
+    content_length: usize,
+    max: usize,
+    prefetched: &[u8],
+) -> Result<Vec<u8>, TropelError> {
+    let want = content_length.min(max);
+    let mut body = prefetched.to_vec();
+    body.truncate(want);
+    if body.len() < want {
+        let mut rest = vec![0u8; want - body.len()];
+        sock.read_exact(&mut rest).await.map_err(TropelError::Io)?;
+        body.extend_from_slice(&rest);
+    }
+    Ok(body)
+}
+
+fn error_body(message: &str) -> String {
+    serde_json::json!({ "error": message }).to_string()
+}
+
+/// Dispatch a signing request to the ungated `tropel-auth` builders.
+///
+/// TR-445: this is deliberately ONE endpoint with a `scheme` discriminant
+/// rather than four routes. The desktop tier calls it from one place, and a
+/// new scheme is a match arm here instead of a new URL its client must learn.
+///
+/// An unknown scheme is refused BY NAME. Falling back to "no headers" would
+/// send the request unsigned while the config says it is authenticated —
+/// invariant #7, silent data loss.
+fn sign_with_scheme(
+    scheme: &str,
+    p: &serde_json::Value,
+) -> Result<Vec<tropel_auth::builders::HeaderOut>, String> {
+    let s = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let opt = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let pairs = |k: &str| -> Vec<(String, String)> {
+        p.get(k)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    };
+
+    match scheme {
+        "digest" => {
+            let challenge = s("wwwAuthenticate");
+            let Some(c) = tropel_auth::builders::find_digest_challenge(&challenge) else {
+                // No Digest challenge in the header — the caller must not
+                // re-send. Distinct from a signing failure.
+                return Err("the WWW-Authenticate header carries no Digest challenge".to_string());
+            };
+            let get = |k: &str| c.get(k).map(String::as_str);
+            Ok(vec![tropel_auth::builders::digest_build_authorization(
+                &tropel_auth::builders::DigestBuildParams {
+                    username: &s("username"),
+                    password: &s("password"),
+                    method: &s("method"),
+                    uri: &s("uri"),
+                    realm: get("realm").unwrap_or(""),
+                    nonce: get("nonce").unwrap_or(""),
+                    nc: p.get("nc").and_then(|v| v.as_u64()).unwrap_or(1),
+                    cnonce: &s("cnonce"),
+                    qop: get("qop"),
+                    algorithm: get("algorithm"),
+                    opaque: get("opaque"),
+                },
+            )])
+        }
+        "hawk" => Ok(vec![tropel_auth::builders::hawk_build_header(
+            &tropel_auth::builders::HawkBuildParams {
+                method: &s("method"),
+                resource: &s("resource"),
+                host: &s("host"),
+                port: p.get("port").and_then(|v| v.as_u64()).unwrap_or(443) as u16,
+                id: &s("id"),
+                key: &s("key"),
+                algorithm: opt("algorithm").as_deref(),
+                ts: &s("ts"),
+                nonce: &s("nonce"),
+                ext: &s("ext"),
+            },
+        )]),
+        "awsSigV4" => {
+            let host = s("host");
+            let region = opt("region").unwrap_or_else(|| "us-east-1".to_string());
+            let service =
+                opt("service").unwrap_or_else(|| tropel_auth::builders::default_service(&host));
+            let signing_service = tropel_auth::builders::signing_name(&service);
+            let path = s("path");
+            let canonical_uri = tropel_auth::builders::sigv4_canonical_uri(&path, &service);
+            let secret = s("secretKey");
+            let date_stamp = s("dateStamp");
+            let key = tropel_auth::builders::derive_signing_key(
+                &secret,
+                &date_stamp,
+                &region,
+                signing_service,
+            );
+            let body = match opt("bodyBase64") {
+                Some(b64) => Some(
+                    base64_decode(&b64).map_err(|e| format!("bodyBase64 is not base64: {e}"))?,
+                ),
+                None => None,
+            };
+            let headers = pairs("headers");
+            let out = tropel_auth::builders::aws_sigv4_build_headers(
+                &tropel_auth::builders::AwsSigV4BuildParams {
+                    method: &s("method"),
+                    path: &path,
+                    query: &s("query"),
+                    host: &tropel_auth::builders::bracket_host(&host),
+                    headers: &headers,
+                    body: body.as_deref(),
+                    access_key: &s("accessKey"),
+                    secret_key: &secret,
+                    session_token: opt("sessionToken").as_deref(),
+                    region: &region,
+                    service: &service,
+                    amz_date: &s("amzDate"),
+                    date_stamp: &date_stamp,
+                },
+                &canonical_uri,
+                signing_service,
+                &key,
+            );
+            Ok(out.headers)
+        }
+        "oauth1" => {
+            let base_uri = tropel_auth::builders::oauth1_base_uri(
+                &s("scheme"),
+                &s("host"),
+                p.get("port").and_then(|v| v.as_u64()).map(|v| v as u16),
+                &s("path"),
+            );
+            let mut params = pairs("queryParams");
+            if let Some(form) = opt("formBody") {
+                params.extend(tropel_auth::builders::parse_form(form.as_bytes()));
+            }
+            let method = s("signatureMethod");
+            tropel_auth::builders::oauth1_build_header(&tropel_auth::builders::OAuth1BuildParams {
+                method: &s("method"),
+                base_uri: &base_uri,
+                request_params: &params,
+                consumer_key: &s("consumerKey"),
+                consumer_secret: &s("consumerSecret"),
+                token: opt("token").as_deref(),
+                token_secret: opt("tokenSecret").as_deref(),
+                signature_method: &method,
+                nonce: &s("nonce"),
+                timestamp: &s("timestamp"),
+            })
+            .map(|o| vec![o.header])
+            .ok_or_else(|| {
+                format!(
+                    "unsupported OAuth1 signature_method '{method}' — supported: {}",
+                    tropel_auth::builders::OAUTH1_SIGNATURE_METHODS.join(", ")
+                )
+            })
+        }
+        other => Err(format!(
+            "unknown auth scheme '{other}' — supported: digest, hawk, awsSigV4, oauth1"
+        )),
+    }
+}
+
+/// Base64 decode without pulling a new dependency into this crate.
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| e.to_string())
+}
+
 async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_json::Value {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
     let url = req.get("url").and_then(|u| u.as_str()).unwrap_or("");
@@ -686,5 +1045,258 @@ mod tests {
             v3["results"][0]["error"].as_str().is_some(),
             "the malformed threshold must report its error"
         );
+    }
+    /// TR-445: the rules endpoints, driven over a REAL loopback socket.
+    ///
+    /// Unit-testing the handler functions would not prove the thing that
+    /// matters — knockport's desktop tier reaches these through HTTP, and the
+    /// bug class this closes (every core-tier method throwing
+    /// `TropelCoreUnavailableError`) is about the WIRE contract, not the Rust.
+    #[tokio::test]
+    async fn the_rules_endpoints_answer_over_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state = Arc::new(AgentState {
+            token: None,
+            client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client"),
+        });
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(&mut sock, st).await;
+                });
+            }
+        });
+
+        let post = |path: &'static str, body: String| async move {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).await.expect("write");
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.expect("read");
+            String::from_utf8_lossy(&out).to_string()
+        };
+
+        // ── /resolve ──
+        let raw = post(
+            "/resolve",
+            serde_json::json!({
+                "template": "{{base}}/v1", "variables": {"base": "https://x.test"},
+                "mode": "plain", "deep": true
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.contains("https://x.test/v1"), "{raw}");
+
+        // A typo'd mode is a NAMED 400, never a silent fallback to plain —
+        // that is how a quote-bearing value corrupts a JSON body.
+        let raw = post(
+            "/resolve",
+            serde_json::json!({"template": "x", "variables": {}, "mode": "jsonn"}).to_string(),
+        )
+        .await;
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(raw.contains("unknown mode"), "{raw}");
+
+        // ── /assert ──
+        let raw = post(
+            "/assert",
+            serde_json::json!({
+                "response": {
+                    "status": 200, "status_text": "OK",
+                    "headers": [["Content-Type", "application/json"]],
+                    "body": "{\"count\":2}", "response_time": 5.0, "size": 12,
+                    "cookies": []
+                },
+                "assertions": [
+                    {"name": "ok", "target": "status", "operator": "eq", "expected": 200},
+                    {"target": "json.count", "operator": "eq", "expected": 99}
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.contains(r#""name":"ok""#), "{raw}");
+        assert!(raw.contains(r#""passed":true"#), "{raw}");
+        // A FAILING row explains itself, and names the TARGET not the row name.
+        assert!(
+            raw.contains("expected target json.count equals 99"),
+            "{raw}"
+        );
+
+        // `matches` is UNSUPPORTED here on purpose: a native agent could link
+        // Rust's regex, but that would make the operator behave differently on
+        // desktop than in the browser (where TR-434 injects the host RegExp) —
+        // the exact divergence this endpoint exists to prevent.
+        let raw = post(
+            "/assert",
+            serde_json::json!({
+                "response": {
+                    "status": 200, "status_text": "OK", "headers": [],
+                    "body": "abc", "response_time": 1.0, "size": 3, "cookies": []
+                },
+                "assertions": [{"target": "body", "operator": "matches", "expected": "^a"}]
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.contains("regex matcher"), "{raw}");
+
+        // ── /operators ──
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        s.write_all(b"GET /operators HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write");
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.expect("read");
+        let raw = String::from_utf8_lossy(&out).to_string();
+        assert!(raw.contains(r#""name":"eq""#), "{raw}");
+        assert!(raw.contains(r#""arity":"unary""#), "{raw}");
+    }
+
+    /// TR-445: `/auth/sign`, over the socket.
+    ///
+    /// This is the endpoint that lets knockport's DESKTOP tier stop throwing
+    /// `TropelAuthUnavailableError`. What it must prove is not "signing
+    /// works" — `tropel-auth` has its own vectors for that — but that the
+    /// desktop tier gets the SAME rules the browser does, applied here rather
+    /// than re-derived in TypeScript.
+    #[tokio::test]
+    async fn the_auth_sign_endpoint_applies_the_rules_server_side() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state = Arc::new(AgentState {
+            token: None,
+            client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client"),
+        });
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(&mut sock, st).await;
+                });
+            }
+        });
+        let sign = |body: String| async move {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let req = format!(
+                "POST /auth/sign HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).await.expect("write");
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.expect("read");
+            String::from_utf8_lossy(&out).to_string()
+        };
+
+        // SigV4: the service must derive to `s3` from a VIRTUAL-HOSTED bucket
+        // host. A desktop tier deriving it itself would take the first DNS
+        // label — the bug `default_service`'s comment records, a 403 on every
+        // virtual-hosted-S3 request (TR-428).
+        let raw = sign(
+            serde_json::json!({
+                "scheme": "awsSigV4",
+                "params": {
+                    "method": "GET", "host": "examplebucket.s3.amazonaws.com",
+                    "path": "/test.txt", "accessKey": "AKID", "secretKey": "SECRET",
+                    "region": "us-east-1", "amzDate": "20130524T000000Z",
+                    "dateStamp": "20130524"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(
+            raw.contains("/20130524/us-east-1/s3/aws4_request"),
+            "service must derive to s3, not the bucket: {raw}"
+        );
+        // Every header that is IN the signature must come back, or the caller
+        // sends a valid-looking Authorization and gets a 403.
+        assert!(raw.contains("x-amz-date"), "{raw}");
+        assert!(raw.contains("x-amz-content-sha256"), "{raw}");
+
+        // Digest: the challenge is parsed HERE — multi-scheme and quoted qop,
+        // the two things a naive client parser gets wrong (TR-429).
+        let raw = sign(
+            serde_json::json!({
+                "scheme": "digest",
+                "params": {
+                    "wwwAuthenticate": "Basic realm=\"b\", Digest realm=\"r\", qop=\"auth, auth-int\", nonce=\"n\"",
+                    "username": "u", "password": "p", "method": "GET",
+                    "uri": "/dir/index.html", "nc": 1, "cnonce": "0a4f113b"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.contains("Digest "), "{raw}");
+        assert!(raw.contains(r#"realm=\"r\""#), "{raw}");
+
+        // A header with no Digest challenge is a NAMED 400, not an unsigned
+        // 200 — the caller must not re-send.
+        let raw = sign(
+            serde_json::json!({
+                "scheme": "digest",
+                "params": {"wwwAuthenticate": "Basic realm=\"b\"", "username": "u"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(raw.contains("no Digest challenge"), "{raw}");
+
+        // OAuth1: the IPv6 host is bracketed HERE. A client forwarding
+        // `URL.hostname` cannot know whether to add them (TR-431).
+        let raw = sign(
+            serde_json::json!({
+                "scheme": "oauth1",
+                "params": {
+                    "method": "POST", "scheme": "http", "host": "::1", "port": 8080,
+                    "path": "/request", "formBody": "c2=&a3=2+q",
+                    "consumerKey": "ck", "consumerSecret": "cs",
+                    "signatureMethod": "HMAC-SHA1", "nonce": "n", "timestamp": "1"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.contains("oauth_signature="), "{raw}");
+
+        // An unsupported signature method is refused BY NAME, never
+        // downgraded to HMAC-SHA1 (TR-409).
+        let raw = sign(
+            serde_json::json!({
+                "scheme": "oauth1",
+                "params": {
+                    "method": "GET", "scheme": "https", "host": "x.test", "path": "/",
+                    "consumerKey": "ck", "consumerSecret": "cs",
+                    "signatureMethod": "RSA-SHA1", "nonce": "n", "timestamp": "1"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(raw.contains("RSA-SHA1"), "{raw}");
+
+        // An unknown scheme is refused, not silently unsigned — sending a
+        // request the config calls authenticated with no Authorization is
+        // invariant #7's silent data loss.
+        let raw = sign(serde_json::json!({"scheme": "ntlm", "params": {}}).to_string()).await;
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(raw.contains("unknown auth scheme"), "{raw}");
     }
 }

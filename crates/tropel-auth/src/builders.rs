@@ -77,7 +77,11 @@ pub fn digest_with(input: &str, algorithm: &str) -> String {
 // ── HTTP Digest (RFC 7616) ──────────────────────────────────────────────────
 
 /// One header to attach.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// TR-445: `Serialize` because the loopback agent returns these as JSON — the
+/// desktop tier reads the SAME shape the wasm tier does, so a header the
+/// browser attaches and one the agent attaches cannot differ in name or case.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeaderOut {
     pub name: String,
     pub value: String,

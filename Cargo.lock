@@ -4396,6 +4396,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.23.0",
  "clap",
  "csv",
  "rand",
@@ -4406,6 +4407,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tropel-auth",
  "tropel-build",
  "tropel-collection",
  "tropel-core",
