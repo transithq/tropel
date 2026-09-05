@@ -26,6 +26,9 @@ tropel-variables.workspace = true
 # tropel-auth's default reqwest feature (signers + tropel-sdk) so simd-json,
 # inventory and rustc-hash drop out of the gated tier.
 tropel-auth = { workspace = true, default-features = false }
+# SigV4 bodies cross the JS boundary base64-encoded: the payload hash is over
+# exact bytes and a JS string cannot represent an arbitrary binary body.
+base64.workspace = true
 wasm-bindgen = "0.2"
 serde.workspace = true
 serde_json.workspace = true

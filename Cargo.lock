@@ -4358,6 +4358,7 @@ dependencies = [
 name = "tropel-core-wasm"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.0",
  "getrandom 0.4.3",
  "serde",
  "serde_json",

@@ -223,9 +223,11 @@ pub fn predefined_variables_meta() -> String {
     format!("[{}]", entries.collect::<Vec<_>>().join(","))
 }
 
+pub mod signers;
+
 // ── OAuth2 flows (tropel-auth::oauth, pure — the embedder sends the requests) ─────
 
-fn err(e: impl std::fmt::Display) -> JsValue {
+pub(crate) fn err(e: impl std::fmt::Display) -> JsValue {
     // ASCII-only: the web-target glue truncates strings at their UTF-16 code
     // unit count when encoding into wasm memory, so any multi-byte UTF-8
     // character would corrupt the message at the JS boundary.
@@ -237,11 +239,11 @@ fn err(e: impl std::fmt::Display) -> JsValue {
     )
 }
 
-fn parse_json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, JsValue> {
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, JsValue> {
     serde_json::from_str(s).map_err(err)
 }
 
-fn to_json<T: serde::Serialize>(v: &T) -> Result<String, JsValue> {
+pub(crate) fn to_json<T: serde::Serialize>(v: &T) -> Result<String, JsValue> {
     serde_json::to_string(v).map_err(err)
 }
 
