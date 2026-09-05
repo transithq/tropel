@@ -1373,4 +1373,49 @@ mod tests {
         let ok = catalog.resolve("hello={{$guid}}");
         assert!(ok.is_ok(), "instance must still be usable after cap error");
     }
+
+    #[test]
+    fn unicode_content_resolves_and_non_ascii_digits_do_not_explode() {
+        // TR-433 pins what dropping regex's `unicode-perl` does and does NOT
+        // change, because the obvious worry — "requests and responses contain
+        // Unicode" — is not what that feature controls.
+        //
+        // The regex crate always operates on UTF-8 `&str` and matches Unicode
+        // scalar values regardless of features; `[^}]*` still matches
+        // non-ASCII. `unicode-perl` only decides whether `\d`/`\w`/`\s` match
+        // non-ASCII members of those classes.
+        let c = DynamicCatalog::new();
+        let out = c
+            .resolve("名前={{$randomFirstName}} ключ={{$guid}} emoji=🎉 ar=مرحبا")
+            .expect("resolution succeeds");
+        assert!(out.contains("名前="), "CJK literal text must survive: {out}");
+        assert!(out.contains("emoji=🎉"), "emoji must survive: {out}");
+        assert!(out.contains("ar=مرحبا"), "RTL text must survive: {out}");
+        assert!(!out.contains("{{$guid}}"), "tokens still resolve: {out}");
+        assert!(
+            !out.contains("{{$randomFirstName}}"),
+            "tokens still resolve: {out}"
+        );
+
+        // ASCII counts work exactly as before.
+        let five = c
+            .resolve("x={{$randomAlphabetic:5}}")
+            .expect("resolution succeeds");
+        assert_eq!(five.len(), "x=".len() + 5, "{five}");
+
+        // A NON-ASCII digit as a count is now left unresolved rather than
+        // matching. That is the safe direction, and it fixes a real bug: with
+        // `unicode-perl`, `\d` matched the Arabic-Indic digit, the count then
+        // failed to parse, and the fallback produced a ~10,000-character
+        // string — from one stray character, in a load generator.
+        let arabic = c
+            .resolve("x={{$randomAlphabetic:٣}}")
+            .expect("resolution succeeds");
+        assert_eq!(
+            arabic, "x={{$randomAlphabetic:٣}}",
+            "a non-ASCII digit count must stay an unresolved literal, not \
+             expand to a multi-kilobyte string"
+        );
+    }
+
 }
