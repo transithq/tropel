@@ -646,10 +646,34 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Install wasm-bindgen and binaryen for TR-404 gate
         run: |
-          cargo install wasm-bindgen-cli --locked || true
-          sudo apt-get update && sudo apt-get install -y binaryen || npm i -g binaryen || true
-          wasm-bindgen --version || true
-          wasm-opt --version || true
+          # PIN the CLI to the wasm-bindgen version in OUR lockfile. The two
+          # schema versions must match EXACTLY, and `--locked` does not do
+          # that: it refers to the CLI crate's own lockfile, not this repo's.
+          # So this installed whatever was latest, and the job broke the moment
+          # upstream released 0.2.128 against our pinned 0.2.126:
+          #
+          #   rust Wasm file schema version: 0.2.126
+          #      this binary schema version: 0.2.128
+          #
+          # A time-bomb wired to someone else's release schedule. Reading the
+          # version out of Cargo.lock is what knockport's CI already does.
+          WB_VERSION=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock \
+            | grep '^version' | head -1 | cut -d '"' -f2)
+          echo "wasm-bindgen (Cargo.lock): ${WB_VERSION}"
+          test -n "$WB_VERSION" || { echo "FAIL: could not read wasm-bindgen version from Cargo.lock" >&2; exit 1; }
+          # No `|| true`: a failed install used to surface later as a confusing
+          # schema mismatch or a missing binary, instead of here.
+          cargo install wasm-bindgen-cli --version "$WB_VERSION" --force
+          sudo apt-get update && sudo apt-get install -y binaryen || npm i -g binaryen
+          # Assert the toolchain is actually present and matches, rather than
+          # printing versions and continuing regardless.
+          wasm-bindgen --version
+          wasm-opt --version
+          INSTALLED=$(wasm-bindgen --version | awk '{print $2}')
+          test "$INSTALLED" = "$WB_VERSION" || {
+            echo "FAIL: wasm-bindgen CLI ${INSTALLED} != Cargo.lock ${WB_VERSION} — the bindgen schema must match exactly" >&2
+            exit 1
+          }
       - name: TR-404 build core-wasm and assert 700 KB budget (generates README)
         run: |
           bash packages/core-wasm/scripts/build.sh
