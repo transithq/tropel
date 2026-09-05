@@ -24,6 +24,8 @@ import {
   awsSigV4Sign,
   oauth1Sign,
   oauth1SignatureMethods,
+  assertEvaluate,
+  assertionOperators,
   resolveTemplate,
   resolveTemplateDetailed,
   maxVariableResolutionPasses,
@@ -376,6 +378,50 @@ if (digestSign({ wwwAuthenticate: 'Basic realm="b"', username: "u", password: "p
   throw new Error("digestSign must return null when no Digest challenge is offered");
 }
 
+
+// ── TR-440: assertions reach the wasm through THIS facade ──────────────────
+// 0.4.0 shipped signer exports the facade never surfaced. Importing is not
+// enough to catch that — an unexported name is `undefined` and only fails
+// when CALLED — so each is invoked.
+const ops = assertionOperators();
+if (!Array.isArray(ops) || ops.length !== 28) {
+  throw new Error(`assertionOperators: expected 28, got ${ops && ops.length}`);
+}
+const assertResponse = {
+  status: 200,
+  status_text: "OK",
+  headers: [["Content-Type", "application/json"]],
+  body: '{"items":[{"name":"first"}],"count":1}',
+  response_time: 12.5,
+  size: 40,
+  cookies: [["session", "s1"]],
+};
+const outcomes = assertEvaluate(assertResponse, [
+  { name: "is 2xx", target: "status", operator: "between", expected: [200, 299] },
+  { target: "json.items.0.name", operator: "eq", expected: "first" },
+  { target: "Content-Type", operator: "contains", expected: "json" },
+]);
+if (outcomes.length !== 3 || !outcomes.every((o) => o.passed)) {
+  throw new Error(`assertEvaluate: ${JSON.stringify(outcomes)}`);
+}
+// An unresolvable target is UNSUPPORTED, not merely failed — a broken
+// collection must not aggregate as an ordinary assertion failure.
+const [bad] = assertEvaluate(assertResponse, [
+  { target: 'header("X-Nope")', operator: "eq", expected: "x" },
+]);
+if (bad.passed || !bad.unsupported) throw new Error(`unresolvable target: ${JSON.stringify(bad)}`);
+// The host RegExp is injected; without it `matches` says so by name.
+const [noMatcher] = assertEvaluate(assertResponse, [
+  { target: "body", operator: "matches", expected: "^\\{" },
+]);
+if (!noMatcher.unsupported) throw new Error("matches must report unsupported with no matcher");
+const [withMatcher] = assertEvaluate(
+  assertResponse,
+  [{ target: "body", operator: "matches", expected: "^\\{" }],
+  (pattern, hay) => new RegExp(pattern).test(hay),
+);
+if (!withMatcher.passed) throw new Error(`injected matcher: ${JSON.stringify(withMatcher)}`);
+
 console.log(
-  `core-wasm smoke OK — catalog: ${meta.length} variables · oauth2 flows verified · 5 signers verified · resolveTemplate verified (grammar, 3 escape modes, chains, pass cap ${maxVariableResolutionPasses()}) · corpus ${corpusRun}/${corpus.cases.length} cases`,
+  `core-wasm smoke OK — catalog: ${meta.length} variables · oauth2 flows verified · 5 signers verified · assertions verified (28 ops) · resolveTemplate verified (grammar, 3 escape modes, chains, pass cap ${maxVariableResolutionPasses()}) · corpus ${corpusRun}/${corpus.cases.length} cases`,
 );

@@ -412,6 +412,122 @@ pub fn wsse_sign(params_json: &str) -> Result<String, JsValue> {
     to_json(&sign_wsse(&params).map_err(err)?)
 }
 
+// ── Declarative assertions (TR-440) ─────────────────────────────────────────
+
+/// Evaluate a batch of assertions against one response → JSON
+/// `[{name, passed, unsupported?}, …]`.
+///
+/// BATCHED, not one call per assertion. A request commonly carries several,
+/// and each crossing costs a JSON encode/decode plus a wasm boundary hop; more
+/// importantly the response — headers, cookies, body — would be re-serialised
+/// and the body re-parsed for every one. Batching parses it at most once.
+///
+/// # The regex matcher
+///
+/// `matches` / `notMatches` are evaluated with the HOST's `RegExp`, passed in
+/// as `regex_matches`. Two reasons, both load-bearing: linking a Rust regex
+/// would put back the 152 KB TR-434 removed from this tier, and it would be
+/// unfaithful — KnockPort's operator has JS backreferences and lookaround
+/// that Rust's engine deliberately lacks. Omit the callback and those two
+/// operators report `unsupported` by name rather than failing silently.
+#[wasm_bindgen(js_name = "assertEvaluate")]
+pub fn assert_evaluate_batch(
+    response_json: &str,
+    assertions_json: &str,
+    regex_matches: Option<js_sys::Function>,
+) -> Result<String, JsValue> {
+    assert_evaluate_batch_inner(response_json, assertions_json, regex_matches.as_ref()).map_err(err)
+}
+
+/// One assertion as the collection file writes it.
+#[derive(serde::Deserialize)]
+struct AssertionSpec {
+    /// Shown in results and used to aggregate across a load run. Defaults to
+    /// `"<target> <operator>"` so an unnamed assertion is still identifiable.
+    #[serde(default)]
+    name: Option<String>,
+    target: String,
+    operator: String,
+    #[serde(default)]
+    expected: serde_json::Value,
+}
+
+/// A JS `Function` used as the regex engine.
+struct JsMatcher<'a>(&'a js_sys::Function);
+
+impl tropel_variables::assertions::RegexMatcher for JsMatcher<'_> {
+    fn is_match(&self, pattern: &str, haystack: &str) -> bool {
+        // A throwing or non-boolean callback is `false`, never a panic: this
+        // runs inside the send path and an unwind across the wasm boundary
+        // would take the whole send with it.
+        self.0
+            .call2(
+                &JsValue::NULL,
+                &JsValue::from_str(pattern),
+                &JsValue::from_str(haystack),
+            )
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+}
+
+fn assert_evaluate_batch_inner(
+    response_json: &str,
+    assertions_json: &str,
+    regex_matches: Option<&js_sys::Function>,
+) -> Result<String, String> {
+    let target: tropel_variables::assertions::AssertionTarget =
+        serde_json::from_str(response_json).map_err(|e| format!("response: {e}"))?;
+    let specs: Vec<AssertionSpec> =
+        serde_json::from_str(assertions_json).map_err(|e| format!("assertions: {e}"))?;
+
+    let matcher = regex_matches.map(JsMatcher);
+    let matcher_ref = matcher
+        .as_ref()
+        .map(|m| m as &dyn tropel_variables::assertions::RegexMatcher);
+
+    let outcomes: Vec<_> = specs
+        .iter()
+        .map(|spec| {
+            let name = spec
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{} {}", spec.target, spec.operator));
+            match tropel_variables::assertions::resolve_assertion_target(&spec.target, &target) {
+                Ok(actual) => tropel_variables::assertions::assert_evaluate(
+                    &name,
+                    &actual,
+                    &spec.operator,
+                    &spec.expected,
+                    matcher_ref,
+                ),
+                // An unresolvable target is `unsupported`, NOT `passed: false`.
+                // The distinction matters in a load run: a failing assertion is
+                // a result, an unresolvable one is a broken collection, and
+                // aggregating them together hides the second behind the first.
+                Err(why) => tropel_variables::assertions::AssertionOutcome {
+                    name,
+                    passed: false,
+                    unsupported: Some(why),
+                },
+            }
+        })
+        .collect();
+
+    serde_json::to_string(&outcomes).map_err(|e| e.to_string())
+}
+
+/// The 28-operator vocabulary → JSON `[{name, arity, summary}, …]`.
+///
+/// Exported so the editor's operator dropdown reads the SAME table the
+/// evaluator dispatches on. A second copy in TypeScript is how an operator
+/// ends up offered but unevaluated, or evaluated but unofferable.
+#[wasm_bindgen(js_name = "assertionOperators")]
+pub fn assertion_operators() -> Result<String, JsValue> {
+    serde_json::to_string(tropel_variables::assertions::ASSERTION_OPERATORS).map_err(err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,5 +860,105 @@ mod tests {
         // And a malformed map is an error, never a silent passthrough.
         let err = resolve_template_inner("x", "[]", "plain", true).unwrap_err();
         assert!(err.contains("flat JSON object"), "{err}");
+    }
+    #[test]
+    fn assert_batch_resolves_targets_and_evaluates() {
+        let response = serde_json::json!({
+            "status": 200,
+            "status_text": "OK",
+            "headers": [["Content-Type", "application/json"]],
+            "body": r#"{"items":[{"name":"first"}],"count":1}"#,
+            "response_time": 12.5,
+            "size": 40,
+            "cookies": [["session", "s1"]],
+        })
+        .to_string();
+        let assertions = serde_json::json!([
+            {"name": "is 2xx", "target": "status", "operator": "between", "expected": [200, 299]},
+            {"target": "json.items.0.name", "operator": "eq", "expected": "first"},
+            {"target": "Content-Type", "operator": "contains", "expected": "json"},
+        ])
+        .to_string();
+        let out = assert_evaluate_batch_inner(&response, &assertions, None).expect("evaluates");
+        let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["name"], "is 2xx");
+        for r in rows {
+            assert_eq!(r["passed"], true, "{r}");
+        }
+        // An unnamed assertion still identifies itself, so a load run can
+        // aggregate it without the author having named every row.
+        assert_eq!(rows[1]["name"], "json.items.0.name eq");
+    }
+
+    #[test]
+    fn an_unresolvable_target_is_unsupported_not_merely_failed() {
+        // The distinction matters in a load run: a failing assertion is a
+        // RESULT, an unresolvable one is a BROKEN COLLECTION. Aggregating them
+        // together hides the second behind the first.
+        let response = serde_json::json!({
+            "status": 200, "status_text": "OK", "headers": [],
+            "body": "", "response_time": 1.0, "size": 0, "cookies": [],
+        })
+        .to_string();
+        let assertions =
+            serde_json::json!([{"target": "header(\"X-Nope\")", "operator": "eq", "expected": "x"}])
+                .to_string();
+        let out = assert_evaluate_batch_inner(&response, &assertions, None).unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(rows[0]["passed"], false);
+        assert!(
+            rows[0]["unsupported"].as_str().unwrap().contains("X-Nope"),
+            "{}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn matches_without_a_host_matcher_reports_unsupported_by_name() {
+        let response = serde_json::json!({
+            "status": 200, "status_text": "OK", "headers": [],
+            "body": "abc", "response_time": 1.0, "size": 3, "cookies": [],
+        })
+        .to_string();
+        let assertions =
+            serde_json::json!([{"target": "body", "operator": "matches", "expected": "^a"}])
+                .to_string();
+        let out = assert_evaluate_batch_inner(&response, &assertions, None).unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(rows[0]["passed"], false);
+        let why = rows[0]["unsupported"].as_str().unwrap();
+        assert!(why.contains("regex matcher"), "{why}");
+    }
+
+    #[test]
+    fn malformed_input_is_an_error_not_a_silent_empty_batch() {
+        // Returning `[]` would read as "every assertion passed".
+        let ok_response = serde_json::json!({
+            "status": 200, "status_text": "OK", "headers": [],
+            "body": "", "response_time": 1.0, "size": 0, "cookies": [],
+        })
+        .to_string();
+        assert!(assert_evaluate_batch_inner("not json", "[]", None).is_err());
+        assert!(assert_evaluate_batch_inner(&ok_response, "not json", None).is_err());
+        // A missing `operator` is a malformed assertion, not a default.
+        assert!(
+            assert_evaluate_batch_inner(&ok_response, r#"[{"target":"status"}]"#, None).is_err()
+        );
+    }
+
+    #[test]
+    fn the_operator_table_is_exported_for_the_editor() {
+        let json = serde_json::to_string(tropel_variables::assertions::ASSERTION_OPERATORS)
+            .expect("serialises");
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 28);
+        assert_eq!(rows[0]["name"], "eq");
+        assert!(rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["arity"] == "unary"));
     }
 }

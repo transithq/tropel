@@ -317,3 +317,49 @@ export function oauth1Sign(params: {
 
 /** The signature methods `oauth1Sign` accepts. */
 export function oauth1SignatureMethods(): string[];
+
+/** One assertion as a collection file writes it. */
+export interface AssertionSpec {
+  /** Defaults to `"<target> <operator>"` so an unnamed assertion is still
+   *  identifiable when a load run aggregates outcomes. */
+  name?: string;
+  target: string;
+  operator: string;
+  expected?: unknown;
+}
+
+export interface AssertionOutcome {
+  name: string;
+  passed: boolean;
+  /** Set when the assertion could not be evaluated AT ALL — unknown operator,
+   *  unresolvable target, or `matches` with no matcher. Distinct from
+   *  `passed: false`, which means the predicate ran and said no. */
+  unsupported?: string;
+}
+
+export interface AssertionResponse {
+  status: number;
+  status_text: string;
+  /** As received; lookup is case-insensitive. */
+  headers: [string, string][];
+  body: string;
+  response_time: number;
+  size: number;
+  cookies: [string, string][];
+}
+
+/** Evaluate a batch of assertions against one response. `regexMatches` is the
+ *  HOST's RegExp, injected rather than linked — omit it and `matches` /
+ *  `notMatches` report `unsupported` by name. */
+export function assertEvaluate(
+  response: AssertionResponse,
+  assertions: readonly AssertionSpec[],
+  regexMatches?: (pattern: string, haystack: string) => boolean,
+): AssertionOutcome[];
+
+/** The 28 operators in declaration order — an editor renders this directly. */
+export function assertionOperators(): {
+  name: string;
+  arity: "unary" | "binary";
+  summary: string;
+}[];

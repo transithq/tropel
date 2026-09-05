@@ -22,6 +22,9 @@ wasm-opt = false
 
 [dependencies]
 tropel-variables.workspace = true
+# TR-440: the assertion export takes the HOST's RegExp as a callback rather
+# than linking a Rust regex — see the export's doc comment.
+js-sys = "0.3"
 # TR-404: the browser oauth module needs ZERO tropel-sdk deps; disable
 # tropel-auth's default reqwest feature (signers + tropel-sdk) so simd-json,
 # inventory and rustc-hash drop out of the gated tier.
