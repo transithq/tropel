@@ -35,6 +35,8 @@
 //! - A request with an invalid method token fails the parse loudly.
 
 use serde::Deserialize;
+
+mod text;
 use std::collections::HashMap;
 use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, FormDataPart, Method, Request};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
@@ -233,6 +235,14 @@ impl InputAdapter for BruInputAdapter {
     }
 
     fn detect(&self, bytes: &[u8]) -> bool {
+        // TR-458: the on-disk `.bru` TEXT format, checked first because it is
+        // not JSON at all — a `meta {` opener. Every .bru file has one and no
+        // JSON, YAML or cURL document does.
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if text::looks_like_bru_text(text) {
+                return true;
+            }
+        }
         // Structural detection: a Bruno collection JSON has `version: "1"`,
         // a `name` and an `items` array. The version string is enough to
         // disambiguate from Postman (`info.schema`), HAR (`log`), OpenAPI
@@ -246,12 +256,32 @@ impl InputAdapter for BruInputAdapter {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
-        let col: BruCollection = serde_json::from_slice(bytes)
-            .map_err(|e| TropelError::Parse(format!("Failed to parse Bruno collection: {}", e)))?;
-
         // TR-410: collect conversion notes (skipped items, degraded requests)
         // into a structured report the client can render, instead of eprintln.
         let mut notes: Vec<String> = Vec::new();
+
+        // TR-458: a `.bru` TEXT document is converted into the shape Bruno's
+        // own EXPORT produces, then parsed by the path below. The mapping to a
+        // Scenario — methods, header/param merging, auth and body modes, path
+        // params — therefore happens ONCE, for both inputs. A second mapping
+        // for the text format is exactly what the TypeScript stopgap this
+        // replaces had, and what let the two drift.
+        let owned;
+        let bytes = match std::str::from_utf8(bytes) {
+            Ok(t) if text::looks_like_bru_text(t) => {
+                let value = text::bru_text_to_json(t, &mut notes).map_err(|e| {
+                    TropelError::Parse(format!("Failed to parse the .bru document: {e}"))
+                })?;
+                owned = serde_json::to_vec(&value).map_err(|e| {
+                    TropelError::Parse(format!("Failed to re-encode the .bru document: {e}"))
+                })?;
+                owned.as_slice()
+            }
+            _ => bytes,
+        };
+
+        let col: BruCollection = serde_json::from_slice(bytes)
+            .map_err(|e| TropelError::Parse(format!("Failed to parse Bruno collection: {}", e)))?;
         let items = build_items(&col.items, &mut notes);
         if items.is_empty() {
             return Err(TropelError::Parse(
@@ -1128,5 +1158,159 @@ mod exporter_spelling_regression {
             "both spellings describe the same request and must agree"
         );
         assert_eq!(exported.items[0].name, internal.items[0].name);
+    }
+}
+
+#[cfg(test)]
+mod bru_text_format {
+    use super::*;
+
+    // ── TR-458 · the `.bru` TEXT format ──────────────────────────────────
+    //
+    // Driven from KnockPort's OWN fixtures, byte for byte. Those two files
+    // are what its TypeScript parser was written against, so they are the
+    // suite this port has to satisfy — writing fresh fixtures here would
+    // encode my reading of the format instead of the one already in use.
+
+    const GET_USER: &str = include_str!("../fixtures/get-user.bru");
+    const POST_LOGIN: &str = include_str!("../fixtures/post-login.bru");
+
+    #[test]
+    fn detect_claims_bru_text_and_nothing_else() {
+        assert!(BruInputAdapter.detect(GET_USER.as_bytes()));
+        assert!(BruInputAdapter.detect(POST_LOGIN.as_bytes()));
+        // The formats it shares an import chain with must NOT be claimed.
+        assert!(!BruInputAdapter.detect(b"{\"info\":{\"schema\":\"postman\"}}"));
+        assert!(!BruInputAdapter.detect(b"{\"log\":{\"entries\":[]}}"));
+        assert!(!BruInputAdapter.detect(b"openapi: 3.0.0\npaths: {}\n"));
+        assert!(!BruInputAdapter.detect(b"curl https://api.test"));
+        // A YAML mapping named `meta` is the near-miss: it needs a COLON, and
+        // a .bru opener needs a BRACE.
+        assert!(!BruInputAdapter.detect(b"meta:\n  name: not a bru file\n"));
+    }
+
+    #[test]
+    fn a_get_request_carries_its_method_url_headers_and_query() {
+        let s = BruInputAdapter.parse(GET_USER.as_bytes()).expect("parses");
+        let item = &s.items[0];
+        assert_eq!(item.name, "Get Users");
+        let req = item.request.as_ref().expect("a request");
+        assert_eq!(req.method, Method::GET);
+        assert!(
+            req.url.starts_with("https://api.example.com/users"),
+            "{}",
+            req.url
+        );
+        // `~x-draft` is disabled and must NOT reach the request; `accept` must.
+        let names: Vec<&str> = req.headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"accept"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.eq_ignore_ascii_case("x-draft")),
+            "a ~disabled header must not be imported: {names:?}"
+        );
+    }
+
+    #[test]
+    fn auth_blocks_map_by_the_mode_the_method_block_names() {
+        // The `auth: bearer` line in the method block selects WHICH
+        // `auth:*` block is authoritative — a file may carry several.
+        let s = BruInputAdapter.parse(GET_USER.as_bytes()).expect("parses");
+        let auth = s.items[0].request.as_ref().unwrap().auth.as_ref();
+        // The token itself is `[redacted]` in Debug — deliberate secret
+        // hygiene — so what is asserted is the VARIANT, which is what the
+        // method block's `auth: bearer` line actually selects.
+        assert!(
+            matches!(auth, Some(tropel_sdk::types::AuthConfig::Bearer { .. })),
+            "the bearer block must select Bearer auth: {auth:?}"
+        );
+
+        let s = BruInputAdapter
+            .parse(POST_LOGIN.as_bytes())
+            .expect("parses");
+        let auth = s.items[0].request.as_ref().unwrap().auth.as_ref();
+        assert!(
+            matches!(auth, Some(tropel_sdk::types::AuthConfig::Basic { .. })),
+            "the basic block must select Basic auth: {auth:?}"
+        );
+    }
+
+    #[test]
+    fn a_form_urlencoded_body_keeps_enabled_pairs_and_drops_disabled_ones() {
+        let s = BruInputAdapter
+            .parse(POST_LOGIN.as_bytes())
+            .expect("parses");
+        let body = format!("{:?}", s.items[0].request.as_ref().unwrap().body);
+        assert!(
+            body.contains("john"),
+            "the enabled pair must survive: {body}"
+        );
+        assert!(
+            !body.contains("remember"),
+            "`~remember` is disabled and must not be sent: {body}"
+        );
+    }
+
+    #[test]
+    fn a_script_block_is_text_not_pairs() {
+        // `console.log('fetching users');` contains a colon-free line and
+        // parentheses; treating a script block as `key: value` pairs would
+        // mangle or drop it.
+        let s = BruInputAdapter.parse(GET_USER.as_bytes()).expect("parses");
+        let rendered = format!("{:?}", s.items[0]);
+        assert!(
+            rendered.contains("fetching users"),
+            "the pre-request script must survive verbatim: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_json_body_survives_its_own_braces() {
+        // The failure this guards: a text block closed on the first `}` would
+        // truncate every JSON body at its first nested object.
+        let doc = concat!(
+            "meta {\n  name: Nested\n}\n\n",
+            "post {\n  url: https://api.test/x\n  body: json\n}\n\n",
+            "body:json {\n  {\n    \"a\": { \"b\": 1 }\n  }\n}\n"
+        );
+        let s = BruInputAdapter.parse(doc.as_bytes()).expect("parses");
+        let body = format!("{:?}", s.items[0].request.as_ref().unwrap().body);
+        // The body is PARSED, so this asserts the nested object survived as
+        // structure — a text block closed on its first `}` would have
+        // truncated it to `{ "a": {` and failed to parse at all.
+        assert!(
+            body.contains("\"a\"") && body.contains("\"b\""),
+            "the nested object must survive: {body}"
+        );
+    }
+
+    #[test]
+    fn dropped_blocks_are_reported_rather_than_silently_lost() {
+        // GET_USER carries an `assert` block and a `docs` block. The Scenario
+        // model has no field for assertions, and "the import worked" must not
+        // look identical to "the import worked and dropped your assertions".
+        let s = BruInputAdapter.parse(GET_USER.as_bytes()).expect("parses");
+        let notes = format!("{:?}", s.conversion_notes);
+        assert!(
+            notes.contains("assertions"),
+            "the dropped assert block must be reported: {notes}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_document_fails_by_name() {
+        // Never a half-parsed request: an unterminated block means the file is
+        // not what it claims, and a partial import is the silent corruption
+        // invariant #7 forbids.
+        let err = BruInputAdapter
+            .parse(b"meta {\n  name: Broken\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unterminated"), "{err}");
+
+        let err = BruInputAdapter
+            .parse(b"meta {\n  name: NoMethod\n}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no method block"), "{err}");
     }
 }
