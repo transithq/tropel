@@ -92,7 +92,16 @@ if command -v node >/dev/null 2>&1; then
     const size=Number(process.argv[1]);
     const headroom=Number(process.argv[2]);
     const kb=(size/1024).toFixed(1);
-    const line='**'+size.toLocaleString('en-US')+' B** raw after \`wasm-opt -Oz --strip-debug\` (≈140 KB brotli, **'+headroom.toLocaleString('en-US')+' B headroom** under the **700 KB** gate). ✅MEAS';
+    // TR-433: brotli is MEASURED, not asserted. This line was a hard-coded
+    // '≈140 KB brotli' string that never looked at the artifact — it read as a
+    // measurement (the line is stamped ✅MEAS) while understating the real
+    // transfer size by ~27%. Brotli is what actually ships, so it is the
+    // number a reader is most likely to act on.
+    const zlib=require('zlib');
+    const wasm=fs.readFileSync('pkg/tropel_core_wasm_bg.wasm');
+    const brotli=zlib.brotliCompressSync(wasm,{params:{[zlib.constants.BROTLI_PARAM_QUALITY]:11}}).length;
+    const brKb=(brotli/1024).toFixed(0);
+    const line='**'+size.toLocaleString('en-US')+' B** raw after \`wasm-opt -Oz --strip-debug\` ('+brKb+' KB brotli, measured, **'+headroom.toLocaleString('en-US')+' B headroom** under the **700 KB** gate). ✅MEAS';
     // Replace the generated block between the HTML comment and the next heading or EOF
     // The README has a comment line then the size line; replace the first occurrence of '**... B** raw after'
     // TOLERANCE — do not rewrite for sub-1% drift.
@@ -113,7 +122,16 @@ if command -v node >/dev/null 2>&1; then
     const prevMatch=s.match(/\*\*([\d,]+) B\*\* raw after \`wasm-opt/);
     const prev=prevMatch?Number(prevMatch[1].replace(/,/g,'')):0;
     const drift=prev?Math.abs(size-prev)/prev:1;
-    if(prev && drift<0.01) {
+    // TR-433: the tolerance compared the NUMBER only, so a change to the
+    // line's SHAPE could never land — the brotli figure sat wrong for as long
+    // as the byte count happened to stay within 1%. Compare the skeletons too
+    // (the line with every digit stripped): same shape + sub-1% drift means
+    // host noise and is kept; a different shape is a real format change and is
+    // always written, drift or not.
+    const prevLine=(s.match(/\*\*[\d,]+ B\*\* raw after \`wasm-opt[^\n]*✅MEAS[^\n]*/)||[''])[0];
+    const skeleton=t=>t.replace(/[\d,]+/g,'#');
+    const sameShape=skeleton(prevLine)===skeleton(line);
+    if(prev && drift<0.01 && sameShape) {
       console.log('  README.md Size line kept at '+prev+' B (this host measured '
         +size+' B, '+(drift*100).toFixed(2)+'% drift — under the 1% rewrite threshold)');
     } else if(s.includes('raw after \`wasm-opt')) {
