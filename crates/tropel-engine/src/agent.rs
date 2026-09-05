@@ -180,13 +180,46 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             // index, so a reordered or short reply would put a header's value
             // in a param. One output per input, always, even for the ones
             // that fail.
+            // TR-449: each item reports `hitCap` and `unresolved`, not just a
+            // string. KnockPort's `resolveVariables` uses them to tell a CYCLE
+            // (`{{a}}` -> `{{b}}` -> `{{a}}`, a failed send) from an UNKNOWN
+            // NAME (the user's typo, left visible and sent). Both leave a
+            // literal `{{…}}` in the text, so a bare string cannot distinguish
+            // them — and only the resolver's own loop knows which happened.
+            let scope = tropel_variables::VariableScope {
+                env: vars.clone(),
+                ..Default::default()
+            };
+            let resolver = tropel_variables::VariableResolver::new();
             let mut out = Vec::with_capacity(items.len());
             for item in &items {
-                let deep = item.deep.unwrap_or(true);
                 let mode = item.mode.as_deref().unwrap_or("plain");
-                match tropel_variables::resolve_template_for_host(&item.template, &vars, mode, deep)
-                {
-                    Ok(resolved) => out.push(serde_json::json!({ "resolved": resolved })),
+                // TR-449: `deep: false` is REFUSED here, not ignored. The
+                // batched path exists to serve `resolveTemplateDetailed`,
+                // whose report only means something for a chain the resolver
+                // ran to settlement: a shallow pass stops BY DESIGN, so it has
+                // no cap to hit. Emulating one with `max_passes = 1` would
+                // report `{{a}}` -> `{{b}}` as a CYCLE, and silently upgrading
+                // to deep is the worse half of the same trade — the caller
+                // asked for one pass, got twenty, and cannot tell. `POST
+                // /resolve` still answers a shallow single resolve.
+                if item.deep == Some(false) {
+                    out.push(serde_json::json!({
+                        "error": "deep: false is not supported by POST /resolve/batch \u{2014} the batched reply reports hitCap/unresolved, which only a chain resolved to settlement has; use POST /resolve for a shallow resolve"
+                    }));
+                    continue;
+                }
+                match resolver.resolve_reporting(
+                    &item.template,
+                    &scope,
+                    tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                    mode,
+                ) {
+                    Ok(outcome) => out.push(serde_json::json!({
+                        "value": outcome.value,
+                        "hitCap": outcome.hit_cap,
+                        "unresolved": outcome.unresolved,
+                    })),
                     // A per-item failure does NOT fail the batch: one bad
                     // escape mode must not lose the other 32 resolutions, and
                     // the caller can still see exactly which item broke.
@@ -1870,19 +1903,76 @@ mod tests {
         // ORDER IS THE CONTRACT — the caller re-assembles its request by index,
         // so a reordered or short reply would put a header's value in a param.
         assert_eq!(items.len(), 5, "one output per input, always: {body}");
-        assert_eq!(items[0]["resolved"], "https://api.test/v2");
-        assert_eq!(items[1]["resolved"], "Bearer abc");
-        assert_eq!(items[2]["resolved"], "{\"t\":\"abc\"}");
+        assert_eq!(items[0]["value"], "https://api.test/v2");
+        assert_eq!(items[1]["value"], "Bearer abc");
+        assert_eq!(items[2]["value"], "{\"t\":\"abc\"}");
         // A per-item failure does NOT fail the batch: one bad escape mode must
         // not lose the other four resolutions.
         assert!(
             items[3]["error"].is_string(),
             "item 3 should carry an error: {body}"
         );
-        assert!(items[3]["resolved"].is_null());
+        assert!(items[3]["value"].is_null());
         assert_eq!(
-            items[4]["resolved"], "https://api.test",
+            items[4]["value"], "https://api.test",
             "later items still resolve"
+        );
+
+        // TR-449: a CYCLE and an UNKNOWN NAME both leave a literal `{{…}}`,
+        // and only the resolver's own loop can tell them apart. KnockPort
+        // turns `hitCap` into a failed send and an unresolved name into a
+        // visible typo, so collapsing them to a bare string would make a
+        // cyclic chain look like a harmless placeholder.
+        let raw = post(
+            serde_json::json!({
+                "variables": {"a": "{{b}}", "b": "{{a}}"},
+                "items": [
+                    {"template": "{{a}}"},
+                    {"template": "{{nosuchvar}}"}
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let items = parsed["items"].as_array().expect("items");
+        assert_eq!(
+            items[0]["hitCap"], true,
+            "a cycle must report hitCap: {body}"
+        );
+        assert_eq!(
+            items[1]["hitCap"], false,
+            "an unknown name is NOT a cycle: {body}"
+        );
+        assert!(
+            items[1]["unresolved"]
+                .as_array()
+                .is_some_and(|u| u.iter().any(|n| n == "nosuchvar")),
+            "the unknown name must be reported so the user sees their typo: {body}"
+        );
+
+        // TR-449: a shallow item is REFUSED by name. Silently resolving it
+        // deep would hand the caller twenty passes when it asked for one,
+        // with nothing in the reply to say so — the D4 failure this seam
+        // exists to prevent.
+        let raw = post(
+            serde_json::json!({
+                "variables": {"a": "{{b}}", "b": "final"},
+                "items": [{"template": "{{a}}", "deep": false}]
+            })
+            .to_string(),
+        )
+        .await;
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let item = &parsed["items"][0];
+        assert!(item["value"].is_null(), "a refused item carries no value: {body}");
+        assert!(
+            item["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("deep: false") && e.contains("/resolve")),
+            "the refusal must name the field AND the endpoint that serves it: {body}"
         );
 
         // An empty batch is a valid batch — a request with no templates is not
