@@ -2562,6 +2562,69 @@ mod tests {
         );
     }
 
+    /// TR-470: the QuickJS realm has no host escape.
+    ///
+    /// The desktop tier runs user scripts HERE rather than in the webview,
+    /// and the sandbox is the reason that decision was taken: the API
+    /// client's own realm gate states it "is NOT airtight" against an
+    /// obfuscated escape and names this realm as the airtight path. That
+    /// claim rested on READING the gate rather than attacking it — and an
+    /// escape here sits next to the user's filesystem, where in a tab it
+    /// would be tab-scoped.
+    ///
+    /// The indirect-eval case is the one that matters most: it is exactly
+    /// what the textual gate admits it cannot catch, so this is the test
+    /// that has to hold when that one does not.
+    #[tokio::test]
+    async fn the_script_realm_has_no_host_escape() {
+        fn kp() -> tropel_sandbox::config::SandboxConfig {
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            }
+        }
+
+        // Host capabilities a script must not be able to name. Read back
+        // through the environment rather than asserted on a throw, so a probe
+        // that never ran cannot be mistaken for a probe that found nothing.
+        let probe = "kp.environment.set('process', typeof process);\
+                     kp.environment.set('require', typeof require);\
+                     kp.environment.set('fetch', typeof fetch);\
+                     kp.environment.set('module', typeof module);\
+                     kp.environment.set('viaFn', typeof Function('return this')().process);";
+        let out = run_script_once(probe, HashMap::new(), None, None, kp())
+            .await
+            .expect("the realm runs");
+        let env = out.get("environment").expect("the environment comes back");
+        for name in ["process", "require", "fetch", "module", "viaFn"] {
+            assert_eq!(
+                env.get(name).and_then(|v| v.as_str()),
+                Some("undefined"),
+                "`{name}` must not be reachable from a script: {out}"
+            );
+        }
+
+        // And no host module loader is wired — including through an indirect
+        // eval, which hides the syntax from any textual gate.
+        for (label, code) in [
+            ("direct", "import('fs');"),
+            ("indirect eval", "var e = eval; e(\"import\" + \"('fs')\");"),
+        ] {
+            let result = run_script_once(code, HashMap::new(), None, None, kp()).await;
+            let refused = match &result {
+                Err(why) => why.contains("module"),
+                Ok(out) => out
+                    .get("scriptError")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|e| e.contains("module")),
+            };
+            assert!(
+                refused,
+                "a {label} import must not load a host module: {result:?}"
+            );
+        }
+    }
+
     /// TR-465 / KT-404 — the QuickJS half of the script-realm corpus.
     ///
     /// The corpus is a COMMITTED, MEASURED table of what a user script can
