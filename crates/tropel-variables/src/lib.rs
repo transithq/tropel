@@ -5,6 +5,7 @@
 
 pub mod assertions;
 pub mod catalog;
+pub mod headers;
 pub mod resolver;
 
 pub use catalog::*;
