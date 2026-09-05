@@ -1,21 +1,7 @@
 use rand::RngExt;
-use regex::Regex;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use tracing::warn;
-
-/// Compile a regex ONCE per process (lazily) and return a reference to the
-/// cached instance. The old code called `Regex::new` on EVERY `resolve` for
-/// every one of the ~30 patterns — plus ~30 full-string `contains` marker
-/// scans — even when the input had no dynamic variables at all. Compiled
-/// once, a `Regex` is reused by all threads/VUs (it is `Sync`); the `$` fast
-/// path below skips even the marker scans for the common no-`$` case.
-macro_rules! cached_re {
-    ($name:ident, $pattern:literal) => {{
-        static $name: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        $name.get_or_init(|| regex::Regex::new($pattern).expect("valid dynamic-variable regex"))
-    }};
-}
 
 /// Cap for `:length` / `:count` arguments on dynamic variables (backlog line
 /// 162). Postman's own values are single-digit-to-low-hundreds; a collection
@@ -269,379 +255,182 @@ impl DynamicCatalog {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // Fast path: no `$` means no dynamic variable anywhere — return
         // unchanged. This is the common case (plain URLs, headers, bodies
-        // with scoped `{{var}}` refs only) and it skips the ~30 marker
-        // `contains` scans and all regex work entirely.
+        // with scoped `{{var}}` refs only).
         if !s.contains('$') {
             return Ok(s.to_string());
         }
         // Second fast path: a bare `$` without `{{` cannot be a dynamic
-        // variable (all Postman dynamic vars use `{{$...}}` syntax), so
-        // skip the 44 marker scans. Common in URLs with prices, JSONPath
-        // refs, and Stripe/GitHub-style query params.
+        // variable (all Postman dynamic vars use `{{$...}}` syntax). Common
+        // in URLs with prices, JSONPath refs, and Stripe/GitHub-style params.
         if !s.contains("{{") {
             return Ok(s.to_string());
         }
-        let mut result = s.to_string();
+
         let mut rng = rand::rng();
+        let mut out = String::with_capacity(s.len());
+        let mut pos = 0usize;
 
-        // {{$guid}} — fresh UUID per occurrence
-        if result.contains("{{$guid}}") {
-            let re = cached_re!(RE_GUID, r"\{\{\$guid\}\}");
-            result = self.replace_with_func(&result, re, |_| uuid::Uuid::new_v4().to_string());
-        }
+        // TR-434: ONE left-to-right scan. This replaced 37 compiled regexes
+        // driven by 44 sequential whole-string passes — the input was walked
+        // once per variable KIND, whether or not that kind was present.
+        //
+        // Every pattern had the same shape, `{{$name}}` or `{{$name:arg}}`,
+        // which a scanner can recognise directly. Dropping `regex` from this
+        // crate removed 186 KB from the eager wasm tier (F12); the pass count
+        // going from 44 to 1 is the incidental win.
+        while let Some(tok) = next_dynamic_token(s, pos) {
+            out.push_str(&s[pos..tok.start]);
 
-        // {{$timestamp}} — fresh Unix timestamp per occurrence
-        if result.contains("{{$timestamp}}") {
-            let re = cached_re!(RE_TIMESTAMP, r"\{\{\$timestamp\}\}");
-            result = self.replace_with_func(&result, re, |_| epoch_secs().to_string());
-        }
+            // A length argument is valid only when absent, or present and
+            // entirely ASCII digits. `Some(None)` means "absent, use the
+            // handler's default"; `None` means "present but not a number",
+            // which matches nothing and falls through to the literal +
+            // warn-once path — exactly what the old `(?::([0-9]+))?` capture
+            // did by simply failing to match.
+            let digits: Option<Option<&str>> = match tok.arg {
+                None => Some(None),
+                Some(a) if !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit()) => Some(Some(a)),
+                Some(_) => None,
+            };
+            let bare = tok.arg.is_none();
 
-        // {{$isoTimestamp}} — fresh ISO timestamp per occurrence
-        if result.contains("{{$isoTimestamp}}") {
-            let re = cached_re!(RE_ISO_TIMESTAMP, r"\{\{\$isoTimestamp\}\}");
-            result = self.replace_with_func(&result, re, |_| chrono_now_iso());
-        }
+            const ALPHA: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            const ALNUM: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            const HEX: &str = "0123456789abcdef";
+            const PASSWORD: &str =
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
 
-        // {{$randomUUID}} — fresh UUID per occurrence
-        if result.contains("{{$randomUUID}}") {
-            let re = cached_re!(RE_RANDOM_UUID, r"\{\{\$randomUUID\}\}");
-            result = self.replace_with_func(&result, re, |_| uuid::Uuid::new_v4().to_string());
-        }
-
-        // {{$randomInt}} — fresh random integer per occurrence
-        if result.contains("{{$randomInt}}") {
-            let re = cached_re!(RE_RANDOM_INT, r"\{\{\$randomInt\}\}");
-            result =
-                self.replace_with_func(&result, re, |_| rng.random_range(0..1000u32).to_string());
-        }
-
-        // {{$randomFloat}} — fresh random float per occurrence
-        if result.contains("{{$randomFloat}}") {
-            let re = cached_re!(RE_RANDOM_FLOAT, r"\{\{\$randomFloat\}\}");
-            result = self.replace_with_func(&result, re, |_| {
-                format!("{:.6}", rng.random::<f64>() * 1000.0)
-            });
-        }
-
-        // {{$randomString[:length]}}
-        if result.contains("{{$randomString") {
-            let re = cached_re!(RE_RANDOM_STRING, r"\{\{\$randomString(?::([0-9]+))?\}\}");
-            result = self.replace_with_func(&result, re, |caps| {
-                let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
-                random_string(
-                    &mut rng,
-                    len,
-                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                )
-            });
-        }
-
-        // {{$randomAlphabetic[:length]}}
-        if result.contains("{{$randomAlphabetic") {
-            let re = cached_re!(
-                RE_RANDOM_ALPHABETIC,
-                r"\{\{\$randomAlphabetic(?::([0-9]+))?\}\}"
-            );
-            result = self.replace_with_func(&result, re, |caps| {
-                let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
-                random_string(
-                    &mut rng,
-                    len,
-                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
-                )
-            });
-        }
-
-        // {{$randomAlphaNumeric[:length]}} — Postman's spelling (W2 #199:
-        // the old $randomAlphanumeric misspelling never resolves in real
-        // collections). The misspelling is kept as a resolving alias.
-        if result.contains("{{$randomAlphaNumeric") || result.contains("{{$randomAlphanumeric") {
-            let re = cached_re!(
-                RE_RANDOM_ALPHANUMERIC,
-                r"\{\{\$random(?:AlphaNumeric|Alphanumeric)(?::([0-9]+))?\}\}"
-            );
-            result = self.replace_with_func(&result, re, |caps| {
-                let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
-                random_string(
-                    &mut rng,
-                    len,
-                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                )
-            });
-        }
-
-        // {{$randomBoolean}} — fresh random bool per occurrence
-        if result.contains("{{$randomBoolean}}") {
-            let re = cached_re!(RE_RANDOM_BOOLEAN, r"\{\{\$randomBoolean\}\}");
-            result = self.replace_with_func(&result, re, |_| rng.random_bool(0.5).to_string());
-        }
-
-        // {{$randomHexColor}} — a `#rrggbb` hex colour (Postman:
-        // faker.internet.color). Distinct from {{$randomHex}}, which is a bare
-        // hex NUMBER with no `#`. Placed BEFORE the {{$randomHex}} block
-        // because that handler's `contains("{{$randomHex")` gate would fire
-        // on this prefix and run a wasted regex pass for every occurrence.
-        if result.contains("{{$randomHexColor}}") {
-            let re = cached_re!(RE_RANDOM_HEX_COLOR, r"\{\{\$randomHexColor\}\}");
-            result = self.replace_with_func(&result, re, |_| {
-                format!("#{:06x}", rng.random::<u32>() & 0xFFFFFF)
-            });
-        }
-
-        // {{$randomHex[:length]}}
-        if result.contains("{{$randomHex") {
-            let re = cached_re!(RE_RANDOM_HEX, r"\{\{\$randomHex(?::([0-9]+))?\}\}");
-            result = self.replace_with_func(&result, re, |caps| {
-                let len = capped_len(caps.get(1).map(|m| m.as_str()), 8);
-                random_string(&mut rng, len, "0123456789abcdef")
-            });
-        }
-
-        // {{$randomEmail}} — fresh email per occurrence
-        if result.contains("{{$randomEmail}}") {
-            let re = cached_re!(RE_RANDOM_EMAIL, r"\{\{\$randomEmail\}\}");
-            result = self.replace_with_func(&result, re, |_| random_email(&mut rng));
-        }
-
-        // {{$randomPhone}} / {{$randomPhoneNumber}}
-        if result.contains("{{$randomPhone") {
-            let re = cached_re!(RE_RANDOM_PHONE, r"\{\{\$randomPhone(?:Number)?\}\}");
-            result = self.replace_with_func(&result, re, |_| random_phone_number(&mut rng));
-        }
-
-        // {{$randomCompany}} / {{$randomCompanyName}}
-        if result.contains("{{$randomCompany") {
-            let re = cached_re!(RE_RANDOM_COMPANY, r"\{\{\$randomCompany(?:Name)?\}\}");
-            result = self.replace_with_func(&result, re, |_| random_company_name(&mut rng));
-        }
-
-        // {{$randomLoremText}} — one paragraph of lorem-style text. Postman's
-        // spelling is $randomLoremText, not $randomLorem (W2 #199); the
-        // misspelling is kept as a resolving alias.
-        if result.contains("{{$randomLoremText}}") || result.contains("{{$randomLorem}}") {
-            let re = cached_re!(RE_RANDOM_LOREM, r"\{\{\$random(?:LoremText|Lorem)\}\}");
-            result = self.replace_with_func(&result, re, |_| random_lorem_paragraph(&mut rng));
-        }
-
-        // {{$randomLoremSentence}} / {{$randomWords[:count]}} / {{$randomWord}}
-        // Postman's spelling is $randomLoremSentence, not $randomSentence
-        // (W2 #199); the misspelling is kept as a resolving alias.
-        if result.contains("{{$randomLoremSentence}}") || result.contains("{{$randomSentence}}") {
-            let re = cached_re!(RE_RANDOM_SENTENCE, r"\{\{\$random(?:Lorem)?Sentence\}\}");
-            result = self.replace_with_func(&result, re, |_| random_sentence(&mut rng));
-        }
-        if result.contains("{{$randomWords") {
-            let re = cached_re!(RE_RANDOM_WORDS, r"\{\{\$randomWords(?::([0-9]+))?\}\}");
-            result = self.replace_with_func(&result, re, |caps| {
-                let count = capped_len(caps.get(1).map(|m| m.as_str()), 5);
-                random_words(&mut rng, count)
-            });
-        }
-        if result.contains("{{$randomWord}}") {
-            let re = cached_re!(RE_RANDOM_WORD, r"\{\{\$randomWord\}\}");
-            result = self.replace_with_func(&result, re, |_| random_word(&mut rng));
-        }
-
-        // {{$randomDate}} / {{$randomDatePast}} / {{$randomDateFuture}} / {{$randomTime}}
-        if result.contains("{{$randomDatePast}}") {
-            let re = cached_re!(RE_RANDOM_DATE_PAST, r"\{\{\$randomDatePast\}\}");
-            result = self.replace_with_func(&result, re, |_| random_date_past(&mut rng));
-        }
-        if result.contains("{{$randomDateFuture}}") {
-            let re = cached_re!(RE_RANDOM_DATE_FUTURE, r"\{\{\$randomDateFuture\}\}");
-            result = self.replace_with_func(&result, re, |_| random_date_future(&mut rng));
-        }
-        if result.contains("{{$randomDate}}") {
-            let re = cached_re!(RE_RANDOM_DATE, r"\{\{\$randomDate\}\}");
-            result = self.replace_with_func(&result, re, |_| random_date(&mut rng));
-        }
-        if result.contains("{{$randomTime}}") {
-            let re = cached_re!(RE_RANDOM_TIME, r"\{\{\$randomTime\}\}");
-            result = self.replace_with_func(&result, re, |_| random_time(&mut rng));
-        }
-
-        // {{$randomIP}} — fresh IP per occurrence
-        if result.contains("{{$randomIP}}") {
-            let re = cached_re!(RE_RANDOM_IP, r"\{\{\$randomIP\}\}");
-            result = self.replace_with_func(&result, re, |_| {
-                format!(
+            let replacement: Option<String> = match tok.name {
+                // ── no argument ──────────────────────────────────────────
+                "guid" | "randomUUID" if bare => Some(uuid::Uuid::new_v4().to_string()),
+                "timestamp" if bare => Some(epoch_secs().to_string()),
+                "isoTimestamp" if bare => Some(chrono_now_iso()),
+                "randomInt" if bare => Some(rng.random_range(0..1000u32).to_string()),
+                "randomFloat" if bare => Some(format!("{:.6}", rng.random::<f64>() * 1000.0)),
+                "randomBoolean" if bare => Some(rng.random_bool(0.5).to_string()),
+                "randomHexColor" if bare => {
+                    Some(format!("#{:06x}", rng.random::<u32>() & 0xFFFFFF))
+                }
+                "randomEmail" if bare => Some(random_email(&mut rng)),
+                // W2 #199: Postman's spellings win; the older misspellings
+                // below are kept as resolving aliases so existing collections
+                // keep working.
+                "randomPhone" | "randomPhoneNumber" if bare => Some(random_phone_number(&mut rng)),
+                "randomCompany" | "randomCompanyName" if bare => {
+                    Some(random_company_name(&mut rng))
+                }
+                "randomLoremText" | "randomLorem" if bare => Some(random_lorem_paragraph(&mut rng)),
+                "randomLoremSentence" | "randomSentence" if bare => Some(random_sentence(&mut rng)),
+                "randomWord" if bare => Some(random_word(&mut rng)),
+                "randomDatePast" if bare => Some(random_date_past(&mut rng)),
+                "randomDateFuture" if bare => Some(random_date_future(&mut rng)),
+                "randomDate" if bare => Some(random_date(&mut rng)),
+                "randomTime" if bare => Some(random_time(&mut rng)),
+                "randomIP" if bare => Some(format!(
                     "{}.{}.{}.{}",
                     rng.random_range(1..255u32),
                     rng.random_range(0..255u32),
                     rng.random_range(0..255u32),
                     rng.random_range(1..255u32)
-                )
-            });
-        }
+                )),
+                "randomIPV6" if bare => Some(
+                    (0..8)
+                        .map(|_| format!("{:04x}", rng.random::<u16>()))
+                        .collect::<Vec<_>>()
+                        .join(":"),
+                ),
+                "randomCity" if bare => Some(random_city(&mut rng)),
+                "randomCountry" if bare => Some(random_country(&mut rng)),
+                "randomStreetName" | "randomStreet" if bare => Some(random_street(&mut rng)),
+                "randomPostcode" if bare => Some(random_postcode(&mut rng)),
+                // `$randomName` is Postman's full-name variable, and so are
+                // the `$random(Name)?FullName` forms — all three produce a
+                // full name.
+                "randomName" | "randomNameFullName" | "randomFullName" if bare => {
+                    Some(random_full_name(&mut rng))
+                }
+                "randomNameFirstName" | "randomFirstName" if bare => {
+                    Some(random_first_name(&mut rng))
+                }
+                "randomNameLastName" | "randomLastName" if bare => Some(random_last_name(&mut rng)),
+                "randomColor" if bare => Some(random_color(&mut rng)),
+                "randomMACAddress" | "randomMAC" if bare => {
+                    let hex = random_string(&mut rng, 12, HEX);
+                    Some(
+                        hex.chars()
+                            .collect::<Vec<_>>()
+                            .chunks(2)
+                            .map(|c| c.iter().collect::<String>())
+                            .collect::<Vec<_>>()
+                            .join(":"),
+                    )
+                }
 
-        // {{$randomIPV6}} — full-form random IPv6 address (8×4 hex groups).
-        if result.contains("{{$randomIPV6}}") {
-            let re = cached_re!(RE_RANDOM_IPV6, r"\{\{\$randomIPV6\}\}");
-            result = self.replace_with_func(&result, re, |_| {
-                (0..8)
-                    .map(|_| format!("{:04x}", rng.random::<u16>()))
-                    .collect::<Vec<_>>()
-                    .join(":")
-            });
-        }
+                // ── optional numeric length ──────────────────────────────
+                "randomString" => digits.map(|d| random_string(&mut rng, capped_len(d, 10), ALNUM)),
+                "randomAlphabetic" => {
+                    digits.map(|d| random_string(&mut rng, capped_len(d, 10), ALPHA))
+                }
+                "randomAlphaNumeric" | "randomAlphanumeric" => {
+                    digits.map(|d| random_string(&mut rng, capped_len(d, 10), ALNUM))
+                }
+                "randomHex" => digits.map(|d| random_string(&mut rng, capped_len(d, 8), HEX)),
+                "randomWords" => digits.map(|d| random_words(&mut rng, capped_len(d, 5))),
+                "randomPassword" => {
+                    digits.map(|d| random_string(&mut rng, capped_len(d, 12), PASSWORD))
+                }
 
-        // {{$randomCity}}, {{$randomCountry}}, {{$randomStreetName}}, {{$randomPostcode}},
-        // {{$randomFullName}}, {{$randomFirstName}}, {{$randomLastName}},
-        // {{$randomName}}, {{$randomColor}}, {{$randomMACAddress}}
-        if result.contains("{{$randomCity}}") {
-            let re = cached_re!(RE_RANDOM_CITY, r"\{\{\$randomCity\}\}");
-            result = self.replace_with_func(&result, re, |_| random_city(&mut rng));
-        }
-        if result.contains("{{$randomCountry}}") {
-            let re = cached_re!(RE_RANDOM_COUNTRY, r"\{\{\$randomCountry\}\}");
-            result = self.replace_with_func(&result, re, |_| random_country(&mut rng));
-        }
-        // Postman's spelling is $randomStreetName, not $randomStreet (W2
-        // #199); the misspelling is kept as a resolving alias.
-        if result.contains("{{$randomStreetName}}") || result.contains("{{$randomStreet}}") {
-            let re = cached_re!(RE_RANDOM_STREET, r"\{\{\$random(?:StreetName|Street)\}\}");
-            result = self.replace_with_func(&result, re, |_| random_street(&mut rng));
-        }
-        if result.contains("{{$randomPostcode}}") {
-            let re = cached_re!(RE_RANDOM_POSTCODE, r"\{\{\$randomPostcode\}\}");
-            result = self.replace_with_func(&result, re, |_| random_postcode(&mut rng));
-        }
-        if result.contains("{{$randomName}}") {
-            // Note: {{$randomName}} is the base pattern; longer forms like
-            // {{$randomFullName}} are handled later with more specific regexes.
-            let re = cached_re!(RE_RANDOM_NAME, r"\{\{\$randomName\}\}");
-            result = self.replace_with_func(&result, re, |_| random_full_name(&mut rng));
-        }
-        // Postman's spellings are $randomFullName / $randomFirstName /
-        // $randomLastName, NOT the $randomName* forms (W2 #199). The old
-        // misspellings are kept as resolving aliases.
-        if result.contains("{{$randomNameFullName}}") || result.contains("{{$randomFullName}}") {
-            let re = cached_re!(RE_RANDOM_NAME_FULL, r"\{\{\$random(?:Name)?FullName\}\}");
-            result = self.replace_with_func(&result, re, |_| random_full_name(&mut rng));
-        }
-        if result.contains("{{$randomNameFirstName}}") || result.contains("{{$randomFirstName}}") {
-            let re = cached_re!(RE_RANDOM_NAME_FIRST, r"\{\{\$random(?:Name)?FirstName\}\}");
-            result = self.replace_with_func(&result, re, |_| random_first_name(&mut rng));
-        }
-        if result.contains("{{$randomNameLastName}}") || result.contains("{{$randomLastName}}") {
-            let re = cached_re!(RE_RANDOM_NAME_LAST, r"\{\{\$random(?:Name)?LastName\}\}");
-            result = self.replace_with_func(&result, re, |_| random_last_name(&mut rng));
-        }
-        // {{$randomColor}} — a colour WORD (Postman: faker.commerce.color), NOT
-        // a bare hex string.
-        if result.contains("{{$randomColor}}") {
-            let re = cached_re!(RE_RANDOM_COLOR, r"\{\{\$randomColor\}\}");
-            result = self.replace_with_func(&result, re, |_| random_color(&mut rng));
-        }
+                _ => None,
+            };
 
-        // Backlog line 141: any dynamic variable that is NOT in the catalog
-        // ({{$randomUserName}}, …) survives resolution and is sent to the
-        // server as the literal placeholder — silently, with no warning. Warn
-        // ONCE per distinct name so a multi-million-iteration load run spams
-        // the log exactly N times, not once per request. The cheap `{{$`
-        // gate means the regex pass only runs for inputs that actually
-        // contain an unresolved dynamic variable.
-        // Postman's spelling is $randomMACAddress, not $randomMAC (W2 #199);
-        // the misspelling is kept as a resolving alias.
-        if result.contains("{{$randomMACAddress}}") || result.contains("{{$randomMAC}}") {
-            let re = cached_re!(RE_RANDOM_MAC, r"\{\{\$randomMAC(?:Address)?\}\}");
-            result = self.replace_with_func(&result, re, |_| {
-                let hex = random_string(&mut rng, 12, "0123456789abcdef");
-                hex.chars()
-                    .collect::<Vec<_>>()
-                    .chunks(2)
-                    .map(|c| c.iter().collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join(":")
-            });
-        }
-
-        // {{$randomPassword[:length]}}
-        if result.contains("{{$randomPassword") {
-            let re = cached_re!(RE_RANDOM_PASSWORD, r"\{\{\$randomPassword(?::([0-9]+))?\}\}");
-            result = self.replace_with_func(&result, re, |caps| {
-                let len = capped_len(caps.get(1).map(|m| m.as_str()), 12);
-                random_string(
-                    &mut rng,
-                    len,
-                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*",
-                )
-            });
-        }
-
-        // Backlog line 141: any dynamic variable that is NOT in the catalog
-        // ({{$randomUserName}}, …) survives resolution and is sent to the
-        // server as the literal placeholder — silently, with no warning. Warn
-        // ONCE per distinct name so a multi-million-iteration load run spams
-        // the log exactly N times, not once per request. The cheap `{{$`
-        // gate means the regex pass only runs for inputs that actually
-        // contain an unresolved dynamic variable.
-        //
-        // W2 #199: this pass runs LAST, after every implemented handler — it
-        // used to sit before the $randomMAC / $randomPassword handlers, so it
-        // warned about two variables that ARE implemented, immediately before
-        // resolving them.
-        if result.contains("{{$") {
-            let re = cached_re!(
-                RE_UNRESOLVED_DYNAMIC,
-                r"\{\{\$([A-Za-z][A-Za-z0-9_]*)(?::[^}]*)?\}\}"
-            );
-            for caps in re.captures_iter(&result) {
-                let name = caps.get(1).unwrap().as_str().to_string();
-                let warned = UNKNOWN_DYNAMIC_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-                let mut warned = warned.lock().unwrap();
-                if warned.insert(name.clone()) {
-                    warn!(
-                        variable = %name,
-                        "unimplemented Postman dynamic variable — sent verbatim as the literal placeholder"
-                    );
+            match replacement {
+                Some(rep) => {
+                    // P1 line 151: stop expanding if total output exceeds cap.
+                    if out.len() + rep.len() > MAX_TOTAL_OUTPUT {
+                        self.capped
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            "dynamic variable expansion capped at {} bytes (input: {} bytes)",
+                            MAX_TOTAL_OUTPUT,
+                            s.len()
+                        );
+                        out.push_str(&s[tok.start..]);
+                        return Err(format!(
+                            "dynamic variable expansion exceeded max output ({} bytes)",
+                            MAX_TOTAL_OUTPUT
+                        ));
+                    }
+                    out.push_str(&rep);
+                }
+                None => {
+                    // Backlog line 141: a dynamic variable that is NOT in the
+                    // catalog survives resolution and is sent to the server as
+                    // the literal placeholder. Warn ONCE per distinct name so a
+                    // multi-million-iteration load run logs N times, not once
+                    // per request.
+                    //
+                    // W2 #199: this is reached only after every implemented
+                    // name has been tried. The old code ran the warn pass as a
+                    // separate regex sweep that once sat BEFORE two implemented
+                    // handlers and warned about variables it was about to
+                    // resolve; a single scan makes that ordering bug
+                    // unrepresentable.
+                    let warned = UNKNOWN_DYNAMIC_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+                    let mut warned = warned.lock().unwrap();
+                    if warned.insert(tok.name.to_string()) {
+                        warn!(
+                            variable = %tok.name,
+                            "unimplemented Postman dynamic variable — sent verbatim as the literal placeholder"
+                        );
+                    }
+                    out.push_str(&s[tok.start..tok.end]);
                 }
             }
+            pos = tok.end;
         }
 
-        if self.capped.load(std::sync::atomic::Ordering::Relaxed) {
-            Err(format!(
-                "dynamic variable expansion exceeded max output ({} bytes)",
-                MAX_TOTAL_OUTPUT
-            ))
-        } else {
-            Ok(result)
-        }
-    }
-
-    /// Replace regex matches using a closure with proper lifetime handling.
-    fn replace_with_func<F>(&self, input: &str, re: &Regex, mut f: F) -> String
-    where
-        F: FnMut(&regex::Captures) -> String,
-    {
-        let mut result = String::new();
-        let mut last_end = 0;
-
-        for caps in re.captures_iter(input) {
-            let m = caps.get(0).unwrap();
-            // Append text before this match
-            result.push_str(&input[last_end..m.start()]);
-            // Append replacement
-            let replacement = f(&caps);
-            // P1 line 151: stop expanding if total output exceeds cap
-            if result.len() + replacement.len() > MAX_TOTAL_OUTPUT {
-                self.capped
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    "dynamic variable expansion capped at {} bytes (input: {} bytes)",
-                    MAX_TOTAL_OUTPUT,
-                    input.len()
-                );
-                result.push_str(&input[last_end..]);
-                return result;
-            }
-            result.push_str(&replacement);
-            last_end = m.end();
-        }
-
-        // Append remaining text
-        result.push_str(&input[last_end..]);
-        result
+        out.push_str(&s[pos..]);
+        Ok(out)
     }
 }
 
@@ -1060,6 +849,82 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// One `{{$name}}` or `{{$name:arg}}` occurrence.
+struct DynamicToken<'a> {
+    /// Byte offset of the opening `{`.
+    start: usize,
+    /// Byte offset just past the closing `}}`.
+    end: usize,
+    /// The name WITHOUT the leading `$`.
+    name: &'a str,
+    /// The raw text between `:` and `}}`, if an argument was present.
+    arg: Option<&'a str>,
+}
+
+/// Find the next `{{$ident}}` / `{{$ident:arg}}` at or after `from`.
+///
+/// TR-434: this replaces `regex`'s job in this crate. It recognises exactly
+/// what the 37 patterns recognised between them —
+/// `\{\{\$([A-Za-z][A-Za-z0-9_]*)(?::[^}]*)?\}\}` — which was already written
+/// out as the catch-all pattern the unresolved-variable warning used, so the
+/// grammar is not a new invention.
+///
+/// Returns byte offsets, and only ever splits `s` at ASCII boundaries (`{`,
+/// `}`, `:` and the ASCII-only identifier), so slicing with them cannot panic
+/// on multi-byte input.
+fn next_dynamic_token(s: &str, from: usize) -> Option<DynamicToken<'_>> {
+    let bytes = s.as_bytes();
+    let mut i = from;
+    while i + 3 < bytes.len() {
+        // Cheap scan to the next `{{$`.
+        if bytes[i] != b'{' || bytes[i + 1] != b'{' || bytes[i + 2] != b'$' {
+            i += 1;
+            continue;
+        }
+        let name_start = i + 3;
+        let mut j = name_start;
+        // ident: [A-Za-z][A-Za-z0-9_]*
+        if j >= bytes.len() || !bytes[j].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        let name = &s[name_start..j];
+
+        // Optional `:arg`, where arg is any run of non-`}` bytes. Matching
+        // the old `[^}]*` exactly matters: `{{$randomInt:abc}}` must be
+        // RECOGNISED as a token (so it warns once and stays literal) rather
+        // than skipped as not-a-token.
+        let (arg, mut k) = if j < bytes.len() && bytes[j] == b':' {
+            let arg_start = j + 1;
+            let mut a = arg_start;
+            while a < bytes.len() && bytes[a] != b'}' {
+                a += 1;
+            }
+            (Some(&s[arg_start..a]), a)
+        } else {
+            (None, j)
+        };
+
+        // Require the closing `}}`.
+        if k + 1 < bytes.len() && bytes[k] == b'}' && bytes[k + 1] == b'}' {
+            k += 2;
+            return Some(DynamicToken {
+                start: i,
+                end: k,
+                name,
+                arg,
+            });
+        }
+        // Not a well-formed token — resume scanning after this `{`.
+        i += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1388,7 +1253,10 @@ mod tests {
         let out = c
             .resolve("名前={{$randomFirstName}} ключ={{$guid}} emoji=🎉 ar=مرحبا")
             .expect("resolution succeeds");
-        assert!(out.contains("名前="), "CJK literal text must survive: {out}");
+        assert!(
+            out.contains("名前="),
+            "CJK literal text must survive: {out}"
+        );
         assert!(out.contains("emoji=🎉"), "emoji must survive: {out}");
         assert!(out.contains("ar=مرحبا"), "RTL text must survive: {out}");
         assert!(!out.contains("{{$guid}}"), "tokens still resolve: {out}");
@@ -1417,5 +1285,127 @@ mod tests {
              expand to a multi-kilobyte string"
         );
     }
+    #[test]
+    fn scanner_matches_exactly_what_the_regexes_matched() {
+        // TR-434 replaced 37 compiled patterns with one scanner. These are
+        // the grammar edges the regexes enforced implicitly and that a
+        // hand-written scanner is most likely to get wrong.
+        let c = DynamicCatalog::new();
+        let r = |s: &str| c.resolve(s).expect("resolution succeeds");
 
+        // A known name with a NON-numeric argument matched no handler and
+        // fell through to the literal + warn path. It must still be
+        // RECOGNISED as a token (the old catch-all was `(?::[^}]*)?`), not
+        // silently skipped.
+        assert_eq!(r("{{$randomInt:abc}}"), "{{$randomInt:abc}}");
+        // A no-argument variable given an argument matched nothing either —
+        // `\{\{\$guid\}\}` requires the braces to follow the name directly.
+        assert_eq!(r("{{$guid:5}}"), "{{$guid:5}}");
+        // Unknown names survive verbatim (backlog line 141).
+        assert_eq!(r("{{$randomUserName}}"), "{{$randomUserName}}");
+
+        // Malformed tokens are left alone rather than consuming the rest of
+        // the input.
+        assert_eq!(r("{{$guid"), "{{$guid");
+        assert_eq!(r("{{$}}"), "{{$}}");
+        assert_eq!(
+            r("{{$9bad}}"),
+            "{{$9bad}}",
+            "ident must start with a letter"
+        );
+
+        // Adjacent tokens both resolve, and surrounding text is preserved.
+        let two = r("a{{$randomInt}}b{{$randomInt}}c");
+        assert!(two.starts_with('a') && two.ends_with('c'), "{two}");
+        assert!(!two.contains("{{$"), "{two}");
+
+        // Each occurrence gets a FRESH value — the old code re-ran the
+        // closure per match, and a scanner that computed once and reused
+        // would silently break load-test fixtures.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..40 {
+            seen.insert(r("{{$guid}}"));
+        }
+        assert!(
+            seen.len() > 35,
+            "guids must differ per call: {}",
+            seen.len()
+        );
+        let pair = r("{{$guid}}|{{$guid}}");
+        let (l, right) = pair.split_once('|').unwrap();
+        assert_ne!(l, right, "two guids in ONE input must differ");
+    }
+
+    #[test]
+    fn scanner_is_safe_and_correct_around_multibyte_text() {
+        // The scanner indexes `s.as_bytes()` and slices `s` with those byte
+        // offsets. It only ever splits at ASCII `{`, `}`, `:` or an ASCII
+        // identifier, so slicing cannot land mid-codepoint — but that is a
+        // property worth pinning, because getting it wrong is a panic in
+        // production on any non-English payload.
+        let c = DynamicCatalog::new();
+        let out = c
+            .resolve("🎉{{$randomInt}}日本語{{$guid}}—مرحبا")
+            .expect("resolution succeeds");
+        assert!(out.starts_with('🎉'), "{out}");
+        assert!(out.contains("日本語"), "{out}");
+        assert!(out.ends_with("—مرحبا"), "{out}");
+        assert!(!out.contains("{{$"), "{out}");
+    }
+
+    #[test]
+    fn length_arguments_keep_their_defaults_and_their_cap() {
+        let c = DynamicCatalog::new();
+        let r = |s: &str| c.resolve(s).expect("resolution succeeds");
+        // Defaults, per variable.
+        assert_eq!(r("{{$randomString}}").len(), 10);
+        assert_eq!(r("{{$randomAlphabetic}}").len(), 10);
+        assert_eq!(r("{{$randomHex}}").len(), 8);
+        assert_eq!(r("{{$randomPassword}}").len(), 12);
+        // Explicit length.
+        assert_eq!(r("{{$randomString:3}}").len(), 3);
+        // MAX_DYNAMIC_LENGTH clamp — backlog line 162, where an unbounded
+        // parse attempted a ~10 GB allocation and aborted the process.
+        assert_eq!(r("{{$randomString:99999}}").len(), MAX_DYNAMIC_LENGTH);
+        // A value that OVERFLOWS usize clamps rather than falling back to
+        // the small default.
+        assert_eq!(
+            r("{{$randomString:99999999999999999999999999}}").len(),
+            MAX_DYNAMIC_LENGTH
+        );
+    }
+
+    #[test]
+    fn every_documented_variable_and_alias_still_resolves() {
+        // PREDEFINED_VARIABLE_META is the editor-facing catalogue, and the
+        // W2 #199 aliases are what existing collections actually contain.
+        // A rewrite that dropped an arm would otherwise show up as a literal
+        // `{{$…}}` on the wire rather than a test failure.
+        let c = DynamicCatalog::new();
+        for meta in PREDEFINED_VARIABLE_META {
+            let tpl = format!("{{{{{}}}}}", meta.name);
+            let got = c.resolve(&tpl).expect("resolution succeeds");
+            assert_ne!(
+                got, tpl,
+                "documented variable {} did not resolve",
+                meta.name
+            );
+        }
+        for alias in [
+            "$randomLorem",
+            "$randomSentence",
+            "$randomStreet",
+            "$randomPhoneNumber",
+            "$randomCompanyName",
+            "$randomNameFullName",
+            "$randomNameFirstName",
+            "$randomNameLastName",
+            "$randomMAC",
+            "$randomAlphanumeric",
+        ] {
+            let tpl = format!("{{{{{alias}}}}}");
+            let got = c.resolve(&tpl).expect("resolution succeeds");
+            assert_ne!(got, tpl, "alias {alias} stopped resolving");
+        }
+    }
 }

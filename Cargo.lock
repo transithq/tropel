@@ -4755,7 +4755,6 @@ version = "0.3.0"
 dependencies = [
  "chrono",
  "rand",
- "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

@@ -15,15 +15,6 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 rand.workspace = true
-# Narrowed regex (direct dep, NOT workspace inheritance — cargo silently
-# ignores a member's `default-features = false` when the workspace entry
-# leaves defaults on, which it does here): the catalog patterns are
-# ASCII-only (`\{\{\$guid\}\}`, `\d` length args, `[^}]`), so the default
-# Unicode property tables (~400 KB of wasm data, twiggy-measured) are dead
-# weight on the browser tier. Direct deps still unify inside any single
-# build graph — native consumers that pull regex with defaults keep their
-# unicode tables; only this crate's own graph narrows.
-regex = { version = "1.13.1", default-features = false, features = ["std"] }
 # `serde` on chrono only adds its derive glue; nothing serializes chrono
 # types here. Same inheritance caveat: direct dep.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

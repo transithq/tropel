@@ -1,5 +1,4 @@
 use crate::catalog::DynamicCatalog;
-use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -18,22 +17,6 @@ pub struct VariableScope {
     pub collection: Arc<HashMap<String, serde_json::Value>>,
     /// Global variables (same Arc optimization).
     pub globals: Arc<HashMap<String, serde_json::Value>>,
-}
-
-/// The `{{var}}` placeholder regex, compiled ONCE per process. `VariableResolver`
-/// is constructed per iteration / per VU on the hot path (see the runner), so a
-/// `Regex::new` on every construction was pure waste — compiled once, a `Regex`
-/// is `Sync` and reused by all threads.
-static VAR_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-
-fn var_re() -> &'static Regex {
-    // `[^{}]+` matches only the INNERMOST placeholder: a variable name
-    // contains no braces, so a name with `{`/`}` inside cannot be a valid
-    // reference. `{{host_{{suffix}}}}` therefore resolves `{{suffix}}`
-    // first, then `{{host_dev}}` on the next deep pass — the greedy
-    // `[^}]+` matched `host_{{suffix` (the OUTER span) and could never
-    // recurse inward (backlog line 135).
-    VAR_RE.get_or_init(|| Regex::new(r"\{\{([^{}]+)\}\}").expect("valid variable regex"))
 }
 
 /// Postman resolves nested `{{a}}` → `{{b}}` chains up to 20 levels deep
@@ -101,16 +84,21 @@ impl VariableResolver {
         });
 
         // Then resolve scoped variables ({{var_name}})
-        let result = var_re().replace_all(&after_dynamic, |caps: &regex::Captures| {
-            let var_name = caps.get(1).unwrap().as_str().trim();
+        let mut result = String::with_capacity(after_dynamic.len());
+        let mut cursor = 0usize;
+        while let Some((range, inner)) = next_placeholder(&after_dynamic, cursor) {
+            result.push_str(&after_dynamic[cursor..range.start]);
+            cursor = range.end;
+            let var_name = inner.trim();
 
             // Skip dynamic vars (already handled)
             if var_name.starts_with('$') {
-                return caps.get(0).unwrap().as_str().to_string();
+                result.push_str(&after_dynamic[range.clone()]);
+                continue;
             }
 
             let value = self.resolve_variable(var_name, scope);
-            if value.contains("{{") {
+            let replacement = if value.contains("{{") {
                 // The value is an unresolved placeholder (keep it literal)
                 // OR a nested template that later passes must resolve —
                 // `{{base_url}}` → `https://{{host}}`. Escaping it NOW
@@ -122,8 +110,7 @@ impl VariableResolver {
                 match mode {
                     EscapeMode::None => value,
                     EscapeMode::Json => {
-                        if placeholder_in_json_string(&after_dynamic, caps.get(0).unwrap().range())
-                        {
+                        if placeholder_in_json_string(&after_dynamic, range.clone()) {
                             json_escape(&value)
                         } else {
                             // A bare JSON-fragment variable —
@@ -135,12 +122,11 @@ impl VariableResolver {
                     }
                     EscapeMode::Url => value,
                 }
-            }
-        });
-
-        // Backlog line 349: .to_string() on Cow::Owned allocates a fresh
-        // String + memcpy; .into_owned() is free for Cow::Owned.
-        result.into_owned()
+            };
+            result.push_str(&replacement);
+        }
+        result.push_str(&after_dynamic[cursor..]);
+        result
     }
 
     /// Resolve a single variable name against the scope.
@@ -258,8 +244,10 @@ impl VariableResolver {
         // makes the error actionable. Walking the passes reports `a, b`.
         let mut unresolved: Vec<String> = Vec::new();
         let collect = |text: &str, out: &mut Vec<String>| {
-            for caps in var_re().captures_iter(text) {
-                let name = caps[1].trim().to_string();
+            let mut at = 0usize;
+            while let Some((range, inner)) = next_placeholder(text, at) {
+                at = range.end;
+                let name = inner.trim().to_string();
                 if !out.contains(&name) {
                     out.push(name);
                 }
@@ -399,6 +387,37 @@ fn value_to_string(val: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// Find the next `{{name}}` placeholder at or after `from`.
+///
+/// TR-434: replaces `Regex::new(r"\{\{([^{}]+)\}\}")` — the last regex in this
+/// crate. Same grammar: `{{`, one or more characters that are neither `{` nor
+/// `}`, then `}}`. `{{}}` does not match, exactly as `[^{}]+` required.
+///
+/// Returns `(range_of_whole_match, inner_text)`. The range is what
+/// `EscapeMode::Json` needs to decide whether the placeholder sits inside a
+/// JSON string, so it is part of the contract rather than a convenience.
+fn next_placeholder(s: &str, from: usize) -> Option<(std::ops::Range<usize>, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = from;
+    while i + 3 < bytes.len() {
+        if bytes[i] != b'{' || bytes[i + 1] != b'{' {
+            i += 1;
+            continue;
+        }
+        let inner_start = i + 2;
+        let mut j = inner_start;
+        while j < bytes.len() && bytes[j] != b'{' && bytes[j] != b'}' {
+            j += 1;
+        }
+        // `[^{}]+` — at least one inner byte, then a literal `}}`.
+        if j > inner_start && j + 1 < bytes.len() && bytes[j] == b'}' && bytes[j + 1] == b'}' {
+            return Some((i..j + 2, &s[inner_start..j]));
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
