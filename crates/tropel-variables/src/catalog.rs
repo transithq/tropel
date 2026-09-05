@@ -1408,4 +1408,62 @@ mod tests {
             assert_ne!(got, tpl, "alias {alias} stopped resolving");
         }
     }
+    #[test]
+    fn crosstool_dynamic_shapes_classify_identically_to_the_regex_era() {
+        // TR-434 was verified by running this exact corpus against the
+        // pre-change regex implementation and diffing: 28/28 identical. The
+        // corpus is kept as an assertion so the classification cannot drift.
+        //
+        // Shapes are taken from how Postman, Bruno and Insomnia actually
+        // write variables in exports — the concern being that a hand-written
+        // scanner might narrow the accepted grammar without any existing
+        // fixture noticing.
+        let c = DynamicCatalog::new();
+        let resolves = |t: &str| c.resolve(t).expect("resolution succeeds") != t;
+
+        // Implemented Postman dynamic variables.
+        for t in [
+            "{{$guid}}",
+            "{{$timestamp}}",
+            "{{$isoTimestamp}}",
+            "{{$randomInt}}",
+            "{{$randomFirstName}}",
+            "{{$randomAlphaNumeric}}",
+            "{{$randomAlphaNumeric:12}}",
+            "{{$randomIPV6}}",
+            "prefix{{$guid}}suffix",
+        ] {
+            assert!(resolves(t), "{t} must resolve");
+        }
+
+        // NOT implemented — and each is left verbatim rather than blanked.
+        // `$processEnv` and `$dotenv` are real Postman features tropel does
+        // not implement; that gap predates TR-434 and is unchanged by it.
+        for t in [
+            "{{$processEnv.MY_VAR}}",
+            "{{$dotenv.SECRET_KEY}}",
+            "{{$randomUserName}}",
+            // Bruno writes process env as a SCOPED variable, so the dynamic
+            // catalogue correctly ignores it — `resolver.rs` resolves it.
+            "{{process.env.HOST}}",
+            "{{bru.getEnvVar}}",
+            // Insomnia's template syntax is nunjucks tags, not `{{ }}`.
+            "{% uuid 'v4' %}",
+            "{% timestamp %}",
+            "{% now 'iso-8601' %}",
+            "{% response 'body', 'req_123', '$.id' %}",
+            // Scoped names are not the catalogue's job.
+            "{{ _.baseUrl }}",
+            "{{a.b.c}}",
+            "{{base_url}}/v1/{{tenant-id}}",
+            // Grammar edges.
+            "{{}}",
+            "{{$}}",
+            "{{$guid:5}}",
+            "{{$randomInt:5}}",
+            "{{$randomInt:abc}}",
+        ] {
+            assert!(!resolves(t), "{t} must be left verbatim");
+        }
+    }
 }

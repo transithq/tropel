@@ -828,4 +828,58 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
         assert_eq!(parsed["s"], "he said \"hi\"");
     }
+    #[test]
+    fn scoped_names_from_other_tools_still_resolve() {
+        // TR-434 replaced `\{\{([^{}]+)\}\}` with a scanner. That pattern is
+        // what makes NON-identifier variable names work, and every competing
+        // tool relies on it in its own way:
+        //   Bruno     {{process.env.HOST}}     — dots
+        //   Insomnia  {{ _.baseUrl }}          — underscore, dots, spaces
+        //   Postman   {{tenant-id}}            — dashes
+        // A scanner that quietly narrowed to `[A-Za-z_][A-Za-z0-9_]*` would
+        // break all three and pass every existing test, because the existing
+        // fixtures all use plain names.
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            env: HashMap::from([
+                ("process.env.HOST".into(), "bruno.example.com".into()),
+                ("_.baseUrl".into(), "https://insomnia.example.com".into()),
+                ("_.user.id".into(), "u-42".into()),
+                ("tenant-id".into(), "acme".into()),
+                ("spaced".into(), "trimmed-ok".into()),
+                ("a.b.c".into(), "deep".into()),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolver.resolve("{{process.env.HOST}}", &scope),
+            "bruno.example.com"
+        );
+        assert_eq!(
+            resolver.resolve("{{ _.baseUrl }}/v1", &scope),
+            "https://insomnia.example.com/v1"
+        );
+        assert_eq!(resolver.resolve("{{ _.user.id }}", &scope), "u-42");
+        assert_eq!(
+            resolver.resolve("https://x/{{tenant-id}}/y", &scope),
+            "https://x/acme/y"
+        );
+        // Surrounding whitespace inside the braces is trimmed, as the regex
+        // path did via `.trim()` on the capture.
+        assert_eq!(resolver.resolve("{{  spaced  }}", &scope), "trimmed-ok");
+        assert_eq!(resolver.resolve("{{a.b.c}}", &scope), "deep");
+        // An unknown name is left verbatim, not blanked.
+        assert_eq!(
+            resolver.resolve("{{no.such.var}}", &scope),
+            "{{no.such.var}}"
+        );
+        // `[^{}]+` requires at least one inner character.
+        assert_eq!(resolver.resolve("{{}}", &scope), "{{}}");
+        // Insomnia's nunjucks tags are not `{{ }}` at all and pass through
+        // untouched — the input adapters handle those, not this resolver.
+        assert_eq!(
+            resolver.resolve("{% uuid 'v4' %}", &scope),
+            "{% uuid 'v4' %}"
+        );
+    }
 }
