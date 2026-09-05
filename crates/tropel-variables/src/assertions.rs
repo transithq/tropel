@@ -172,6 +172,30 @@ pub struct AssertionOutcome {
     /// `passed: false`, which means the predicate ran and said no.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsupported: Option<String>,
+    /// Why it failed, worded for a human. Present only on a FAILING row — a
+    /// passing assertion needs no explanation, and this is emitted per
+    /// assertion per request in a load run.
+    ///
+    /// TR-443: built HERE, not by the caller. The caller does not have the
+    /// resolved `actual` value — only this function does — and the app and a
+    /// load report must word the same failure the same way. Two formatters
+    /// would drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A short, safe rendering of a value for a failure message.
+///
+/// Long strings are truncated: a failed assertion against a 2 MB body must not
+/// put 2 MB into every result row of a load run.
+fn preview(value: &Value) -> String {
+    match value {
+        Value::String(s) if s.chars().count() > 120 => {
+            let head: String = s.chars().take(117).collect();
+            Value::String(format!("{head}...")).to_string()
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Numeric coercion: both sides must be numbers, or numeric strings.
@@ -316,6 +340,7 @@ pub fn assert_evaluate(
         return AssertionOutcome {
             name: name.to_string(),
             passed: false,
+            message: None,
             unsupported: Some(format!(
                 "unknown assertion operator '{operator}' — supported: {}",
                 ASSERTION_OPERATORS
@@ -411,10 +436,30 @@ pub fn assert_evaluate(
         }
     };
 
+    // The wording matches what KnockPort's TypeScript evaluator produced, so
+    // migrating does not silently reword every existing failure.
+    let message = if passed || unsupported.is_some() {
+        None
+    } else if op.arity == AssertionArity::Unary {
+        Some(format!(
+            "expected target {name} {}; actual {}",
+            op.summary,
+            preview(actual)
+        ))
+    } else {
+        Some(format!(
+            "expected target {name} {} {}; actual {}",
+            op.summary,
+            preview(expected),
+            preview(actual)
+        ))
+    };
+
     AssertionOutcome {
         name: name.to_string(),
         passed,
         unsupported,
+        message,
     }
 }
 
@@ -1266,5 +1311,48 @@ mod tests {
                  editor WITHOUT the wasm, so this file is a real interface, not a cache."
             );
         }
+    }
+    #[test]
+    fn a_failing_assertion_carries_a_human_message_and_a_passing_one_does_not() {
+        // TR-443: the TypeScript evaluator produced this wording, and the
+        // panel renders it. Keeping it byte-compatible means migrating does
+        // not silently reword every existing failure.
+        let fail = assert_evaluate("status", &json!(200), "eq", &json!(500), None);
+        assert!(!fail.passed);
+        assert_eq!(
+            fail.message.as_deref(),
+            Some("expected target status equals 500; actual 200")
+        );
+
+        // A unary operator has no expected value to name.
+        let unary = assert_evaluate("body", &json!("x"), "isEmpty", &json!(null), None);
+        assert!(!unary.passed);
+        assert_eq!(
+            unary.message.as_deref(),
+            Some("expected target body is empty; actual \"x\"")
+        );
+
+        // A PASSING row carries none — it is emitted per assertion per
+        // request in a load run, and "why did it pass" is not a question.
+        let pass = assert_evaluate("status", &json!(200), "eq", &json!(200), None);
+        assert!(pass.passed && pass.message.is_none());
+        let json = serde_json::to_string(&pass).expect("serialises");
+        assert!(!json.contains("message"), "{json}");
+
+        // `unsupported` and `message` do not both appear: an assertion that
+        // could not run has no comparison to describe.
+        let unknown = assert_evaluate("x", &json!(1), "nope", &json!(1), None);
+        assert!(unknown.unsupported.is_some() && unknown.message.is_none());
+    }
+
+    #[test]
+    fn a_failure_message_truncates_a_huge_actual_value() {
+        // A failed assertion against a 2 MB body must not put 2 MB into every
+        // result row of a load run.
+        let big = json!("y".repeat(5000));
+        let out = assert_evaluate("body", &big, "eq", &json!("x"), None);
+        let msg = out.message.expect("a failing row has a message");
+        assert!(msg.len() < 300, "message was {} bytes", msg.len());
+        assert!(msg.contains("..."), "{msg}");
     }
 }

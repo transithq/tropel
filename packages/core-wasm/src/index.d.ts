@@ -335,6 +335,10 @@ export interface AssertionOutcome {
    *  unresolvable target, or `matches` with no matcher. Distinct from
    *  `passed: false`, which means the predicate ran and said no. */
   unsupported?: string;
+  /** Why it failed, worded for a human — present only on a FAILING row.
+   *  Built in Rust so the app and a load report word the same failure the
+   *  same way. */
+  message?: string;
 }
 
 export interface AssertionResponse {
