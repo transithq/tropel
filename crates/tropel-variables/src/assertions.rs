@@ -1342,8 +1342,19 @@ mod tests {
              // Do not hand-edit — the test rewrites it and fails when it is stale.\n\
              export default {want};"
         );
-        let got_js = std::fs::read_to_string(js_path).unwrap_or_default();
-        let got = std::fs::read_to_string(path).unwrap_or_default();
+        // Read NORMALISED. `.gitattributes` carries `* text=auto`, so a
+        // Windows checkout materialises these generated files as CRLF while
+        // the generator above emits LF. A raw byte compare therefore called a
+        // content-identical fixture STALE on Windows only — and then rewrote
+        // it, so the job failed AND left a dirty tree. The comparison is about
+        // the vocabulary, not about the checkout's line-ending policy.
+        let normalise = |p: &str| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .replace("\r\n", "\n")
+        };
+        let got_js = normalise(js_path);
+        let got = normalise(path);
         if got != want || got_js != want_js {
             std::fs::write(path, &want).expect("fixture is writable");
             std::fs::write(js_path, &want_js).expect("js fixture is writable");
