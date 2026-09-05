@@ -23,7 +23,7 @@ rand.workspace = true
 # weight on the browser tier. Direct deps still unify inside any single
 # build graph — native consumers that pull regex with defaults keep their
 # unicode tables; only this crate's own graph narrows.
-regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
+regex = { version = "1.13.1", default-features = false, features = ["std"] }
 # `serde` on chrono only adds its derive glue; nothing serializes chrono
 # types here. Same inheritance caveat: direct dep.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

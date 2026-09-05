@@ -325,7 +325,7 @@ impl DynamicCatalog {
 
         // {{$randomString[:length]}}
         if result.contains("{{$randomString") {
-            let re = cached_re!(RE_RANDOM_STRING, r"\{\{\$randomString(?::(\d+))?\}\}");
+            let re = cached_re!(RE_RANDOM_STRING, r"\{\{\$randomString(?::([0-9]+))?\}\}");
             result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
@@ -340,7 +340,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomAlphabetic") {
             let re = cached_re!(
                 RE_RANDOM_ALPHABETIC,
-                r"\{\{\$randomAlphabetic(?::(\d+))?\}\}"
+                r"\{\{\$randomAlphabetic(?::([0-9]+))?\}\}"
             );
             result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
@@ -358,7 +358,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomAlphaNumeric") || result.contains("{{$randomAlphanumeric") {
             let re = cached_re!(
                 RE_RANDOM_ALPHANUMERIC,
-                r"\{\{\$random(?:AlphaNumeric|Alphanumeric)(?::(\d+))?\}\}"
+                r"\{\{\$random(?:AlphaNumeric|Alphanumeric)(?::([0-9]+))?\}\}"
             );
             result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
@@ -390,7 +390,7 @@ impl DynamicCatalog {
 
         // {{$randomHex[:length]}}
         if result.contains("{{$randomHex") {
-            let re = cached_re!(RE_RANDOM_HEX, r"\{\{\$randomHex(?::(\d+))?\}\}");
+            let re = cached_re!(RE_RANDOM_HEX, r"\{\{\$randomHex(?::([0-9]+))?\}\}");
             result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 8);
                 random_string(&mut rng, len, "0123456789abcdef")
@@ -431,7 +431,7 @@ impl DynamicCatalog {
             result = self.replace_with_func(&result, re, |_| random_sentence(&mut rng));
         }
         if result.contains("{{$randomWords") {
-            let re = cached_re!(RE_RANDOM_WORDS, r"\{\{\$randomWords(?::(\d+))?\}\}");
+            let re = cached_re!(RE_RANDOM_WORDS, r"\{\{\$randomWords(?::([0-9]+))?\}\}");
             result = self.replace_with_func(&result, re, |caps| {
                 let count = capped_len(caps.get(1).map(|m| m.as_str()), 5);
                 random_words(&mut rng, count)
@@ -558,7 +558,7 @@ impl DynamicCatalog {
 
         // {{$randomPassword[:length]}}
         if result.contains("{{$randomPassword") {
-            let re = cached_re!(RE_RANDOM_PASSWORD, r"\{\{\$randomPassword(?::(\d+))?\}\}");
+            let re = cached_re!(RE_RANDOM_PASSWORD, r"\{\{\$randomPassword(?::([0-9]+))?\}\}");
             result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 12);
                 random_string(
