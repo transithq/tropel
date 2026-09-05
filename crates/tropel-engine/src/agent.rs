@@ -642,7 +642,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 .get("environment")
                 .and_then(|e| serde_json::from_value(e.clone()).ok())
                 .unwrap_or_default();
-            match run_script_once(code, environment).await {
+            // TR-467: the request the script may mutate. Optional, so a
+            // caller that only needs environment effects (a bare `pm.test`)
+            // keeps working unchanged.
+            let script_request: Option<TropelRequest> = payload
+                .get("request")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            match run_script_once(code, environment, script_request).await {
                 Ok(out) => respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await,
                 Err(why) => respond_raw_cors(sock, cors.as_deref(), 500, &error_body(&why)).await,
             }
@@ -1327,6 +1333,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 async fn run_script_once(
     code: &str,
     environment: HashMap<String, String>,
+    request: Option<TropelRequest>,
 ) -> Result<serde_json::Value, String> {
     let mut ctx = tropel_js::JsContext::new(None, Some(std::time::Duration::from_secs(10)))
         .await
@@ -1361,6 +1368,13 @@ async fn run_script_once(
         // panic.
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         st.environment = environment;
+        // TR-467: seed the REQUEST the script is about to mutate.
+        //
+        // Without it `pm.request.headers.add(...)` had nothing to write to, so
+        // a pre-request script ran, appeared to succeed, and its header never
+        // reached the wire — the silent no-op invariant #7 forbids. The state
+        // has always carried the field; /script simply never filled it.
+        st.request = request;
     }
     tropel_sandbox::bindings::trp::TrpBridge::new(state.clone())
         .install(&mut ctx)
@@ -1430,6 +1444,12 @@ async fn run_script_once(
         // The MUTATIONS: what the script left behind. The caller merges these
         // into its own scope — the agent holds no session state.
         "environment": st.environment,
+        // TR-467: the request AS THE SCRIPT LEFT IT. The bridges mutate
+        // `st.request` in place, so every `pm.request.headers.add/upsert/
+        // remove`, URL change and body change is already recorded here — it
+        // was simply never returned, which made every one of them a no-op
+        // from the caller's point of view.
+        "request": st.request,
         "scriptError": script_error,
     }))
 }
@@ -2307,6 +2327,64 @@ mod tests {
         assert!(raw.starts_with("HTTP/1.1 401"), "{raw}");
     }
 
+    /// TR-467 — a pre-request script's header reaches the caller.
+    ///
+    /// Before this, `/script` never seeded `st.request`, so
+    /// `pm.request.headers.add(...)` wrote to nothing and the reply carried no
+    /// request at all. The script ran, reported success, and its header simply
+    /// did not exist — a silent no-op, on the stage whose entire job is
+    /// mutating the request (invariant #7).
+    ///
+    /// KT-404 makes this load-bearing: desktop runs pre-request scripts in
+    /// THIS realm, so a header added by a script would have vanished on
+    /// desktop while working in the app.
+    #[tokio::test]
+    async fn a_pre_request_script_mutation_comes_back() {
+        let request = TropelRequest {
+            url: "https://api.test/v1".into(),
+            method: Method::GET,
+            headers: vec![("Accept".into(), "application/json".into())],
+            query_params: HashMap::new(),
+            body: None,
+            auth: None,
+            certificate: None,
+            follow_redirects: true,
+            host: None,
+            cookies: Vec::new(),
+            timeout: None,
+            response_type: ResponseType::Text,
+        };
+
+        let out = run_script_once(
+            "pm.request.headers.add({ key: 'X-Trace', value: 'abc' });",
+            HashMap::new(),
+            Some(request),
+        )
+        .await
+        .expect("the realm runs");
+
+        assert!(
+            out.get("scriptError").is_some_and(|e| e.is_null()),
+            "the script must not error: {out}"
+        );
+        let headers = out
+            .get("request")
+            .and_then(|r| r.get("headers"))
+            .and_then(|h| h.as_array())
+            .unwrap_or_else(|| panic!("the mutated request must come back: {out}"));
+        let rendered = format!("{headers:?}");
+        assert!(
+            rendered.contains("X-Trace") && rendered.contains("abc"),
+            "the header the script added must survive the round trip: {rendered}"
+        );
+        // And the header it started with must still be there — a reply that
+        // returned ONLY the additions would silently drop the rest.
+        assert!(
+            rendered.contains("Accept"),
+            "the original headers must survive too: {rendered}"
+        );
+    }
+
     /// TR-465 / KT-404 — the QuickJS half of the script-realm corpus.
     ///
     /// The corpus is a COMMITTED, MEASURED table of what a user script can
@@ -2340,7 +2418,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let out = run_script_once(&script, HashMap::new())
+        let out = run_script_once(&script, HashMap::new(), None)
             .await
             .expect("the realm runs");
 
