@@ -1010,6 +1010,72 @@ fn unquote_challenge_value(value: &str) -> String {
     out
 }
 
+// ── OAuth1 request-data rules ───────────────────────────────────────────────
+// TR-431, third and last instance of the TR-428 gap. These sat in `signers.rs`
+// behind the `reqwest` gate even though they are RFC 5849 rules, not transport
+// plumbing, and a browser caller has to apply all of them to build
+// `OAuth1BuildParams` correctly.
+//
+// `bracket_host` is the one that would have bitten silently: JS
+// `new URL("http://[::1]/x").hostname` yields `::1` WITHOUT the brackets, so a
+// TypeScript re-derivation of the §3.4.1.2 base-string URI produces
+// `http://::1/x` and signs a base string no server agrees with — for IPv6
+// hosts only, so every IPv4 test passes.
+
+pub fn percent_decode(s: &str) -> Option<String> {
+    use percent_encoding::percent_decode_str;
+    percent_decode_str(s)
+        .decode_utf8()
+        .ok()
+        .map(|c| c.to_string())
+}
+/// Wrap IPv6 literal hosts in brackets; pass everything else through.
+pub fn bracket_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+pub fn parse_form(bytes: &[u8]) -> Vec<(String, String)> {
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return vec![];
+    };
+    s.split('&')
+        .filter(|p| !p.is_empty())
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            // RFC 5849 §3.4.1.1: form-urlencoded bodies use `+` for space
+            // (the same decoding as `application/x-www-form-urlencoded`).
+            // The decoded value is then percent-encoded by `enc()` when the
+            // base string is built — so `+` must become space here, not
+            // survive as a literal `+` (which would re-encode as `%2B`).
+            Some((decode_form_value(k), decode_form_value(v)))
+        })
+        .collect()
+}
+/// Decode a form-urlencoded value: `+` → space, then percent-decode `%XX`.
+pub fn decode_form_value(s: &str) -> String {
+    let plus_to_space = s.replace('+', " ");
+    percent_decode(&plus_to_space).unwrap_or(plus_to_space)
+}
+
+/// RFC 5849 §3.4.1.2 base-string URI: `scheme://host[:port]path`, with the
+/// query and fragment excluded and a DEFAULT port omitted.
+///
+/// Takes components rather than a parsed URL so the browser tier can call it:
+/// `port` is `None` when the URL uses its scheme's default, matching both
+/// `reqwest::Url::port()` and JS `URL.port === ""`. The IPv6 bracketing is
+/// applied here rather than left to the caller — see the note above.
+pub fn oauth1_base_uri(scheme: &str, host: &str, port: Option<u16>, path: &str) -> String {
+    let host = bracket_host(host);
+    let port = match port {
+        Some(p) => format!(":{p}"),
+        None => String::new(),
+    };
+    format!("{scheme}://{host}{port}{path}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1816,5 +1882,93 @@ mod tests {
             parse_challenge_part(r#"  ReAlm = "r"  "#),
             Some(("realm".into(), "r".into()))
         );
+    }
+    #[test]
+    fn oauth1_is_fully_derivable_without_the_reqwest_feature() {
+        // TR-431, same completeness test as TR-428/429: this runs under
+        // `--no-default-features` — the configuration `tropel-core-wasm`
+        // builds — so it fails to COMPILE if any rule drifts back behind the
+        // gate. A browser caller starts with URL components and a form body
+        // and must reach a signed header using nothing but `builders`.
+        let base = oauth1_base_uri("https", "example.com", None, "/request");
+        assert_eq!(base, "https://example.com/request");
+        let params = parse_form(b"c2=&a3=2+q");
+        assert_eq!(
+            params,
+            vec![
+                ("c2".to_string(), String::new()),
+                ("a3".to_string(), "2 q".to_string()),
+            ],
+            "form bodies use + for space (RFC 5849 §3.4.1.1)"
+        );
+        let out = oauth1_build_header(&OAuth1BuildParams {
+            method: "POST",
+            base_uri: &base,
+            request_params: &params,
+            consumer_key: "ck",
+            consumer_secret: "cs",
+            token: None,
+            token_secret: None,
+            signature_method: "HMAC-SHA1",
+            nonce: "n",
+            timestamp: "1",
+        })
+        .expect("HMAC-SHA1 is supported");
+        assert!(out.header.value.starts_with("OAuth "));
+        // The decoded space must be re-encoded as %2520 in the base string
+        // (%20 inside the already-encoded param string), NOT survive as +.
+        assert!(
+            out.base_string.contains("a3%3D2%2520q"),
+            "base string: {}",
+            out.base_string
+        );
+    }
+
+    #[test]
+    fn oauth1_base_uri_brackets_ipv6_hosts() {
+        // The rule that would have failed SILENTLY in a TypeScript
+        // re-derivation: JS `new URL("http://[::1]/x").hostname` returns
+        // `::1` WITHOUT brackets, so a caller forwarding `.hostname` builds
+        // `http://::1/x` and signs a base string the server never computes.
+        // Every IPv4 test would still pass.
+        assert_eq!(
+            oauth1_base_uri("http", "::1", Some(8080), "/x"),
+            "http://[::1]:8080/x"
+        );
+        // Already-bracketed input must not double-bracket.
+        assert_eq!(
+            oauth1_base_uri("http", "[::1]", None, "/x"),
+            "http://[::1]/x"
+        );
+        // IPv4 and DNS names are untouched, and a default port is omitted.
+        assert_eq!(
+            oauth1_base_uri("https", "example.com", None, "/a/b"),
+            "https://example.com/a/b"
+        );
+        assert_eq!(
+            oauth1_base_uri("http", "127.0.0.1", Some(3000), "/"),
+            "http://127.0.0.1:3000/"
+        );
+    }
+
+    #[test]
+    fn parse_form_decodes_plus_and_percent_but_not_bare_ampersands() {
+        // `+` must become a space BEFORE percent-decoding, or a literal
+        // `%2B` would round-trip to `+` and then to a space.
+        assert_eq!(
+            parse_form(b"a=1+2&b=%2B&c=x%20y"),
+            vec![
+                ("a".to_string(), "1 2".to_string()),
+                ("b".to_string(), "+".to_string()),
+                ("c".to_string(), "x y".to_string()),
+            ]
+        );
+        // A pair with no `=` is skipped, not turned into an empty value.
+        assert_eq!(
+            parse_form(b"novalue&a=1"),
+            vec![("a".to_string(), "1".to_string())]
+        );
+        // Non-UTF-8 yields no params rather than panicking.
+        assert!(parse_form(&[0xff, 0xfe]).is_empty());
     }
 }
