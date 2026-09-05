@@ -256,6 +256,42 @@
         }
     };
 
+    // ── bru.runRequest (TR-474) ─────────────────────────────────────────────
+    //
+    // Runs ANOTHER request from the caller's collection and returns its
+    // response. The agent cannot do this itself: the collection, its auth and
+    // its variables live in the API client, not here. So this is the one
+    // binding that calls BACK out of the realm, over the host-callback
+    // channel the caller opened with a `runId`.
+    //
+    // Guarded like every other bridge here. Without the channel the binding
+    // is absent and this REFUSES BY NAME — a load run has no collection to
+    // re-enter, and silently returning undefined there would read as "the
+    // request ran and gave nothing back".
+    bru.runRequest = function (path) {
+        if (typeof __tropel_trp_run_request !== 'function') {
+            throw new Error(
+                'bru.runRequest is not available here: it re-enters the API client\'s ' +
+                'collection, which this runtime has no access to. It works when the ' +
+                'caller opened a host-callback channel (tropel TR-474).'
+            );
+        }
+        var raw = __tropel_trp_run_request(String(path));
+        var parsed;
+        try {
+            parsed = JSON.parse(raw);
+        } catch (e) {
+            throw new Error('bru.runRequest: the host answered with invalid JSON: ' + raw);
+        }
+        // A refusal from the host stays a THROW, not a value. The recursion
+        // guard, an unknown name and a timeout all arrive this way, and a
+        // script must not be able to mistake any of them for a response.
+        if (parsed && parsed.error) {
+            throw new Error('bru.runRequest: ' + parsed.error);
+        }
+        return parsed;
+    };
+
     // ── req object (pre-request scripts) ───────────────────────────────────
     var req = {};
     req.setHeader = function (name, value) {
