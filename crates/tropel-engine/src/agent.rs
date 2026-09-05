@@ -141,15 +141,6 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
         .map(|i| buf[i + 4..n].to_vec())
         .unwrap_or_default();
 
-    // Rate limit + auth on every request (a fresh limiter per connection —
-    // good enough for the localhost boundary).
-    {
-        let mut limiter = RateLimiter::new();
-        if limiter.allow().is_err() {
-            return respond(sock, 429, "rate limit exceeded").await;
-        }
-    }
-
     // Parse the request line, path, and headers.
     let mut lines = raw.lines();
     let request_line = lines.next().unwrap_or("");
@@ -179,6 +170,21 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
     }
 
     let cors = cors_headers(&state, origin.as_deref(), false);
+
+    // Rate limit on every request (a fresh limiter per connection — good
+    // enough for the localhost boundary).
+    //
+    // TR-459 moved this AFTER the head is parsed. It costs no extra I/O — the
+    // head is already in the buffer from the single read above — and it means
+    // a rate-limited browser gets a 429 it can actually READ. Answered before
+    // the Origin was known, the reply carried no CORS header, so the page saw
+    // a CORS failure and the real cause never reached the user.
+    {
+        let mut limiter = RateLimiter::new();
+        if limiter.allow().is_err() {
+            return respond_raw_cors(sock, cors.as_deref(), 429, "rate limit exceeded").await;
+        }
+    }
 
     // TR-459: the CORS preflight, answered BEFORE the auth check — a browser
     // never sends `Authorization` on a preflight, so requiring the token here
@@ -212,14 +218,15 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
 
     if let Some(expected) = &state.token {
         if auth_header != format!("Bearer {expected}") {
-            return respond(sock, 401, r#"{"error":"unauthorized"}"#).await;
+            return respond_raw_cors(sock, cors.as_deref(), 401, r#"{"error":"unauthorized"}"#)
+                .await;
         }
     }
 
     match (method, path) {
         ("GET", "/version") => {
             let body = format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION"));
-            respond(sock, 200, &body).await
+            respond_raw_cors(sock, cors.as_deref(), 200, &body).await
         }
         // ── TR-445 · the RULES endpoints ─────────────────────────────────────
         //
@@ -247,7 +254,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let Some(payload) =
                 read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
             else {
-                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
             };
             let vars: HashMap<String, String> = payload
                 .get("variables")
@@ -257,8 +270,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 match serde_json::from_value(payload.get("items").cloned().unwrap_or_default()) {
                     Ok(v) => v,
                     Err(e) => {
-                        return respond(sock, 400, &error_body(&format!("invalid items: {e}")))
-                            .await
+                        return respond_raw_cors(
+                            sock,
+                            cors.as_deref(),
+                            400,
+                            &error_body(&format!("invalid items: {e}")),
+                        )
+                        .await
                     }
                 };
             // ORDER IS THE CONTRACT: the caller re-assembles its request by
@@ -311,14 +329,26 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                     Err(why) => out.push(serde_json::json!({ "error": why })),
                 }
             }
-            respond(sock, 200, &serde_json::json!({ "items": out }).to_string()).await
+            respond_raw_cors(
+                sock,
+                cors.as_deref(),
+                200,
+                &serde_json::json!({ "items": out }).to_string(),
+            )
+            .await
         }
 
         ("POST", "/resolve") => {
             let Some(payload) =
                 read_json_body(sock, content_length, 1024 * 1024, &prefetched_body).await?
             else {
-                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
             };
             let template = payload
                 .get("template")
@@ -347,7 +377,7 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 }
                 // A typo'd mode is a NAMED 400, never a silent fallback to
                 // plain — that is how a quote-bearing value corrupts a body.
-                Err(why) => respond(sock, 400, &error_body(&why)).await,
+                Err(why) => respond_raw_cors(sock, cors.as_deref(), 400, &error_body(&why)).await,
             }
         }
 
@@ -355,14 +385,26 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let Some(payload) =
                 read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
             else {
-                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
             };
             let target: tropel_variables::assertions::AssertionTarget = match serde_json::from_value(
                 payload.get("response").cloned().unwrap_or_default(),
             ) {
                 Ok(t) => t,
                 Err(e) => {
-                    return respond(sock, 400, &error_body(&format!("invalid response: {e}"))).await
+                    return respond_raw_cors(
+                        sock,
+                        cors.as_deref(),
+                        400,
+                        &error_body(&format!("invalid response: {e}")),
+                    )
+                    .await
                 }
             };
             let specs: Vec<AgentAssertionSpec> = match serde_json::from_value(
@@ -370,8 +412,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             ) {
                 Ok(v) => v,
                 Err(e) => {
-                    return respond(sock, 400, &error_body(&format!("invalid assertions: {e}")))
-                        .await
+                    return respond_raw_cors(
+                        sock,
+                        cors.as_deref(),
+                        400,
+                        &error_body(&format!("invalid assertions: {e}")),
+                    )
+                    .await
                 }
             };
             // A native agent CAN link a regex engine — unlike the wasm tier,
@@ -430,7 +477,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let Some(payload) =
                 read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
             else {
-                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
             };
             let items: Vec<BatchResolveItem> = payload
                 .get("items")
@@ -446,7 +499,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                     Err(why) => out.push(serde_json::json!({ "error": why })),
                 }
             }
-            respond(sock, 200, &serde_json::json!({ "items": out }).to_string()).await
+            respond_raw_cors(
+                sock,
+                cors.as_deref(),
+                200,
+                &serde_json::json!({ "items": out }).to_string(),
+            )
+            .await
         }
 
         ("POST", "/variables/dynamic") => {
@@ -462,7 +521,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let Some(payload) =
                 read_json_body(sock, content_length, 1024 * 1024, &prefetched_body).await?
             else {
-                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
             };
             let template = payload
                 .get("template")
@@ -482,7 +547,7 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 // a truncated body: `{{$randomLoremParagraphs}}` in a loop is
                 // the shape that hits it, and silently returning half of it is
                 // the data loss invariant #7 forbids.
-                Err(why) => respond(sock, 400, &error_body(&why)).await,
+                Err(why) => respond_raw_cors(sock, cors.as_deref(), 400, &error_body(&why)).await,
             }
         }
 
@@ -508,7 +573,7 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 "maxVariableResolutionPasses": tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
                 "predefinedVariables": variables,
             });
-            respond(sock, 200, &body.to_string()).await
+            respond_raw_cors(sock, cors.as_deref(), 200, &body.to_string()).await
         }
 
         ("GET", "/operators") => {
@@ -516,7 +581,7 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             // dropdown the evaluator dispatches on.
             let body = serde_json::to_string(tropel_variables::assertions::ASSERTION_OPERATORS)
                 .unwrap_or_default();
-            respond(sock, 200, &body).await
+            respond_raw_cors(sock, cors.as_deref(), 200, &body).await
         }
 
         ("POST", "/auth/sign") => {
@@ -529,7 +594,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let Some(payload) =
                 read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
             else {
-                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
             };
             let scheme = payload.get("scheme").and_then(|s| s.as_str()).unwrap_or("");
             let params = payload.get("params").cloned().unwrap_or_default();
@@ -542,7 +613,7 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                     )
                     .await
                 }
-                Err(why) => respond(sock, 400, &error_body(&why)).await,
+                Err(why) => respond_raw_cors(sock, cors.as_deref(), 400, &error_body(&why)).await,
             }
         }
 
@@ -553,7 +624,13 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let Some(payload) =
                 read_json_body(sock, content_length, 4 * 1024 * 1024, &prefetched_body).await?
             else {
-                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
             };
             let code = payload.get("code").and_then(|c| c.as_str()).unwrap_or("");
             let environment: HashMap<String, String> = payload
@@ -561,8 +638,8 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 .and_then(|e| serde_json::from_value(e.clone()).ok())
                 .unwrap_or_default();
             match run_script_once(code, environment).await {
-                Ok(out) => respond(sock, 200, &out.to_string()).await,
-                Err(why) => respond(sock, 500, &error_body(&why)).await,
+                Ok(out) => respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await,
+                Err(why) => respond_raw_cors(sock, cors.as_deref(), 500, &error_body(&why)).await,
             }
         }
 
@@ -574,13 +651,19 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let Some(payload) =
                 read_json_body(sock, content_length, 1024 * 1024, &prefetched_body).await?
             else {
-                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"invalid JSON body"}"#,
+                )
+                .await;
             };
             let op = payload.get("op").and_then(|o| o.as_str()).unwrap_or("");
             let params = payload.get("params").cloned().unwrap_or_default();
             match oauth2_dispatch(op, &params) {
-                Ok(out) => respond(sock, 200, &out.to_string()).await,
-                Err(why) => respond(sock, 400, &error_body(&why)).await,
+                Ok(out) => respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await,
+                Err(why) => respond_raw_cors(sock, cors.as_deref(), 400, &error_body(&why)).await,
             }
         }
 
@@ -588,10 +671,18 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let body_buf = read_body(sock, content_length, 64 * 1024, &prefetched_body).await?;
             let req: serde_json::Value = match serde_json::from_slice(&body_buf) {
                 Ok(v) => v,
-                Err(_) => return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await,
+                Err(_) => {
+                    return respond_raw_cors(
+                        sock,
+                        cors.as_deref(),
+                        400,
+                        r#"{"error":"invalid JSON body"}"#,
+                    )
+                    .await
+                }
             };
             let out = execute_single(&state, &req).await;
-            respond(sock, 200, &out.to_string()).await
+            respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await
         }
         ("POST", "/run") => {
             // TR-411: the relay is explicitly NOT a load transport — the agent
@@ -624,7 +715,15 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 read_body(sock, content_length, 4 * 1024 * 1024, &prefetched_body).await?;
             let payload: serde_json::Value = match serde_json::from_slice(&body_buf) {
                 Ok(v) => v,
-                Err(_) => return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await,
+                Err(_) => {
+                    return respond_raw_cors(
+                        sock,
+                        cors.as_deref(),
+                        400,
+                        r#"{"error":"invalid JSON body"}"#,
+                    )
+                    .await
+                }
             };
             let scenario_json = payload
                 .get("scenario")
@@ -669,9 +768,9 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 return run_load_streaming(sock, &state, &scenario, iterations, &thresholds).await;
             }
             let out = run_load(&state, &scenario, iterations, &thresholds).await;
-            respond(sock, 200, &out.to_string()).await
+            respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await
         }
-        _ => respond(sock, 404, r#"{"error":"not found"}"#).await,
+        _ => respond_raw_cors(sock, cors.as_deref(), 404, r#"{"error":"not found"}"#).await,
     }
 }
 
@@ -935,6 +1034,22 @@ fn threshold_verdict(
 
 async fn respond(sock: &mut TcpStream, status: u16, body: &str) -> tropel_sdk::Result<()> {
     respond_raw(sock, status, body, None).await
+}
+
+/// `respond`, with the connection's CORS headers attached.
+///
+/// TR-459: a separate name rather than a fourth argument on `respond`,
+/// because the argument would sit between the socket and the status at every
+/// one of these call sites and read as noise. The CORS value is computed once
+/// per connection and is `None` for every non-browser caller, which is all of
+/// them today.
+async fn respond_raw_cors(
+    sock: &mut TcpStream,
+    cors: Option<&str>,
+    status: u16,
+    body: &str,
+) -> tropel_sdk::Result<()> {
+    respond_raw(sock, status, body, cors).await
 }
 
 /// `respond`, plus any extra headers the caller needs on the wire.
