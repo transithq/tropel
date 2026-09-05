@@ -744,10 +744,7 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                         .unwrap_or_default(),
                 })
                 .unwrap_or_default();
-            let environment: HashMap<String, String> = payload
-                .get("environment")
-                .and_then(|e| serde_json::from_value(e.clone()).ok())
-                .unwrap_or_default();
+            let scopes = ScriptScopes::from_payload(&payload);
             // TR-467: the request the script may mutate. Optional, so a
             // caller that only needs environment effects (a bare `pm.test`)
             // keeps working unchanged.
@@ -759,7 +756,7 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
             match run_script_once(
                 code,
-                environment,
+                scopes,
                 script_request,
                 script_response,
                 sandbox_cfg,
@@ -1448,9 +1445,52 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 /// context would let one request's script change the next one's behaviour —
 /// a bug that reproduces only under a specific ordering, which is the worst
 /// kind to chase. The agent is a per-request ABI, not a session.
+/// The four variable scopes a script reads and writes.
+///
+/// TR-473: `/script` carried only `environment`. The realm has always had the
+/// other three — `pm.collectionVariables`, `pm.globals` and `pm.variables` are
+/// separate stores with a defined precedence (local > data > env > collection)
+/// — so a script reading any of them saw an empty scope, and anything it wrote
+/// to them was discarded on the way back. Both directions silently, which is
+/// the shape invariant 7 forbids.
+///
+/// A struct rather than four more positional parameters: the call already took
+/// six, and `environment`/`collection`/`globals`/`variables` are four maps that
+/// would be trivially transposable at a call site.
+#[derive(Default)]
+struct ScriptScopes {
+    environment: HashMap<String, String>,
+    collection: HashMap<String, serde_json::Value>,
+    globals: HashMap<String, serde_json::Value>,
+    variables: HashMap<String, serde_json::Value>,
+}
+
+impl ScriptScopes {
+    /// Read the scopes off a `/script` payload. Every one is optional — a
+    /// caller that sends none keeps the previous behaviour exactly.
+    fn from_payload(payload: &serde_json::Value) -> Self {
+        fn map_of(payload: &serde_json::Value, key: &str) -> HashMap<String, serde_json::Value> {
+            payload
+                .get(key)
+                .and_then(|v| v.as_object())
+                .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default()
+        }
+        Self {
+            environment: payload
+                .get("environment")
+                .and_then(|e| serde_json::from_value(e.clone()).ok())
+                .unwrap_or_default(),
+            collection: map_of(payload, "collectionVariables"),
+            globals: map_of(payload, "globals"),
+            variables: map_of(payload, "variables"),
+        }
+    }
+}
+
 async fn run_script_once(
     code: &str,
-    environment: HashMap<String, String>,
+    scopes: ScriptScopes,
     request: Option<TropelRequest>,
     response: Option<tropel_sdk::types::Response>,
     sandbox: tropel_sandbox::config::SandboxConfig,
@@ -1496,7 +1536,12 @@ async fn run_script_once(
         // is fresh, and refusing would strand the caller on someone else's
         // panic.
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        st.environment = environment;
+        st.environment = scopes.environment;
+        // TR-473: the other three stores. `collection_vars`/`globals` are
+        // Arc'd (they are cloned per build_scope), `local_vars` is not.
+        st.collection_vars = std::sync::Arc::new(scopes.collection);
+        st.globals = std::sync::Arc::new(scopes.globals);
+        st.local_vars = scopes.variables;
         // TR-467: seed the REQUEST the script is about to mutate.
         //
         // Without it `pm.request.headers.add(...)` had nothing to write to, so
@@ -1594,6 +1639,13 @@ async fn run_script_once(
         // The MUTATIONS: what the script left behind. The caller merges these
         // into its own scope — the agent holds no session state.
         "environment": st.environment,
+        // TR-473: the scopes AS THE SCRIPT LEFT THEM. Returned even when the
+        // caller sent none, so a `pm.globals.set` in a script that seeded only
+        // `environment` still reaches the caller rather than dying with the
+        // realm.
+        "collectionVariables": *st.collection_vars,
+        "globals": *st.globals,
+        "variables": st.local_vars,
         // TR-467: the request AS THE SCRIPT LEFT IT. The bridges mutate
         // `st.request` in place, so every `pm.request.headers.add/upsert/
         // remove`, URL change and body change is already recorded here — it
@@ -2504,7 +2556,7 @@ mod tests {
 
         let out = run_script_once(
             "pm.test('status', () => pm.response.code === 201);\n             pm.test('body', () => pm.response.json().id === 7);",
-            HashMap::new(),
+            ScriptScopes::default(),
             None,
             Some(response),
             tropel_sandbox::config::SandboxConfig::default(),
@@ -2558,7 +2610,7 @@ mod tests {
 
         let out = run_script_once(
             "pm.request.headers.add({ key: 'X-Trace', value: 'abc' });",
-            HashMap::new(),
+            ScriptScopes::default(),
             Some(request),
             None,
             tropel_sandbox::config::SandboxConfig::default(),
@@ -2618,7 +2670,7 @@ mod tests {
 
         let configured = run_script_once(
             code,
-            HashMap::new(),
+            ScriptScopes::default(),
             None,
             None,
             tropel_sandbox::config::SandboxConfig {
@@ -2644,7 +2696,7 @@ mod tests {
 
         let stock = run_script_once(
             code,
-            HashMap::new(),
+            ScriptScopes::default(),
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
@@ -2661,6 +2713,69 @@ mod tests {
             "the stock install must NOT bind kp — if it does, this test no \
              longer proves the preamble is what carries the namespace: {stock}"
         );
+    }
+
+    /// TR-473: all FOUR scopes reach the realm and come back.
+    ///
+    /// `/script` carried only `environment`. The realm has always had four
+    /// separate stores with a defined precedence, so a script reading
+    /// `pm.collectionVariables` / `pm.globals` / `pm.variables` saw an empty
+    /// scope, and anything it wrote to them was dropped on the way out.
+    ///
+    /// Both directions are asserted for each scope. Seeding alone would pass
+    /// against a realm that read the seed and discarded every write; returning
+    /// alone would pass against one that started empty. It is the round trip
+    /// that pins the behaviour.
+    #[tokio::test]
+    async fn every_variable_scope_round_trips() {
+        let mut scopes = ScriptScopes::default();
+        scopes.environment.insert("envIn".into(), "e".into());
+        scopes
+            .collection
+            .insert("colIn".into(), serde_json::json!("c"));
+        scopes.globals.insert("gloIn".into(), serde_json::json!("g"));
+        scopes
+            .variables
+            .insert("varIn".into(), serde_json::json!("v"));
+
+        let out = run_script_once(
+            "kp.environment.set('envSeen', String(kp.environment.get('envIn')));\
+             kp.collectionVariables.set('colSeen', String(kp.collectionVariables.get('colIn')));\
+             kp.globals.set('gloSeen', String(kp.globals.get('gloIn')));\
+             kp.variables.set('varSeen', String(kp.variables.get('varIn')));",
+            scopes,
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            },
+            test_http_client(),
+        )
+        .await
+        .expect("the realm runs");
+
+        assert!(
+            out.get("scriptError").map(|e| e.is_null()).unwrap_or(false),
+            "the script must not error: {out}"
+        );
+        for (scope, seen, expected) in [
+            ("environment", "envSeen", "e"),
+            ("collectionVariables", "colSeen", "c"),
+            ("globals", "gloSeen", "g"),
+            ("variables", "varSeen", "v"),
+        ] {
+            let got = out
+                .get(scope)
+                .and_then(|m| m.get(seen))
+                .and_then(|v| v.as_str());
+            assert_eq!(
+                got,
+                Some(expected),
+                "`{scope}` must be seeded AND returned — the script read \
+                 `{expected}` from it and wrote `{seen}` back: {out}"
+            );
+        }
     }
 
     /// TR-472: `pm.sendRequest` is WIRED, not merely present.
@@ -2684,7 +2799,7 @@ mod tests {
                kp.environment.set('err', String(err));\
                kp.environment.set('code', String(res && res.code));\
              });",
-            HashMap::new(),
+            ScriptScopes::default(),
             None,
             None,
             tropel_sandbox::config::SandboxConfig {
@@ -2743,7 +2858,7 @@ mod tests {
                      kp.environment.set('fetch', typeof fetch);\
                      kp.environment.set('module', typeof module);\
                      kp.environment.set('viaFn', typeof Function('return this')().process);";
-        let out = run_script_once(probe, HashMap::new(), None, None, kp(), test_http_client())
+        let out = run_script_once(probe, ScriptScopes::default(), None, None, kp(), test_http_client())
             .await
             .expect("the realm runs");
         let env = out.get("environment").expect("the environment comes back");
@@ -2761,7 +2876,7 @@ mod tests {
             ("direct", "import('fs');"),
             ("indirect eval", "var e = eval; e(\"import\" + \"('fs')\");"),
         ] {
-            let result = run_script_once(code, HashMap::new(), None, None, kp(), test_http_client()).await;
+            let result = run_script_once(code, ScriptScopes::default(), None, None, kp(), test_http_client()).await;
             let refused = match &result {
                 Err(why) => why.contains("module"),
                 Ok(out) => out
@@ -2811,7 +2926,7 @@ mod tests {
 
         let out = run_script_once(
             &script,
-            HashMap::new(),
+            ScriptScopes::default(),
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
