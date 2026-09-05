@@ -29,6 +29,8 @@
 use base64::Engine as _;
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
+use std::collections::HashMap;
+
 use md5::Digest as _;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use sha1::Sha1;
@@ -858,6 +860,107 @@ pub fn oauth1_build_header(p: &OAuth1BuildParams<'_>) -> Option<OAuth1Out> {
     })
 }
 
+// ── WWW-Authenticate challenge parsing ──────────────────────────────────────
+// TR-429, same class as TR-428: `DigestBuildParams` is filled ENTIRELY from a
+// parsed `WWW-Authenticate` challenge, and the parser sat behind the `reqwest`
+// gate. A browser caller could reach `digest_build_authorization` but had no
+// way to produce its inputs without re-implementing RFC 7235 §4.1 parsing in
+// TypeScript — including the two rules below that a naive `split(',')` gets
+// wrong, both of which tropel has already shipped wrong once.
+
+/// Parse a `WWW-Authenticate` header value into a list of `(scheme, params)`
+/// challenges (RFC 7235 §4.1). Handles MULTIPLE schemes in one header value
+/// — `Basic realm=\"x\", Digest realm=\"y\", nonce=\"z\"` is two challenges, and
+/// the old parser only ever looked at the first scheme, so a Digest challenge
+/// listed after a Basic one was silently skipped (backlog line 176).
+pub fn parse_challenges(header: &str) -> Vec<(String, HashMap<String, String>)> {
+    let mut challenges: Vec<(String, HashMap<String, String>)> = Vec::new();
+    let mut current: Option<(String, HashMap<String, String>)> = None;
+
+    for part in split_challenge_parts(header) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // A new challenge starts with a bare scheme token: a token NOT
+        // followed by '=' (e.g. `Digest realm=\"y\"` — "Digest" then space).
+        // A `key=value` part (no whitespace before the '=') belongs to the
+        // current challenge.
+        let first_space = part.find(char::is_whitespace).unwrap_or(usize::MAX);
+        let first_eq = part.find('=').unwrap_or(usize::MAX);
+        // New scheme iff the part's first token is NOT a `key=value`: either
+        // there is no '=' at all (bare/token68 challenge) or the '=' comes
+        // after the first whitespace (scheme then params).
+        if first_eq == usize::MAX || first_eq > first_space {
+            // Flush the previous challenge, start a new scheme.
+            if let Some(c) = current.take() {
+                challenges.push(c);
+            }
+            let (scheme, rest) = match part.find(char::is_whitespace) {
+                Some(i) => (&part[..i], &part[i..]),
+                None => (part, ""),
+            };
+            let mut params = HashMap::new();
+            if let Some((k, v)) = parse_challenge_part(rest) {
+                params.insert(k, v);
+            }
+            current = Some((scheme.to_string(), params));
+        } else if let Some((_, params)) = current.as_mut() {
+            if let Some((k, v)) = parse_challenge_part(part) {
+                params.insert(k, v);
+            }
+        }
+    }
+    if let Some(c) = current {
+        challenges.push(c);
+    }
+    challenges
+}
+
+/// Find the Digest challenge among possibly several schemes in a
+/// `WWW-Authenticate` value (backlog line 176).
+pub fn find_digest_challenge(header: &str) -> Option<HashMap<String, String>> {
+    parse_challenges(header)
+        .into_iter()
+        .find(|(scheme, _)| scheme.eq_ignore_ascii_case("digest"))
+        .map(|(_, params)| params)
+}
+
+/// Split a `WWW-Authenticate` value on commas, but NOT commas inside a
+/// quoted-string — RFC 2617/7616 challenges frequently quote a list
+/// (`qop=\"auth, auth-int\"`). The old naive `split(',')` split inside the
+/// quotes, so a challenge advertising `auth` second would be mis-parsed as
+/// only the first qop value.
+pub fn split_challenge_parts(header: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut part_start = 0usize;
+    let bytes = header.as_bytes();
+    let mut in_quotes = false;
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                parts.push(&header[part_start..i]);
+                part_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&header[part_start..]);
+    parts
+}
+
+/// Parse one `key=value` segment of a challenge (may be quoted or bare).
+pub fn parse_challenge_part(part: &str) -> Option<(String, String)> {
+    let part = part.trim();
+    if part.is_empty() {
+        return None;
+    }
+    let (k, v) = part.split_once('=')?;
+    let v = v.trim().trim_matches('"').to_string();
+    Some((k.trim().to_ascii_lowercase(), v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1496,5 +1599,83 @@ mod tests {
         assert_eq!(signing_name("s3-control"), "s3");
         assert_eq!(signing_name("s3control"), "s3");
         assert_eq!(signing_name("execute-api"), "execute-api");
+    }
+    #[test]
+    fn parse_challenge_handles_quotes_and_bare_values() {
+        let challenges = parse_challenges(r#"Digest realm="r", qop="auth", algorithm=MD5"#);
+        assert_eq!(challenges.len(), 1);
+        let (scheme, m) = &challenges[0];
+        assert_eq!(scheme, "Digest");
+        assert_eq!(m.get("realm").map(|s| s.as_str()), Some("r"));
+        assert_eq!(m.get("qop").map(|s| s.as_str()), Some("auth"));
+        assert_eq!(m.get("algorithm").map(|s| s.as_str()), Some("MD5"));
+    }
+
+    #[test]
+    fn parse_challenges_finds_digest_after_basic_in_one_header() {
+        // Regression (backlog line 176): `WWW-Authenticate: Basic …, Digest …`
+        // in ONE header line — the old parser only looked at the first
+        // scheme, so Digest after Basic was silently skipped.
+        let www =
+            r#"Basic realm="basic-realm", Digest realm="digest-realm", qop="auth", nonce="n1""#;
+        let m = find_digest_challenge(www).expect("digest challenge must be found");
+        assert_eq!(m.get("realm").map(|s| s.as_str()), Some("digest-realm"));
+        assert_eq!(m.get("nonce").map(|s| s.as_str()), Some("n1"));
+        assert_eq!(m.get("qop").map(|s| s.as_str()), Some("auth"));
+        // The Basic challenge's realm must NOT leak into the digest params.
+        assert_ne!(m.get("realm").map(|s| s.as_str()), Some("basic-realm"));
+    }
+
+    #[test]
+    fn parse_challenges_handles_multi_line_joined_header() {
+        // A server may send several WWW-Authenticate header lines (one per
+        // scheme); the client joins them with ", " before parsing. The joined
+        // value must still resolve the Digest challenge correctly.
+        let joined = r#"Basic realm="b", Digest realm="d", nonce="n2", algorithm=SHA-256"#;
+        let challenges = parse_challenges(joined);
+        assert_eq!(
+            challenges.len(),
+            2,
+            "two schemes must be split: {challenges:?}"
+        );
+        assert_eq!(challenges[0].0, "Basic");
+        assert_eq!(challenges[1].0, "Digest");
+        assert_eq!(challenges[1].1.get("realm").map(|s| s.as_str()), Some("d"));
+    }
+
+    #[test]
+    fn digest_challenge_is_fully_parseable_without_the_reqwest_feature() {
+        // TR-429, the same completeness test as TR-428: this runs under
+        // `--no-default-features` — the configuration `tropel-core-wasm`
+        // builds — so it fails to COMPILE if the parser drifts back behind
+        // the gate.
+        //
+        // `DigestBuildParams` is filled ENTIRELY from a parsed challenge, so
+        // a browser caller that cannot parse one cannot use the digest
+        // builder at all. This walks challenge -> params -> Authorization
+        // using nothing but `builders`.
+        let www = r#"Basic realm="b", Digest realm="r", qop="auth, auth-int", nonce="n", opaque="o", algorithm=MD5"#;
+        let c = find_digest_challenge(www).expect("Digest challenge is present after Basic");
+        assert_eq!(c.get("realm").map(String::as_str), Some("r"));
+        // The quoted list must survive whole — a naive split(',') truncates
+        // it to "auth" and loses the caller's ability to choose auth-int.
+        assert_eq!(c.get("qop").map(String::as_str), Some("auth, auth-int"));
+
+        let out = digest_build_authorization(&DigestBuildParams {
+            username: "u",
+            password: "p",
+            method: "GET",
+            uri: "/dir/index.html",
+            realm: c.get("realm").unwrap(),
+            nonce: c.get("nonce").unwrap(),
+            nc: 1,
+            cnonce: "0a4f113b",
+            qop: Some("auth"),
+            algorithm: c.get("algorithm").map(String::as_str),
+            opaque: c.get("opaque").map(String::as_str),
+        });
+        assert!(out.value.starts_with("Digest "));
+        assert!(out.value.contains(r#"username="u""#));
+        assert!(out.value.contains(r#"opaque="o""#));
     }
 }

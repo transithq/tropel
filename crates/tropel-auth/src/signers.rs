@@ -730,7 +730,7 @@ impl AuthSigner for DigestAuth {
         // and the header may repeat across lines — the old parser only ever
         // looked at the first scheme, so Digest after Basic was skipped
         // (backlog line 176).
-        let challenge = find_digest_challenge(www_authenticate)?;
+        let challenge = crate::builders::find_digest_challenge(www_authenticate)?;
         let realm = challenge.get("realm")?;
         let nonce = challenge.get("nonce")?;
         let key = digest_session_key(request.url());
@@ -829,99 +829,6 @@ fn build_digest_authorization(
         opaque: sess.opaque.as_deref(),
     })
     .value
-}
-
-/// Parse a `WWW-Authenticate` header value into a list of `(scheme, params)`
-/// challenges (RFC 7235 §4.1). Handles MULTIPLE schemes in one header value
-/// — `Basic realm=\"x\", Digest realm=\"y\", nonce=\"z\"` is two challenges, and
-/// the old parser only ever looked at the first scheme, so a Digest challenge
-/// listed after a Basic one was silently skipped (backlog line 176).
-fn parse_challenges(header: &str) -> Vec<(String, HashMap<String, String>)> {
-    let mut challenges: Vec<(String, HashMap<String, String>)> = Vec::new();
-    let mut current: Option<(String, HashMap<String, String>)> = None;
-
-    for part in split_challenge_parts(header) {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        // A new challenge starts with a bare scheme token: a token NOT
-        // followed by '=' (e.g. `Digest realm=\"y\"` — "Digest" then space).
-        // A `key=value` part (no whitespace before the '=') belongs to the
-        // current challenge.
-        let first_space = part.find(char::is_whitespace).unwrap_or(usize::MAX);
-        let first_eq = part.find('=').unwrap_or(usize::MAX);
-        // New scheme iff the part's first token is NOT a `key=value`: either
-        // there is no '=' at all (bare/token68 challenge) or the '=' comes
-        // after the first whitespace (scheme then params).
-        if first_eq == usize::MAX || first_eq > first_space {
-            // Flush the previous challenge, start a new scheme.
-            if let Some(c) = current.take() {
-                challenges.push(c);
-            }
-            let (scheme, rest) = match part.find(char::is_whitespace) {
-                Some(i) => (&part[..i], &part[i..]),
-                None => (part, ""),
-            };
-            let mut params = HashMap::new();
-            if let Some((k, v)) = parse_challenge_part(rest) {
-                params.insert(k, v);
-            }
-            current = Some((scheme.to_string(), params));
-        } else if let Some((_, params)) = current.as_mut() {
-            if let Some((k, v)) = parse_challenge_part(part) {
-                params.insert(k, v);
-            }
-        }
-    }
-    if let Some(c) = current {
-        challenges.push(c);
-    }
-    challenges
-}
-
-/// Find the Digest challenge among possibly several schemes in a
-/// `WWW-Authenticate` value (backlog line 176).
-fn find_digest_challenge(header: &str) -> Option<HashMap<String, String>> {
-    parse_challenges(header)
-        .into_iter()
-        .find(|(scheme, _)| scheme.eq_ignore_ascii_case("digest"))
-        .map(|(_, params)| params)
-}
-
-/// Split a `WWW-Authenticate` value on commas, but NOT commas inside a
-/// quoted-string — RFC 2617/7616 challenges frequently quote a list
-/// (`qop=\"auth, auth-int\"`). The old naive `split(',')` split inside the
-/// quotes, so a challenge advertising `auth` second would be mis-parsed as
-/// only the first qop value.
-fn split_challenge_parts(header: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut part_start = 0usize;
-    let bytes = header.as_bytes();
-    let mut in_quotes = false;
-    for (i, b) in bytes.iter().enumerate() {
-        match b {
-            b'"' => in_quotes = !in_quotes,
-            b',' if !in_quotes => {
-                parts.push(&header[part_start..i]);
-                part_start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&header[part_start..]);
-    parts
-}
-
-/// Parse one `key=value` segment of a challenge (may be quoted or bare).
-fn parse_challenge_part(part: &str) -> Option<(String, String)> {
-    let part = part.trim();
-    if part.is_empty() {
-        return None;
-    }
-    let (k, v) = part.split_once('=')?;
-    let v = v.trim().trim_matches('"').to_string();
-    Some((k.trim().to_ascii_lowercase(), v))
 }
 
 // ─────────────────────────── Shared helpers ───────────────────────────
@@ -1910,49 +1817,6 @@ mod tests {
             cnonce(&h2),
             "Digest cnonce must vary per request"
         );
-    }
-
-    #[test]
-    fn parse_challenge_handles_quotes_and_bare_values() {
-        let challenges = parse_challenges(r#"Digest realm="r", qop="auth", algorithm=MD5"#);
-        assert_eq!(challenges.len(), 1);
-        let (scheme, m) = &challenges[0];
-        assert_eq!(scheme, "Digest");
-        assert_eq!(m.get("realm").map(|s| s.as_str()), Some("r"));
-        assert_eq!(m.get("qop").map(|s| s.as_str()), Some("auth"));
-        assert_eq!(m.get("algorithm").map(|s| s.as_str()), Some("MD5"));
-    }
-
-    #[test]
-    fn parse_challenges_finds_digest_after_basic_in_one_header() {
-        // Regression (backlog line 176): `WWW-Authenticate: Basic …, Digest …`
-        // in ONE header line — the old parser only looked at the first
-        // scheme, so Digest after Basic was silently skipped.
-        let www =
-            r#"Basic realm="basic-realm", Digest realm="digest-realm", qop="auth", nonce="n1""#;
-        let m = find_digest_challenge(www).expect("digest challenge must be found");
-        assert_eq!(m.get("realm").map(|s| s.as_str()), Some("digest-realm"));
-        assert_eq!(m.get("nonce").map(|s| s.as_str()), Some("n1"));
-        assert_eq!(m.get("qop").map(|s| s.as_str()), Some("auth"));
-        // The Basic challenge's realm must NOT leak into the digest params.
-        assert_ne!(m.get("realm").map(|s| s.as_str()), Some("basic-realm"));
-    }
-
-    #[test]
-    fn parse_challenges_handles_multi_line_joined_header() {
-        // A server may send several WWW-Authenticate header lines (one per
-        // scheme); the client joins them with ", " before parsing. The joined
-        // value must still resolve the Digest challenge correctly.
-        let joined = r#"Basic realm="b", Digest realm="d", nonce="n2", algorithm=SHA-256"#;
-        let challenges = parse_challenges(joined);
-        assert_eq!(
-            challenges.len(),
-            2,
-            "two schemes must be split: {challenges:?}"
-        );
-        assert_eq!(challenges[0].0, "Basic");
-        assert_eq!(challenges[1].0, "Digest");
-        assert_eq!(challenges[1].1.get("realm").map(|s| s.as_str()), Some("d"));
     }
 
     #[test]
