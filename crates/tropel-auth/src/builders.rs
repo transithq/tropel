@@ -327,6 +327,221 @@ pub fn hawk_build_header(p: &HawkBuildParams<'_>) -> HeaderOut {
     }
 }
 
+// ── AWS Signature Version 4 ─────────────────────────────────────────────────
+
+/// Everything needed to build the SigV4 headers.
+///
+/// `headers` is the request's headers in INSERTION order, names as sent.
+/// Duplicates are allowed and are what the multi-value comma-join operates on.
+#[derive(Debug, Clone)]
+pub struct AwsSigV4BuildParams<'a> {
+    /// Uppercase HTTP method.
+    pub method: &'a str,
+    /// Path, un-encoded (the canonicalizer encodes it).
+    pub path: &'a str,
+    /// Raw query string WITHOUT the leading `?`. Empty when there is none.
+    pub query: &'a str,
+    /// Canonical host — `host[:port]`, port omitted when default for scheme.
+    pub host: &'a str,
+    pub headers: &'a [(String, String)],
+    /// `None` signs UNSIGNED-PAYLOAD.
+    pub body: Option<&'a [u8]>,
+    pub access_key: &'a str,
+    pub secret_key: &'a str,
+    pub session_token: Option<&'a str>,
+    pub region: &'a str,
+    /// The service label used for BOTH the canonical URI rule and the scope.
+    pub service: &'a str,
+    /// `YYYYMMDDTHHMMSSZ`.
+    pub amz_date: &'a str,
+    /// `YYYYMMDD` — the scope's date component.
+    pub date_stamp: &'a str,
+}
+
+/// AWS "Trimall": collapse runs of spaces to one and trim the ends.
+pub fn trim_all(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Canonical query string: pairs sorted by RAW bytes, joined `k=v` with `&`.
+///
+/// Takes the raw query rather than a parsed URL deliberately — re-encoding a
+/// value that is already percent-encoded double-encodes it, and AWS signs the
+/// bytes that are on the wire.
+pub fn sigv4_canonical_query(query: &str) -> String {
+    let mut pairs: Vec<(&str, &str)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (p, ""),
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Canonical headers, sorted by lowercased name.
+///
+/// Multi-value headers are joined with a BARE COMMA and no space, each value
+/// Trimall'd. `", "` produces a different canonical hash and therefore a 403
+/// `SignatureDoesNotMatch` on any duplicated header — that was a real bug, so
+/// the join is spelled out rather than reached for.
+///
+/// `authorization` is excluded (it is what we are building). Non-UTF-8 values
+/// cannot appear in a canonical request and are skipped rather than panicking.
+pub fn sigv4_canonical_headers(
+    host: &str,
+    headers: &[(String, String)],
+    payload_hash: &str,
+    amz_date: &str,
+    session_token: Option<&str>,
+) -> Vec<(String, String)> {
+    use std::collections::BTreeMap;
+    // BTreeMap gives sorted keys for free.
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in headers {
+        let key = name.to_ascii_lowercase();
+        if key == "authorization" {
+            continue;
+        }
+        grouped.entry(key).or_default().push(trim_all(value));
+    }
+    let mut out: BTreeMap<String, String> = grouped
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k, v.join(",")))
+        .collect();
+
+    out.insert("host".to_string(), host.to_string());
+    out.insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
+    out.insert("x-amz-date".to_string(), amz_date.to_string());
+    if let Some(token) = session_token {
+        out.insert("x-amz-security-token".to_string(), token.to_string());
+    }
+    out.into_iter().collect()
+}
+
+fn hmac_sha256_bytes(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::digest::KeyInit as _;
+    use hmac::{Hmac, Mac as _};
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Hex HMAC-SHA256.
+pub fn hex_hmac_sha256(key: &[u8], data: &[u8]) -> String {
+    hex::encode(hmac_sha256_bytes(key, data))
+}
+
+/// The SigV4 derived signing key: HMAC chain over date → region → service.
+///
+/// Uncached here on purpose. `signers.rs` keeps its process-wide cache around
+/// this call (the key changes only at UTC midnight, so caching saves four
+/// chained HMACs per request); a browser embedder signs one request at a time
+/// and does not need it. Caching inside would put a global mutex in the wasm
+/// tier for no gain.
+pub fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_date = hmac_sha256_bytes(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256_bytes(&k_date, region.as_bytes());
+    let k_service = hmac_sha256_bytes(&k_region, service.as_bytes());
+    hmac_sha256_bytes(&k_service, b"aws4_request")
+}
+
+/// Everything SigV4 attaches: the `Authorization` header plus the `x-amz-*`
+/// headers that are part of the signature and must therefore also be sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigV4Out {
+    pub headers: Vec<HeaderOut>,
+    /// Exposed for tests and for anyone diffing a 403.
+    pub canonical_request: String,
+    pub string_to_sign: String,
+}
+
+/// Build the SigV4 headers.
+///
+/// `canonical_uri` is supplied by the caller because the encoding rule is
+/// service-dependent — S3 signs the path single-encoded, every other service
+/// double-encodes it — and that rule lives with the service derivation in
+/// `signers.rs`.
+pub fn aws_sigv4_build_headers(
+    p: &AwsSigV4BuildParams<'_>,
+    canonical_uri: &str,
+    signing_service: &str,
+    signing_key: &[u8],
+) -> SigV4Out {
+    let payload_hash = match p.body {
+        Some(bytes) => hex_sha256(bytes),
+        None => "UNSIGNED-PAYLOAD".to_string(),
+    };
+    let canonical_query = sigv4_canonical_query(p.query);
+    let headers = sigv4_canonical_headers(
+        p.host,
+        p.headers,
+        &payload_hash,
+        p.amz_date,
+        p.session_token,
+    );
+    let signed_headers = headers
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers = headers
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect::<Vec<_>>()
+        .concat();
+
+    let canonical_request = format!(
+        "{}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+        p.method.to_uppercase()
+    );
+    let scope = format!(
+        "{}/{}/{signing_service}/aws4_request",
+        p.date_stamp, p.region
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
+        p.amz_date,
+        hex_sha256(canonical_request.as_bytes())
+    );
+    let signature = hex_hmac_sha256(signing_key, string_to_sign.as_bytes());
+
+    let mut out = vec![HeaderOut {
+        name: "Authorization".to_string(),
+        value: format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            p.access_key
+        ),
+    }];
+    // These are IN the signature, so they must reach the wire too.
+    out.push(HeaderOut {
+        name: "x-amz-date".to_string(),
+        value: p.amz_date.to_string(),
+    });
+    out.push(HeaderOut {
+        name: "x-amz-content-sha256".to_string(),
+        value: payload_hash,
+    });
+    if let Some(token) = p.session_token {
+        out.push(HeaderOut {
+            name: "x-amz-security-token".to_string(),
+            value: token.to_string(),
+        });
+    }
+    SigV4Out {
+        headers: out,
+        canonical_request,
+        string_to_sign,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +824,57 @@ mod tests {
             hawk_mac(&normalized, hawk(None).key, None),
             "6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE="
         );
+    }
+
+    // ── SigV4 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sigv4_canonical_query_preserves_raw_bytes() {
+        // Regression, ported with the move (TR-426). `query_pairs()`
+        // form-decodes `+` to a space and re-encoding writes `%20` back —
+        // AWS canonicalizes the RAW bytes, so both must survive untouched.
+        // Sorted by raw key then value: `%` (0x25) sorts before `+` (0x2B).
+        assert_eq!(
+            sigv4_canonical_query("a=b+c&z=1&a=b%20c"),
+            "a=b%20c&a=b+c&z=1"
+        );
+        // Duplicate keys sort by value; valueless params keep their `=`.
+        assert_eq!(sigv4_canonical_query("flag&a=2&a=1"), "a=1&a=2&flag=");
+        assert_eq!(sigv4_canonical_query(""), "");
+    }
+
+    #[test]
+    fn sigv4_trimall_and_multi_value_join() {
+        // AWS joins duplicated headers with a BARE comma — no space — and
+        // Trimall collapses internal runs of whitespace. `", "` yields a
+        // different canonical hash and therefore a 403 SignatureDoesNotMatch
+        // on any request carrying a duplicated header.
+        assert_eq!(trim_all("  a   b  "), "a b");
+        let headers = vec![
+            ("X-Multi".to_string(), "  one  ".to_string()),
+            ("x-multi".to_string(), "two".to_string()),
+        ];
+        let out =
+            sigv4_canonical_headers("example.com", &headers, "HASH", "20130524T000000Z", None);
+        let multi = out
+            .iter()
+            .find(|(k, _)| k == "x-multi")
+            .expect("x-multi present");
+        assert_eq!(multi.1, "one,two");
+        // authorization is excluded — it is what we are building.
+        let with_auth = vec![("Authorization".to_string(), "old".to_string())];
+        let out = sigv4_canonical_headers("example.com", &with_auth, "H", "T", None);
+        assert!(!out.iter().any(|(k, _)| k == "authorization"), "{out:?}");
+    }
+
+    #[test]
+    fn sigv4_session_token_is_signed_when_present() {
+        let out = sigv4_canonical_headers("example.com", &[], "H", "T", Some("tok"));
+        assert!(out
+            .iter()
+            .any(|(k, v)| k == "x-amz-security-token" && v == "tok"));
+        let without = sigv4_canonical_headers("example.com", &[], "H", "T", None);
+        assert!(!without.iter().any(|(k, _)| k == "x-amz-security-token"));
     }
 
     #[test]
