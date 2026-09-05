@@ -19,3 +19,9 @@
 # Vendored JS shims are text
 js/**/*.js text eol=lf
 js/**/*.mjs text eol=lf
+
+# Generated fixtures that a test compares against, byte for byte. `text=auto`
+# above would hand a Windows checkout CRLF while the generator emits LF, which
+# fails the comparison on Windows ONLY and then rewrites the file.
+packages/core-wasm/fixtures/assertion-operators.json text eol=lf
+packages/core-wasm/src/assertion-operators.js text eol=lf
