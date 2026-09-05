@@ -936,8 +936,19 @@ pub fn split_challenge_parts(header: &str) -> Vec<&str> {
     let mut part_start = 0usize;
     let bytes = header.as_bytes();
     let mut in_quotes = false;
+    // TR-430: a quoted-string may contain `quoted-pair` escapes (RFC 7230
+    // §3.2.6: `\\` escapes the next octet). Toggling `in_quotes` on every
+    // `"` treated the `"` of an escaped quote as the CLOSING quote, so the
+    // next comma looked top-level and split mid-value — which both corrupted
+    // that value and swallowed every parameter after it, the nonce included.
+    let mut escaped = false;
     for (i, b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match b {
+            b'\\' if in_quotes => escaped = true,
             b'"' => in_quotes = !in_quotes,
             b',' if !in_quotes => {
                 parts.push(&header[part_start..i]);
@@ -957,8 +968,46 @@ pub fn parse_challenge_part(part: &str) -> Option<(String, String)> {
         return None;
     }
     let (k, v) = part.split_once('=')?;
-    let v = v.trim().trim_matches('"').to_string();
-    Some((k.trim().to_ascii_lowercase(), v))
+    Some((
+        k.trim().to_ascii_lowercase(),
+        unquote_challenge_value(v.trim()),
+    ))
+}
+
+/// Strip ONE balanced quoted-string and undo its `quoted-pair` escapes
+/// (RFC 7230 §3.2.6). A bare token is returned unchanged.
+///
+/// TR-430: the previous `trim_matches('"')` was wrong twice over — it
+/// stripped *every* leading and trailing quote rather than one balanced pair,
+/// and it never unescaped, so a realm sent as `"foo\\"bar"` was read back
+/// with the backslash still in it. `digest_build_authorization` ESCAPES on the
+/// way out (that escaping is what stops a username ending in a backslash from
+/// breaking out of the quoted string and injecting directives), so failing to
+/// unescape on the way in left the two halves disagreeing about what a
+/// quoted-string means.
+fn unquote_challenge_value(value: &str) -> String {
+    if !value.starts_with('"') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut escaped = false;
+    for ch in value[1..].chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            // The closing quote ends the string; anything after it is not
+            // part of the value (RFC-invalid input, but do not absorb it).
+            '"' => return out,
+            _ => out.push(ch),
+        }
+    }
+    // Unterminated quoted-string: return what was readable rather than
+    // discarding the value entirely.
+    out
 }
 
 #[cfg(test)]
@@ -1677,5 +1726,95 @@ mod tests {
         assert!(out.value.starts_with("Digest "));
         assert!(out.value.contains(r#"username="u""#));
         assert!(out.value.contains(r#"opaque="o""#));
+    }
+    #[test]
+    fn challenge_escaped_quote_keeps_the_value_and_the_later_params() {
+        // TR-430 (F11). `split_challenge_parts` toggled its quote flag on
+        // every `"`, so the `"` of an escaped quote read as the CLOSING
+        // quote. The comma after it then looked top-level and split
+        // mid-value. Two failures, and the second is the dangerous one:
+        //   * realm came back as `foo\"bar", nonce="n` — and realm feeds
+        //     HA1 = MD5(username:realm:password), so the server answers 401
+        //     with no diagnostic, and
+        //   * `nonce` was ABSENT from the map entirely, so the response
+        //     could not be computed at all.
+        let www = r#"Digest realm="foo\"bar", nonce="n", qop="auth""#;
+        let c = find_digest_challenge(www).expect("Digest challenge parses");
+        assert_eq!(
+            c.get("realm").map(String::as_str),
+            Some(r#"foo"bar"#),
+            "the escaped quote must be unescaped, not left in the value"
+        );
+        assert_eq!(
+            c.get("nonce").map(String::as_str),
+            Some("n"),
+            "parameters after an escaped quote must not be swallowed"
+        );
+        assert_eq!(c.get("qop").map(String::as_str), Some("auth"));
+    }
+
+    #[test]
+    fn challenge_escape_round_trips_against_the_writer() {
+        // The asymmetry F11 is really about: `digest_build_authorization`
+        // escapes quoted strings on the way OUT, and the parser did not
+        // unescape on the way IN. Its output is itself a `<scheme> <params>`
+        // value, so parsing it back is the symmetry check — whatever the
+        // writer escapes, the reader must recover EXACTLY.
+        let nasty_realm = r#"re"alm\end"#;
+        let nasty_user = r#"user\"#;
+        let out = digest_build_authorization(&DigestBuildParams {
+            username: nasty_user,
+            password: "p",
+            method: "GET",
+            uri: "/x",
+            realm: nasty_realm,
+            nonce: "n",
+            nc: 1,
+            cnonce: "c",
+            qop: Some("auth"),
+            algorithm: None,
+            opaque: None,
+        });
+        let (scheme, m) = parse_challenges(&out.value)
+            .into_iter()
+            .next()
+            .expect("the writer's own output must parse");
+        assert_eq!(scheme, "Digest");
+        assert_eq!(m.get("realm").map(String::as_str), Some(nasty_realm));
+        assert_eq!(m.get("username").map(String::as_str), Some(nasty_user));
+        // And the trailing-backslash username must not have eaten the next
+        // directive — that is the injection this escaping exists to stop.
+        assert_eq!(m.get("nonce").map(String::as_str), Some("n"));
+        assert_eq!(m.get("uri").map(String::as_str), Some("/x"));
+    }
+
+    #[test]
+    fn challenge_value_quoting_edge_cases() {
+        // One balanced pair, not `trim_matches`, which stripped every
+        // leading/trailing quote. A value that legitimately begins and ends
+        // with an escaped quote must keep them.
+        assert_eq!(
+            parse_challenge_part(r#"a="""#),
+            Some(("a".into(), String::new()))
+        );
+        assert_eq!(
+            parse_challenge_part(r#"a="\"x\"""#),
+            Some(("a".into(), r#""x""#.into()))
+        );
+        // Bare tokens are untouched (algorithm=MD5-sess, stale=true).
+        assert_eq!(
+            parse_challenge_part("algorithm=MD5-sess"),
+            Some(("algorithm".into(), "MD5-sess".into()))
+        );
+        // An escaped backslash is one backslash, not two.
+        assert_eq!(
+            parse_challenge_part(r#"a="x\\y""#),
+            Some(("a".into(), r"x\y".into()))
+        );
+        // Keys are lowercased; surrounding whitespace is trimmed.
+        assert_eq!(
+            parse_challenge_part(r#"  ReAlm = "r"  "#),
+            Some(("realm".into(), "r".into()))
+        );
     }
 }
