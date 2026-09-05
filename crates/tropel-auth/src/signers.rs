@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Sha256, Sha512};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -268,67 +268,62 @@ impl AwsSigV4Auth {
         // verify the body hash" — the correct semantic for unbuffered
         // streams. The old code used EMPTY_SHA256 (hash of empty string),
         // which signs the wrong hash and fails verification.
-        let payload_hash = match request.body().and_then(|b| b.as_bytes()) {
-            Some(bytes) => hex_sha256(bytes),
-            None => "UNSIGNED-PAYLOAD".to_string(),
-        };
-
         // Canonical URI. AWS requires DOUBLE URI-encoding of the path for
         // every service EXCEPT the S3 family (s3, s3control, s3-object-lambda,
-        // …), which sign the single-encoded path exactly as sent. The url
-        // crate already single-encodes `path()` with the RFC 3986 unreserved
-        // rules, so re-encoding each segment yields the required second
-        // encoding for non-S3 services.
-        let path = url.path();
-        let canonical_uri = sigv4_canonical_uri(path, &service);
-
-        // Canonical query string: sorted by encoded key.
-        let canonical_query = sigv4_canonical_query(url);
-
-        // Canonical headers: host + x-amz-* AND every header already present
-        // on the request (lowercased, deduped), including ALL values of
-        // multi-value headers comma-joined (AWS canonicalization).
-        let mut headers = sigv4_canonical_headers(
-            request,
-            &payload_hash,
-            amz_date,
-            self.session_token.as_deref(),
-        );
-        headers.sort();
-        let signed_headers = headers
-            .iter()
-            .map(|(k, _)| k.clone())
-            .collect::<Vec<_>>()
-            .join(";");
-        let canonical_headers = headers
-            .iter()
-            .map(|(k, v)| format!("{k}:{v}\n"))
-            .collect::<String>();
-
-        let canonical_request = format!(
-            "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-        );
+        // …), which sign the single-encoded path exactly as sent. The rule is
+        // service-dependent, so it stays here with the service derivation and
+        // the builder takes the result.
+        let canonical_uri = sigv4_canonical_uri(url.path(), &service);
         // Backlog line 240: s3-control's signing name is "s3", not
         // "s3-control" — botocore's own model says signingName = "s3".
         let sn = signing_name(&service);
-        let scope = format!("{date_stamp}/{region}/{sn}/aws4_request");
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-            hex_sha256(canonical_request.as_bytes())
-        );
-
+        // Cached HERE, not in the builder: the key changes only at UTC
+        // midnight so this saves four chained HMACs per request, and a browser
+        // embedder signing one request at a time gains nothing from a global
+        // mutex in the wasm tier.
         let signing_key = derive_signing_key(&self.secret_key, date_stamp, &region, sn);
-        let signature = hex_hmac_sha256(&signing_key, string_to_sign.as_bytes());
 
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={signed_headers}, Signature={signature}",
-            self.access_key, scope
+        // Headers as plain data, in insertion order, duplicates preserved —
+        // the multi-value comma-join operates on exactly this.
+        let headers: Vec<(String, String)> = request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect();
+
+        let out = crate::builders::aws_sigv4_build_headers(
+            &crate::builders::AwsSigV4BuildParams {
+                method,
+                path: url.path(),
+                query: url.query().unwrap_or(""),
+                host: &canonical_host(url),
+                headers: &headers,
+                body: request.body().and_then(|b| b.as_bytes()),
+                access_key: &self.access_key,
+                secret_key: &self.secret_key,
+                session_token: self.session_token.as_deref(),
+                region: &region,
+                service: &service,
+                amz_date,
+                date_stamp,
+            },
+            &canonical_uri,
+            sn,
+            &signing_key,
         );
 
-        insert_header(request, "x-amz-date", amz_date)?;
-        insert_header(request, "x-amz-content-sha256", &payload_hash)?;
-        if let Some(token) = &self.session_token {
-            insert_header(request, "x-amz-security-token", token)?;
+        let mut authorization = String::new();
+        for header in &out.headers {
+            if header.name.eq_ignore_ascii_case("authorization") {
+                authorization = header.value.clone();
+            } else {
+                insert_header(request, &header.name, &header.value)?;
+            }
         }
         set_auth_header(request, &authorization)?;
         Ok(())
@@ -347,34 +342,6 @@ impl AuthSigner for AwsSigV4Auth {
 
 // P1 line 147: EMPTY_SHA256 removed — streaming bodies now use
 // UNSIGNED-PAYLOAD instead of the empty-string hash.
-
-/// Canonical query string for SigV4.
-///
-/// AWS canonicalizes the RAW query bytes: split the raw (still-encoded)
-/// query on `&` and the first `=`, sort by (key, value), rejoin unchanged.
-/// The old `Url::query_pairs()` was the FORM decoder (`+` → space) and then
-/// `enc()` wrote `%20` back — so `?a=b+c` was signed as `a=b%20c` while AWS
-/// computed `a=b+c`, a guaranteed 403 SignatureDoesNotMatch (backlog line
-/// 61). No re-encoding here: the raw bytes ARE the canonical form (the
-/// client already encoded).
-fn sigv4_canonical_query(url: &reqwest::Url) -> String {
-    let mut pairs: Vec<(&str, &str)> = url
-        .query()
-        .unwrap_or("")
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| match p.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (p, ""),
-        })
-        .collect();
-    pairs.sort();
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&")
-}
 
 /// AWS services that expose VIRTUAL-HOSTED endpoints, where the tenant label
 /// (S3 bucket, API Gateway ID, OpenSearch domain, …) precedes the service
@@ -436,17 +403,6 @@ fn signing_name(service: &str) -> &str {
     }
 }
 
-/// `host[:port]` — omit the port when it is the scheme default. IPv6 hosts
-/// are wrapped in brackets (`[::1]:443`) since `Url::host_str` returns the
-/// bare address.
-/// AWS "Trimall": trim leading/trailing whitespace AND collapse each run of
-/// internal whitespace to a single space. SigV4 canonicalization requires
-/// this — `.trim()` alone leaves `"a  b"` intact, which changes the
-/// canonical hash and yields 403 SignatureDoesNotMatch.
-fn trim_all(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn canonical_host(url: &reqwest::Url) -> String {
     let host = bracket_host(url.host_str().unwrap_or(""));
     match url.port() {
@@ -491,19 +447,11 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
     derived
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
-}
-
-fn hex_hmac_sha256(key: &[u8], data: &[u8]) -> String {
-    hex::encode(hmac_sha256(key, data))
 }
 
 /// RFC 3986 percent-encode (unreserved chars pass through).
@@ -555,60 +503,6 @@ fn is_s3_family(service: &str) -> bool {
         service,
         "s3" | "s3control" | "s3-control" | "s3-object-lambda" | "s3-outposts" | "s3express"
     )
-}
-
-/// Canonical headers for SigV4.
-///
-/// Collects the `host` header plus every header already present on the
-/// request (lowercased, deduped), joining the VALUES of multi-value headers
-/// with a bare `","` (NO space, per AWS canonicalization) after applying
-/// Trimall (ends trimmed, internal whitespace runs collapsed to one space),
-/// then adds the `x-amz-*` signing headers. The `Authorization` header is
-/// never signed (it is the output of this signer). Uses `get_all` so
-/// duplicate header values are preserved — the old `headers().iter()`
-/// collapsed multi-value headers to the first.
-fn sigv4_canonical_headers(
-    request: &reqwest::Request,
-    payload_hash: &str,
-    amz_date: &str,
-    session_token: Option<&str>,
-) -> Vec<(String, String)> {
-    // BTreeMap gives sorted keys for free — no need for HashMap + sort.
-    let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-
-    out.insert("host".to_string(), canonical_host(request.url()));
-
-    for name in request.headers().keys() {
-        let key = name.as_str().to_ascii_lowercase();
-        if key == "authorization" {
-            continue;
-        }
-        // Non-UTF8 header values cannot appear in a canonical request (the
-        // sigstring is ASCII); such values are skipped rather than panicking.
-        // HeaderMap preserves insertion order, so the comma-join is stable.
-        let values: Vec<String> = request
-            .headers()
-            .get_all(name)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .map(trim_all)
-            .collect();
-        if values.is_empty() {
-            continue;
-        }
-        // AWS joins multi-value headers with a bare comma — NO space — and
-        // requires Trimall (sequential spaces collapsed to one). The old
-        // `", "` join produced a different canonical hash → 403
-        // SignatureDoesNotMatch on any duplicated header.
-        out.insert(key, values.join(","));
-    }
-
-    out.insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
-    out.insert("x-amz-date".to_string(), amz_date.to_string());
-    if let Some(token) = session_token {
-        out.insert("x-amz-security-token".to_string(), token.to_string());
-    }
-    out.into_iter().collect()
 }
 
 // ─────────────────────────── OAuth1 (RFC 5849) ───────────────────────────
@@ -1473,22 +1367,6 @@ mod tests {
     }
 
     #[test]
-    fn sigv4_canonical_query_preserves_raw_bytes() {
-        // Regression (backlog line 61): query_pairs() form-decodes '+' →
-        // space, then enc() wrote %20 back — AWS canonicalizes the RAW bytes.
-        let url: reqwest::Url = "http://example.com/?a=b+c&z=1&a=b%20c".parse().unwrap();
-        // Sorted by raw (encoded) key then value: '%' (0x25) < '+' (0x2B), so
-        // the a=b%20c pair sorts first; '+' and '%20' survive untouched.
-        assert_eq!(sigv4_canonical_query(&url), "a=b%20c&a=b+c&z=1");
-        // Duplicate keys sort by value; valueless params keep their '='.
-        let url: reqwest::Url = "http://example.com/?flag&a=2&a=1".parse().unwrap();
-        assert_eq!(sigv4_canonical_query(&url), "a=1&a=2&flag=");
-        // No query at all.
-        let url: reqwest::Url = "http://example.com/".parse().unwrap();
-        assert_eq!(sigv4_canonical_query(&url), "");
-    }
-
-    #[test]
     fn basic_base64s_credentials() {
         let mut req = build_request("GET", "http://example.com/", None);
         BasicAuth::new("user", "pass").sign(&mut req).unwrap();
@@ -1679,42 +1557,72 @@ mod tests {
     }
 
     #[test]
-    fn sigv4_multi_value_headers_joined_in_canonical_headers() {
-        let mut req = build_request("GET", "https://example.com/thing", None);
-        req.headers_mut().append("x-test", "one".parse().unwrap());
-        req.headers_mut().append("x-test", "two".parse().unwrap());
-        req.headers_mut().append("x-test", "three".parse().unwrap());
-        let headers = sigv4_canonical_headers(&req, "HASH", "20260729T000000Z", None);
-        // Multi-value header values are comma-joined with NO space per AWS
-        // canonicalization; host + x-amz-* are also present.
-        let map: std::collections::HashMap<String, String> = headers.into_iter().collect();
-        assert_eq!(map.get("x-test").map(|s| s.as_str()), Some("one,two,three"));
-        assert_eq!(map.get("host").map(|s| s.as_str()), Some("example.com"));
-        assert_eq!(
-            map.get("x-amz-content-sha256").map(|s| s.as_str()),
-            Some("HASH")
-        );
-        assert_eq!(
-            map.get("x-amz-date").map(|s| s.as_str()),
-            Some("20260729T000000Z")
-        );
-    }
+    fn sigv4_adapter_preserves_multi_value_headers_and_trimall() {
+        // TR-426: the canonicalization itself is unit-tested in `builders`.
+        // What THIS covers is the adapter added with the delegation — the
+        // reqwest `HeaderMap` → `Vec<(String, String)>` conversion, which is
+        // the only place multi-value grouping and insertion order could be
+        // lost. Neither published-vector test carries a duplicated header, so
+        // without this the adapter's grouping path is unexercised end to end.
+        //
+        // The property: three appended values must canonicalize identically
+        // to one pre-joined header, because AWS comma-joins them. If the
+        // adapter dropped duplicates or reordered them, the signatures would
+        // differ.
+        let sign = |build: &dyn Fn(&mut reqwest::Request)| {
+            let mut req = build_request("GET", "https://example.com/thing", None);
+            build(&mut req);
+            AwsSigV4Auth::new(
+                "AKID",
+                "SECRET",
+                Some("us-east-1".to_string()),
+                Some("s3".to_string()),
+                None,
+            )
+            .sign_at(
+                &mut req,
+                chrono::DateTime::from_timestamp(1_374_652_800, 0).unwrap(),
+            )
+            .unwrap();
+            req.headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
 
-    #[test]
-    fn sigv4_trimall_collapses_internal_whitespace() {
-        // AWS requires Trimall: trim ends AND collapse internal whitespace
-        // runs to a single space. `.trim()` alone leaves "a  b" intact,
-        // changing the canonical hash → 403 SignatureDoesNotMatch.
-        let mut req = build_request("GET", "https://example.com/thing", None);
-        req.headers_mut()
-            .insert("x-test", "  one   two \t three  ".parse().unwrap());
-        let headers = sigv4_canonical_headers(&req, "HASH", "20260729T000000Z", None);
-        let map: std::collections::HashMap<String, String> = headers.into_iter().collect();
+        let appended = sign(&|req: &mut reqwest::Request| {
+            req.headers_mut().append("x-test", "one".parse().unwrap());
+            req.headers_mut().append("x-test", "two".parse().unwrap());
+            req.headers_mut().append("x-test", "three".parse().unwrap());
+        });
+        let joined = sign(&|req: &mut reqwest::Request| {
+            req.headers_mut()
+                .insert("x-test", "one,two,three".parse().unwrap());
+        });
         assert_eq!(
-            map.get("x-test").map(|s| s.as_str()),
-            Some("one two three"),
-            "internal whitespace runs must collapse to a single space"
+            appended, joined,
+            "multi-value headers must comma-join through the adapter"
         );
+
+        // Trimall: internal whitespace runs collapse to one space, so a
+        // padded value signs the same as its trimmed form. `.trim()` alone
+        // would leave "one   two" intact and change the canonical hash.
+        //
+        // Deliberately NOT compared against `joined`: comma-joining three
+        // values and whitespace-collapsing one value are different canonical
+        // results (`one,two,three` vs `one two three`), so asserting those
+        // equal would be asserting a bug.
+        let padded = sign(&|req: &mut reqwest::Request| {
+            req.headers_mut()
+                .insert("x-test", "  one   two \t three  ".parse().unwrap());
+        });
+        let trimmed = sign(&|req: &mut reqwest::Request| {
+            req.headers_mut()
+                .insert("x-test", "one two three".parse().unwrap());
+        });
+        assert_eq!(padded, trimmed, "Trimall must collapse internal whitespace");
     }
 
     #[test]
@@ -1776,7 +1684,7 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         );
         assert_eq!(
-            hex_sha256(canonical_request.as_bytes()),
+            crate::builders::hex_sha256(canonical_request.as_bytes()),
             "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59",
             "canonical request must hash to the AWS-published value"
         );
@@ -1795,7 +1703,7 @@ mod tests {
             "iam",
         );
         assert_eq!(
-            hex_hmac_sha256(&key, string_to_sign.as_bytes()),
+            crate::builders::hex_hmac_sha256(&key, string_to_sign.as_bytes()),
             "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7",
             "signature must match the AWS-published value (kDate→kRegion→kService→kSigning chain)"
         );
@@ -2344,5 +2252,83 @@ mod tests {
             .unwrap();
         assert!(h3.contains("nonce=\"nonce-b\""));
         assert!(h3.contains("nc=00000001"), "rotated nonce resets nc: {h3}");
+    }
+    #[test]
+    fn dbg_multi() {
+        let show = |f: &dyn Fn(&mut reqwest::Request)| {
+            let mut r = build_request("GET", "https://example.com/thing", None);
+            f(&mut r);
+            let hs: Vec<(String, String)> = r
+                .headers()
+                .iter()
+                .filter_map(|(n, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|x| (n.as_str().to_string(), x.to_string()))
+                })
+                .collect();
+            let out = crate::builders::aws_sigv4_build_headers(
+                &crate::builders::AwsSigV4BuildParams {
+                    method: "GET",
+                    path: "/thing",
+                    query: "",
+                    host: "example.com",
+                    headers: &hs,
+                    body: None,
+                    access_key: "AKID",
+                    secret_key: "SECRET",
+                    session_token: None,
+                    region: "us-east-1",
+                    service: "s3",
+                    amz_date: "20130724T000000Z",
+                    date_stamp: "20130724",
+                },
+                "/thing",
+                "s3",
+                &crate::builders::derive_signing_key("SECRET", "20130724", "us-east-1", "s3"),
+            );
+            eprintln!("CANON:\n{}\n---", out.canonical_request);
+        };
+        show(&|r: &mut reqwest::Request| {
+            r.headers_mut().append("x-test", "one".parse().unwrap());
+            r.headers_mut().append("x-test", "two".parse().unwrap());
+        });
+        show(&|r: &mut reqwest::Request| {
+            r.headers_mut().insert("x-test", "one,two".parse().unwrap());
+        });
+
+        let mut a = build_request("GET", "https://example.com/thing", None);
+        a.headers_mut().append("x-test", "one".parse().unwrap());
+        a.headers_mut().append("x-test", "two".parse().unwrap());
+        let ha: Vec<(String, String)> = a
+            .headers()
+            .iter()
+            .filter_map(|(n, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (n.as_str().to_string(), s.to_string()))
+            })
+            .collect();
+        eprintln!("APPENDED adapter view: {ha:?}");
+        let mut b = build_request("GET", "https://example.com/thing", None);
+        b.headers_mut().insert("x-test", "one,two".parse().unwrap());
+        let hb: Vec<(String, String)> = b
+            .headers()
+            .iter()
+            .filter_map(|(n, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (n.as_str().to_string(), s.to_string()))
+            })
+            .collect();
+        eprintln!("JOINED   adapter view: {hb:?}");
+        eprintln!(
+            "canon A: {:?}",
+            crate::builders::sigv4_canonical_headers("example.com", &ha, "H", "T", None)
+        );
+        eprintln!(
+            "canon B: {:?}",
+            crate::builders::sigv4_canonical_headers("example.com", &hb, "H", "T", None)
+        );
     }
 }
