@@ -334,11 +334,127 @@ pub fn hawk_build_header(p: &HawkBuildParams<'_>) -> HeaderOut {
 
 // ── AWS Signature Version 4 ─────────────────────────────────────────────────
 
+// ── SigV4 service rules ─────────────────────────────────────────────────────
+// TR-428: these were left in `signers.rs` by TR-426, which made them
+// unreachable from `tropel-core-wasm` (`default-features = false` turns the
+// `reqwest` feature, and therefore the whole `signers` module, off). A browser
+// caller could reach `aws_sigv4_build_headers` but could NOT compute two of
+// the inputs it requires — `canonical_uri` and the signing service — so the
+// only way to call it from the web tier would have been to re-derive both in
+// TypeScript. That is invariant #3, and `default_service`'s comment below
+// records exactly what re-deriving it wrongly costs: a 403 on every S3
+// request. They live here now.
+
+const VIRTUAL_HOSTED_SERVICE_LABELS: &[&str] = &[
+    "s3",
+    "s3-control",
+    "s3-object-lambda",
+    "s3-outposts",
+    "s3express",
+    "execute-api",
+    "es",
+    "aoss",
+    "cloudsearch",
+];
+
+pub fn default_service(host: &str) -> String {
+    // Virtual-hosted AWS endpoints put the tenant BEFORE the service label
+    // (examplebucket.s3.amazonaws.com, {api-id}.execute-api.{region}.
+    // amazonaws.com, {domain}.{region}.es.amazonaws.com), so the first DNS
+    // label is NOT the signing service (backlog line 60: the old code derived
+    // `examplebucket` / `abc` / `search-x`, breaking the scope, the signing
+    // key, and is_s3_family → double-encoded S3 path → 403 on everything).
+    // For *.amazonaws.com hosts, scan labels RIGHT-TO-LEFT for a known
+    // virtual-hosted service: the service label sits closest to the
+    // amazonaws suffix, so this is also collision-robust when a tenant
+    // happens to BE a service name (es.s3.amazonaws.com → s3, not es). The
+    // S3 website/fips endpoints (bucket.s3-website-{region}…,
+    // s3-fips…amazonaws.com) still sign as s3. Everything else keeps the
+    // first-label rule (s3.us-west-2.amazonaws.com → s3; non-AWS hosts keep
+    // their first label).
+    let is_aws = host.ends_with(".amazonaws.com")
+        || host.ends_with(".amazonaws.com.cn")
+        || host == "amazonaws.com";
+    if is_aws {
+        for label in host.split('.').rev() {
+            if label == "amazonaws" || label == "com" || label == "cn" {
+                continue;
+            }
+            if VIRTUAL_HOSTED_SERVICE_LABELS.contains(&label) {
+                return label.to_string();
+            }
+            if label.starts_with("s3-website-") || label == "s3-fips" {
+                return "s3".to_string();
+            }
+        }
+    }
+    host.split('.').next().unwrap_or(host).to_string()
+}
+
+/// Map a service name to its SigV4 signing name. Most services sign with
+/// their own name, but AWS S3 Control uses `s3` as the signing name despite
+/// the endpoint prefix being `s3-control` (backlog line 240).
+pub fn signing_name(service: &str) -> &str {
+    match service {
+        "s3-control" | "s3control" => "s3",
+        other => other,
+    }
+}
+
+/// Canonical URI for SigV4.
+///
+/// AWS requires DOUBLE URI-encoding of the absolute path for every service
+/// EXCEPT the S3 family (s3, s3control, s3-object-lambda, s3-outposts,
+/// s3express), which sign the single-encoded path exactly as sent. The `url`
+/// crate already single-encodes `Url::path()` with the RFC 3986 unreserved
+/// rules, so re-encoding each segment yields the required second encoding
+/// for non-S3 services (`%` is not unreserved → `%25`). Empty segments
+/// (leading/trailing slash, `//`) are preserved; an empty path becomes `/`.
+pub fn sigv4_canonical_uri(path: &str, service: &str) -> String {
+    if is_s3_family(service) {
+        return if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        };
+    }
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    // Backlog line 240: normalize consecutive slashes — AWS's official
+    // test suite expects //prod/users → /prod/users. Without this, the
+    // classic base-URL-ends-in-/ join produces a double-slash that fails
+    // signature verification with a 403.
+    // TR-603: single replace("//","/") only handles pairs; use a loop
+    // for runs of 3+ consecutive slashes.
+    let mut normalized = path.to_string();
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+    let encoded: Vec<String> = normalized
+        .split('/')
+        .map(percent_encode_unreserved)
+        .collect();
+    encoded.join("/")
+}
+
+/// True for the S3 family of services, which sign the single-encoded path.
+///
+/// Matches both spellings of S3 Control's signing name ("s3-control" is what
+/// `default_service` derives from `s3-control.<region>.amazonaws.com`; some
+/// tools emit the un-hyphenated "s3control").
+pub fn is_s3_family(service: &str) -> bool {
+    matches!(
+        service,
+        "s3" | "s3control" | "s3-control" | "s3-object-lambda" | "s3-outposts" | "s3express"
+    )
+}
+
+/// Duplicates are allowed and are what the multi-value comma-join operates on.
+#[derive(Debug, Clone)]
 /// Everything needed to build the SigV4 headers.
 ///
 /// `headers` is the request's headers in INSERTION order, names as sent.
-/// Duplicates are allowed and are what the multi-value comma-join operates on.
-#[derive(Debug, Clone)]
 pub struct AwsSigV4BuildParams<'a> {
     /// Uppercase HTTP method.
     pub method: &'a str,
@@ -556,7 +672,7 @@ pub fn aws_sigv4_build_headers(
 /// its own identical copy; a single definition is the point of this module,
 /// because a percent-encoding set that drifts by one character produces a
 /// signature the server rejects with no useful diagnostic.
-const OAUTH1_UNRESERVED: AsciiSet = NON_ALPHANUMERIC
+const RFC3986_UNRESERVED: AsciiSet = NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')
@@ -577,9 +693,14 @@ pub fn oauth1_is_supported_signature_method(method: &str) -> bool {
         .any(|m| m.eq_ignore_ascii_case(method))
 }
 
-/// RFC 5849 §3.6 percent-encoding.
-pub fn oauth1_percent_encode(value: &str) -> String {
-    utf8_percent_encode(value, &OAUTH1_UNRESERVED).to_string()
+/// RFC 3986 §2.3 percent-encoding: everything except `A-Z a-z 0-9 - . _ ~`.
+///
+/// Shared, not per-scheme: RFC 5849 §3.6 (OAuth1) and SigV4's canonical URI
+/// both specify exactly this set. Two copies of a percent-encoding set is how
+/// two signers start disagreeing by one character, which is a 403 with no
+/// useful diagnostic.
+pub fn percent_encode_unreserved(value: &str) -> String {
+    utf8_percent_encode(value, &RFC3986_UNRESERVED).to_string()
 }
 
 /// RFC 5849 §3.4.1.1 signature base string.
@@ -591,7 +712,7 @@ pub fn oauth1_percent_encode(value: &str) -> String {
 pub fn oauth1_base_string(method: &str, base_uri: &str, params: &[(String, String)]) -> String {
     let mut encoded: Vec<(String, String)> = params
         .iter()
-        .map(|(k, v)| (oauth1_percent_encode(k), oauth1_percent_encode(v)))
+        .map(|(k, v)| (percent_encode_unreserved(k), percent_encode_unreserved(v)))
         .collect();
     encoded.sort();
     let param_string = encoded
@@ -602,14 +723,14 @@ pub fn oauth1_base_string(method: &str, base_uri: &str, params: &[(String, Strin
     format!(
         "{}&{}&{}",
         method.to_uppercase(),
-        oauth1_percent_encode(base_uri),
-        oauth1_percent_encode(&param_string)
+        percent_encode_unreserved(base_uri),
+        percent_encode_unreserved(&param_string)
     )
 }
 
 /// RFC 5849 §3.4.2 HMAC signature over the base string, base64-encoded.
 ///
-/// Signing key = `enc(consumer_secret) & enc(token_secret)` — the `&` is
+/// Signing key = `percent_encode_unreserved(consumer_secret) & percent_encode_unreserved(token_secret)` — the `&` is
 /// present even when the token secret is empty (two-legged OAuth), which is
 /// why the caller passes `""` rather than omitting it.
 ///
@@ -624,8 +745,8 @@ pub fn oauth1_signature(
 ) -> Option<String> {
     let key = format!(
         "{}&{}",
-        oauth1_percent_encode(consumer_secret),
-        oauth1_percent_encode(token_secret)
+        percent_encode_unreserved(consumer_secret),
+        percent_encode_unreserved(token_secret)
     );
     // One macro rather than a generic: `hmac::Hmac<D>` needs bounds that are
     // awkward to name across digest crates, and three explicit arms match how
@@ -721,8 +842,8 @@ pub fn oauth1_build_header(p: &OAuth1BuildParams<'_>) -> Option<OAuth1Out> {
         .map(|(k, v)| {
             format!(
                 "{}=\"{}\"",
-                oauth1_percent_encode(k),
-                oauth1_percent_encode(v)
+                percent_encode_unreserved(k),
+                percent_encode_unreserved(v)
             )
         })
         .collect::<Vec<_>>()
@@ -1216,7 +1337,7 @@ mod tests {
 
     #[test]
     fn oauth1_two_legged_none_token_secret_equals_empty() {
-        // RFC 5849 §3.4.2: the signing key is `enc(consumer_secret) & enc(token_secret)`.
+        // RFC 5849 §3.4.2: the signing key is `percent_encode_unreserved(consumer_secret) & percent_encode_unreserved(token_secret)`.
         // In two-legged OAuth there is no token secret, and `None` must be
         // treated as the empty string — not as an absent component, and not
         // as a placeholder. Any other default silently changes every
@@ -1280,5 +1401,100 @@ mod tests {
         );
         assert!(out.header.value.starts_with("OAuth "));
         assert!(out.header.value.contains("oauth_token=\"tok\""));
+    }
+    #[test]
+    fn sigv4_default_service_derives_virtual_hosted_endpoints() {
+        // Regression (backlog line 60): default_service took the FIRST DNS
+        // label, so virtual-hosted endpoints derived the TENANT as the
+        // signing service (examplebucket / abc / search-x) — wrong scope,
+        // wrong signing key, and for S3 a false is_s3_family → double-encoded
+        // path (403 on every virtual-hosted-S3 and API-Gateway request).
+        assert_eq!(default_service("s3.us-west-2.amazonaws.com"), "s3");
+        assert_eq!(default_service("examplebucket.s3.amazonaws.com"), "s3");
+        assert_eq!(
+            default_service("examplebucket.s3.us-west-2.amazonaws.com"),
+            "s3"
+        );
+        assert_eq!(
+            default_service("mybucket.s3-website-us-west-2.amazonaws.com"),
+            "s3"
+        );
+        assert_eq!(default_service("s3-fips.us-west-2.amazonaws.com"), "s3");
+        // Collision-robustness: a tenant that IS a service name must not win
+        // over the real (suffix-closest) service label.
+        assert_eq!(default_service("es.s3.amazonaws.com"), "s3");
+        assert_eq!(
+            default_service("abc123.execute-api.us-east-1.amazonaws.com"),
+            "execute-api"
+        );
+        assert_eq!(default_service("search-x.us-east-1.es.amazonaws.com"), "es");
+        // Non-virtual-hosted service: first label IS the service.
+        assert_eq!(
+            default_service("dynamodb.us-east-1.amazonaws.com"),
+            "dynamodb"
+        );
+        // Non-AWS host: first label preserved (unchanged behavior).
+        assert_eq!(default_service("api.example.com"), "api");
+    }
+
+    #[test]
+    fn sigv4_is_fully_derivable_without_the_reqwest_feature() {
+        // TR-428: the point of moving the service rules here. This test runs
+        // under `--no-default-features`, which is the configuration
+        // `tropel-core-wasm` builds — so it fails to COMPILE if any step of
+        // the chain drifts back behind the `reqwest` gate.
+        //
+        // A browser caller starts with a URL and must reach a signed header
+        // using nothing but this module. Every step below is a rule that
+        // would otherwise have to be re-derived in TypeScript.
+        let host = "examplebucket.s3.amazonaws.com";
+        let service = default_service(host);
+        assert_eq!(service, "s3");
+        assert!(is_s3_family(&service));
+        let signing_service = signing_name(&service);
+        // The input is the path as `Url::path()` yields it — ALREADY
+        // single-encoded, so a literal space never arrives here. S3 signs
+        // that exactly as sent; every other service encodes it a second
+        // time (`%` is not unreserved, so `%20` becomes `%2520`).
+        assert_eq!(sigv4_canonical_uri("/a%20b/c", &service), "/a%20b/c");
+        assert_eq!(sigv4_canonical_uri("/a%20b/c", "execute-api"), "/a%2520b/c");
+
+        let key = derive_signing_key("SECRET", "20130524", "us-east-1", signing_service);
+        let out = aws_sigv4_build_headers(
+            &AwsSigV4BuildParams {
+                method: "GET",
+                path: "/test.txt",
+                query: "",
+                host,
+                headers: &[],
+                body: Some(b""),
+                access_key: "AKIAIOSFODNN7EXAMPLE",
+                secret_key: "SECRET",
+                session_token: None,
+                region: "us-east-1",
+                service: &service,
+                amz_date: "20130524T000000Z",
+                date_stamp: "20130524",
+            },
+            &sigv4_canonical_uri("/test.txt", &service),
+            signing_service,
+            &key,
+        );
+        assert!(out.headers[0]
+            .value
+            .starts_with("AWS4-HMAC-SHA256 Credential="));
+        assert!(out.headers[0]
+            .value
+            .contains("/20130524/us-east-1/s3/aws4_request"));
+    }
+
+    #[test]
+    fn sigv4_signing_name_maps_s3_control() {
+        // backlog line 240: s3-control's SIGNING name is "s3" even though the
+        // endpoint prefix is not. Getting this wrong changes the credential
+        // scope and the signing key, so it is a 403 with no diagnostic.
+        assert_eq!(signing_name("s3-control"), "s3");
+        assert_eq!(signing_name("s3control"), "s3");
+        assert_eq!(signing_name("execute-api"), "execute-api");
     }
 }
