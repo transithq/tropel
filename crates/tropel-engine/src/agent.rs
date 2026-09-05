@@ -1534,14 +1534,65 @@ async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_js
         .and_then(|f| f.as_bool())
         .unwrap_or(true);
 
-    let headers: Vec<(String, String)> = req
-        .get("headers")
-        .and_then(|h| h.as_object())
-        .map(|o| {
-            o.iter()
-                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                .collect()
-        })
+    // TR-463: headers arrive as an ARRAY of pairs, with the old object form
+    // still accepted.
+    //
+    // A JSON object cannot hold two entries with the same key, so the object
+    // form silently collapsed duplicate header names — one of two `Set-Cookie`
+    // or `Accept` rows reached the wire and nothing reported the other. That
+    // is the same silent-loss class as TR-462's mangled bodies, refusing to
+    // send data the caller asked for rather than corrupting what came back.
+    //
+    // The relay has always used a pair list for exactly this reason
+    // (`duplicateNames: true` in its capability descriptor); /execute now
+    // matches, so a transport built on it can declare the same.
+    let headers: Vec<(String, String)> = match req.get("headers") {
+        Some(serde_json::Value::Array(rows)) => rows
+            .iter()
+            .filter_map(|row| match row {
+                // ["Name", "value"]
+                serde_json::Value::Array(pair) if pair.len() == 2 => Some((
+                    pair[0].as_str()?.to_string(),
+                    pair[1].as_str().unwrap_or("").to_string(),
+                )),
+                // {"name": "...", "value": "..."}
+                serde_json::Value::Object(o) => Some((
+                    o.get("name")?.as_str()?.to_string(),
+                    o.get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )),
+                _ => None,
+            })
+            .collect(),
+        Some(serde_json::Value::Object(o)) => o
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    // TR-463: the fields the engine has always supported and the wire format
+    // dropped on the floor. Each was hard-coded to its empty value, so a
+    // client asking for a client certificate, a Host override, a cookie or a
+    // timeout was ignored WITHOUT being told — the request went out missing
+    // what it asked for. `tropel_sdk::Request` carries every one of them.
+    let certificate: Option<tropel_sdk::types::CertificateConfig> = req
+        .get("certificate")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let host: Option<String> = req.get("host").and_then(|h| h.as_str()).map(str::to_string);
+    let cookies: Vec<tropel_sdk::types::RequestCookie> = req
+        .get("cookies")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let timeout = req
+        .get("timeout_ms")
+        .and_then(|t| t.as_u64())
+        .map(std::time::Duration::from_millis);
+    let query_params: HashMap<String, String> = req
+        .get("query_params")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
     let method_parsed = Method::parse(method).unwrap_or(Method::GET);
@@ -1555,17 +1606,17 @@ async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_js
         url: url.to_string(),
         method: method_parsed,
         headers,
-        query_params: HashMap::new(),
+        query_params,
         body: req
             .get("body")
             .and_then(|b| b.as_str())
             .map(|s| Body::Raw(s.to_string())),
         auth: auth.clone(),
-        certificate: None,
+        certificate,
         follow_redirects: follow,
-        host: None,
-        cookies: Vec::new(),
-        timeout: None,
+        host,
+        cookies,
+        timeout,
         response_type: ResponseType::Text,
     };
 
@@ -2239,6 +2290,83 @@ mod tests {
         s.read_to_end(&mut out).await.expect("read");
         let raw = String::from_utf8_lossy(&out).to_string();
         assert!(raw.starts_with("HTTP/1.1 401"), "{raw}");
+    }
+
+    /// TR-463 — duplicate header names survive `/execute`.
+    ///
+    /// The object form cannot hold two entries with the same key, so
+    /// `{"Accept": "a", "Accept": "b"}` is not even expressible — one row is
+    /// gone before the agent sees it. Two `Set-Cookie` rows, or the `Accept`
+    /// pair an API needs, arrived as one and nothing reported the other.
+    ///
+    /// Pins the ARRAY form carrying both, and the object form still working,
+    /// because breaking the old shape would break every existing caller.
+    #[test]
+    fn duplicate_header_names_survive_the_execute_wire_format() {
+        // Exactly the parsing branch `execute_single` runs.
+        fn parse(v: &serde_json::Value) -> Vec<(String, String)> {
+            match v.get("headers") {
+                Some(serde_json::Value::Array(rows)) => rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        serde_json::Value::Array(pair) if pair.len() == 2 => Some((
+                            pair[0].as_str()?.to_string(),
+                            pair[1].as_str().unwrap_or("").to_string(),
+                        )),
+                        serde_json::Value::Object(o) => Some((
+                            o.get("name")?.as_str()?.to_string(),
+                            o.get("value")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        )),
+                        _ => None,
+                    })
+                    .collect(),
+                Some(serde_json::Value::Object(o)) => o
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        // Pair form: BOTH rows survive, in order.
+        let pairs = parse(&serde_json::json!({
+            "headers": [["Accept", "application/json"], ["Accept", "text/plain"]]
+        }));
+        assert_eq!(
+            pairs,
+            vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("Accept".to_string(), "text/plain".to_string()),
+            ],
+            "a duplicate header name must reach the wire twice"
+        );
+
+        // Object form: still accepted, so existing callers keep working.
+        let obj = parse(&serde_json::json!({"headers": {"Accept": "application/json"}}));
+        assert_eq!(
+            obj,
+            vec![("Accept".to_string(), "application/json".to_string())]
+        );
+
+        // The {name, value} row shape too — what a KnockPort KeyValuePair
+        // serialises to, so a caller does not have to reshape it first.
+        let named = parse(&serde_json::json!({
+            "headers": [{"name": "X-A", "value": "1"}, {"name": "X-A", "value": "2"}]
+        }));
+        assert_eq!(named.len(), 2, "{named:?}");
+
+        // And the loss the object form CANNOT avoid, pinned so the reason
+        // this changed is visible: serde keeps the last of two equal keys.
+        let collapsed: serde_json::Value =
+            serde_json::from_str(r#"{"headers":{"Accept":"a","Accept":"b"}}"#).unwrap();
+        assert_eq!(
+            parse(&collapsed).len(),
+            1,
+            "the object form loses one row before the agent ever sees it"
+        );
     }
 
     /// TR-462 — a non-UTF-8 response body survives, and says how.
