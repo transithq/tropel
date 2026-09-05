@@ -402,3 +402,42 @@ export function oauth1Sign(params) {
 export function oauth1SignatureMethods() {
   return JSON.parse(requireGlue("oauth1SignatureMethods").oauth1SignatureMethods());
 }
+
+// ── Declarative assertions (TR-440) ─────────────────────────────────────────
+
+/**
+ * Evaluate a batch of assertions against one response.
+ * @param {object} response `{status, status_text, headers:[[k,v]], body,
+ *   response_time, size, cookies:[[k,v]]}`
+ * @param {Array<{name?:string, target:string, operator:string, expected?:any}>} assertions
+ * @param {(pattern:string, haystack:string)=>boolean} [regexMatches] the HOST's
+ *   RegExp, used for `matches`/`notMatches`. Omit it and those two operators
+ *   report `unsupported` by name rather than failing silently. It is injected
+ *   rather than linked because a Rust regex would put back the 152 KB TR-434
+ *   removed from this tier, AND would be unfaithful — JS RegExp has
+ *   backreferences and lookaround that Rust's engine deliberately lacks.
+ * @returns {Array<{name:string, passed:boolean, unsupported?:string}>} one
+ *   outcome per assertion, in order. `unsupported` means it could not be
+ *   evaluated at all (unknown operator, unresolvable target, missing matcher)
+ *   — distinct from `passed:false`, which means the predicate ran and said no.
+ */
+export function assertEvaluate(response, assertions, regexMatches) {
+  return JSON.parse(
+    requireGlue("assertEvaluate").assertEvaluate(
+      JSON.stringify(response),
+      JSON.stringify(assertions),
+      regexMatches,
+    ),
+  );
+}
+
+/**
+ * The 28-operator vocabulary.
+ * @returns {Array<{name:string, arity:"unary"|"binary", summary:string}>} in
+ *   declaration order — an editor dropdown renders it directly, so the order
+ *   is part of the contract. Read this rather than keeping a second list: a
+ *   copy is how an operator ends up offered but unevaluated.
+ */
+export function assertionOperators() {
+  return JSON.parse(requireGlue("assertionOperators").assertionOperators());
+}
