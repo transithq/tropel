@@ -290,6 +290,18 @@ pub enum Commands {
         #[arg(long = "bind", default_value = "127.0.0.1")]
         bind: String,
 
+        /// Exit as soon as the process that spawned this agent is gone.
+        ///
+        /// TR-471: a supervisor's own cleanup does not run when it is
+        /// SIGKILLed or crashes, and an agent left behind keeps a loopback
+        /// port open with the variables and client secrets it was sent.
+        ///
+        /// Detected by stdin EOF, so the spawning process MUST give the agent
+        /// a stdin pipe and hold it open. With stdin on /dev/null or closed,
+        /// the agent exits immediately (and says so).
+        #[arg(long = "exit-with-parent")]
+        exit_with_parent: bool,
+
         /// Browser origin allowed to reach this agent, e.g.
         /// `--allow-origin https://app.knockport.dev`. Repeatable.
         ///
@@ -392,7 +404,17 @@ pub async fn run_cli() -> Result<()> {
             token,
             bind,
             allow_origin,
-        } => crate::agent::run_agent(port, bind.as_str(), token.as_deref(), &allow_origin).await,
+            exit_with_parent,
+        } => {
+            crate::agent::run_agent(
+                port,
+                bind.as_str(),
+                token.as_deref(),
+                &allow_origin,
+                exit_with_parent,
+            )
+            .await
+        }
     }
 }
 
