@@ -497,6 +497,7 @@ fn assert_evaluate_batch_inner(
             match tropel_variables::assertions::resolve_assertion_target(&spec.target, &target) {
                 Ok(actual) => tropel_variables::assertions::assert_evaluate(
                     &name,
+                    &spec.target,
                     &actual,
                     &spec.operator,
                     &spec.expected,

@@ -325,10 +325,18 @@ fn as_string(v: &Value) -> String {
 
 /// Evaluate one assertion.
 ///
+/// `name` and `target` are DIFFERENT and both are needed. `name` is the
+/// assertion's identity — its description, used to aggregate outcomes across a
+/// load run — while `target` is what was actually checked (`status`,
+/// `json.items.0.name`) and is what a failure message must name. Wording a
+/// failure with the description produces "expected target should fail equals
+/// 500", which says nothing about what was inspected.
+///
 /// Never panics, never allocates for the unary paths, and returns a named
 /// `unsupported` rather than a bare `false` when it cannot evaluate at all.
 pub fn assert_evaluate(
     name: &str,
+    target: &str,
     actual: &Value,
     operator: &str,
     expected: &Value,
@@ -442,13 +450,13 @@ pub fn assert_evaluate(
         None
     } else if op.arity == AssertionArity::Unary {
         Some(format!(
-            "expected target {name} {}; actual {}",
+            "expected target {target} {}; actual {}",
             op.summary,
             preview(actual)
         ))
     } else {
         Some(format!(
-            "expected target {name} {} {}; actual {}",
+            "expected target {target} {} {}; actual {}",
             op.summary,
             preview(expected),
             preview(actual)
@@ -875,7 +883,7 @@ mod tests {
     use serde_json::json;
 
     fn ev(actual: Value, op: &str, expected: Value) -> AssertionOutcome {
-        assert_evaluate("t", &actual, op, &expected, None)
+        assert_evaluate("t", "t", &actual, op, &expected, None)
     }
     fn ok(actual: Value, op: &str, expected: Value) -> bool {
         let o = ev(actual, op, expected);
@@ -1013,11 +1021,18 @@ mod tests {
     #[test]
     fn matches_uses_the_injected_matcher_for_both_polarities() {
         let m = |pattern: &str, hay: &str| pattern == "^a" && hay.starts_with('a');
-        let hit = assert_evaluate("t", &json!("abc"), "matches", &json!("^a"), Some(&m));
+        let hit = assert_evaluate("t", "t", &json!("abc"), "matches", &json!("^a"), Some(&m));
         assert!(hit.passed && hit.unsupported.is_none());
-        let miss = assert_evaluate("t", &json!("xyz"), "matches", &json!("^a"), Some(&m));
+        let miss = assert_evaluate("t", "t", &json!("xyz"), "matches", &json!("^a"), Some(&m));
         assert!(!miss.passed && miss.unsupported.is_none());
-        let neg = assert_evaluate("t", &json!("xyz"), "notMatches", &json!("^a"), Some(&m));
+        let neg = assert_evaluate(
+            "t",
+            "t",
+            &json!("xyz"),
+            "notMatches",
+            &json!("^a"),
+            Some(&m),
+        );
         assert!(neg.passed, "notMatches inverts the same matcher");
     }
 
@@ -1036,7 +1051,14 @@ mod tests {
         // aggregated like k6 checks — pass/fail counts grouped by assertion
         // name, not one row per request. Correlating by INDEX instead breaks
         // the moment a conditional assertion is skipped.
-        let o = assert_evaluate("status is 200", &json!(200), "eq", &json!(200), None);
+        let o = assert_evaluate(
+            "status is 200",
+            "status",
+            &json!(200),
+            "eq",
+            &json!(200),
+            None,
+        );
         assert_eq!(o.name, "status is 200");
         assert!(o.passed);
         let json = serde_json::to_string(&o).expect("outcome serialises");
@@ -1066,7 +1088,7 @@ mod tests {
         for op in ASSERTION_OPERATORS {
             for a in &shapes {
                 for b in &shapes {
-                    let o = assert_evaluate("t", a, op.name, b, None);
+                    let o = assert_evaluate("t", "t", a, op.name, b, None);
                     if op.name == "matches" || op.name == "notMatches" {
                         assert!(o.unsupported.is_some());
                     } else {
@@ -1254,18 +1276,35 @@ mod tests {
         // The pair as a caller uses them: resolve, then evaluate.
         let c = ctx();
         let actual = resolve_assertion_target("json.items.0.name", &c).unwrap();
-        let o = assert_evaluate("first item", &actual, "eq", &json!("first"), None);
+        let o = assert_evaluate(
+            "first item",
+            "json.items.0.name",
+            &actual,
+            "eq",
+            &json!("first"),
+            None,
+        );
         assert!(o.passed && o.unsupported.is_none());
 
         let status = resolve_assertion_target("status", &c).unwrap();
-        assert!(assert_evaluate("2xx", &status, "between", &json!([200, 299]), None).passed);
+        assert!(
+            assert_evaluate(
+                "2xx",
+                "status",
+                &status,
+                "between",
+                &json!([200, 299]),
+                None
+            )
+            .passed
+        );
 
         // A header compared numerically — the reason numeric coercion crosses
         // string/number at all.
         let mut c2 = ctx();
         c2.headers.push(("Content-Length".into(), "1024".into()));
         let len = resolve_assertion_target("Content-Length", &c2).unwrap();
-        assert!(assert_evaluate("big", &len, "gt", &json!(1000), None).passed);
+        assert!(assert_evaluate("big", "Content-Length", &len, "gt", &json!(1000), None).passed);
     }
     /// TR-442: the vocabulary is also shipped as a STATIC JSON fixture so a
     /// consumer can read it WITHOUT initialising the wasm.
@@ -1317,7 +1356,7 @@ mod tests {
         // TR-443: the TypeScript evaluator produced this wording, and the
         // panel renders it. Keeping it byte-compatible means migrating does
         // not silently reword every existing failure.
-        let fail = assert_evaluate("status", &json!(200), "eq", &json!(500), None);
+        let fail = assert_evaluate("status", "status", &json!(200), "eq", &json!(500), None);
         assert!(!fail.passed);
         assert_eq!(
             fail.message.as_deref(),
@@ -1325,7 +1364,7 @@ mod tests {
         );
 
         // A unary operator has no expected value to name.
-        let unary = assert_evaluate("body", &json!("x"), "isEmpty", &json!(null), None);
+        let unary = assert_evaluate("body", "body", &json!("x"), "isEmpty", &json!(null), None);
         assert!(!unary.passed);
         assert_eq!(
             unary.message.as_deref(),
@@ -1334,14 +1373,14 @@ mod tests {
 
         // A PASSING row carries none — it is emitted per assertion per
         // request in a load run, and "why did it pass" is not a question.
-        let pass = assert_evaluate("status", &json!(200), "eq", &json!(200), None);
+        let pass = assert_evaluate("status", "status", &json!(200), "eq", &json!(200), None);
         assert!(pass.passed && pass.message.is_none());
         let json = serde_json::to_string(&pass).expect("serialises");
         assert!(!json.contains("message"), "{json}");
 
         // `unsupported` and `message` do not both appear: an assertion that
         // could not run has no comparison to describe.
-        let unknown = assert_evaluate("x", &json!(1), "nope", &json!(1), None);
+        let unknown = assert_evaluate("x", "x", &json!(1), "nope", &json!(1), None);
         assert!(unknown.unsupported.is_some() && unknown.message.is_none());
     }
 
@@ -1350,9 +1389,31 @@ mod tests {
         // A failed assertion against a 2 MB body must not put 2 MB into every
         // result row of a load run.
         let big = json!("y".repeat(5000));
-        let out = assert_evaluate("body", &big, "eq", &json!("x"), None);
+        let out = assert_evaluate("body", "body", &big, "eq", &json!("x"), None);
         let msg = out.message.expect("a failing row has a message");
         assert!(msg.len() < 300, "message was {} bytes", msg.len());
         assert!(msg.contains("..."), "{msg}");
+    }
+    #[test]
+    fn the_failure_message_names_the_target_not_the_assertion_name() {
+        // These are different things and conflating them produces a message
+        // that says nothing about what was inspected — "expected target
+        // should fail equals 500" instead of "expected target status equals
+        // 500". `name` exists to aggregate outcomes across a load run;
+        // `target` is what was actually checked.
+        let out = assert_evaluate(
+            "should fail",
+            "status",
+            &json!(200),
+            "eq",
+            &json!(500),
+            None,
+        );
+        assert_eq!(out.name, "should fail", "identity is the description");
+        assert_eq!(
+            out.message.as_deref(),
+            Some("expected target status equals 500; actual 200"),
+            "the WORDING names the target"
+        );
     }
 }
