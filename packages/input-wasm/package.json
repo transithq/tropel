@@ -1,6 +1,6 @@
 {
   "name": "@tropel/input-wasm",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Tropel collection-import slice for browser embedders (KnockPort). Lazy sibling of @tropel/core-wasm: OpenAPI 3.x, Postman v2.x, and HAR parsers compiled to wasm32-unknown-unknown. See API_CLIENT_WEB_PAYLOAD.md \u00a72.3 for the two-tier split.",
   "license": "Apache-2.0",
   "type": "module",
