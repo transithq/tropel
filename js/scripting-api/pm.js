@@ -370,12 +370,12 @@ function assertStatusCode(code, label) {
     }
 }
 
-pm.response.to = guardChain({
+var __pmResponseToRaw = {
     // Backlog line 41: be/have are nested objects, so wrap them in guardChain
     // explicitly — an unknown assertion name must throw, not silently pass.
     // (Master's guardChain deliberately does not recurse: the AssertChain hot
     // path hands back `this`, so recursion would add a proxy per nested read.)
-    be: guardChain({
+    be: {
         get success() { assertStatusClass(2, 'success'); },
         get ok() { assertStatusClass(2, 'ok'); },
         get redirection() { assertStatusClass(3, 'redirection'); },
@@ -438,8 +438,18 @@ pm.response.to = guardChain({
             }
             return function () {};
         }
-    }),
-    have: guardChain({
+    },
+    have: {
+        // TR-441 (KT-309): Postman's schema assertion. Unknown keywords are
+        // REFUSED, not ignored — see validateJsonSchema.
+        jsonSchema: function (schema) {
+            var body = pm.response.json();
+            var errors = [];
+            validateJsonSchema(body, schema, '$', errors);
+            if (errors.length > 0) {
+                throw new Error('response body does not match the JSON schema: ' + errors.join('; '));
+            }
+        },
         status: function (code) {
             // Backlog line 143: pm.response.code is a VALUE now.
             // TR-114: accept BOTH a numeric code AND a reason-phrase string.
@@ -512,8 +522,195 @@ pm.response.to = guardChain({
                 throw new Error('expected response JSON body to match');
             }
         }
-    })
+    }
+};
+
+// ── TR-441 · `.not` on the response chain (KT-308, F14) ─────────────────────
+//
+// `pm.response.to.not.have.status(500)` threw "unknown assertion property
+// 'not'". Plain-value negation already worked (`pm.expect(1).to.not.eql(2)`),
+// so this read as a PARTIAL implementation — and "assert it is not a 500" is
+// a common smoke test that surfaced as a SCRIPT ERROR rather than a red
+// assertion, which is worse than either passing or failing.
+//
+// Every assertion in the chain signals failure by THROWING, so negation is
+// mechanical: run the original, and throw only if it did NOT. Building it by
+// mirroring the raw literals means a new assertion added above is negatable
+// for free — a hand-written `not` table would silently omit it.
+function negateChainMember(name, run) {
+    return function () {
+        var threw = false;
+        try {
+            run.apply(this, arguments);
+        } catch (e) {
+            threw = true;
+        }
+        if (!threw) {
+            throw new Error('expected response NOT to satisfy ' + name + ', but it did');
+        }
+    };
+}
+
+function negateChainObject(source, prefix) {
+    var out = {};
+    var names = Object.getOwnPropertyNames(source);
+    for (var i = 0; i < names.length; i++) {
+        (function (key) {
+            var d = Object.getOwnPropertyDescriptor(source, key);
+            var label = prefix + '.' + key;
+            if (typeof d.get === 'function') {
+                // A property assertion (`.ok`, `.notFound`): negate the getter,
+                // keeping it a GETTER so `pm.response.to.not.be.ok` works
+                // without parentheses, exactly as the positive form does.
+                Object.defineProperty(out, key, {
+                    get: negateChainMember(label, d.get),
+                    enumerable: true
+                });
+            } else if (typeof d.value === 'function') {
+                out[key] = negateChainMember(label, d.value);
+            }
+        })(names[i]);
+    }
+    return guardChain(out);
+}
+
+// ── TR-441 · jsonSchema (KT-309, F14) ───────────────────────────────────────
+//
+// `pm.response.to.have.jsonSchema(schema)` threw "unknown assertion property",
+// so any imported collection using it errored out.
+//
+// A BOUNDED subset of JSON Schema, and unknown keywords are REFUSED BY NAME
+// rather than ignored. That choice is the whole point: ajv implements the full
+// spec, and a partial validator that silently skips what it does not
+// understand reports PASS on data the author's schema rejects — a green
+// assertion that checked less than it says. Refusing names the gap instead.
+var JSON_SCHEMA_SUPPORTED = [
+    'type', 'properties', 'required', 'items', 'enum', 'const',
+    'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum',
+    'minLength', 'maxLength', 'minItems', 'maxItems', 'pattern',
+    'additionalProperties', 'nullable', '$schema', 'title', 'description'
+];
+
+function jsonSchemaTypeOf(value) {
+    if (value === null) { return 'null'; }
+    if (Array.isArray(value)) { return 'array'; }
+    if (typeof value === 'number') {
+        return Number.isInteger(value) ? 'integer' : 'number';
+    }
+    return typeof value;
+}
+
+function validateJsonSchema(value, schema, path, errors) {
+    if (schema === null || typeof schema !== 'object') {
+        errors.push(path + ': schema must be an object');
+        return;
+    }
+    var keys = Object.keys(schema);
+    for (var k = 0; k < keys.length; k++) {
+        if (JSON_SCHEMA_SUPPORTED.indexOf(keys[k]) === -1) {
+            errors.push(
+                path + ": schema keyword '" + keys[k] + "' is not supported by this " +
+                'validator (supported: ' + JSON_SCHEMA_SUPPORTED.join(', ') + ')'
+            );
+        }
+    }
+    var actual = jsonSchemaTypeOf(value);
+    if (schema.type !== undefined) {
+        var allowed = Array.isArray(schema.type) ? schema.type : [schema.type];
+        // `integer` satisfies `number`, per the spec.
+        var typeOk = allowed.some(function (t) {
+            return t === actual || (t === 'number' && actual === 'integer');
+        });
+        if (!typeOk && !(schema.nullable === true && value === null)) {
+            errors.push(path + ': expected type ' + allowed.join('|') + ', got ' + actual);
+            return;
+        }
+    }
+    if (schema.enum !== undefined && !schema.enum.some(function (e) { return deepEqual(e, value); })) {
+        errors.push(path + ': value is not in enum');
+    }
+    if (schema.const !== undefined && !deepEqual(schema.const, value)) {
+        errors.push(path + ': value does not equal const');
+    }
+    if (typeof value === 'number') {
+        if (schema.minimum !== undefined && value < schema.minimum) {
+            errors.push(path + ': ' + value + ' < minimum ' + schema.minimum);
+        }
+        if (schema.maximum !== undefined && value > schema.maximum) {
+            errors.push(path + ': ' + value + ' > maximum ' + schema.maximum);
+        }
+        if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) {
+            errors.push(path + ': ' + value + ' <= exclusiveMinimum');
+        }
+        if (schema.exclusiveMaximum !== undefined && value >= schema.exclusiveMaximum) {
+            errors.push(path + ': ' + value + ' >= exclusiveMaximum');
+        }
+    }
+    if (typeof value === 'string') {
+        if (schema.minLength !== undefined && value.length < schema.minLength) {
+            errors.push(path + ': shorter than minLength ' + schema.minLength);
+        }
+        if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+            errors.push(path + ': longer than maxLength ' + schema.maxLength);
+        }
+        if (schema.pattern !== undefined) {
+            var re;
+            try {
+                re = new RegExp(schema.pattern);
+            } catch (e) {
+                errors.push(path + ": pattern '" + schema.pattern + "' is not a valid regex");
+                re = null;
+            }
+            if (re && !re.test(value)) {
+                errors.push(path + ': does not match pattern ' + schema.pattern);
+            }
+        }
+    }
+    if (Array.isArray(value)) {
+        if (schema.minItems !== undefined && value.length < schema.minItems) {
+            errors.push(path + ': fewer than minItems ' + schema.minItems);
+        }
+        if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+            errors.push(path + ': more than maxItems ' + schema.maxItems);
+        }
+        if (schema.items !== undefined) {
+            for (var i = 0; i < value.length; i++) {
+                validateJsonSchema(value[i], schema.items, path + '[' + i + ']', errors);
+            }
+        }
+    }
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+        if (Array.isArray(schema.required)) {
+            for (var r = 0; r < schema.required.length; r++) {
+                if (!Object.prototype.hasOwnProperty.call(value, schema.required[r])) {
+                    errors.push(path + ": missing required property '" + schema.required[r] + "'");
+                }
+            }
+        }
+        var props = schema.properties || {};
+        var names = Object.keys(value);
+        for (var n = 0; n < names.length; n++) {
+            var name = names[n];
+            if (Object.prototype.hasOwnProperty.call(props, name)) {
+                validateJsonSchema(value[name], props[name], path + '.' + name, errors);
+            } else if (schema.additionalProperties === false) {
+                errors.push(path + ": additional property '" + name + "' is not allowed");
+            }
+        }
+    }
+}
+
+__pmResponseToRaw.not = guardChain({
+    be: negateChainObject(__pmResponseToRaw.be, 'be'),
+    have: negateChainObject(__pmResponseToRaw.have, 'have')
 });
+
+// Wrap the raw literals only AFTER `not` has mirrored them: guardChain returns
+// a Proxy that throws on unknown reads, and Object.getOwnPropertyNames on a
+// Proxy would trip that trap.
+__pmResponseToRaw.be = guardChain(__pmResponseToRaw.be);
+__pmResponseToRaw.have = guardChain(__pmResponseToRaw.have);
+pm.response.to = guardChain(__pmResponseToRaw);
 
 // ── pm.test ──
 // Backlog line 84: an async body (fn returning a Promise) used to record

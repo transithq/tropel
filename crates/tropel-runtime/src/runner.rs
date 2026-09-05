@@ -2590,4 +2590,127 @@ mod tests {
              ({phases_total}) on the failure path — that identity is the whole of TR-202"
         );
     }
+    /// TR-441 (F14 / KT-308, KT-309): `.not` on the response chain, and
+    /// `jsonSchema`. Both threw "unknown assertion property" before this.
+    #[tokio::test]
+    async fn postman_response_chain_negation_and_json_schema() {
+        let mut ctx = JsContext::new(None, None)
+            .await
+            .expect("js context should construct");
+        ctx.eval(include_str!("../../../js/shared/deep-equal.js"))
+            .await
+            .expect("deep-equal evals");
+        ctx.eval(concat!(
+            include_str!("../../../js/shared/k6-core.js"),
+            "\n",
+            include_str!("../../../js/scripting-api/pm.js")
+        ))
+        .await
+        .expect("pm shim evals");
+        // A minimal response the chain can read.
+        // The chain reads the response through bridge functions, so stub
+        // those rather than assigning to `pm.response.*` (which is a getter).
+        ctx.eval(
+            r#"
+            globalThis.__tropel_trp_response_code = function () { return 200; };
+            globalThis.__tropel_trp_response_json = function () {
+                return JSON.stringify({ id: 7, name: "x", tags: ["a"] });
+            };
+            "#,
+        )
+        .await
+        .expect("response stub evals");
+
+        // `probe(expr)` -> "PASS" when it does not throw, else the message.
+        let probe = |code: &str| {
+            format!(
+                r#"(function () {{ try {{ {code}; return "PASS"; }} catch (e) {{ return "THROW:" + (e && e.message); }} }})()"#
+            )
+        };
+
+        // ── KT-308 · negation ──
+        for (code, want_pass) in [
+            ("pm.response.to.not.have.status(500)", true),
+            ("pm.response.to.not.have.status(200)", false),
+            ("pm.response.to.not.be.notFound", true),
+            ("pm.response.to.not.be.ok", false),
+            // The positive forms must be untouched.
+            ("pm.response.to.have.status(200)", true),
+            ("pm.response.to.be.ok", true),
+        ] {
+            let got = ctx.eval(&probe(code)).await.expect("probe evals");
+            if want_pass {
+                assert_eq!(got, "PASS", "{code}");
+            } else {
+                assert!(got.starts_with("THROW:"), "{code} -> {got}");
+            }
+        }
+        // An unknown name under `.not` must still throw, not silently pass —
+        // the guard the whole chain depends on.
+        let got = ctx
+            .eval(&probe("pm.response.to.not.have.nonsense(1)"))
+            .await
+            .unwrap();
+        assert!(got.contains("unknown assertion property"), "{got}");
+
+        // ── KT-309 · jsonSchema ──
+        for (code, want_pass) in [
+            (r#"pm.response.to.have.jsonSchema({type:"object"})"#, true),
+            (
+                r#"pm.response.to.have.jsonSchema({type:"object",required:["id","name"]})"#,
+                true,
+            ),
+            (
+                r#"pm.response.to.have.jsonSchema({type:"object",required:["missing"]})"#,
+                false,
+            ),
+            (
+                r#"pm.response.to.have.jsonSchema({properties:{id:{type:"integer",minimum:10}}})"#,
+                false,
+            ),
+            (
+                r#"pm.response.to.have.jsonSchema({properties:{name:{type:"string",pattern:"^x$"}}})"#,
+                true,
+            ),
+            (r#"pm.response.to.have.jsonSchema({type:"array"})"#, false),
+        ] {
+            let got = ctx.eval(&probe(code)).await.expect("probe evals");
+            if want_pass {
+                assert_eq!(got, "PASS", "{code}");
+            } else {
+                assert!(got.starts_with("THROW:"), "{code} -> {got}");
+            }
+        }
+
+        // The CANONICAL binding must get both features too. pm.js is a
+        // factory parameterised by namespace, so `trp.*` is a peer view over
+        // the same state — but "should share" is not evidence, and an
+        // addition hung off the wrong object would give Postman users a
+        // feature Tropel-native users silently lack.
+        for (code, want_pass) in [
+            ("trp.response.to.not.have.status(500)", true),
+            ("trp.response.to.not.have.status(200)", false),
+            (r#"trp.response.to.have.jsonSchema({type:"object"})"#, true),
+            (r#"trp.response.to.have.jsonSchema({type:"array"})"#, false),
+        ] {
+            let got = ctx.eval(&probe(code)).await.expect("probe evals");
+            if want_pass {
+                assert_eq!(got, "PASS", "{code}");
+            } else {
+                assert!(got.starts_with("THROW:"), "{code} -> {got}");
+            }
+        }
+
+        // An UNSUPPORTED keyword is refused BY NAME, not ignored. Ignoring it
+        // would report PASS on data the author's schema rejects — a green
+        // assertion that checked less than it says.
+        let got = ctx
+            .eval(&probe(
+                r#"pm.response.to.have.jsonSchema({type:"object",allOf:[]})"#,
+            ))
+            .await
+            .unwrap();
+        assert!(got.contains("allOf"), "{got}");
+        assert!(got.contains("not supported"), "{got}");
+    }
 }
