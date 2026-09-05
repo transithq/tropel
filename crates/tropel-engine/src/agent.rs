@@ -637,7 +637,49 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 )
                 .await;
             };
-            let code = payload.get("code").and_then(|c| c.as_str()).unwrap_or("");
+            // TR-469: a MISSING or non-string `code` is a caller bug, not an
+            // empty script. `.unwrap_or("")` ran nothing and answered 200 with
+            // a success-shaped body, so a client that misspelled the field saw
+            // "the script ran and did nothing" — the silent success invariant 8
+            // forbids. An empty STRING stays legal (a stage with no script).
+            let Some(code) = payload.get("code").and_then(|c| c.as_str()) else {
+                return respond_raw_cors(
+                    sock,
+                    cors.as_deref(),
+                    400,
+                    r#"{"error":"`code` is required and must be a string"}"#,
+                )
+                .await;
+            };
+            // TR-469: the embedder's canonical namespace. pm.js installs the
+            // name named here (P4b `__tropel_sandbox_config`); absent a config
+            // the stock install applies, whose canonical name is `trp`.
+            //
+            // The API client's realm is built with namespace "kp", so WITHOUT
+            // this the agent realm had no `kp` at all: a `kp.test(...)` script
+            // passed in the app and died with "kp is not defined" on desktop —
+            // two realms for one script, disagreeing invisibly. tropel stays
+            // product-neutral; the client declares its own namespace and sends
+            // the SAME value it builds its local realm from.
+            let sandbox_cfg = payload
+                .get("sandbox")
+                .map(|v| tropel_sandbox::config::SandboxConfig {
+                    namespace: v
+                        .get("namespace")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("trp")
+                        .to_string(),
+                    aliases: v
+                        .get("aliases")
+                        .and_then(|a| a.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .unwrap_or_default();
             let environment: HashMap<String, String> = payload
                 .get("environment")
                 .and_then(|e| serde_json::from_value(e.clone()).ok())
@@ -651,7 +693,9 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let script_response: Option<tropel_sdk::types::Response> = payload
                 .get("response")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
-            match run_script_once(code, environment, script_request, script_response).await {
+            match run_script_once(code, environment, script_request, script_response, sandbox_cfg)
+                .await
+            {
                 Ok(out) => respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await,
                 Err(why) => respond_raw_cors(sock, cors.as_deref(), 500, &error_body(&why)).await,
             }
@@ -1338,10 +1382,19 @@ async fn run_script_once(
     environment: HashMap<String, String>,
     request: Option<TropelRequest>,
     response: Option<tropel_sdk::types::Response>,
+    sandbox: tropel_sandbox::config::SandboxConfig,
 ) -> Result<serde_json::Value, String> {
     let mut ctx = tropel_js::JsContext::new(None, Some(std::time::Duration::from_secs(10)))
         .await
         .map_err(|e| format!("js context: {e:?}"))?;
+
+    // TR-469: BEFORE the bundle — pm.js's install tail reads this global to
+    // decide the canonical binding name and its aliases, so a preamble
+    // evaluated afterwards would be read too late and silently leave the
+    // stock `trp` install in place.
+    ctx.eval(&sandbox.render_js_preamble())
+        .await
+        .map_err(|e| format!("sandbox config preamble: {e:?}"))?;
 
     ctx.eval(include_str!("../../../js/shared/deep-equal.js"))
         .await
@@ -2366,6 +2419,7 @@ mod tests {
             HashMap::new(),
             None,
             Some(response),
+            tropel_sandbox::config::SandboxConfig::default(),
         )
         .await
         .expect("the realm runs");
@@ -2418,6 +2472,7 @@ mod tests {
             HashMap::new(),
             Some(request),
             None,
+            tropel_sandbox::config::SandboxConfig::default(),
         )
         .await
         .expect("the realm runs");
@@ -2441,6 +2496,69 @@ mod tests {
         assert!(
             rendered.contains("Accept"),
             "the original headers must survive too: {rendered}"
+        );
+    }
+
+    /// TR-469: the embedder's canonical namespace reaches the realm.
+    ///
+    /// The API client builds its LOCAL realm with namespace `kp`, but the
+    /// agent applied tropel's stock install (canonical `trp`, no aliases)
+    /// because `/script` never rendered a `SandboxConfig` preamble. So the
+    /// very same script passed in the app and died with "kp is not defined"
+    /// on the desktop tier — two realms for one script, disagreeing where
+    /// nothing looked. The D4 question ("can two implementations disagree
+    /// invisibly?") answered yes, and no test asked it.
+    ///
+    /// Both halves are asserted deliberately: that the configured name works,
+    /// AND that the stock install genuinely lacks it. Without the second, a
+    /// future default of `kp` everywhere would make this test vacuous while
+    /// still passing.
+    #[tokio::test]
+    async fn the_embedder_namespace_reaches_the_script_realm() {
+        let code = "kp.environment.set('viaKp', '2');";
+
+        let configured = run_script_once(
+            code,
+            HashMap::new(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            },
+        )
+        .await
+        .expect("the realm runs");
+        assert!(
+            configured.get("scriptError").map(|e| e.is_null()).unwrap_or(false),
+            "a kp.* script must run when the caller declares the kp namespace: {configured}"
+        );
+        assert_eq!(
+            configured
+                .get("environment")
+                .and_then(|e| e.get("viaKp"))
+                .and_then(|v| v.as_str()),
+            Some("2"),
+            "the effect must come back, not just the absence of an error: {configured}"
+        );
+
+        let stock = run_script_once(
+            code,
+            HashMap::new(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig::default(),
+        )
+        .await
+        .expect("the realm runs");
+        let err = stock
+            .get("scriptError")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        assert!(
+            err.contains("kp is not defined"),
+            "the stock install must NOT bind kp — if it does, this test no \
+             longer proves the preamble is what carries the namespace: {stock}"
         );
     }
 
@@ -2477,7 +2595,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let out = run_script_once(&script, HashMap::new(), None, None)
+        let out = run_script_once(
+            &script,
+            HashMap::new(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig::default(),
+        )
             .await
             .expect("the realm runs");
 

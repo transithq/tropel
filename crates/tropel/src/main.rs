@@ -36,13 +36,43 @@ fn outer_worker_threads() -> usize {
 }
 
 fn main() -> tropel_sdk::Result<()> {
-    // `tropel agent` — the API client's process boundary (P6). Dispatched here
+    // `tropel worker` — the distributed load-test worker (P6). Dispatched here
     // (the binary crate) rather than in tropel-engine's CLI because
     // tropel-distributed depends on tropel-engine; a CLI-level reference would
-    // be a dependency cycle. The client repo carries zero Rust — it spawns
-    // `tropel agent` and talks to it over the controller protocol.
-    if std::env::args().nth(1).as_deref() == Some("agent") {
-        return agent_command();
+    // be a dependency cycle.
+    //
+    // TR-467: this answered to `tropel agent` until that was found to SHADOW
+    // `Commands::Agent` in tropel-engine's CLI — the loopback HTTP agent
+    // (`agent.rs`, TR-405) that the API client actually spawns. Two unrelated
+    // features, one name, and this one won because it is matched before
+    // run_cli() ever sees argv: `tropel agent --port 9876` died on
+    // "unexpected argument '--port'", so the loopback agent had NO reachable
+    // entry point from this binary at all.
+    //
+    // `agent` now belongs to the loopback agent — the meaning every knockport
+    // doc, error message and `agent.rs` startup line already assumed. The
+    // worker answers to `tropel worker` and to the standalone `tropel-agent`
+    // binary, which is unchanged. (`tropel-cloud-run agent` is a different
+    // binary and is unaffected.)
+    match std::env::args().nth(1).as_deref() {
+        Some("worker") => return worker_command(),
+        // Invariant 8: an unsupported invocation names its reason. Without this
+        // arm, the old worker command line would die on clap's "unexpected
+        // argument '--controller'", which does not say that the subcommand was
+        // renamed or where it went. Any OTHER `agent` invocation falls through
+        // to run_cli() -> Commands::Agent, the loopback agent.
+        Some("agent")
+            if std::env::args().any(|a| a == "--controller" || a == "-C" || a == "--token-file") =>
+        {
+            eprintln!(
+                "tropel: `agent` is the loopback HTTP agent \
+                 (--port/--bind/--token/--allow-origin).\n\
+                 The distributed worker moved to `tropel worker` (same flags); \
+                 the standalone `tropel-agent` binary is unchanged."
+            );
+            std::process::exit(2);
+        }
+        _ => {}
     }
 
     let workers = outer_worker_threads();
@@ -54,20 +84,20 @@ fn main() -> tropel_sdk::Result<()> {
     rt.block_on(tropel_engine::cli::run_cli())
 }
 
-/// `tropel agent [--controller HOST:PORT] [--token TOKEN] [--token-file FILE]`
+/// `tropel worker [--controller HOST:PORT] [--token TOKEN] [--token-file FILE]`
 ///
 /// Connect to a `tropel-controller` and run this worker's segment of the job.
 /// Same contract as the standalone `tropel-agent` binary, surfaced as a
-/// subcommand of the main binary so the API client needs nothing but `tropel`.
-fn agent_command() -> tropel_sdk::Result<()> {
+/// subcommand of the main binary so a worker image needs nothing but `tropel`.
+fn worker_command() -> tropel_sdk::Result<()> {
     use clap::Parser;
     use std::path::PathBuf;
 
     #[derive(Parser, Debug)]
     #[command(
-        name = "tropel agent",
-        about = "Distributed load-test worker (API client process boundary)",
-        // P6 version handshake: `tropel agent --version` prints the binary's
+        name = "tropel worker",
+        about = "Distributed load-test worker (runs one segment of a job for a controller)",
+        // P6 version handshake: `tropel worker --version` prints the binary's
         // version so the API client can feed it to checkVersionParity against
         // the loaded wasm's runtimeVersion. clap wires this from
         // CARGO_PKG_VERSION automatically.
@@ -85,20 +115,20 @@ fn agent_command() -> tropel_sdk::Result<()> {
         token_file: Option<PathBuf>,
     }
 
-    // run_cli() initializes tracing for the main commands; the agent path
+    // run_cli() initializes tracing for the main commands; the worker path
     // bypasses it, so initialize here (mirrors the standalone `tropel-agent`
     // bin) or run_agent's tracing::info! calls would be silent no-ops.
     tracing_subscriber::fmt::init();
 
-    // clap::parse() would treat the leading "agent" as an unknown positional;
+    // clap::parse() would treat the leading "worker" as an unknown positional;
     // parse_from over args[2..] scopes the subcommand's own argv correctly.
     //
     // IMPORTANT: parse_from treats its FIRST element as argv[0] (the program
-    // name), so a lone `tropel agent --version` would have "--version" eaten
+    // name), so a lone `tropel worker --version` would have "--version" eaten
     // as the binary name and fall through to the auth check. Prepend a dummy
     // name so real flags (--version/--help included) land at argv[1..].
     let args = AgentArgs::parse_from(
-        std::iter::once("tropel agent".to_string()).chain(std::env::args().skip(2)),
+        std::iter::once("tropel worker".to_string()).chain(std::env::args().skip(2)),
     );
 
     if args.controller.is_empty() {
