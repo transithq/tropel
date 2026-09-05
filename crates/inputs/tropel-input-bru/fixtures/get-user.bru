@@ -1,0 +1,36 @@
+meta {
+  name: Get Users
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://api.example.com/users?page=2
+  body: none
+  auth: bearer
+}
+
+headers {
+  ~x-draft: true
+  accept: application/json
+}
+
+query {
+  limit: 10
+}
+
+auth:bearer {
+  token: {{bearer_token}}
+}
+
+assert {
+  res.status: eq 200
+}
+
+script:pre-request {
+  console.log('fetching users');
+}
+
+docs {
+  Lists the users of the workspace.
+}

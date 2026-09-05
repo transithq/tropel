@@ -1,0 +1,35 @@
+meta {
+  name: Login
+  type: http
+  seq: 2
+}
+
+post {
+  url: https://api.example.com/login
+  body: form-urlencoded
+  auth: basic
+}
+
+headers {
+  content-type: application/x-www-form-urlencoded
+}
+
+auth:basic {
+  username: john
+  password: s3cret
+}
+
+body:form-urlencoded {
+  user: john
+  ~remember: true
+}
+
+vars:pre-request {
+  @requestId: req-1
+  baseUrl: https://api.example.com
+}
+
+settings {
+  timeout: 3000
+  encodeUrl: false
+}
