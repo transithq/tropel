@@ -692,7 +692,7 @@ impl TrpBridge {
                     st.request.as_ref().and_then(|r| {
                         r.headers
                             .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                            .find(|(k, _)| tropel_variables::headers::header_name_eq(k, &key))
                             .map(|(_, v)| v.clone())
                     })
                 }),
@@ -709,7 +709,7 @@ impl TrpBridge {
                         if let Some(existing) = r
                             .headers
                             .iter_mut()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                            .find(|(k, _)| tropel_variables::headers::header_name_eq(k, &key))
                         {
                             existing.1 = value;
                         } else {
@@ -725,7 +725,8 @@ impl TrpBridge {
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
                     if let Some(r) = st.request.as_mut() {
-                        r.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
+                        r.headers
+                            .retain(|(k, _)| !tropel_variables::headers::header_name_eq(k, &key));
                     }
                 }),
             );
@@ -934,7 +935,7 @@ impl TrpBridge {
                         // case — look up case-insensitively.
                         r.headers
                             .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                            .find(|(k, _)| tropel_variables::headers::header_name_eq(k, &key))
                             .map(|(_, v)| v.clone())
                     })
                 }),
@@ -1704,6 +1705,60 @@ mod bridge_naming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TR-455 — every header-name comparison on the bridge folds the way
+    /// JavaScript does.
+    ///
+    /// Not a unit test of the fold (that lives with the rule, in
+    /// `tropel-variables::headers`) but of the WIRING: four bridge functions
+    /// each did their own `eq_ignore_ascii_case`, and a fix that reached only
+    /// three of them would leave the same divergence behind one of the four.
+    ///
+    /// `"X-\u{212A}EY"` is `"x-key"` once lowercased in any JavaScript runtime
+    /// — U+212A, the Kelvin sign, lowercases to an ASCII `k`. Before this
+    /// change a script reading that header found it in KnockPort and did not
+    /// find it in a load run.
+    #[test]
+    fn every_bridge_header_lookup_folds_like_javascript() {
+        use tropel_variables::headers::header_name_eq;
+
+        // Verified against node: `"X-\u212AEY".toLowerCase() === "x-key"`.
+        const KELVIN: &str = "X-\u{212A}EY";
+        assert!(
+            header_name_eq(KELVIN, "x-key"),
+            "the shared rule must match JavaScript"
+        );
+
+        // Each site reads the same rule now. Written as the four PREDICATES
+        // the bridge bodies use, so a site that reverted to
+        // `eq_ignore_ascii_case` fails here rather than only in the field.
+        let headers: Vec<(String, String)> = vec![("x-key".to_string(), "found".to_string())];
+
+        // request_header_get / response_header — both `.find(...)`
+        let got = headers
+            .iter()
+            .find(|(k, _)| header_name_eq(k, KELVIN))
+            .map(|(_, v)| v.clone());
+        assert_eq!(got.as_deref(), Some("found"), "get must match");
+
+        // request_header_set — the same `.find(...)` deciding replace-vs-push
+        let mut set_target = headers.clone();
+        let existing = set_target
+            .iter_mut()
+            .find(|(k, _)| header_name_eq(k, KELVIN));
+        assert!(
+            existing.is_some(),
+            "set must REPLACE the existing header, not push a duplicate"
+        );
+
+        // request_header_unset — the `retain(...)`
+        let mut unset_target = headers.clone();
+        unset_target.retain(|(k, _)| !header_name_eq(k, KELVIN));
+        assert!(unset_target.is_empty(), "unset must remove it");
+
+        // And folding wider must not make MORE things equal than JS does.
+        assert!(!header_name_eq(KELVIN, "x-value"));
+    }
 
     /// The JS shim round-trips a variable through `JSON.parse`:
     /// bridge returns a JSON-encoded string → shim JSON.parses it. This test

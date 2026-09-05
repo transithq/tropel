@@ -44,7 +44,28 @@ there are three — and neither failed anything. Wrong bytes went on the wire si
 4. **`Option<String>` means absent, not empty.** Rust returns `None`; a JS host must return
    `undefined` or `null`, NOT `""`. The shims distinguish them.
 5. **`to_object` returns a plain string→string map.** Values are stringified by the host.
-6. **Nothing here may block indefinitely.** The shims are synchronous by construction (a QuickJS
+6. **Header names fold with UNICODE lowercase, not ASCII.** Every
+   header-name comparison — `request_header_get`/`set`/`unset`,
+   `response_header`, and the `headers.<name>` assertion target — folds with
+   the same rule JavaScript's `String.prototype.toLowerCase()` uses.
+
+   This is a rule and not an implementation detail because the two hosts
+   disagreed about it (TR-455). tropel compared with `eq_ignore_ascii_case`
+   while KnockPort compared with `toLowerCase()`, and
+   `"X-\u212AEY".toLowerCase()` is `"x-key"` — U+212A, the Kelvin sign,
+   lowercases to an ASCII `k`. So a script reading that header found it in the
+   app and did not find it in a load run, with no error on either side.
+
+   RFC 9110 defines a field name as an ASCII `token`, so ASCII folding is
+   defensible for HTTP alone. It is not the rule here, because the lookup KEY
+   comes from a user's script rather than from the wire, and every JavaScript
+   host folds Unicode. In Rust, use
+   `tropel_variables::headers::header_name_eq`.
+
+   **Signing is exempt.** AWS SigV4, Hawk and OAuth1 canonicalise header names
+   with ASCII lowercasing because their specifications say so; folding wider
+   there changes the signature and produces a 403.
+7. **Nothing here may block indefinitely.** The shims are synchronous by construction (a QuickJS
    embedding constraint); a host that needs async work must replace the *binding*, not stall the
    bridge — see the note on `send_request` below.
 
