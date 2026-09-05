@@ -298,6 +298,39 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             .await
         }
 
+        ("POST", "/variables/dynamic/batch") => {
+            // TR-452: the batched twin, for the same reason /resolve has one.
+            // KnockPort's `resolveVariables` calls the dynamic pass for EVERY
+            // template, unconditionally, before it looks at the `{{var}}` map
+            // — so without this the desktop tier pays a round trip per field.
+            //
+            // A client-side "skip it unless the text contains `{{$`" would
+            // remove those trips without an endpoint, and it is exactly the
+            // shortcut not to take: `{{ $guid }}` with spaces is a dynamic
+            // token that such a test would miss, and deciding what counts as
+            // one is the catalogue's job, not the caller's (invariant #3).
+            let Some(payload) =
+                read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
+            else {
+                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+            };
+            let items: Vec<BatchResolveItem> = payload
+                .get("items")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            // ORDER IS THE CONTRACT, as in /resolve/batch: the caller
+            // re-assembles by index, so one output per input, always.
+            let catalog = tropel_variables::DynamicCatalog::new();
+            let mut out = Vec::with_capacity(items.len());
+            for item in &items {
+                match catalog.resolve(&item.template) {
+                    Ok(value) => out.push(serde_json::json!({ "value": value })),
+                    Err(why) => out.push(serde_json::json!({ "error": why })),
+                }
+            }
+            respond(sock, 200, &serde_json::json!({ "items": out }).to_string()).await
+        }
+
         ("POST", "/variables/dynamic") => {
             // TR-451: `{{$guid}}`, `{{$timestamp}}`, `{{$randomInt}}` — the
             // predefined catalogue. SEPARATE from /resolve on purpose, and
@@ -1570,6 +1603,35 @@ mod tests {
         assert!(
             raw.contains("{{base}}"),
             "a plain variable must survive the dynamic pass untouched: {raw}"
+        );
+
+        // ── /variables/dynamic/batch (TR-452) ──
+        // One output per input, in order: the caller re-assembles its request
+        // by index, so a short or reordered reply puts a header's value in a
+        // param.
+        let raw = post(
+            "/variables/dynamic/batch",
+            serde_json::json!({
+                "items": [
+                    {"template": "{{$guid}}"},
+                    {"template": "no tokens here"},
+                    {"template": "{{$timestamp}}"}
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let items = parsed["items"].as_array().expect("items");
+        assert_eq!(items.len(), 3, "one output per input, always: {body}");
+        assert_eq!(
+            items[1]["value"], "no tokens here",
+            "a template with nothing to resolve comes back unchanged: {body}"
+        );
+        assert_ne!(
+            items[0]["value"], items[2]["value"],
+            "different tokens, different values: {body}"
         );
 
         // ── /constants (TR-451) ──
