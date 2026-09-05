@@ -82,6 +82,7 @@ pub async fn run_agent(
     bind: &str,
     token: Option<&str>,
     allowed_origins: &[String],
+    exit_with_parent: bool,
 ) -> tropel_sdk::Result<()> {
     let ip: IpAddr = bind
         .parse()
@@ -90,6 +91,69 @@ pub async fn run_agent(
         return Err(TropelError::Other(format!(
             "refusing to bind {bind}: the agent is a localhost-only execution endpoint (TR-405)"
         )));
+    }
+
+    // TR-471: die with the process that spawned us.
+    //
+    // The desktop shell kills the agent on window-destroy, but that handler
+    // does not run when the shell is SIGKILLed, crashes, or is restarted by a
+    // dev rebuild — and every one of those leaves an agent listening on a
+    // loopback port, holding the collection variables and OAuth client
+    // secrets it was sent, with nothing left to talk to it. Observed twice in
+    // one session: two agents reparented to init while the app was gone.
+    //
+    // A parent-side handler cannot close this on its own (it is precisely the
+    // cases where the parent runs no code), so the agent has to notice. On
+    // Unix an orphan is reparented, so the parent id CHANGING is the signal —
+    // no pid to pass in, and no way to mistake a recycled pid for the parent
+    // still being alive.
+    if exit_with_parent {
+        // Watch stdin for EOF, on a dedicated thread.
+        //
+        // The FIRST attempt at this compared parent process ids — an orphan is
+        // reparented, so a changed parent id looks like a death signal. It
+        // failed its own test: a process can be reparented before it ever
+        // reads its parent id, in which case "changed" never happens and the
+        // watchdog is a no-op that looks armed. That is the wrong failure
+        // direction for something whose whole job is to not leak.
+        //
+        // A pipe cannot be fooled that way. The spawning process hands us a
+        // stdin pipe and simply holds it; when it dies for ANY reason — exit,
+        // crash, or SIGKILL, which runs no cleanup on either side — the OS
+        // closes the write end and this read returns 0. It needs no pid, wins
+        // no race, and works the same on Windows.
+        //
+        // The contract this places on the caller is real and worth stating:
+        // stdin MUST be a pipe the parent keeps open. Handed /dev/null or a
+        // closed descriptor, the read returns 0 at once and the agent exits
+        // immediately — which is why the flag says so, and why the exit says
+        // which of the two happened rather than vanishing silently.
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 256];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        // Deliberately ONE message naming both causes. An
+                        // earlier version tried to tell them apart with a
+                        // "did we ever read a byte" flag, which is wrong: a
+                        // parent that holds the pipe open and never writes to
+                        // it — the normal case — looks identical to a parent
+                        // that never gave us a pipe at all. A diagnostic that
+                        // confidently names the wrong cause is worse than one
+                        // that names both.
+                        tracing::info!(
+                            "tropel agent exiting: stdin reached EOF — either the process that \
+                             spawned it is gone, or stdin was not a pipe held open by it \
+                             (--exit-with-parent requires one)"
+                        );
+                        std::process::exit(0);
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
     }
 
     let addr = format!("{bind}:{port}");
