@@ -26,8 +26,13 @@
 //! and Hawk end to end. Anything moved here inherits that coverage precisely
 //! because the signers keep calling it.
 
+use base64::Engine as _;
+use hmac::digest::KeyInit;
+use hmac::{Hmac, Mac};
 use md5::Digest as _;
-use sha2::{Sha256, Sha512_256};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use sha1::Sha1;
+use sha2::{Sha256, Sha512, Sha512_256};
 
 // ── Hashes ──────────────────────────────────────────────────────────────────
 // Moved here from `signers.rs` rather than duplicated: they are shared by the
@@ -542,6 +547,196 @@ pub fn aws_sigv4_build_headers(
     }
 }
 
+// ─────────────────────────── OAuth1 (RFC 5849) ───────────────────────────
+
+/// RFC 3986 unreserved characters: `A-Z a-z 0-9 - . _ ~` stay unencoded.
+///
+/// RFC 5849 §3.6 mandates exactly this set for every OAuth1 encoding — the
+/// base string, the signing key and the header parameters. `signers.rs` had
+/// its own identical copy; a single definition is the point of this module,
+/// because a percent-encoding set that drifts by one character produces a
+/// signature the server rejects with no useful diagnostic.
+const OAUTH1_UNRESERVED: AsciiSet = NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// The signature methods [`oauth1_build_header`] implements.
+///
+/// Exported so the caller's "unsupported method" guard and the builder's own
+/// dispatch read from ONE list. When they were separate, adding a method to
+/// one and not the other was a silent downgrade — the TR-004/TR-409 failure
+/// shape, where an unsupported method quietly signs as HMAC-SHA1.
+pub const OAUTH1_SIGNATURE_METHODS: [&str; 3] = ["HMAC-SHA1", "HMAC-SHA256", "HMAC-SHA512"];
+
+/// Whether `method` (case-insensitive) is one of [`OAUTH1_SIGNATURE_METHODS`].
+pub fn oauth1_is_supported_signature_method(method: &str) -> bool {
+    OAUTH1_SIGNATURE_METHODS
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(method))
+}
+
+/// RFC 5849 §3.6 percent-encoding.
+pub fn oauth1_percent_encode(value: &str) -> String {
+    utf8_percent_encode(value, &OAUTH1_UNRESERVED).to_string()
+}
+
+/// RFC 5849 §3.4.1.1 signature base string.
+///
+/// `HTTPMethod & "&" & baseURI & "&" & normalizedParams` where the separators
+/// are literal `&` characters (ASCII 38), NOT newlines. Each component is
+/// percent-encoded per §3.6; params are sorted by encoded name, then encoded
+/// value (§3.4.1.3.2), which is why the sort happens AFTER encoding.
+pub fn oauth1_base_string(method: &str, base_uri: &str, params: &[(String, String)]) -> String {
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (oauth1_percent_encode(k), oauth1_percent_encode(v)))
+        .collect();
+    encoded.sort();
+    let param_string = encoded
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!(
+        "{}&{}&{}",
+        method.to_uppercase(),
+        oauth1_percent_encode(base_uri),
+        oauth1_percent_encode(&param_string)
+    )
+}
+
+/// RFC 5849 §3.4.2 HMAC signature over the base string, base64-encoded.
+///
+/// Signing key = `enc(consumer_secret) & enc(token_secret)` — the `&` is
+/// present even when the token secret is empty (two-legged OAuth), which is
+/// why the caller passes `""` rather than omitting it.
+///
+/// Returns `None` for a method outside [`OAUTH1_SIGNATURE_METHODS`] rather
+/// than falling back to HMAC-SHA1: a silent downgrade is the exact failure
+/// TR-409 exists to prevent.
+pub fn oauth1_signature(
+    base_string: &str,
+    consumer_secret: &str,
+    token_secret: &str,
+    signature_method: &str,
+) -> Option<String> {
+    let key = format!(
+        "{}&{}",
+        oauth1_percent_encode(consumer_secret),
+        oauth1_percent_encode(token_secret)
+    );
+    // One macro rather than a generic: `hmac::Hmac<D>` needs bounds that are
+    // awkward to name across digest crates, and three explicit arms match how
+    // the rest of this module dispatches.
+    macro_rules! sign_with {
+        ($alg:ty) => {{
+            let mut mac = <Hmac<$alg> as KeyInit>::new_from_slice(key.as_bytes())
+                .expect("HMAC accepts any key length");
+            mac.update(base_string.as_bytes());
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+        }};
+    }
+    Some(match signature_method.to_ascii_uppercase().as_str() {
+        "HMAC-SHA1" => sign_with!(Sha1),
+        "HMAC-SHA256" => sign_with!(Sha256),
+        "HMAC-SHA512" => sign_with!(Sha512),
+        _ => return None,
+    })
+}
+
+/// Everything [`oauth1_build_header`] needs, as plain data.
+pub struct OAuth1BuildParams<'a> {
+    /// HTTP method; uppercased by the builder.
+    pub method: &'a str,
+    /// RFC 5849 §3.4.1.2 base string URI: `scheme://host[:port]/path`, with
+    /// the query and fragment stripped and the default port omitted. The
+    /// caller derives this because it needs the parsed URL.
+    pub base_uri: &'a str,
+    /// Protocol parameters from the query string and, when the body is
+    /// `application/x-www-form-urlencoded`, from the body — already
+    /// percent-DECODED (§3.4.1.3.1). The `oauth_*` params are added by the
+    /// builder; do not pass them here.
+    pub request_params: &'a [(String, String)],
+    pub consumer_key: &'a str,
+    pub consumer_secret: &'a str,
+    pub token: Option<&'a str>,
+    pub token_secret: Option<&'a str>,
+    /// One of [`OAUTH1_SIGNATURE_METHODS`], any case.
+    pub signature_method: &'a str,
+    pub nonce: &'a str,
+    /// Seconds since the epoch, as a decimal string.
+    pub timestamp: &'a str,
+}
+
+/// An OAuth1 `Authorization` header plus the base string it was signed over.
+pub struct OAuth1Out {
+    pub header: HeaderOut,
+    /// Returned for the differential harness and for diagnosing a 401: a
+    /// rejected OAuth1 request is almost always a base-string mismatch, and
+    /// without this the only way to see it is a debugger.
+    pub base_string: String,
+}
+
+/// Build the OAuth1 `Authorization` header (RFC 5849 §3.5.1).
+///
+/// Returns `None` when `signature_method` is unsupported, so the caller can
+/// raise its own error naming the supported set.
+pub fn oauth1_build_header(p: &OAuth1BuildParams<'_>) -> Option<OAuth1Out> {
+    let method_str = p.signature_method.to_ascii_uppercase();
+    if !oauth1_is_supported_signature_method(&method_str) {
+        return None;
+    }
+
+    let mut oauth: Vec<(String, String)> = vec![
+        ("oauth_consumer_key".to_string(), p.consumer_key.to_string()),
+        ("oauth_nonce".to_string(), p.nonce.to_string()),
+        ("oauth_signature_method".to_string(), method_str.clone()),
+        ("oauth_timestamp".to_string(), p.timestamp.to_string()),
+        ("oauth_version".to_string(), "1.0".to_string()),
+    ];
+    if let Some(token) = p.token {
+        oauth.push(("oauth_token".to_string(), token.to_string()));
+    }
+
+    // §3.4.1.3: the base string signs the request params AND the oauth params
+    // together. The header below carries only the oauth ones.
+    let mut all_params: Vec<(String, String)> = p.request_params.to_vec();
+    all_params.extend(oauth.clone());
+
+    let base_string = oauth1_base_string(p.method, p.base_uri, &all_params);
+    let signature = oauth1_signature(
+        &base_string,
+        p.consumer_secret,
+        p.token_secret.unwrap_or(""),
+        &method_str,
+    )?;
+
+    let mut header_params = oauth;
+    header_params.push(("oauth_signature".to_string(), signature));
+    header_params.sort();
+    let value = header_params
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}=\"{}\"",
+                oauth1_percent_encode(k),
+                oauth1_percent_encode(v)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Some(OAuth1Out {
+        header: HeaderOut {
+            name: "Authorization".to_string(),
+            value: format!("OAuth {value}"),
+        },
+        base_string,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,5 +1137,148 @@ mod tests {
         let mut p = params(Some("MD5"), Some("auth"));
         p.nc = 255;
         assert!(digest_build_authorization(&p).value.contains("nc=000000ff"));
+    }
+    // ── OAuth1 ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn oauth1_every_listed_method_actually_dispatches() {
+        // TR-427: `signers.rs` now admits a signature method by asking
+        // `oauth1_is_supported_signature_method`, and `oauth1_signature`
+        // dispatches on a separate `match`. That is a coupling this refactor
+        // created: adding a method to the list without adding a match arm
+        // would let the guard pass and then fail at the builder with a
+        // confusing second error. Assert the two agree in both directions.
+        for method in OAUTH1_SIGNATURE_METHODS {
+            assert!(
+                oauth1_is_supported_signature_method(method),
+                "{method} is listed but the predicate rejects it"
+            );
+            assert!(
+                oauth1_signature("base", "cs", "ts", method).is_some(),
+                "{method} is listed but `oauth1_signature` has no arm for it"
+            );
+        }
+        // And the converse: unsupported methods must return None, NOT fall
+        // back to HMAC-SHA1. A silent downgrade is the TR-004/TR-409 shape.
+        for method in ["RSA-SHA1", "RSA-SHA256", "PLAINTEXT", "HMAC-MD5", ""] {
+            assert!(
+                !oauth1_is_supported_signature_method(method),
+                "{method} must not be treated as supported"
+            );
+            assert!(
+                oauth1_signature("base", "cs", "ts", method).is_none(),
+                "{method} must not produce a signature"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth1_signature_methods_produce_distinct_signatures() {
+        // The three arms are generated by one macro differing only in the
+        // digest type. A copy-paste slip that passed `Sha256` twice would
+        // leave every test above green — they never compare the arms against
+        // each other — while silently signing SHA-512 requests with SHA-256.
+        let sigs: Vec<String> = OAUTH1_SIGNATURE_METHODS
+            .iter()
+            .map(|m| oauth1_signature("base-string", "cs", "ts", m).expect("listed method"))
+            .collect();
+        for (i, a) in sigs.iter().enumerate() {
+            for (j, b) in sigs.iter().enumerate().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "{} and {} produced the same signature — the macro arms are not distinct",
+                    OAUTH1_SIGNATURE_METHODS[i], OAUTH1_SIGNATURE_METHODS[j]
+                );
+            }
+        }
+        // Lengths follow the digest, so a wrong arm is visible even if two
+        // digests somehow collided.
+        assert_eq!(
+            sigs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![28, 44, 88],
+            "base64 lengths must match SHA-1 (20B), SHA-256 (32B), SHA-512 (64B)"
+        );
+    }
+
+    #[test]
+    fn oauth1_method_matching_is_case_insensitive() {
+        // The signer uppercases before calling, but the builder is public and
+        // a wasm caller may not. Both halves must agree on case handling, or
+        // a lowercase config value passes the predicate and returns None.
+        for method in ["hmac-sha1", "Hmac-Sha256", "HMAC-sha512"] {
+            assert!(oauth1_is_supported_signature_method(method), "{method}");
+            assert!(
+                oauth1_signature("b", "c", "t", method).is_some(),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth1_two_legged_none_token_secret_equals_empty() {
+        // RFC 5849 §3.4.2: the signing key is `enc(consumer_secret) & enc(token_secret)`.
+        // In two-legged OAuth there is no token secret, and `None` must be
+        // treated as the empty string — not as an absent component, and not
+        // as a placeholder. Any other default silently changes every
+        // two-legged signature.
+        let params = [("a".to_string(), "1".to_string())];
+        let build = |token_secret: Option<&str>| {
+            oauth1_build_header(&OAuth1BuildParams {
+                method: "GET",
+                base_uri: "https://example.com/r",
+                request_params: &params,
+                consumer_key: "ck",
+                consumer_secret: "cs",
+                token: None,
+                token_secret,
+                signature_method: "HMAC-SHA1",
+                nonce: "n",
+                timestamp: "1",
+            })
+            .expect("HMAC-SHA1 is supported")
+            .header
+            .value
+        };
+        assert_eq!(build(None), build(Some("")));
+        // NOTE: that the separator is present at all is pinned by the two
+        // published vectors (`oauth1_rfc5849_published_vector`,
+        // `oauth1_matches_oauth_net_reference_vector`), which both carry a
+        // token secret — dropping the `&` fails them. This test covers the
+        // half they cannot see: the two-legged case, where `None` must behave
+        // exactly like an empty secret rather than taking a different path.
+    }
+
+    #[test]
+    fn oauth1_header_omits_request_params_but_base_string_signs_them() {
+        // §3.5.1: the Authorization header carries only the `oauth_*` params.
+        // The base string signs those AND the query/body params. Leaking a
+        // request param into the header is a real interop break, and dropping
+        // one from the base string is a 401 with no diagnostic.
+        let params = [("q".to_string(), "search term".to_string())];
+        let out = oauth1_build_header(&OAuth1BuildParams {
+            method: "GET",
+            base_uri: "https://example.com/r",
+            request_params: &params,
+            consumer_key: "ck",
+            consumer_secret: "cs",
+            token: Some("tok"),
+            token_secret: Some("ts"),
+            signature_method: "HMAC-SHA1",
+            nonce: "n",
+            timestamp: "1",
+        })
+        .expect("HMAC-SHA1 is supported");
+        assert!(
+            !out.header.value.contains("search"),
+            "request params must not appear in the header: {}",
+            out.header.value
+        );
+        assert!(
+            out.base_string.contains("q%3Dsearch%2520term"),
+            "request params must be signed: {}",
+            out.base_string
+        );
+        assert!(out.header.value.starts_with("OAuth "));
+        assert!(out.header.value.contains("oauth_token=\"tok\""));
     }
 }
