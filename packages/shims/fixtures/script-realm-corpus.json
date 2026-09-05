@@ -1,0 +1,40 @@
+{
+  "$comment": "TR-465 / KT-404 — what a user script can rely on in each realm. MEASURED, not asserted from documentation: every value here came from running the probe in that realm and recording the answer. The point is that the divergence between KnockPort's host-JS realm (new Function + eval, the browser and the web app) and tropel's QuickJS realm (load runs, and desktop from KT-404 on) becomes a committed table instead of folklore. A probe whose answer changes fails the test in BOTH repos until this file is updated, so the surface cannot drift silently.",
+  "$realms": {
+    "hostJs": "KnockPort's scripting realm — `createRealmWithHost` in packages/engine/src/scripting-core.ts. The page's own engine.",
+    "quickJs": "tropel's script realm — the shim bundle over tropel-js, used by every load run and by POST /script."
+  },
+  "probes": [
+    { "name": "fetch", "expression": "typeof fetch", "hostJs": "function", "quickJs": "undefined",
+      "why": "A script calling fetch() directly works in the app and throws under load. The supported path is pm.sendRequest, which both realms bridge to the host transport." },
+    { "name": "crypto", "expression": "typeof crypto", "hostJs": "object", "quickJs": "undefined",
+      "why": "No WebCrypto in QuickJS. Signing belongs to tropel-auth, reached through the shims; a script reaching for crypto directly is reaching past the seam." },
+    { "name": "crypto.randomUUID", "expression": "typeof crypto !== 'undefined' && typeof crypto.randomUUID", "hostJs": "function", "quickJs": "false",
+      "why": "The commonest way a script mints a request id. Use {{$guid}} or pm.variables — the dynamic catalogue is the same Rust in both realms." },
+    { "name": "TextEncoder", "expression": "typeof TextEncoder", "hostJs": "function", "quickJs": "undefined", "why": "A browser global." },
+    { "name": "Intl", "expression": "typeof Intl", "hostJs": "object", "quickJs": "undefined",
+      "why": "No Intl in QuickJS, so toLocaleString and friends format differently. Date and number formatting in a script is a real divergence, not a theoretical one." },
+    { "name": "setTimeout", "expression": "typeof setTimeout", "hostJs": "function", "quickJs": "undefined",
+      "why": "There is no event loop to schedule onto in the script realm. A script that awaits a timer hangs in the app and throws under load." },
+    { "name": "structuredClone", "expression": "typeof structuredClone", "hostJs": "function", "quickJs": "undefined", "why": "A browser global." },
+    { "name": "URL", "expression": "typeof URL", "hostJs": "function", "quickJs": "undefined",
+      "why": "URL parsing in a script diverges. The resolver's own URL handling is tropel's and is identical in both realms." },
+    { "name": "error.stack contains the message", "expression": "(() => { try { null.x; } catch (e) { return String(e.stack).indexOf(String(e.message)) >= 0 ? 'yes' : 'no'; } })()", "hostJs": "yes", "quickJs": "no",
+      "why": "QuickJS's stack carries frames only. `e.stack || e.message` therefore LOSES the message in one realm and not the other — this exact shape swallowed a script error during KT-203 and is why the agent reports message-first." },
+    { "name": "localStorage", "expression": "typeof localStorage", "hostJs": "undefined", "quickJs": "undefined",
+      "why": "Absent in BOTH. Recorded because agreeing is worth pinning too: this is not a divergence and must not become one." },
+    { "name": "console", "expression": "typeof console", "hostJs": "object", "quickJs": "object", "why": "Both realms install console." },
+    { "name": "btoa", "expression": "typeof btoa", "hostJs": "function", "quickJs": "function", "why": "Both." },
+    { "name": "BigInt", "expression": "typeof BigInt", "hostJs": "function", "quickJs": "function", "why": "Both." },
+    { "name": "Array.prototype.at", "expression": "typeof [].at", "hostJs": "function", "quickJs": "function", "why": "ES2022 — both." },
+    { "name": "String.prototype.replaceAll", "expression": "typeof ''.replaceAll", "hostJs": "function", "quickJs": "function", "why": "ES2021 — both." },
+    { "name": "Object.hasOwn", "expression": "typeof Object.hasOwn", "hostJs": "function", "quickJs": "function", "why": "ES2022 — both." },
+    { "name": "Promise.allSettled", "expression": "typeof Promise.allSettled", "hostJs": "function", "quickJs": "function", "why": "ES2020 — both." },
+    { "name": "regexp lookbehind", "expression": "(() => { try { new RegExp('(?<=a)b'); return 'ok'; } catch (e) { return 'unsupported'; } })()", "hostJs": "ok", "quickJs": "ok",
+      "why": "QuickJS's libregexp supports lookbehind. Worth pinning: the regex engines genuinely differ, so agreement here is a measurement, not an assumption." },
+    { "name": "regexp named groups", "expression": "(() => { try { return 'x'.match(/(?<n>x)/).groups.n; } catch (e) { return 'unsupported'; } })()", "hostJs": "x", "quickJs": "x", "why": "Both." },
+    { "name": "pm", "expression": "typeof pm", "hostJs": "object", "quickJs": "object", "why": "The Postman-compat surface, in both." },
+    { "name": "bru", "expression": "typeof bru", "hostJs": "object", "quickJs": "object",
+      "why": "The Bruno-compat surface. This probe FOUND A BUG: POST /script hand-rolled its shim list (k6-core + pm only) instead of using ShimBundle::default(), so `bru` was undefined on the agent and an object in the app — a Bruno-style script worked in KnockPort and failed on desktop. js_bootstrap.rs exists because that exact defect happened once before ('bru.js was compiled into the binary but NEVER evaluated'); re-deriving the list in agent.rs re-opened it one endpoint over. Fixed in TR-465." }
+  ]
+}
