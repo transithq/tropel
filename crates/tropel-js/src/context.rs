@@ -1560,6 +1560,41 @@ mod tests {
             .expect("context creation should succeed")
     }
 
+    /// TR-434 review question: k6 scripts use regular expressions — did
+    /// dropping the `regex` crate from `tropel-variables` break them?
+    ///
+    /// No, and this proves it rather than asserting it. JS `RegExp` is
+    /// QuickJS's OWN engine (`libregexp.c`, vendored by rquickjs-sys); Rust's
+    /// `regex` crate was never on that path. What `tropel-variables` used
+    /// `regex` for was matching `{{$guid}}` / `{{name}}` PLACEHOLDER syntax
+    /// in templates — not any user-facing regex feature.
+    #[tokio::test]
+    async fn js_regexp_is_quickjs_own_engine_not_the_rust_regex_crate() {
+        let mut ctx = new_ctx().await;
+        // The RegExp surface a k6 script actually uses.
+        let cases: [(&str, &str); 7] = [
+            (
+                r#"String(/^Bearer\s+[A-Za-z0-9._-]+$/.test("Bearer abc.def-123"))"#,
+                "true",
+            ),
+            (r#""id=42;name=x".match(/id=(\d+)/)[1]"#, "42"),
+            (r#"new RegExp("st(a)tus", "i").exec("STATUS")[1]"#, "A"),
+            (r##""a1b2c3".replace(/\d/g, "#")"##, "a#b#c#"),
+            (r#""a,b;c".split(/[,;]/).join("|")"#, "a|b|c"),
+            (r#"/(?<ver>v\d+)/.exec("/api/v3/x").groups.ver"#, "v3"),
+            // Unicode property escapes — the case most likely to depend on
+            // large tables, and QuickJS carries its own.
+            (r#"/\p{L}+/u.exec("日本語abc")[0]"#, "日本語abc"),
+        ];
+        for (expr, want) in cases {
+            let got = ctx
+                .eval(expr)
+                .await
+                .unwrap_or_else(|e| panic!("evaluating {expr} failed: {e:?}"));
+            assert_eq!(got, want, "{expr}");
+        }
+    }
+
     #[tokio::test]
     async fn console_log_accepts_objects_and_multiple_args() {
         // Regression (backlog line 172): console.log took a strict String
