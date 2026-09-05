@@ -916,19 +916,23 @@ impl HawkAuth {
             .port()
             .unwrap_or_else(|| if url.scheme() == "https" { 443 } else { 80 });
 
-        // Normalized string per the Hawk spec (mozilla/hawk lib/crypto.js
-        // generateNormalizedString): ts and nonce come FIRST, immediately
-        // after the scheme line; method/resource/host/port follow; then hash
-        // and ext (empty here — this shim doesn't do payload validation).
-        let normalized =
-            hawk_normalized_string(&method, ts, nonce, &resource, &host, port, "", ext);
-        let mac = hawk_mac(&normalized, &self.auth_key, self.algorithm.as_deref());
-
-        let header = format!(
-            "Hawk id=\"{}\", ts=\"{}\", nonce=\"{}\", mac=\"{}\"",
-            self.auth_id, ts, nonce, mac
-        );
-        set_auth_header(request, &header)
+        // Delegates to `crate::builders`, which is NOT behind the `reqwest`
+        // feature — that is what lets a browser embedder reach the same bytes
+        // (TR-425). `host` is already bracketed for IPv6 above; the builder
+        // lowercases and does not re-bracket.
+        let header = crate::builders::hawk_build_header(&crate::builders::HawkBuildParams {
+            method: &method,
+            resource: &resource,
+            host: &host,
+            port,
+            id: &self.auth_id,
+            key: &self.auth_key,
+            algorithm: self.algorithm.as_deref(),
+            ts,
+            nonce,
+            ext,
+        });
+        set_auth_header(request, &header.value)
     }
 }
 
@@ -945,49 +949,6 @@ impl AuthSigner for HawkAuth {
             .to_string();
         let nonce = generate_nonce();
         self.sign_with_ts_nonce(request, &ts, &nonce, "")
-    }
-}
-
-/// Hawk normalized request string ("hawk.1.header" scheme).
-///
-/// Each value is followed by a newline, in the order: scheme, ts, nonce,
-/// method (uppercased), resource, host (lowercased), port, hash, ext.
-/// ts/nonce come FIRST per the Hawk spec — the earlier implementation put
-/// method/resource/host/port first, producing a MAC any Hawk server rejects.
-/// The normalized request string has exactly 8 spec-ordered fields (scheme,
-/// ts, nonce, method, resource, host, port, hash, ext) — grouping them would
-/// obscure the wire order the spec mandates, so allow the arity.
-#[allow(clippy::too_many_arguments)]
-fn hawk_normalized_string(
-    method: &str,
-    ts: &str,
-    nonce: &str,
-    resource: &str,
-    host: &str,
-    port: u16,
-    hash: &str,
-    ext: &str,
-) -> String {
-    let method = method.to_uppercase();
-    let host = host.to_lowercase();
-    format!("hawk.1.header\n{ts}\n{nonce}\n{method}\n{resource}\n{host}\n{port}\n{hash}\n{ext}\n")
-}
-
-/// Hawk request MAC = base64(HMAC(algorithm, key, normalized)).
-fn hawk_mac(normalized: &str, key: &str, algorithm: Option<&str>) -> String {
-    let sha1 = algorithm
-        .map(|a| a.eq_ignore_ascii_case("sha1"))
-        .unwrap_or(false);
-    if sha1 {
-        let mut mac = <HmacSha1 as KeyInit>::new_from_slice(key.as_bytes())
-            .expect("HMAC-SHA1 accepts any key length");
-        mac.update(normalized.as_bytes());
-        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-    } else {
-        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key.as_bytes())
-            .expect("HMAC-SHA256 accepts any key length");
-        mac.update(normalized.as_bytes());
-        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
     }
 }
 
@@ -1933,57 +1894,6 @@ mod tests {
     }
 
     #[test]
-    fn hawk_normalized_orders_ts_nonce_first() {
-        // Hawk spec: ts and nonce come FIRST, immediately after the scheme
-        // line — the old implementation put method/resource/host/port first.
-        let normalized = hawk_normalized_string(
-            "GET",
-            "1353832234",
-            "j4h3g2",
-            "/resource/1?b=1&a=2",
-            "example.com",
-            8000,
-            "",
-            "",
-        );
-        let lines: Vec<&str> = normalized.lines().collect();
-        assert_eq!(lines[0], "hawk.1.header");
-        assert_eq!(lines[1], "1353832234");
-        assert_eq!(lines[2], "j4h3g2");
-        assert_eq!(lines[3], "GET");
-        assert_eq!(lines[4], "/resource/1?b=1&a=2");
-        assert_eq!(lines[5], "example.com");
-        assert_eq!(lines[6], "8000");
-    }
-
-    #[test]
-    fn hawk_matches_api_reference_vector() {
-        // Hawk API.md "Protocol Example": GET /resource/1?b=1&a=2 on
-        // example.com:8000 with ext="some-app-ext-data". Published MAC:
-        // 6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE=
-        let normalized = hawk_normalized_string(
-            "GET",
-            "1353832234",
-            "j4h3g2",
-            "/resource/1?b=1&a=2",
-            "example.com",
-            8000,
-            "",
-            "some-app-ext-data",
-        );
-        assert_eq!(
-            normalized,
-            "hawk.1.header\n1353832234\nj4h3g2\nGET\n/resource/1?b=1&a=2\nexample.com\n8000\n\nsome-app-ext-data\n"
-        );
-        let mac = hawk_mac(
-            &normalized,
-            "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn",
-            None,
-        );
-        assert_eq!(mac, "6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE=");
-    }
-
-    #[test]
     fn hawk_full_signer_matches_api_reference_vector() {
         // TR-409: the FULL Hawk signer (not just `hawk_mac`) must reproduce
         // the Hawk API.md reference MAC. Injects the reference ts + nonce via
@@ -2012,28 +1922,6 @@ mod tests {
         assert!(h.contains("id=\"dh37fgj492je\""));
         assert!(h.contains("ts=\"1353832234\""));
         assert!(h.contains("nonce=\"j4h3g2\""));
-    }
-
-    #[test]
-    fn hawk_matches_api_payload_hash_vector() {
-        // Hawk API.md "Payload Validation": POST /resource/1?b=1&a=2 with a
-        // payload hash and ext. Published MAC: aSe1DERmZuRl3pI36/9BdZmnErTw3sNzOOAUlfeKjVw=
-        let normalized = hawk_normalized_string(
-            "POST",
-            "1353832234",
-            "j4h3g2",
-            "/resource/1?b=1&a=2",
-            "example.com",
-            8000,
-            "Yi9LfIIFRtBEPt74PVmbTF/xVAwPn7ub15ePICfgnuY=",
-            "some-app-ext-data",
-        );
-        let mac = hawk_mac(
-            &normalized,
-            "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn",
-            None,
-        );
-        assert_eq!(mac, "aSe1DERmZuRl3pI36/9BdZmnErTw3sNzOOAUlfeKjVw=");
     }
 
     #[test]

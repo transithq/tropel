@@ -243,6 +243,90 @@ pub fn digest_build_authorization(p: &DigestBuildParams<'_>) -> HeaderOut {
     }
 }
 
+// ── Hawk (hawk.1.header) ────────────────────────────────────────────────────
+
+/// Everything needed to build a Hawk `Authorization` header.
+///
+/// `ts` and `nonce` are caller-supplied so a vector can be pinned; the signer
+/// passes the host clock and a CSPRNG nonce.
+#[derive(Debug, Clone)]
+pub struct HawkBuildParams<'a> {
+    /// HTTP method — uppercased internally.
+    pub method: &'a str,
+    /// Request-target: path + query.
+    pub resource: &'a str,
+    /// Host WITHOUT brackets for IPv6; the caller brackets if it must.
+    pub host: &'a str,
+    pub port: u16,
+    pub id: &'a str,
+    pub key: &'a str,
+    /// `"sha256"` (default) or `"sha1"`.
+    pub algorithm: Option<&'a str>,
+    /// Unix seconds, as a string.
+    pub ts: &'a str,
+    pub nonce: &'a str,
+    /// Application-specific data folded into the MAC. Empty when unused.
+    pub ext: &'a str,
+}
+
+/// The Hawk normalized request string.
+///
+/// Field ORDER is the whole contract: scheme, ts, nonce, method, resource,
+/// host, port, hash, ext — each followed by a newline. `ts` and `nonce` come
+/// FIRST, immediately after the scheme line. An earlier implementation put
+/// method/resource/host/port first and produced a MAC every Hawk server
+/// rejects, which is why the order is spelled out rather than inferred.
+pub fn hawk_normalized_string(p: &HawkBuildParams<'_>, hash: &str) -> String {
+    let method = p.method.to_uppercase();
+    let host = p.host.to_lowercase();
+    format!(
+        "hawk.1.header\n{}\n{}\n{method}\n{}\n{host}\n{}\n{hash}\n{}\n",
+        p.ts, p.nonce, p.resource, p.port, p.ext
+    )
+}
+
+/// Hawk request MAC = base64(HMAC(algorithm, key, normalized)).
+///
+/// Defaults to SHA-256; `"sha1"` selects the legacy variant. Anything else is
+/// treated as SHA-256 rather than refused, matching the signer — a Hawk server
+/// that wanted SHA-1 will reject the MAC, which is a loud failure at the wire.
+pub fn hawk_mac(normalized: &str, key: &str, algorithm: Option<&str>) -> String {
+    use base64::Engine as _;
+    use hmac::digest::KeyInit as _;
+    use hmac::{Hmac, Mac as _};
+    use sha1::Sha1;
+    let sha1 = algorithm.is_some_and(|a| a.eq_ignore_ascii_case("sha1"));
+    if sha1 {
+        let mut mac =
+            Hmac::<Sha1>::new_from_slice(key.as_bytes()).expect("HMAC-SHA1 accepts any key length");
+        mac.update(normalized.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    } else {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(normalized.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    }
+}
+
+/// Build the `Authorization: Hawk …` header.
+///
+/// Payload validation (`hash`) is deliberately not implemented — the signer
+/// has never sent one, and emitting an empty `hash=""` would be worse than
+/// omitting it. The normalized string still carries the empty hash field,
+/// because the spec's field COUNT is fixed.
+pub fn hawk_build_header(p: &HawkBuildParams<'_>) -> HeaderOut {
+    let normalized = hawk_normalized_string(p, "");
+    let mac = hawk_mac(&normalized, p.key, p.algorithm);
+    HeaderOut {
+        name: "Authorization".to_string(),
+        value: format!(
+            "Hawk id=\"{}\", ts=\"{}\", nonce=\"{}\", mac=\"{}\"",
+            p.id, p.ts, p.nonce, mac
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +568,107 @@ mod tests {
         let mut sorted = positions.clone();
         sorted.sort_unstable();
         assert_eq!(positions, sorted, "fields out of wire order: {out}");
+    }
+
+    // ── Hawk ─────────────────────────────────────────────────────────────
+
+    fn hawk<'a>(algorithm: Option<&'a str>) -> HawkBuildParams<'a> {
+        HawkBuildParams {
+            method: "GET",
+            resource: "/resource/1?b=1&a=2",
+            host: "example.com",
+            port: 8000,
+            id: "dh37fgj492je",
+            key: "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn",
+            algorithm,
+            ts: "1353832234",
+            nonce: "j4h3g2",
+            ext: "some-app-ext-data",
+        }
+    }
+
+    #[test]
+    fn hawk_normalized_string_matches_the_spec_vector() {
+        // The published example from the Hawk spec / mozilla-hawk's own
+        // README. Field ORDER is the whole contract here: ts and nonce come
+        // FIRST, right after the scheme line. An earlier implementation put
+        // method/resource/host/port first and produced a MAC every Hawk
+        // server rejects — a bug a length check would never have caught.
+        let out = hawk_normalized_string(&hawk(None), "");
+        assert_eq!(
+            out,
+            "hawk.1.header\n1353832234\nj4h3g2\nGET\n/resource/1?b=1&a=2\nexample.com\n8000\n\nsome-app-ext-data\n"
+        );
+    }
+
+    #[test]
+    fn hawk_mac_matches_the_published_vector() {
+        // Hawk spec §3.2.1 example → the published MAC for the string above.
+        let normalized = hawk_normalized_string(&hawk(None), "");
+        assert_eq!(
+            hawk_mac(&normalized, hawk(None).key, None),
+            "6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE="
+        );
+    }
+
+    #[test]
+    fn hawk_payload_hash_vector() {
+        // Hawk API.md "Payload Validation": the same request WITH a payload
+        // hash. Ported from `signers.rs` with the delegation (TR-425) — a
+        // distinct published vector from the empty-hash one above, and the
+        // only thing that pins the `hash` field's position in the normalized
+        // string. `hawk_build_header` never sends one, but the normalizer
+        // must still place it correctly for anything that does.
+        let mut p = hawk(None);
+        p.method = "POST";
+        let normalized = hawk_normalized_string(&p, "Yi9LfIIFRtBEPt74PVmbTF/xVAwPn7ub15ePICfgnuY=");
+        assert_eq!(
+            hawk_mac(&normalized, p.key, None),
+            "aSe1DERmZuRl3pI36/9BdZmnErTw3sNzOOAUlfeKjVw="
+        );
+    }
+
+    #[test]
+    fn hawk_method_uppercases_and_host_lowercases() {
+        // Both are normalization the spec requires; getting either wrong
+        // changes the MAC without changing anything visible in the header.
+        let mut p = hawk(None);
+        p.method = "get";
+        p.host = "EXAMPLE.com";
+        assert_eq!(
+            hawk_normalized_string(&p, ""),
+            hawk_normalized_string(&hawk(None), "")
+        );
+    }
+
+    #[test]
+    fn hawk_sha1_differs_from_sha256_and_unknown_falls_back() {
+        let n = hawk_normalized_string(&hawk(None), "");
+        let k = hawk(None).key;
+        let sha256 = hawk_mac(&n, k, None);
+        let sha1 = hawk_mac(&n, k, Some("sha1"));
+        assert_ne!(sha256, sha1);
+        // Case-insensitive, and an unrecognised algorithm falls back to
+        // SHA-256 rather than refusing — the server rejects the MAC, which is
+        // a loud failure at the wire rather than a silent local one.
+        assert_eq!(hawk_mac(&n, k, Some("SHA1")), sha1);
+        assert_eq!(hawk_mac(&n, k, Some("md5")), sha256);
+    }
+
+    #[test]
+    fn hawk_header_carries_id_ts_nonce_and_mac() {
+        let out = hawk_build_header(&hawk(None));
+        assert!(
+            out.value.starts_with("Hawk id=\"dh37fgj492je\""),
+            "{}",
+            out.value
+        );
+        assert!(out.value.contains("ts=\"1353832234\""), "{}", out.value);
+        assert!(out.value.contains("nonce=\"j4h3g2\""), "{}", out.value);
+        assert!(out.value.contains("mac=\""), "{}", out.value);
+        // No payload hash is sent, so none is advertised — an empty
+        // `hash=""` would be worse than omitting it.
+        assert!(!out.value.contains("hash="), "{}", out.value);
     }
 
     #[test]
