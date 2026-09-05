@@ -337,19 +337,10 @@ impl AuthSigner for AwsSigV4Auth {
 /// label. For these, `host.split('.').next()` returns the TENANT — the
 /// signing service is a later label (examplebucket.s3.amazonaws.com → s3).
 fn canonical_host(url: &reqwest::Url) -> String {
-    let host = bracket_host(url.host_str().unwrap_or(""));
+    let host = crate::builders::bracket_host(url.host_str().unwrap_or(""));
     match url.port() {
         Some(port) => format!("{host}:{port}"),
         None => host,
-    }
-}
-
-/// Wrap IPv6 literal hosts in brackets; pass everything else through.
-fn bracket_host(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
     }
 }
 
@@ -456,7 +447,7 @@ impl OAuth1Auth {
             .collect();
         if is_form_urlencoded(request) {
             if let Some(bytes) = request.body().and_then(|b| b.as_bytes()) {
-                params.extend(parse_form(bytes));
+                params.extend(crate::builders::parse_form(bytes));
             }
         }
         let method_str = self
@@ -526,45 +517,16 @@ fn is_form_urlencoded(request: &reqwest::Request) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_form(bytes: &[u8]) -> Vec<(String, String)> {
-    let Ok(s) = std::str::from_utf8(bytes) else {
-        return vec![];
-    };
-    s.split('&')
-        .filter(|p| !p.is_empty())
-        .filter_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
-            // RFC 5849 §3.4.1.1: form-urlencoded bodies use `+` for space
-            // (the same decoding as `application/x-www-form-urlencoded`).
-            // The decoded value is then percent-encoded by `enc()` when the
-            // base string is built — so `+` must become space here, not
-            // survive as a literal `+` (which would re-encode as `%2B`).
-            Some((decode_form_value(k), decode_form_value(v)))
-        })
-        .collect()
-}
-
-/// Decode a form-urlencoded value: `+` → space, then percent-decode `%XX`.
-fn decode_form_value(s: &str) -> String {
-    let plus_to_space = s.replace('+', " ");
-    percent_decode(&plus_to_space).unwrap_or(plus_to_space)
-}
-
-fn percent_decode(s: &str) -> Option<String> {
-    use percent_encoding::percent_decode_str;
-    percent_decode_str(s)
-        .decode_utf8()
-        .ok()
-        .map(|c| c.to_string())
-}
-
+/// Adapter: read the §3.4.1.2 components off a `reqwest::Url` and let
+/// `builders` assemble them. `Url::port()` is already `None` for a default
+/// port, which is the contract `oauth1_base_uri` expects.
 fn base_url(url: &reqwest::Url) -> String {
-    let host = bracket_host(url.host_str().unwrap_or(""));
-    let port = match url.port() {
-        Some(port) => format!(":{port}"),
-        None => String::new(),
-    };
-    format!("{}://{host}{port}{}", url.scheme(), url.path())
+    crate::builders::oauth1_base_uri(
+        url.scheme(),
+        url.host_str().unwrap_or(""),
+        url.port(),
+        url.path(),
+    )
 }
 
 // ─────────────────────────── Hawk ───────────────────────────
@@ -604,7 +566,7 @@ impl HawkAuth {
             Some(q) => format!("{}?{}", url.path(), q),
             None => url.path().to_string(),
         };
-        let host = bracket_host(url.host_str().unwrap_or(""));
+        let host = crate::builders::bracket_host(url.host_str().unwrap_or(""));
         let port = url
             .port()
             .unwrap_or_else(|| if url.scheme() == "https" { 443 } else { 80 });
@@ -1416,7 +1378,7 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split('"').next())
             .unwrap();
-        let sig = percent_decode(sig_enc).expect("signature percent-decodes");
+        let sig = crate::builders::percent_decode(sig_enc).expect("signature percent-decodes");
         assert!(base64::engine::general_purpose::STANDARD
             .decode(&sig)
             .is_ok());
