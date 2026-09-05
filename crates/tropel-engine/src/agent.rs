@@ -304,6 +304,24 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             }
         }
 
+        ("POST", "/auth/oauth2") => {
+            // TR-447: the OAuth2/JWT/WSSE family. Closes the last arm of the
+            // gap `native-agent.ts` documents — every method on its
+            // `TropelAuthProvider` threw because the agent exposed none of
+            // this, and desktop ships no wasm to fall back on.
+            let Some(payload) =
+                read_json_body(sock, content_length, 1024 * 1024, &prefetched_body).await?
+            else {
+                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+            };
+            let op = payload.get("op").and_then(|o| o.as_str()).unwrap_or("");
+            let params = payload.get("params").cloned().unwrap_or_default();
+            match oauth2_dispatch(op, &params) {
+                Ok(out) => respond(sock, 200, &out.to_string()).await,
+                Err(why) => respond(sock, 400, &error_body(&why)).await,
+            }
+        }
+
         ("POST", "/execute") => {
             let body_buf = read_body(sock, content_length, 64 * 1024, &prefetched_body).await?;
             let req: serde_json::Value = match serde_json::from_slice(&body_buf) {
@@ -990,6 +1008,113 @@ async fn run_script_once(
     }))
 }
 
+/// Dispatch an OAuth2/JWT/WSSE operation to the ungated `tropel-auth::oauth`.
+///
+/// TR-447, the last of KT-203's auth gap. Like `/auth/sign`, this is ONE
+/// endpoint with an `op` discriminant rather than nine routes: the desktop
+/// tier calls it from one place, and a new operation is a match arm instead
+/// of a new URL its client has to learn.
+///
+/// Every arm is a straight call into the same functions the wasm tier
+/// exports. No wrapper logic — a second implementation of PKCE, token
+/// building or JWT signing is the invariant #3 failure this endpoint exists
+/// to prevent, and D4 names signing specifically ("a signing byte-difference
+/// is a 403 that takes a day to find").
+/// Serialise a builder's output for the wire.
+///
+/// A free generic fn rather than a closure: `impl Trait` is not allowed in
+/// closure parameters, and the alternative — a `dyn Serialize` box per call —
+/// would allocate on a path that runs per request.
+fn as_json<T: serde::Serialize>(v: &T) -> Result<serde_json::Value, String> {
+    serde_json::to_value(v).map_err(|e| e.to_string())
+}
+
+fn oauth2_dispatch(op: &str, p: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use tropel_auth::oauth;
+    let as_str = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let opt = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+
+    match op {
+        "buildAuthorizeUrl" => {
+            let params: oauth::AuthorizeParams =
+                serde_json::from_value(p.clone()).map_err(|e| e.to_string())?;
+            as_json(&oauth::build_authorize_url(&params).map_err(|e| e.to_string())?)
+        }
+        "buildTokenRequest" => {
+            let params: oauth::TokenRequestParams =
+                serde_json::from_value(p.clone()).map_err(|e| e.to_string())?;
+            as_json(&oauth::build_token_request(&params).map_err(|e| e.to_string())?)
+        }
+        "parseTokenResponse" => {
+            as_json(&oauth::parse_token_response(as_str("body")).map_err(|e| e.to_string())?)
+        }
+        "attachToken" => {
+            // The placement vocabulary is the Rust's, not a string the caller
+            // invents — an unknown placement must be refused, not defaulted
+            // to header, or a token silently stops reaching a query-auth API.
+            let placement = match p.get("placement").and_then(|v| v.as_str()) {
+                Some("header") | None => oauth::TokenPlacement::Header,
+                Some("query") => oauth::TokenPlacement::Query,
+                Some(other) => {
+                    return Err(format!(
+                        "unknown token placement '{other}' — expected header or query"
+                    ))
+                }
+            };
+            as_json(&oauth::attach_token(
+                as_str("token"),
+                opt("tokenType").as_deref(),
+                placement,
+                opt("headerPrefix").as_deref(),
+                opt("queryKey").as_deref(),
+            ))
+        }
+        "decodeJwt" => as_json(&oauth::decode_jwt(as_str("token")).map_err(|e| e.to_string())?),
+        "jwtExpiresAt" => {
+            let exp = oauth::jwt_expires_at(as_str("token")).map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "expiresAt": exp }))
+        }
+        "signJwt" => {
+            let algorithm = match p.get("algorithm").and_then(|v| v.as_str()) {
+                Some("HS256") | None => oauth::JwtAlgorithm::Hs256,
+                Some("HS384") => oauth::JwtAlgorithm::Hs384,
+                Some("HS512") => oauth::JwtAlgorithm::Hs512,
+                // Never downgrade to HS256: the config would say one thing
+                // and the wire another (the TR-004/TR-409 shape).
+                Some(other) => {
+                    return Err(format!(
+                        "unsupported JWT algorithm '{other}' — supported: HS256, HS384, HS512"
+                    ))
+                }
+            };
+            let payload = p.get("payload").cloned().unwrap_or_default();
+            let header = p.get("header").cloned().filter(|h| !h.is_null());
+            let token = oauth::sign_jwt(header.as_ref(), &payload, algorithm, as_str("secret"))
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "token": token }))
+        }
+        "wsseSign" => {
+            let params: oauth::WsseParams =
+                serde_json::from_value(p.clone()).map_err(|e| e.to_string())?;
+            as_json(&oauth::sign_wsse(&params).map_err(|e| e.to_string())?)
+        }
+        "codeChallengeS256" => Ok(serde_json::json!({
+            "codeChallenge": oauth::code_challenge_s256(as_str("verifier")),
+            "codeChallengeMethod": "S256",
+        })),
+        other => Err(format!(
+            "unknown oauth2 op '{other}' — supported: buildAuthorizeUrl, buildTokenRequest, \
+             parseTokenResponse, attachToken, decodeJwt, jwtExpiresAt, signJwt, wsseSign, \
+             codeChallengeS256"
+        )),
+    }
+}
+
 async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_json::Value {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
     let url = req.get("url").and_then(|u| u.as_str()).unwrap_or("");
@@ -1529,5 +1654,101 @@ mod tests {
             raw.contains(r#""passed":1"#),
             "realms must not share globals: {raw}"
         );
+    }
+    /// TR-447: `POST /auth/oauth2`, over the socket.
+    ///
+    /// The last arm of the gap `native-agent.ts` documents. What this must
+    /// prove is that the desktop tier gets the SAME OAuth2/JWT/WSSE the
+    /// browser does — D4 names signing specifically ("a signing
+    /// byte-difference is a 403 that takes a day to find").
+    #[tokio::test]
+    async fn the_oauth2_endpoint_serves_the_whole_family() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state = Arc::new(AgentState {
+            token: None,
+            client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client"),
+        });
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(&mut sock, st).await;
+                });
+            }
+        });
+        let call = |op: &'static str, params: serde_json::Value| async move {
+            let body = serde_json::json!({ "op": op, "params": params }).to_string();
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let req = format!(
+                "POST /auth/oauth2 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).await.expect("write");
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.expect("read");
+            String::from_utf8_lossy(&out).to_string()
+        };
+
+        // PKCE: the challenge must be computed HERE, so it matches the token
+        // request the same tier builds. A client deriving it separately is
+        // how a verifier and challenge stop agreeing.
+        let raw = call(
+            "codeChallengeS256",
+            serde_json::json!({"verifier": "abc123"}),
+        )
+        .await;
+        assert!(raw.contains("codeChallenge"), "{raw}");
+        assert!(raw.contains(r#""codeChallengeMethod":"S256""#), "{raw}");
+
+        // JWT signing, and the algorithm is NEVER downgraded — a config
+        // saying HS512 while the wire carries HS256 is the TR-004/TR-409
+        // shape.
+        let raw = call(
+            "signJwt",
+            serde_json::json!({"payload": {"sub": "u1"}, "algorithm": "HS512", "secret": "s"}),
+        )
+        .await;
+        assert!(raw.contains(r#""token":"#), "{raw}");
+        let raw = call(
+            "signJwt",
+            serde_json::json!({"payload": {"sub": "u1"}, "algorithm": "RS256", "secret": "s"}),
+        )
+        .await;
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(raw.contains("RS256"), "refused by name: {raw}");
+
+        // Token placement is the Rust's vocabulary. An unknown value must be
+        // REFUSED, not defaulted to header — defaulting silently stops a
+        // token reaching a query-auth API.
+        let raw = call(
+            "attachToken",
+            serde_json::json!({"token": "t", "placement": "cookie"}),
+        )
+        .await;
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(raw.contains("unknown token placement"), "{raw}");
+
+        let raw = call(
+            "attachToken",
+            serde_json::json!({"token": "t", "tokenType": "Bearer", "placement": "header"}),
+        )
+        .await;
+        assert!(raw.contains("Bearer"), "{raw}");
+
+        // WSSE, and an unknown op is refused listing what IS supported.
+        let raw = call(
+            "wsseSign",
+            serde_json::json!({"username": "u", "password": "p"}),
+        )
+        .await;
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        let raw = call("nope", serde_json::json!({})).await;
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(raw.contains("unknown oauth2 op"), "{raw}");
+        assert!(raw.contains("signJwt"), "it lists the alternatives: {raw}");
     }
 }
