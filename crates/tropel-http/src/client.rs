@@ -1122,6 +1122,19 @@ impl HttpClient {
             if let Some(jar) = jar {
                 for v in response.headers().get_all(reqwest::header::SET_COOKIE) {
                     if let Ok(s) = v.to_str() {
+                        // TR-457: reject a `Domain` that is a public suffix.
+                        // reqwest's jar does not (`publicsuffix` is in the
+                        // graph via cookie_store but `Jar::default()` never
+                        // consults it), so `Domain=com` from one host was
+                        // stored and replayed to every other `.com` host in
+                        // the jar. Filtered HERE because this is the only
+                        // place Set-Cookie enters the jar on the request path.
+                        if !tropel_variables::cookies::set_cookie_is_acceptable(
+                            s,
+                            hop_url.host_str().unwrap_or_default(),
+                        ) {
+                            continue;
+                        }
                         jar.add_cookie_str(s, &hop_url);
                     }
                 }
