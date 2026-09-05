@@ -422,9 +422,12 @@ const [bad] = assertEvaluate(assertResponse, [
 if (bad.passed || !bad.unsupported) throw new Error(`unresolvable target: ${JSON.stringify(bad)}`);
 // TR-443: a FAILING row explains itself; a passing one carries no message.
 const [failing] = assertEvaluate(assertResponse, [
-  { name: "status", target: "status", operator: "eq", expected: 500 },
+  { name: "a named assertion", target: "status", operator: "eq", expected: 500 },
 ]);
-if (failing.passed || failing.message !== "expected target status equals 500; actual 200") {
+// TR-444: the WORDING names the target, while the row identity keeps the
+// name — conflating them says nothing about what was inspected.
+if (failing.passed || failing.name !== "a named assertion" ||
+    failing.message !== "expected target status equals 500; actual 200") {
   throw new Error(`failure message: ${JSON.stringify(failing)}`);
 }
 if (outcomes.some((o) => o.message !== undefined)) {
