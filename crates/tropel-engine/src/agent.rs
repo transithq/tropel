@@ -331,6 +331,68 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             .await
         }
 
+        ("POST", "/variables/dynamic") => {
+            // TR-451: `{{$guid}}`, `{{$timestamp}}`, `{{$randomInt}}` — the
+            // predefined catalogue. SEPARATE from /resolve on purpose, and
+            // that separation is the contract, not an accident: /resolve
+            // substitutes the embedder's `{{var}}` map and leaves `{{$…}}`
+            // alone, while this one generates a FRESH value per occurrence
+            // and leaves plain `{{var}}` alone. KnockPort runs them in that
+            // order (`resolveVariables` in packages/core/src/utils.ts), so
+            // folding them together here would change which of the two saw a
+            // `{{$guid}}` produced by a variable's value.
+            let Some(payload) =
+                read_json_body(sock, content_length, 1024 * 1024, &prefetched_body).await?
+            else {
+                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+            };
+            let template = payload
+                .get("template")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let catalog = tropel_variables::DynamicCatalog::new();
+            match catalog.resolve(template) {
+                Ok(value) => {
+                    respond(
+                        sock,
+                        200,
+                        &serde_json::json!({ "value": value }).to_string(),
+                    )
+                    .await
+                }
+                // The 16 MiB total-output cap (TR-403). A NAMED failure, never
+                // a truncated body: `{{$randomLoremParagraphs}}` in a loop is
+                // the shape that hits it, and silently returning half of it is
+                // the data loss invariant #7 forbids.
+                Err(why) => respond(sock, 400, &error_body(&why)).await,
+            }
+        }
+
+        ("GET", "/constants") => {
+            // TR-451: the values that CANNOT drift between the two hosts, in
+            // one fetch at handshake.
+            //
+            // The pass cap is here because KnockPort was carrying its own
+            // `MAX_VARIABLE_RESOLUTION_PASSES_FALLBACK` on the desktop path —
+            // a SECOND ceiling, which is the exact duplication KP-424 removed
+            // from the resolver itself. A host that stops at 20 talking to an
+            // agent that stops at 25 disagrees about which chains are cyclic,
+            // and a cycle is a failed send.
+            //
+            // The predefined catalogue rides along rather than getting its own
+            // route: it is equally constant, the editor needs it at the same
+            // moment, and one fetch cannot half-succeed the way two can.
+            let variables: Vec<serde_json::Value> = tropel_variables::PREDEFINED_VARIABLE_META
+                .iter()
+                .map(|m| serde_json::json!({ "name": m.name, "description": m.description }))
+                .collect();
+            let body = serde_json::json!({
+                "maxVariableResolutionPasses": tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+                "predefinedVariables": variables,
+            });
+            respond(sock, 200, &body.to_string()).await
+        }
+
         ("GET", "/operators") => {
             // The assertion vocabulary, so a desktop editor renders the SAME
             // dropdown the evaluator dispatches on.
@@ -1510,6 +1572,72 @@ mod tests {
         let raw = String::from_utf8_lossy(&out).to_string();
         assert!(raw.contains(r#""name":"eq""#), "{raw}");
         assert!(raw.contains(r#""arity":"unary""#), "{raw}");
+
+        // ── /variables/dynamic (TR-451) ──
+        // Each occurrence must generate a FRESH value — that is the whole
+        // point of the catalogue, and a cached-once implementation would put
+        // the same "unique" id on every request in a run.
+        let raw = post(
+            "/variables/dynamic",
+            serde_json::json!({"template": "{{$guid}}|{{$guid}}"}).to_string(),
+        )
+        .await;
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let value = parsed["value"].as_str().expect("value");
+        let (first, second) = value.split_once('|').expect("two guids");
+        assert_ne!(
+            first, second,
+            "each occurrence generates a fresh value: {value}"
+        );
+        assert_eq!(first.len(), 36, "a v4 GUID, not a placeholder: {value}");
+
+        // Plain `{{var}}` is left ALONE here. /resolve owns that map, and
+        // KnockPort runs the two in order — folding them together would
+        // change which pass saw a `{{$guid}}` that came out of a variable.
+        let raw = post(
+            "/variables/dynamic",
+            serde_json::json!({"template": "{{base}}/{{$timestamp}}"}).to_string(),
+        )
+        .await;
+        assert!(
+            raw.contains("{{base}}"),
+            "a plain variable must survive the dynamic pass untouched: {raw}"
+        );
+
+        // ── /constants (TR-451) ──
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        s.write_all(b"GET /constants HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write");
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.expect("read");
+        let raw = String::from_utf8_lossy(&out).to_string();
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        // Read from the resolver's own constant, never a literal here: a
+        // second ceiling is what KP-424 removed, and pinning 20 in this test
+        // would quietly re-introduce one.
+        assert_eq!(
+            parsed["maxVariableResolutionPasses"],
+            tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES,
+            "the cap must come from the resolver: {body}"
+        );
+        let vars = parsed["predefinedVariables"]
+            .as_array()
+            .expect("predefinedVariables array");
+        assert_eq!(
+            vars.len(),
+            tropel_variables::PREDEFINED_VARIABLE_META.len(),
+            "the whole catalogue, not a subset: {body}"
+        );
+        assert!(
+            vars.iter()
+                .any(|v| v["name"] == "$guid" && v["description"].is_string()),
+            "names AND descriptions — the editor renders both: {body}"
+        );
     }
 
     /// TR-445: `/auth/sign`, over the socket.
