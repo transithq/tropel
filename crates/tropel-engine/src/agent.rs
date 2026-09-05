@@ -231,11 +231,16 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
         // ── TR-445 · the RULES endpoints ─────────────────────────────────────
         //
         // The agent exposed request EXECUTION only, which is why every
-        // core-tier method in knockport's `native-agent.ts` throws
+        // core-tier method in knockport's `native-agent.ts` USED TO throw
         // `TropelCoreUnavailableError` naming this gap. Desktop ships no wasm,
         // so without these the only way to resolve a variable or sign a
-        // request there is a TypeScript re-implementation — invariant #3, and
+        // request there was a TypeScript re-implementation — invariant #3, and
         // the most expensive recurring bug class in both repos.
+        //
+        // TR-464: those methods FORWARD now (knockport KP-209), batched at the
+        // provider so a burst of 33 template resolutions costs one round trip
+        // rather than 33. The present tense here described the state this
+        // endpoint set was built to end.
         //
         // These are pure functions over JSON: same Rust the wasm tier calls,
         // reached over the loopback socket instead of a wasm boundary.
