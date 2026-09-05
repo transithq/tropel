@@ -147,6 +147,55 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
         //
         // These are pure functions over JSON: same Rust the wasm tier calls,
         // reached over the loopback socket instead of a wasm boundary.
+        ("POST", "/resolve/batch") => {
+            // TR-448 (knockport KP-209): resolve MANY templates in one call.
+            //
+            // `/resolve` takes a single template, and knockport's
+            // `resolveRequest` walks ~33 of them per request — url, headers,
+            // params, auth fields, body. Per-call that is 33 loopback round
+            // trips at 70 us each: 2.3 ms of pure overhead on every send,
+            // measured. Batched it is one trip, 0.07 ms.
+            //
+            // That difference is the whole reason the desktop tier can use
+            // the agent at all instead of shipping a second copy of this Rust
+            // as wasm.
+            let Some(payload) =
+                read_json_body(sock, content_length, 8 * 1024 * 1024, &prefetched_body).await?
+            else {
+                return respond(sock, 400, r#"{"error":"invalid JSON body"}"#).await;
+            };
+            let vars: HashMap<String, String> = payload
+                .get("variables")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let items: Vec<BatchResolveItem> =
+                match serde_json::from_value(payload.get("items").cloned().unwrap_or_default()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return respond(sock, 400, &error_body(&format!("invalid items: {e}")))
+                            .await
+                    }
+                };
+            // ORDER IS THE CONTRACT: the caller re-assembles its request by
+            // index, so a reordered or short reply would put a header's value
+            // in a param. One output per input, always, even for the ones
+            // that fail.
+            let mut out = Vec::with_capacity(items.len());
+            for item in &items {
+                let deep = item.deep.unwrap_or(true);
+                let mode = item.mode.as_deref().unwrap_or("plain");
+                match tropel_variables::resolve_template_for_host(&item.template, &vars, mode, deep)
+                {
+                    Ok(resolved) => out.push(serde_json::json!({ "resolved": resolved })),
+                    // A per-item failure does NOT fail the batch: one bad
+                    // escape mode must not lose the other 32 resolutions, and
+                    // the caller can still see exactly which item broke.
+                    Err(why) => out.push(serde_json::json!({ "error": why })),
+                }
+            }
+            respond(sock, 200, &serde_json::json!({ "items": out }).to_string()).await
+        }
+
         ("POST", "/resolve") => {
             let Some(payload) =
                 read_json_body(sock, content_length, 1024 * 1024, &prefetched_body).await?
@@ -691,6 +740,16 @@ async fn respond(sock: &mut TcpStream, status: u16, body: &str) -> tropel_sdk::R
 
 /// Execute a single request with full sub-timings — the SAME engine code path
 /// a request under load takes. Returns a JSON response payload.
+/// One template in a batch resolve (TR-448).
+#[derive(serde::Deserialize)]
+struct BatchResolveItem {
+    template: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    deep: Option<bool>,
+}
+
 /// One assertion as the desktop tier sends it.
 #[derive(serde::Deserialize)]
 struct AgentAssertionSpec {
@@ -1750,5 +1809,86 @@ mod tests {
         assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
         assert!(raw.contains("unknown oauth2 op"), "{raw}");
         assert!(raw.contains("signJwt"), "it lists the alternatives: {raw}");
+    }
+    /// TR-448: `POST /resolve/batch`.
+    ///
+    /// The endpoint that lets the DESKTOP tier use the agent instead of
+    /// shipping a second copy of this Rust as wasm. Per-call resolution is 33
+    /// loopback round trips per request — 2.3 ms measured, against 0.07 ms
+    /// batched.
+    #[tokio::test]
+    async fn the_batch_resolve_endpoint_preserves_order_and_isolates_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state = Arc::new(AgentState {
+            token: None,
+            client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client"),
+        });
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(&mut sock, st).await;
+                });
+            }
+        });
+        let post = |body: String| async move {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let req = format!(
+                "POST /resolve/batch HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).await.expect("write");
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.expect("read");
+            String::from_utf8_lossy(&out).to_string()
+        };
+
+        let raw = post(
+            serde_json::json!({
+                "variables": {"base": "https://api.test", "tok": "abc", "n": "2"},
+                "items": [
+                    {"template": "{{base}}/v{{n}}"},
+                    {"template": "Bearer {{tok}}"},
+                    {"template": "{\"t\":\"{{tok}}\"}", "mode": "json"},
+                    // A bad mode: this item fails, the others must not.
+                    {"template": "{{tok}}", "mode": "nope"},
+                    {"template": "{{base}}"}
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let items = parsed["items"].as_array().expect("items array");
+
+        // ORDER IS THE CONTRACT — the caller re-assembles its request by index,
+        // so a reordered or short reply would put a header's value in a param.
+        assert_eq!(items.len(), 5, "one output per input, always: {body}");
+        assert_eq!(items[0]["resolved"], "https://api.test/v2");
+        assert_eq!(items[1]["resolved"], "Bearer abc");
+        assert_eq!(items[2]["resolved"], "{\"t\":\"abc\"}");
+        // A per-item failure does NOT fail the batch: one bad escape mode must
+        // not lose the other four resolutions.
+        assert!(
+            items[3]["error"].is_string(),
+            "item 3 should carry an error: {body}"
+        );
+        assert!(items[3]["resolved"].is_null());
+        assert_eq!(
+            items[4]["resolved"], "https://api.test",
+            "later items still resolve"
+        );
+
+        // An empty batch is a valid batch — a request with no templates is not
+        // an error, and returning one would make the caller special-case it.
+        let raw = post(serde_json::json!({"variables": {}, "items": []}).to_string()).await;
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        assert!(raw.contains(r#""items":[]"#), "{raw}");
     }
 }
