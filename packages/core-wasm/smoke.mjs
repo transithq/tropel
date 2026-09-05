@@ -19,6 +19,11 @@ import {
   oauth2JwtExpiresAt,
   oauth2SignJwt,
   wsseSign,
+  digestSign,
+  hawkSign,
+  awsSigV4Sign,
+  oauth1Sign,
+  oauth1SignatureMethods,
   resolveTemplate,
   resolveTemplateDetailed,
   maxVariableResolutionPasses,
@@ -299,6 +304,78 @@ if (maxVariableResolutionPasses() !== 20) {
   throw new Error(`pass cap: ${maxVariableResolutionPasses()}`);
 }
 
+
+// ── TR-436: the signers reach the wasm through THIS facade ─────────────────
+// 0.4.0 shipped the Rust exports and did not surface them here, so they were
+// present in the artifact and unreachable from JS. Importing them is not
+// enough to catch that — an unexported name is `undefined` and only fails
+// when CALLED. Each is therefore invoked, and each assertion is one a wrong
+// or missing wiring would fail.
+const sigv4 = awsSigV4Sign({
+  method: "GET",
+  host: "examplebucket.s3.amazonaws.com",
+  path: "/test.txt",
+  accessKey: "AKIAIOSFODNN7EXAMPLE",
+  secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  region: "us-east-1",
+  amzDate: "20130524T000000Z",
+  dateStamp: "20130524",
+});
+if (!Array.isArray(sigv4) || sigv4.length === 0) throw new Error("awsSigV4Sign returned no headers");
+// The service must derive to s3 from a VIRTUAL-HOSTED bucket host, not to the
+// bucket name — the rule tropel TR-428 moved out from behind the reqwest gate.
+if (!sigv4[0].value.includes("/20130524/us-east-1/s3/aws4_request")) {
+  throw new Error(`awsSigV4Sign derived the wrong service: ${sigv4[0].value}`);
+}
+
+const hawk = hawkSign({
+  method: "GET", resource: "/resource", host: "example.com", port: 443,
+  id: "dh37fgj492je", key: "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn",
+  ts: "1353832234", nonce: "j4h3g2",
+});
+if (!hawk.value.startsWith("Hawk ")) throw new Error(`hawkSign: ${hawk.value}`);
+
+const oauth1 = oauth1Sign({
+  method: "POST", scheme: "http", host: "::1", port: 8080, path: "/request",
+  formBody: "c2=&a3=2+q",
+  consumerKey: "ck", consumerSecret: "cs",
+  signatureMethod: "HMAC-SHA1", nonce: "n", timestamp: "1",
+});
+if (!oauth1.value.includes("oauth_signature=")) throw new Error(`oauth1Sign: ${oauth1.value}`);
+
+const methods = oauth1SignatureMethods();
+if (!Array.isArray(methods) || !methods.includes("HMAC-SHA1")) {
+  throw new Error(`oauth1SignatureMethods: ${JSON.stringify(methods)}`);
+}
+// An unsupported method must THROW, not downgrade to HMAC-SHA1 (TR-409).
+let refused = false;
+try {
+  oauth1Sign({ method: "GET", scheme: "https", host: "example.com", path: "/",
+    consumerKey: "ck", consumerSecret: "cs", signatureMethod: "RSA-SHA1",
+    nonce: "n", timestamp: "1" });
+} catch { refused = true; }
+if (!refused) throw new Error("oauth1Sign accepted RSA-SHA1 instead of refusing it");
+
+// Digest is challenge-response: the Digest challenge here is listed AFTER
+// Basic and carries a quoted qop list — the two things a naive parser gets
+// wrong (tropel TR-429).
+const digest = digestSign({
+  wwwAuthenticate: 'Basic realm="b", Digest realm="r", qop="auth, auth-int", nonce="n", opaque="o"',
+  username: "u", password: "p", method: "GET", uri: "/dir/index.html",
+  nc: 1, cnonce: "0a4f113b",
+});
+if (digest === null || !digest.value.startsWith("Digest ")) {
+  throw new Error(`digestSign: ${JSON.stringify(digest)}`);
+}
+if (!digest.value.includes('realm="r"') || !digest.value.includes('opaque="o"')) {
+  throw new Error(`digestSign lost challenge fields: ${digest.value}`);
+}
+// A header offering only Basic must yield null, not a bogus Digest header.
+if (digestSign({ wwwAuthenticate: 'Basic realm="b"', username: "u", password: "p",
+                 method: "GET", uri: "/", nc: 1, cnonce: "c" }) !== null) {
+  throw new Error("digestSign must return null when no Digest challenge is offered");
+}
+
 console.log(
-  `core-wasm smoke OK — catalog: ${meta.length} variables · oauth2 flows verified · resolveTemplate verified (grammar, 3 escape modes, chains, pass cap ${maxVariableResolutionPasses()}) · corpus ${corpusRun}/${corpus.cases.length} cases`,
+  `core-wasm smoke OK — catalog: ${meta.length} variables · oauth2 flows verified · 5 signers verified · resolveTemplate verified (grammar, 3 escape modes, chains, pass cap ${maxVariableResolutionPasses()}) · corpus ${corpusRun}/${corpus.cases.length} cases`,
 );
