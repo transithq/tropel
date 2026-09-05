@@ -1702,6 +1702,142 @@ mod tests {
         );
     }
 
+    /// KT-202 — the THIRD differential leg: the same corpus, over the socket.
+    ///
+    /// `packages/core-wasm/fixtures/resolve-corpus.json` already runs through
+    /// two paths: native Rust (`tropel-core-wasm`'s `conformance_corpus`) and
+    /// the real wasm (`packages/core-wasm/smoke.mjs`). Those are the two tiers
+    /// a BROWSER host can be served by. The agent is the third, and since
+    /// KP-209 it is the one KnockPort's DESKTOP tier actually runs on — so an
+    /// agent that resolved `{{base-url}}` differently would put literal text
+    /// on the wire for desktop users only, which is the single divergence
+    /// this corpus was written to catch in the first place.
+    ///
+    /// It reads the SAME bytes rather than restating the cases. A copied
+    /// corpus drifts exactly the way the two resolvers did.
+    ///
+    /// This deviates from KT-202's literal wording ("run the corpus through
+    /// the TypeScript host"): driving KnockPort's TypeScript from a Rust test
+    /// would need Node and a second checkout inside tropel's CI. The agent leg
+    /// covers what that was for — the desktop tier's rules — with no
+    /// cross-repo dependency, and the browser tier is already covered by
+    /// smoke.mjs, which IS the TypeScript leg.
+    #[tokio::test]
+    async fn the_resolution_corpus_agrees_over_the_socket() {
+        const CORPUS: &str =
+            include_str!("../../../packages/core-wasm/fixtures/resolve-corpus.json");
+
+        /// Mirrors `tropel-core-wasm`'s `generated_vars` — same kind, same
+        /// construction from the SAME constant, so the two legs cannot drift
+        /// into testing different chains.
+        fn generated_vars(kind: &str) -> serde_json::Value {
+            match kind {
+                "chain_longer_than_cap" => {
+                    let cap = tropel_variables::MAX_VARIABLE_RESOLUTION_PASSES;
+                    let mut m = serde_json::Map::new();
+                    for i in 0..=cap {
+                        m.insert(
+                            format!("v{i}"),
+                            serde_json::json!(format!("{{{{v{}}}}}", i + 1)),
+                        );
+                    }
+                    m.insert(format!("v{}", cap + 1), serde_json::json!("end"));
+                    serde_json::Value::Object(m)
+                }
+                other => panic!("unknown vars_generated kind: {other}"),
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let state = Arc::new(AgentState {
+            token: None,
+            client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
+                .expect("http client"),
+        });
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(&mut sock, st).await;
+                });
+            }
+        });
+
+        let doc: serde_json::Value = serde_json::from_str(CORPUS).expect("corpus is valid JSON");
+        let cases = doc["cases"].as_array().expect("cases array");
+        assert!(!cases.is_empty(), "an empty corpus asserts nothing");
+
+        for case in cases {
+            let name = case["name"].as_str().expect("every case is named");
+            let template = case["template"].as_str().expect("template");
+            let mode = case["mode"].as_str().expect("mode");
+            let vars = match case.get("vars_generated") {
+                Some(kind) => generated_vars(kind.as_str().unwrap()),
+                None => case["vars"].clone(),
+            };
+
+            // Through /resolve/batch, because that is the endpoint the desktop
+            // tier actually calls — a leg that exercised a different route
+            // would not be testing the path users get.
+            let body = serde_json::json!({
+                "variables": vars,
+                "items": [{"template": template, "mode": mode}],
+            })
+            .to_string();
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let req = format!(
+                "POST /resolve/batch HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).await.expect("write");
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.expect("read");
+            let raw = String::from_utf8_lossy(&out).to_string();
+            let reply = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&reply).unwrap_or_else(|e| panic!("{name}: {e} — {reply}"));
+            let item = &parsed["items"][0];
+            assert!(
+                item["error"].is_null(),
+                "{name}: the agent refused a corpus case: {item}"
+            );
+            let value = item["value"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: no value"));
+
+            // The same assertions the native leg makes, in the same order.
+            if let Some(expected) = case.get("expect").and_then(|v| v.as_str()) {
+                assert_eq!(value, expected, "{name}");
+            }
+            if case.get("parses_as_json").and_then(|v| v.as_bool()) == Some(true) {
+                serde_json::from_str::<serde_json::Value>(value).unwrap_or_else(|e| {
+                    panic!("{name}: result must stay parseable JSON: {e} — {value}")
+                });
+            }
+            if let Some(expected) = case.get("expect_hit_cap").and_then(|v| v.as_bool()) {
+                assert_eq!(item["hitCap"], expected, "{name}: hitCap");
+            }
+            if let Some(expected) = case.get("expect_unresolved") {
+                assert_eq!(&item["unresolved"], expected, "{name}: unresolved");
+            }
+            if let Some(required) = case
+                .get("expect_unresolved_contains")
+                .and_then(|v| v.as_array())
+            {
+                let got = item["unresolved"].as_array().unwrap();
+                for n in required {
+                    assert!(
+                        got.contains(n),
+                        "{name}: unresolved must contain {n} — got {got:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// TR-445: `/auth/sign`, over the socket.
     ///
     /// This is the endpoint that lets knockport's DESKTOP tier stop throwing
