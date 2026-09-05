@@ -1335,13 +1335,23 @@ async fn run_script_once(
     ctx.eval(include_str!("../../../js/shared/deep-equal.js"))
         .await
         .map_err(|e| format!("deep-equal shim: {e:?}"))?;
-    ctx.eval(concat!(
-        include_str!("../../../js/shared/k6-core.js"),
-        "\n",
-        include_str!("../../../js/scripting-api/pm.js")
-    ))
-    .await
-    .map_err(|e| format!("pm shim: {e:?}"))?;
+    // TR-465: the SHARED bundle, not a hand-rolled list.
+    //
+    // This used to eval `k6-core.js` + `pm.js` inline, which quietly gave
+    // /script a SMALLER surface than a load run: `typeof bru === "undefined"`
+    // here and an object there, so a Bruno-style script worked in the app and
+    // failed on the agent. Measured, not guessed — a realm probe across both
+    // engines is what surfaced it.
+    //
+    // `js_bootstrap` exists precisely because this went wrong once before: two
+    // hand-maintained shim lists drifted and "bru.js was compiled into the
+    // binary but NEVER evaluated". Re-deriving the list here re-opened that
+    // exact hole, one endpoint over.
+    for entry in crate::js_bootstrap::ShimBundle::default().0 {
+        ctx.eval(&entry.1)
+            .await
+            .map_err(|e| format!("{} shim: {e:?}", entry.0))?;
+    }
 
     let state = tropel_sandbox::state::SharedPmState::default();
     {
@@ -2295,6 +2305,70 @@ mod tests {
         s.read_to_end(&mut out).await.expect("read");
         let raw = String::from_utf8_lossy(&out).to_string();
         assert!(raw.starts_with("HTTP/1.1 401"), "{raw}");
+    }
+
+    /// TR-465 / KT-404 — the QuickJS half of the script-realm corpus.
+    ///
+    /// The corpus is a COMMITTED, MEASURED table of what a user script can
+    /// rely on in each realm — KnockPort's host-JS one and this one. Both
+    /// repos read the same file, so a probe whose answer changes fails here
+    /// AND there until the table is updated. That is the whole design: the
+    /// divergence stops being folklore and becomes something a test owns.
+    ///
+    /// It runs through `run_script_once`, the production /script path, rather
+    /// than a hand-built context — a realm assembled just for the test could
+    /// pass while the one users reach is missing a shim, which is exactly the
+    /// bug the `bru` probe found.
+    #[tokio::test]
+    async fn the_script_realm_matches_the_committed_corpus() {
+        const CORPUS: &str =
+            include_str!("../../../packages/shims/fixtures/script-realm-corpus.json");
+        let doc: serde_json::Value = serde_json::from_str(CORPUS).expect("corpus is valid JSON");
+        let probes = doc["probes"].as_array().expect("probes array");
+        assert!(!probes.is_empty(), "an empty corpus asserts nothing");
+
+        // One script sets one environment key per probe, so a single realm
+        // answers all of them — and the realm is built exactly once, as a
+        // caller's would be.
+        let script = probes
+            .iter()
+            .map(|p| {
+                let name = p["name"].as_str().expect("name");
+                let expr = p["expression"].as_str().expect("expression");
+                format!("pm.environment.set({name:?}, String({expr}));")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let out = run_script_once(&script, HashMap::new())
+            .await
+            .expect("the realm runs");
+
+        let mut wrong: Vec<String> = Vec::new();
+        for probe in probes {
+            let name = probe["name"].as_str().unwrap();
+            let want = probe["quickJs"].as_str().unwrap();
+            let got = out
+                .get("environment")
+                .and_then(|e| e.get(name))
+                .and_then(|v| v.as_str())
+                .unwrap_or("(probe did not run)");
+            if got != want {
+                wrong.push(format!(
+                    "  {name}: corpus says {want:?}, realm answered {got:?}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the QuickJS realm no longer matches the committed corpus.\n{}\n\n\
+             If the realm CHANGED on purpose, update \
+             packages/shims/fixtures/script-realm-corpus.json — and update the \
+             `why` line too, because KnockPort's half of this corpus asserts \
+             the same file and a user reads those lines to know what their \
+             script can use.",
+            wrong.join("\n")
+        );
     }
 
     /// TR-463 — duplicate header names survive `/execute`.
