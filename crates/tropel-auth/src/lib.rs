@@ -15,6 +15,10 @@
 // module may expose items the embedder chooses not to call).
 #![cfg_attr(not(feature = "reqwest"), allow(dead_code))]
 
+/// Pure auth header builders — NOT behind the `reqwest` feature, so a
+/// browser embedder can reach them. See the module docs for why.
+pub mod builders;
+
 #[cfg(feature = "reqwest")]
 pub mod signers;
 
