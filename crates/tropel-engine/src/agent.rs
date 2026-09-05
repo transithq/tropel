@@ -757,8 +757,15 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let script_response: Option<tropel_sdk::types::Response> = payload
                 .get("response")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
-            match run_script_once(code, environment, script_request, script_response, sandbox_cfg)
-                .await
+            match run_script_once(
+                code,
+                environment,
+                script_request,
+                script_response,
+                sandbox_cfg,
+                state.client.clone(),
+            )
+            .await
             {
                 Ok(out) => respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await,
                 Err(why) => respond_raw_cors(sock, cors.as_deref(), 500, &error_body(&why)).await,
@@ -1447,6 +1454,7 @@ async fn run_script_once(
     request: Option<TropelRequest>,
     response: Option<tropel_sdk::types::Response>,
     sandbox: tropel_sandbox::config::SandboxConfig,
+    http: tropel_http::HttpClient,
 ) -> Result<serde_json::Value, String> {
     let mut ctx = tropel_js::JsContext::new(None, Some(std::time::Duration::from_secs(10)))
         .await
@@ -1502,7 +1510,23 @@ async fn run_script_once(
         // the test stage cannot run on this realm at all until it is seeded.
         st.response = response;
     }
-    tropel_sandbox::bindings::trp::TrpBridge::new(state.clone())
+    // TR-472: the bridge gets the agent's HTTP client, so `pm.sendRequest`
+    // actually sends.
+    //
+    // `TrpBridge::new` leaves `http_client: None`, and the send-request
+    // binding is still INSTALLED in that state — so `typeof pm.sendRequest`
+    // was "function" and calling it handed the script
+    // `Error: pm.sendRequest unavailable in this build (no HTTP client)`.
+    // Declared, present, and non-functional (invariant 4); at least it named
+    // itself rather than failing silently.
+    //
+    // Through `new_arc` rather than a plain `Arc::new`, which publishes this
+    // client's cookie jar against it (TR-233) — a plain Arc leaves the jar
+    // unreachable and the cookie surface degrades to a no-op shim.
+    let vu_client = tropel_http::VuCookieClient::new(http);
+    let driver_client: std::sync::Arc<dyn tropel_sdk::traits::DriverHttpClient> =
+        crate::vu_loop::DriverHttpClientImpl::new_arc(vu_client);
+    tropel_sandbox::bindings::trp::TrpBridge::with_http_client(state.clone(), driver_client)
         .install(&mut ctx)
         .map_err(|e| format!("bridge install: {e:?}"))?;
 
@@ -2484,6 +2508,7 @@ mod tests {
             None,
             Some(response),
             tropel_sandbox::config::SandboxConfig::default(),
+            test_http_client(),
         )
         .await
         .expect("the realm runs");
@@ -2537,6 +2562,7 @@ mod tests {
             Some(request),
             None,
             tropel_sandbox::config::SandboxConfig::default(),
+            test_http_client(),
         )
         .await
         .expect("the realm runs");
@@ -2577,6 +2603,15 @@ mod tests {
     /// AND that the stock install genuinely lacks it. Without the second, a
     /// future default of `kp` everywhere would make this test vacuous while
     /// still passing.
+    /// A real client for the script realm's `pm.sendRequest`. These tests do
+    /// not send anywhere; it exists so the bridge is built the way production
+    /// builds it, rather than in the `http_client: None` state that made
+    /// `pm.sendRequest` a declared-but-dead binding (TR-472).
+    fn test_http_client() -> tropel_http::HttpClient {
+        tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
+            .expect("test http client")
+    }
+
     #[tokio::test]
     async fn the_embedder_namespace_reaches_the_script_realm() {
         let code = "kp.environment.set('viaKp', '2');";
@@ -2590,6 +2625,7 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
+            test_http_client(),
         )
         .await
         .expect("the realm runs");
@@ -2612,6 +2648,7 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
+            test_http_client(),
         )
         .await
         .expect("the realm runs");
@@ -2623,6 +2660,56 @@ mod tests {
             err.contains("kp is not defined"),
             "the stock install must NOT bind kp — if it does, this test no \
              longer proves the preamble is what carries the namespace: {stock}"
+        );
+    }
+
+    /// TR-472: `pm.sendRequest` is WIRED, not merely present.
+    ///
+    /// The bridge was built with `TrpBridge::new`, which leaves
+    /// `http_client: None` — and the send-request binding is installed in
+    /// that state anyway. So `typeof pm.sendRequest` was "function" and
+    /// calling it handed the script
+    /// `Error: pm.sendRequest unavailable in this build (no HTTP client)`:
+    /// declared, present and dead (invariant 4).
+    ///
+    /// Hermetic on purpose. It sends to a port nothing listens on, so the
+    /// call MUST fail — the assertion is on WHICH failure. A connection
+    /// error proves the client was reached; the build-state error proves it
+    /// was not. Asserting success would need the network and would pin
+    /// somebody else's uptime instead of our wiring.
+    #[tokio::test]
+    async fn send_request_reaches_a_real_http_client() {
+        let out = run_script_once(
+            "pm.sendRequest('http://127.0.0.1:1/', function (err, res) {\
+               kp.environment.set('err', String(err));\
+               kp.environment.set('code', String(res && res.code));\
+             });",
+            HashMap::new(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            },
+            test_http_client(),
+        )
+        .await
+        .expect("the realm runs");
+
+        let err = out
+            .get("environment")
+            .and_then(|e| e.get("err"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !err.contains("unavailable in this build"),
+            "the send-request bridge must hold a real client, not be installed \
+             over `http_client: None`: {out}"
+        );
+        assert_ne!(
+            err, "null",
+            "port 1 cannot have answered — a success here means the call never \
+             left the realm: {out}"
         );
     }
 
@@ -2656,7 +2743,7 @@ mod tests {
                      kp.environment.set('fetch', typeof fetch);\
                      kp.environment.set('module', typeof module);\
                      kp.environment.set('viaFn', typeof Function('return this')().process);";
-        let out = run_script_once(probe, HashMap::new(), None, None, kp())
+        let out = run_script_once(probe, HashMap::new(), None, None, kp(), test_http_client())
             .await
             .expect("the realm runs");
         let env = out.get("environment").expect("the environment comes back");
@@ -2674,7 +2761,7 @@ mod tests {
             ("direct", "import('fs');"),
             ("indirect eval", "var e = eval; e(\"import\" + \"('fs')\");"),
         ] {
-            let result = run_script_once(code, HashMap::new(), None, None, kp()).await;
+            let result = run_script_once(code, HashMap::new(), None, None, kp(), test_http_client()).await;
             let refused = match &result {
                 Err(why) => why.contains("module"),
                 Ok(out) => out
@@ -2728,6 +2815,7 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
+            test_http_client(),
         )
             .await
             .expect("the realm runs");
