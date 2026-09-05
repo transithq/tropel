@@ -648,7 +648,10 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             let script_request: Option<TropelRequest> = payload
                 .get("request")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
-            match run_script_once(code, environment, script_request).await {
+            let script_response: Option<tropel_sdk::types::Response> = payload
+                .get("response")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            match run_script_once(code, environment, script_request, script_response).await {
                 Ok(out) => respond_raw_cors(sock, cors.as_deref(), 200, &out.to_string()).await,
                 Err(why) => respond_raw_cors(sock, cors.as_deref(), 500, &error_body(&why)).await,
             }
@@ -1334,6 +1337,7 @@ async fn run_script_once(
     code: &str,
     environment: HashMap<String, String>,
     request: Option<TropelRequest>,
+    response: Option<tropel_sdk::types::Response>,
 ) -> Result<serde_json::Value, String> {
     let mut ctx = tropel_js::JsContext::new(None, Some(std::time::Duration::from_secs(10)))
         .await
@@ -1375,6 +1379,11 @@ async fn run_script_once(
         // reached the wire — the silent no-op invariant #7 forbids. The state
         // has always carried the field; /script simply never filled it.
         st.request = request;
+        // TR-468: and the RESPONSE a test script asserts against. Without it
+        // `pm.response.code` was undefined and every `pm.test` that looked at
+        // the response silently failed on a response that was never there —
+        // the test stage cannot run on this realm at all until it is seeded.
+        st.response = response;
     }
     tropel_sandbox::bindings::trp::TrpBridge::new(state.clone())
         .install(&mut ctx)
@@ -2327,6 +2336,55 @@ mod tests {
         assert!(raw.starts_with("HTTP/1.1 401"), "{raw}");
     }
 
+    /// TR-468 — a test script sees the response it is asserting against.
+    ///
+    /// `st.response` was never seeded either, so `pm.response.code` was
+    /// undefined and every `pm.test` that looked at the response asserted
+    /// against nothing. The test stage could not run on this realm at all —
+    /// which is the stage KT-404 moves to it.
+    #[tokio::test]
+    async fn a_test_script_sees_the_response() {
+        let response = tropel_sdk::types::Response {
+            url: "https://api.test/v1".into(),
+            status_code: 201,
+            status_text: "Created".into(),
+            protocol: "HTTP/1.1".into(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{"id":7}"#.to_vec(),
+            text_cache: std::sync::OnceLock::new(),
+            json_cache: std::sync::OnceLock::new(),
+            response_time: std::time::Duration::from_millis(1),
+            timings: None,
+            cookies: Vec::new(),
+            size: 8,
+            redirects: Vec::new(),
+            request_body_size: 0,
+        };
+
+        let out = run_script_once(
+            "pm.test('status', () => pm.response.code === 201);\n             pm.test('body', () => pm.response.json().id === 7);",
+            HashMap::new(),
+            None,
+            Some(response),
+        )
+        .await
+        .expect("the realm runs");
+
+        assert!(
+            out.get("scriptError").is_some_and(|e| e.is_null()),
+            "the script must not error: {out}"
+        );
+        let tests = out["tests"].as_array().expect("tests array");
+        assert_eq!(tests.len(), 2, "both checks must have run: {out}");
+        for t in tests {
+            assert_eq!(
+                t["passed"], true,
+                "a check asserting against the seeded response must PASS — a \
+                 failing one means the response was not there: {t}"
+            );
+        }
+    }
+
     /// TR-467 — a pre-request script's header reaches the caller.
     ///
     /// Before this, `/script` never seeded `st.request`, so
@@ -2359,6 +2417,7 @@ mod tests {
             "pm.request.headers.add({ key: 'X-Trace', value: 'abc' });",
             HashMap::new(),
             Some(request),
+            None,
         )
         .await
         .expect("the realm runs");
@@ -2418,7 +2477,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let out = run_script_once(&script, HashMap::new(), None)
+        let out = run_script_once(&script, HashMap::new(), None, None)
             .await
             .expect("the realm runs");
 
