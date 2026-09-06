@@ -1000,6 +1000,40 @@ impl TrpBridge {
                 }),
             );
 
+            // ── Test results (TR-478) ──
+            //
+            // The checks THIS realm has recorded so far, as JSON. Lives here
+            // rather than in the agent so a LOAD RUN answers it too: the API
+            // client's prelude had `bru.getTestResults`, so a script calling
+            // it worked in the app and died on a bare ReferenceError
+            // everywhere else — the same split `fetch` had.
+            //
+            // Read at CALL time from the sample stream, which is the same
+            // place the run's own reporting reads them from. Keeping a second
+            // list in step with that one is the drift invariant 3 forbids.
+            let state_for_results = state.clone();
+            set_global!(
+                "__tropel_trp_get_test_results",
+                Func::from(move || -> String {
+                    let st = match state_for_results.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    let rows: Vec<serde_json::Value> = st
+                        .samples
+                        .iter()
+                        .filter(|s| s.metric == "checks")
+                        .map(|s| {
+                            serde_json::json!({
+                                "name": s.tags.get("check").unwrap_or_default(),
+                                "passed": s.value != 0.0,
+                            })
+                        })
+                        .collect();
+                    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+                }),
+            );
+
             // ── Test ──
             let state_clone = state.clone();
             set_global!(

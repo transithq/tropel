@@ -256,6 +256,52 @@
         }
     };
 
+    // ── bru.getTestResults / bru.getAssertionResults (TR-478) ───────────────
+    //
+    // These existed only in the API client's own prelude, so a script calling
+    // either worked in the app and died on a bare ReferenceError under a load
+    // run and on the agent tier — the same one-script-two-answers split
+    // `fetch` had before TR-475.
+    //
+    // They are NOT the same kind of thing, and only one of them can live here:
+    //
+    //   getTestResults      — the checks THIS realm recorded. Ours to answer.
+    //   getAssertionResults — evaluates the caller's DECLARATIVE assertion
+    //                         grammar (`status eq 200`, `jsonpath(...) exists`)
+    //                         through its operator table. That table is the
+    //                         API client's vocabulary and does not exist here;
+    //                         re-implementing it would be a second semantics
+    //                         for one language, which is the drift invariant 3
+    //                         forbids.
+    //
+    // So the second REFUSES BY NAME rather than returning an empty array. An
+    // empty array is an answer — "no assertions failed" — and would be a lie.
+    bru.getTestResults = function () {
+        if (typeof __tropel_trp_get_test_results !== 'function') {
+            throw new Error(
+                'bru.getTestResults is not available here: this realm records no test ' +
+                'results (tropel TR-478).'
+            );
+        }
+        var raw = __tropel_trp_get_test_results();
+        try {
+            return JSON.parse(raw) || [];
+        } catch (e) {
+            throw new Error('bru.getTestResults: the host answered with invalid JSON: ' + raw);
+        }
+    };
+
+    bru.getAssertionResults = function () {
+        throw new Error(
+            'bru.getAssertionResults is not available here. It evaluates the API ' +
+            'client\'s declarative assertion grammar through its operator table, which ' +
+            'this runtime does not have — and implementing a second copy of that ' +
+            'grammar is exactly the drift it exists to avoid. Use bru.getTestResults() ' +
+            'for the checks this realm recorded, or run the assertions on the caller ' +
+            'side (tropel TR-478).'
+        );
+    };
+
     // ── bru.cookies (TR-476) ────────────────────────────────────────────────
     //
     // The cookie jar surface. This shim shipped WITHOUT one for a long time —

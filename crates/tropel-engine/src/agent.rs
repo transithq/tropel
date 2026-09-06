@@ -3507,6 +3507,75 @@ mod tests {
         );
     }
 
+    /// TR-478: `bru.getTestResults` answers; `getAssertionResults` refuses.
+    ///
+    /// Both lived only in the API client's own prelude, so a script calling
+    /// either worked in the app and died on a bare ReferenceError here — the
+    /// same one-script-two-answers split `fetch` had before TR-475.
+    ///
+    /// Only ONE of them can live here, and the asymmetry is the point:
+    /// `getTestResults` reports what THIS realm recorded, which is ours to
+    /// answer. `getAssertionResults` evaluates the caller's declarative
+    /// assertion grammar through its operator table — a vocabulary this
+    /// runtime does not have, and re-implementing it would be a second
+    /// semantics for one language.
+    ///
+    /// So the second REFUSES BY NAME. An empty array would be an answer —
+    /// "nothing failed" — and would be a lie.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_results_answer_and_assertion_results_refuse() {
+        let out = run_script_once(
+            "kp.test('first', function () {});\
+             kp.test('second', function () { throw new Error('no'); });\
+             var r = bru.getTestResults();\
+             kp.environment.set('count', String(r.length));\
+             kp.environment.set('shape', r.map(function (x) { return x.name + ':' + x.passed; }).join(','));",
+            ScriptScopes::default(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            },
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+        )
+        .await
+        .expect("the realm runs");
+
+        let env = out.get("environment").expect("environment comes back");
+        assert_eq!(
+            env.get("count").and_then(|v| v.as_str()),
+            Some("2"),
+            "both checks must be reported, not just the passing one: {out}"
+        );
+        assert_eq!(
+            env.get("shape").and_then(|v| v.as_str()),
+            Some("first:true,second:false"),
+            "each result must carry its own name AND outcome — a count alone \
+             cannot tell a passing suite from a failing one: {out}"
+        );
+
+        let refused = run_script_once(
+            "bru.getAssertionResults();",
+            ScriptScopes::default(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig::default(),
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+        )
+        .await
+        .expect("the realm runs");
+        let err = refused
+            .get("scriptError")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        assert!(
+            err.contains("not available here"),
+            "it must refuse by NAME rather than return an empty list, which would \
+             read as \"no assertions failed\": {refused}"
+        );
+    }
+
     /// TR-476: the cookie jar round-trips, and refuses when absent.
     ///
     /// Three properties in one, because they only mean anything together:
