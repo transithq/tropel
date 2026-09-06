@@ -246,6 +246,84 @@ fn find<'a>(blocks: &'a [Block], name: &str) -> Option<&'a Block> {
 }
 
 /// Enabled + disabled pairs as `[{name, value, enabled}]`.
+/// A Bruno `assert` pair → one JS expression, evaluated in the test realm with
+/// `response` in scope.
+///
+/// Bruno writes assertions as `res.status: eq 200` — a path, an operator and an
+/// argument. `ScenarioItem.assertions` carries expressions, so the operator is
+/// resolved HERE rather than by each embedder: an operator table copied into
+/// two languages is the second implementation invariant #3 forbids, and it
+/// would drift silently because both sides would still "work".
+///
+/// An unknown operator is an ERROR, not a skip. Importing an assertion that
+/// can never run looks exactly like importing one that passes.
+fn assertion_expression(key: &str, raw_value: &str) -> Result<String, String> {
+    let expr = match key.strip_prefix("res.") {
+        Some(rest) => format!("response.{rest}"),
+        None => key.to_string(),
+    };
+    let trimmed = raw_value.trim();
+    let (op, arg) = match trimmed.split_once(char::is_whitespace) {
+        Some((o, a)) => (o, a.trim()),
+        None => ("eq", trimmed),
+    };
+    let lit = assertion_literal(arg);
+    let text = serde_json::to_string(arg).unwrap_or_else(|_| format!("{arg:?}"));
+    let list = || {
+        let inner: Vec<String> = arg.split(',').map(assertion_literal).collect();
+        format!("[{}]", inner.join(", "))
+    };
+    Ok(match op {
+        "eq" => format!("{expr} === {lit}"),
+        "neq" => format!("{expr} !== {lit}"),
+        "gt" => format!("{expr} > {lit}"),
+        "gte" => format!("{expr} >= {lit}"),
+        "lt" => format!("{expr} < {lit}"),
+        "lte" => format!("{expr} <= {lit}"),
+        "in" => format!("{}.includes({expr})", list()),
+        "notIn" => format!("!{}.includes({expr})", list()),
+        "contains" => format!("{expr}.includes({text})"),
+        "notContains" => format!("!{expr}.includes({text})"),
+        "startsWith" => format!("{expr}.startsWith({text})"),
+        "endsWith" => format!("{expr}.endsWith({text})"),
+        "matches" => format!("RegExp({text}).test({expr})"),
+        "minLength" => format!("{expr}.length >= {}", arg.trim()),
+        "maxLength" => format!("{expr}.length <= {}", arg.trim()),
+        "length" => format!("{expr}.length === {}", arg.trim()),
+        "isNumber" => format!("typeof {expr} === \"number\""),
+        "isString" => format!("typeof {expr} === \"string\""),
+        "isBoolean" => format!("typeof {expr} === \"boolean\""),
+        "isNull" => format!("{expr} === null"),
+        "isUndefined" => format!("{expr} === undefined"),
+        "isTruthy" => format!("!!{expr}"),
+        "isFalsy" => format!("!{expr}"),
+        "isEmpty" => format!("({expr} == null || String({expr}).length === 0)"),
+        "isNotEmpty" => format!("!({expr} == null || String({expr}).length === 0)"),
+        other => {
+            return Err(format!(
+                ".bru assert operator {other:?} ({key}: {raw_value}) has no Scenario equivalent — the document is not imported rather than silently dropping the assertion"
+            ))
+        }
+    })
+}
+
+/// A bare number, boolean, `null` or `undefined` stays literal; anything else
+/// becomes a JS string, so `eq 200` compares to the number and `eq ok` to the
+/// text.
+fn assertion_literal(value: &str) -> String {
+    let v = value.trim();
+    if !v.is_empty()
+        && v.parse::<f64>().is_ok()
+        && v.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+    {
+        return v.to_string();
+    }
+    if matches!(v, "true" | "false" | "null" | "undefined") {
+        return v.to_string();
+    }
+    serde_json::to_string(v).unwrap_or_else(|_| format!("{v:?}"))
+}
+
 fn pairs_to_kv(block: &Block) -> Value {
     Value::Array(
         block
@@ -322,6 +400,26 @@ pub fn bru_text_to_json(text: &str, notes: &mut Vec<String>) -> Result<Value, St
         request.insert("body".into(), body);
     }
 
+    // Request-local variables and per-request settings. Both used to be listed
+    // by `note_dropped_blocks` as having "no field for the .bru block" — true
+    // of `Request`, which is what to SEND, and no longer true of
+    // `ScenarioItem.authoring`, which is what the user wrote. Carried in the
+    // export shape so the mapper reads them like any other block.
+    if let Some(v) = find(&blocks, "vars:pre-request") {
+        request.insert("vars".into(), pairs_to_kv(v));
+    }
+    if let Some(s) = find(&blocks, "settings") {
+        request.insert(
+            "settings".into(),
+            Value::Object(
+                s.pairs
+                    .iter()
+                    .map(|p| (p.key.clone(), json!(p.value)))
+                    .collect::<Map<String, Value>>(),
+            ),
+        );
+    }
+
     let mut script = Map::new();
     if let Some(b) = find(&blocks, "script:pre-request") {
         script.insert("req".into(), json!(b.text));
@@ -333,12 +431,28 @@ pub fn bru_text_to_json(text: &str, notes: &mut Vec<String>) -> Result<Value, St
         request.insert("script".into(), Value::Object(script));
     }
 
+    // The `assert` block → expressions on the ITEM, beside the scripts.
+    // A DISABLED assertion is not imported at all: `~` there means "do not
+    // run this", and carrying it as an enabled expression would invent a
+    // check the user had switched off.
+    let mut assertions: Vec<String> = Vec::new();
+    if let Some(b) = find(&blocks, "assert") {
+        for pair in b.pairs.iter().filter(|p| p.enabled) {
+            assertions.push(assertion_expression(&pair.key, &pair.value)?);
+        }
+    }
+
     note_dropped_blocks(&blocks, &name, notes);
 
     Ok(json!({
         "version": "1",
         "name": name,
-        "items": [{ "type": "http", "name": name, "request": Value::Object(request) }],
+        "items": [{
+            "type": "http",
+            "name": name,
+            "request": Value::Object(request),
+            "assertions": assertions,
+        }],
     }))
 }
 
@@ -480,10 +594,12 @@ fn build_body(
 fn note_dropped_blocks(blocks: &[Block], name: &str, notes: &mut Vec<String>) {
     for b in blocks {
         let dropped = match b.name.as_str() {
-            "assert" => "assertions",
-            "vars:pre-request" | "vars:post-response" => "request-local variables",
+            // `vars:pre-request` and `settings` are no longer here: they now
+            // ride on `ScenarioItem.authoring`. `vars:post-response` still is —
+            // it has no home, and claiming otherwise would be worse than the
+            // note, since a note is how a user finds out at all.
+            "vars:post-response" => "post-response variables",
             "tests" => "the tests block",
-            "settings" => "request settings",
             _ => continue,
         };
         if b.pairs.is_empty() && b.text.trim().is_empty() {

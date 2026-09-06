@@ -259,6 +259,7 @@ fn build_items(
             "request_group" => {
                 let id = r.id.clone().unwrap_or_default();
                 out.push(ScenarioItem {
+                    authoring: None,
                     name: r.name.clone().unwrap_or_else(|| "Folder".into()),
                     id: None,
                     request: None,
@@ -337,6 +338,7 @@ fn request_to_item(r: &InsomniaResource) -> Result<ScenarioItem> {
     let auth = r.authentication.as_ref().and_then(build_auth);
 
     Ok(ScenarioItem {
+        authoring: None,
         name: r
             .name
             .clone()

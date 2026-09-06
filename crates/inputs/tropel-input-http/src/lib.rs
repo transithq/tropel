@@ -270,6 +270,7 @@ fn block_to_item(
     let item_name = name_hint.unwrap_or_else(|| generate_item_name(&url, index));
 
     Ok(Some(ScenarioItem {
+        authoring: None,
         name: item_name,
         id: None,
         request: Some(Request {
