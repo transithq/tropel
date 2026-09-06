@@ -250,6 +250,7 @@ mod tests {
                 schema: None,
             },
             items: vec![ScenarioItem {
+                authoring: None,
                 name: "ping".into(),
                 id: None,
                 request: Some(tropel_sdk::types::Request {

@@ -137,6 +137,7 @@ fn build_scenario_from_source(js_code: &str, name: &str) -> Result<Scenario> {
             schema: None,
         },
         items: vec![ScenarioItem {
+            authoring: None,
             id: None,
             name: name.to_string(),
             request: None,

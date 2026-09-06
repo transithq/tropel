@@ -197,6 +197,9 @@ fn convert_items(
                     continue;
                 }
                 let scenario_item = ScenarioItem {
+                    // Postman's own model has no disabled-entry or
+                    // request-vars concept to carry here.
+                    authoring: None,
                     id: folder.id.clone(),
                     name: folder.name.clone().unwrap_or_default(),
                     request: None,
@@ -245,6 +248,9 @@ fn convert_request_item(
     events.extend(req.event.iter().cloned());
 
     ScenarioItem {
+        // Postman's own model has no disabled-entry or
+        // request-vars concept to carry here.
+        authoring: None,
         id: req.id.clone(),
         name: req.name.clone().unwrap_or_default(),
         request: Some(request),

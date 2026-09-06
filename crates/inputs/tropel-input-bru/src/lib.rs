@@ -18,8 +18,11 @@
 //! | item with `type: "folder"` | nested `ScenarioItem` (folders) |
 //! | item with `type: "http-request"` or `"http"` (export spelling) | `ScenarioItem.request` |
 //! | `request.url` / `request.method` | `request.url` / `request.method` |
-//! | `request.headers` (disabled dropped) | `request.headers` |
-//! | `request.params` (`type: "query"`, disabled dropped) | `request.query_params` |
+//! | `request.headers` (enabled only) | `request.headers` |
+//! | `request.params` (`type: "query"`, enabled only) | `request.query_params` |
+//! | `request.headers` / `params` — ALL of them, disabled included | `ScenarioItem.authoring.headers` / `.query` |
+//! | `vars:pre-request` | `ScenarioItem.authoring.vars` |
+//! | the `settings` block | `ScenarioItem.authoring.settings` |
 //! | `request.auth` | `request.auth` |
 //! | `request.body` (by `mode`) | `request.body` |
 //! | `request.script` pre/post | `ScenarioItem.prerequest` / `test` |
@@ -41,6 +44,7 @@ use std::collections::HashMap;
 use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, FormDataPart, Method, Request};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{AuthoredEntry, AuthoredSettings, RequestAuthoring};
 use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
 // ── Bruno collection JSON model (minimal — only what we need) ────
@@ -69,6 +73,11 @@ struct BruItem {
     request: Option<BruRequest>,
     #[serde(default)]
     items: Vec<BruItem>,
+    /// Already-resolved assertion expressions. The `.bru` text path turns
+    /// Bruno's `res.status: eq 200` into one here; Bruno's JSON export has no
+    /// equivalent field, so it stays empty there.
+    #[serde(default)]
+    assertions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +96,15 @@ struct BruRequest {
     body: Option<BruBody>,
     #[serde(default)]
     script: Option<BruScript>,
+    /// `vars:pre-request` — request-local variables. Authoring state: the
+    /// runtime resolves variables from the scenario's own environment, so
+    /// these have no `Request` field and ride on `authoring` instead.
+    #[serde(default)]
+    vars: Vec<BruKeyValue>,
+    /// The `settings` block, as raw strings — Bruno writes `timeout: 3000`
+    /// and `encodeUrl: false` untyped.
+    #[serde(default)]
+    settings: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,6 +343,7 @@ fn build_items(items: &[BruItem], notes: &mut Vec<String>) -> Vec<ScenarioItem> 
     for item in items {
         match item.r#type.as_deref() {
             Some("folder") => out.push(ScenarioItem {
+                authoring: None,
                 name: item.name.clone().unwrap_or_else(|| "Folder".into()),
                 id: None,
                 request: None,
@@ -373,6 +392,28 @@ fn build_items(items: &[BruItem], notes: &mut Vec<String>) -> Vec<ScenarioItem> 
 }
 
 /// Map a single Bruno http-request item to a ScenarioItem.
+/// Bruno's `settings` block, which is untyped text, into typed authoring state.
+///
+/// Unparseable values are DROPPED rather than defaulted: `timeout: soon` is a
+/// mistake in the user's file, and inventing `0` for it would silently change
+/// what the request means.
+fn build_settings(raw: &HashMap<String, String>) -> Option<AuthoredSettings> {
+    if raw.is_empty() {
+        return None;
+    }
+    let flag = |k: &str| raw.get(k).and_then(|v| v.parse::<bool>().ok());
+    let settings = AuthoredSettings {
+        timeout: raw.get("timeout").and_then(|v| v.parse::<u64>().ok()),
+        encode_url: flag("encodeUrl"),
+        follow_redirects: flag("followRedirects"),
+        max_redirects: raw.get("maxRedirects").and_then(|v| v.parse::<u32>().ok()),
+    };
+    if settings == AuthoredSettings::default() {
+        return None;
+    }
+    Some(settings)
+}
+
 fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
     let request = item.request.as_ref().ok_or_else(|| {
         TropelError::Parse(format!(
@@ -427,6 +468,86 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
         }
     }
 
+    // ── What the user WROTE ─────────────────────────────────────────────────
+    //
+    // Everything above builds what gets SENT, and drops what does not: a
+    // `~name:` header, a disabled parameter, a var block with no runtime
+    // meaning. An API client has to be able to show the user that header and
+    // let them switch it back on, so it is carried beside the request rather
+    // than folded into it.
+    //
+    // The URL is left exactly as written. Splitting `?page=2` out of it here
+    // would change what the RUNTIME sends — the HTTP client re-appends
+    // `query_params`, so moving the pair across would only be neutral if every
+    // consumer agreed, and one that did not would silently drop the query.
+    // The authored list carries both the inline pairs and the block's, and the
+    // reader decides how to present them.
+    let mut query: Vec<AuthoredEntry> = Vec::new();
+    if let Some((_, qs)) = request.url.split_once('?') {
+        for pair in qs.split('&').filter(|s| !s.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            query.push(AuthoredEntry {
+                key: k.to_string(),
+                value: v.to_string(),
+                enabled: true,
+            });
+        }
+    }
+    query.extend(
+        request
+            .params
+            .iter()
+            .filter(|p| p.param_type.as_deref() == Some("query"))
+            .filter_map(|p| {
+                Some(AuthoredEntry {
+                    key: p.name.clone()?,
+                    value: p.value.clone().unwrap_or_default(),
+                    enabled: p.enabled.unwrap_or(true),
+                })
+            }),
+    );
+
+    let authored_headers: Vec<AuthoredEntry> = request
+        .headers
+        .iter()
+        .filter_map(|h| {
+            Some(AuthoredEntry {
+                key: h.name.clone()?,
+                value: h.value.clone().unwrap_or_default(),
+                enabled: h.enabled.unwrap_or(true),
+            })
+        })
+        .collect();
+
+    let vars: Vec<AuthoredEntry> = request
+        .vars
+        .iter()
+        .filter_map(|v| {
+            Some(AuthoredEntry {
+                key: v.name.clone()?,
+                value: v.value.clone().unwrap_or_default(),
+                enabled: v.enabled.unwrap_or(true),
+            })
+        })
+        .collect();
+
+    let settings = build_settings(&request.settings);
+
+    let authoring = if authored_headers.is_empty()
+        && query.is_empty()
+        && vars.is_empty()
+        && settings.is_none()
+    {
+        None
+    } else {
+        Some(RequestAuthoring {
+            headers: authored_headers,
+            query,
+            vars,
+            settings,
+        })
+    };
+
     let body = request.body.as_ref().and_then(build_body);
     let auth = request.auth.as_ref().and_then(build_auth);
 
@@ -446,6 +567,7 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
         .unwrap_or_default();
 
     Ok(ScenarioItem {
+        authoring,
         name: item
             .name
             .clone()
@@ -467,7 +589,7 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
         }),
         prerequest,
         test,
-        assertions: vec![],
+        assertions: item.assertions.clone(),
         items: vec![],
     })
 }
@@ -1284,16 +1406,50 @@ mod bru_text_format {
     }
 
     #[test]
-    fn dropped_blocks_are_reported_rather_than_silently_lost() {
-        // GET_USER carries an `assert` block and a `docs` block. The Scenario
-        // model has no field for assertions, and "the import worked" must not
-        // look identical to "the import worked and dropped your assertions".
+    fn assertions_are_carried_now_rather_than_reported_as_dropped() {
+        // GET_USER carries an `assert` block. It used to be reported as
+        // dropped, because `Scenario` had no field for it — untrue since the
+        // expressions land on `ScenarioItem.assertions`. A note claiming a
+        // loss that did not happen is its own defect: it teaches the reader to
+        // ignore the notes.
         let s = BruInputAdapter.parse(GET_USER.as_bytes()).expect("parses");
         let notes = format!("{:?}", s.conversion_notes);
         assert!(
-            notes.contains("assertions"),
-            "the dropped assert block must be reported: {notes}"
+            !notes.contains("assertions"),
+            "assert is carried now, so it must not be reported as dropped: {notes}"
         );
+        assert_eq!(
+            s.items[0].assertions,
+            vec!["response.status === 200".to_string()],
+            "res.status: eq 200 → a test-realm expression"
+        );
+    }
+
+    #[test]
+    fn a_disabled_assertion_is_not_imported() {
+        // `~` on an assert pair means "do not run this". Importing it as an
+        // enabled expression would invent a check the user switched off.
+        let doc = "meta {\n  name: A\n}\n\nget {\n  url: https://e.com\n}\n\nassert {\n  ~res.status: eq 200\n  res.body.ok: eq true\n}\n";
+        let s = BruInputAdapter.parse(doc.as_bytes()).expect("parses");
+        assert_eq!(s.items[0].assertions, vec!["response.body.ok === true".to_string()]);
+    }
+
+    #[test]
+    fn an_unknown_assert_operator_fails_the_import() {
+        // Not a skip: an assertion that can never run looks exactly like one
+        // that passes.
+        let doc = "meta {\n  name: A\n}\n\nget {\n  url: https://e.com\n}\n\nassert {\n  res.status: teleports 200\n}\n";
+        let err = BruInputAdapter.parse(doc.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("teleports"), "{err}");
+    }
+
+    #[test]
+    fn blocks_with_no_home_are_still_reported() {
+        // The channel must keep working for what genuinely has nowhere to go.
+        let doc = "meta {\n  name: A\n}\n\nget {\n  url: https://e.com\n}\n\nvars:post-response {\n  token: res.body.t\n}\n";
+        let s = BruInputAdapter.parse(doc.as_bytes()).expect("parses");
+        let notes = format!("{:?}", s.conversion_notes);
+        assert!(notes.contains("post-response"), "{notes}");
     }
 
     #[test]
@@ -1312,5 +1468,88 @@ mod bru_text_format {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no method block"), "{err}");
+    }
+
+    // ── Authoring fidelity (what the user WROTE) ────────────────────────────
+    //
+    // The runtime `Request` deliberately carries only what gets sent. These
+    // pin the other half: an API client has to show a disabled header and let
+    // the user switch it back on, and before `authoring` existed the importer
+    // recorded these blocks in `conversion_notes` as having nowhere to go.
+
+    fn only_item(src: &str) -> ScenarioItem {
+        let s = BruInputAdapter.parse(src.as_bytes()).unwrap();
+        s.items.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn authoring_keeps_the_disabled_header_the_request_drops() {
+        let item = only_item(GET_USER);
+        let a = item.authoring.as_ref().expect("authoring");
+
+        // What is SENT still excludes it — this is not a behaviour change.
+        let req = item.request.as_ref().unwrap();
+        assert!(
+            !req.headers.iter().any(|(k, _)| k == "x-draft"),
+            "a ~disabled header must never reach the wire: {:?}",
+            req.headers
+        );
+
+        let draft = a.headers.iter().find(|e| e.key == "x-draft").expect("~x-draft");
+        assert_eq!(draft.value, "true");
+        assert!(!draft.enabled, "the ~ prefix means disabled, not absent");
+        let accept = a.headers.iter().find(|e| e.key == "accept").expect("accept");
+        assert!(accept.enabled);
+    }
+
+    #[test]
+    fn authoring_query_carries_the_inline_url_pairs_and_the_block() {
+        let item = only_item(GET_USER);
+        let a = item.authoring.as_ref().expect("authoring");
+
+        // `?page=2` is written inline in the url; `limit` in the query block.
+        // The authored view is BOTH, in that order.
+        let keys: Vec<&str> = a.query.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["page", "limit"]);
+        assert_eq!(a.query[0].value, "2");
+        assert_eq!(a.query[1].value, "10");
+
+        // The url is left exactly as written: moving the pair out would change
+        // what the runtime sends, because the client re-appends query_params.
+        let req = item.request.as_ref().unwrap();
+        assert!(req.url.ends_with("?page=2"), "{}", req.url);
+    }
+
+    #[test]
+    fn authoring_carries_pre_request_vars_and_settings() {
+        let item = only_item(POST_LOGIN);
+        let a = item.authoring.as_ref().expect("authoring");
+
+        let vars: Vec<(&str, &str)> = a.vars.iter().map(|v| (v.key.as_str(), v.value.as_str())).collect();
+        // The `@` marker is Bruno's "request-local" prefix and is not part of
+        // the name.
+        assert_eq!(vars, vec![("requestId", "req-1"), ("baseUrl", "https://api.example.com")]);
+
+        let st = a.settings.as_ref().expect("settings");
+        assert_eq!(st.timeout, Some(3000));
+        assert_eq!(st.encode_url, Some(false));
+    }
+
+    #[test]
+    fn the_dropped_note_is_gone_for_blocks_that_now_have_a_home() {
+        let s = BruInputAdapter.parse(POST_LOGIN.as_bytes()).unwrap();
+        let notes = s.conversion_notes.join("\n");
+        assert!(
+            !notes.contains("request-local variables") && !notes.contains("request settings"),
+            "these are carried now, so claiming they were dropped is a lie: {notes}"
+        );
+    }
+
+    #[test]
+    fn a_request_with_nothing_authored_carries_no_sidecar() {
+        // Absent, not an empty object: every existing Scenario must serialize
+        // byte-identically to before.
+        let item = only_item("meta {\n  name: Bare\n}\n\nget {\n  url: https://example.com\n}\n");
+        assert!(item.authoring.is_none(), "{:?}", item.authoring);
     }
 }
