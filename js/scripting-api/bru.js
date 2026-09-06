@@ -256,6 +256,97 @@
         }
     };
 
+    // ── bru.cookies (TR-476) ────────────────────────────────────────────────
+    //
+    // The cookie jar surface. This shim shipped WITHOUT one for a long time —
+    // tropel's own cookie handling lives in reqwest::Jar, load-gen only — so
+    // every embedder that wanted `bru.cookies` grew its own copy. This is the
+    // canonical one; an embedder carrying a duplicate should drop it rather
+    // than keep two implementations of one API (invariant 3).
+    //
+    // Every method is guarded on the host bindings and REFUSES BY NAME
+    // without them, rather than reading as an empty jar — "no cookies" and
+    // "no jar" must not look the same to a script.
+    //
+    // The dual callback/promise form is deliberate: Bruno's cookie methods
+    // are async, but the jar operations underneath are synchronous. A bare
+    // call returns the value directly; a trailing function gets
+    // callback(null, result) AND a settled promise, so `await` works either
+    // way and neither calling style is wrong.
+    bru.cookies = (function () {
+        function need() {
+            if (typeof __tropel_cookies_all !== 'function') {
+                throw new Error(
+                    'bru.cookies is not available here: this realm was built without a ' +
+                    'cookie jar. The caller must supply one (tropel TR-476).'
+                );
+            }
+        }
+        function current() {
+            return typeof __tropel_cookies_current_url === 'function'
+                ? __tropel_cookies_current_url()
+                : '';
+        }
+        function all() {
+            need();
+            // JSON across the boundary, not a marshalled object: a cookie's
+            // `secure`/`httpOnly` booleans and its expiry survive as
+            // themselves rather than becoming the strings "true"/"false".
+            var raw = __tropel_cookies_all(current());
+            if (!raw) return [];
+            try {
+                return JSON.parse(raw) || [];
+            } catch (e) {
+                throw new Error('bru.cookies: the host answered with invalid JSON: ' + raw);
+            }
+        }
+        function dual(fn) {
+            return function () {
+                var result = fn.apply(null, arguments);
+                var args = Array.prototype.slice.call(arguments);
+                if (args.length > 0 && typeof args[args.length - 1] === 'function') {
+                    var cb = args[args.length - 1];
+                    Promise.resolve(result).then(
+                        function (v) { cb(null, v); },
+                        function (e) { cb(e); }
+                    );
+                    return Promise.resolve(result);
+                }
+                return result;
+            };
+        }
+        return {
+            get: dual(function (name) {
+                var a = all();
+                for (var i = 0; i < a.length; i++) if (a[i].key === name) return a[i].value;
+                return undefined;
+            }),
+            one: dual(function (name) {
+                var a = all();
+                for (var i = 0; i < a.length; i++) if (a[i].key === name) return a[i];
+                return undefined;
+            }),
+            all: dual(function () { return all().slice(); }),
+            idx: dual(function (i) { return all()[i]; }),
+            count: dual(function () { return all().length; }),
+            has: dual(function (name, value) {
+                var a = all();
+                for (var i = 0; i < a.length; i++) {
+                    if (a[i].key === name && (arguments.length < 2 || a[i].value === value)) {
+                        return true;
+                    }
+                }
+                return false;
+            }),
+            add: dual(function (cookieObj) { need(); __tropel_cookies_set(current(), JSON.stringify(cookieObj)); }),
+            upsert: dual(function (cookieObj) { need(); __tropel_cookies_set(current(), JSON.stringify(cookieObj)); }),
+            remove: dual(function (name) { need(); __tropel_cookies_delete(current(), name); }),
+            delete: dual(function (name) { need(); __tropel_cookies_delete(current(), name); }),
+            clear: dual(function () { need(); __tropel_cookies_clear(current()); }),
+            jar: function () { return bru.cookies; }
+        };
+    })();
+
     // ── bru.runRequest (TR-474) ─────────────────────────────────────────────
     //
     // Runs ANOTHER request from the caller's collection and returns its

@@ -270,9 +270,16 @@ fn format_shims(format: &str) -> Option<&'static [Shim]> {
         // `_.map`, `CryptoJS.MD5` are all documented Postman sandbox
         // globals. Only Bruno's `bru`/`req`/`res` is unreachable — a
         // Postman collection has no syntax that produces it.
-        "postman" => &[DeepEqual, K6Core, Pm, Chai, Lodash, CryptoJs, Exec],
+        //
+        // TR-475: `Fetch` belongs here for the same reason Chai and Lodash
+        // do — a Postman script is arbitrary JS, and `fetch` is how arbitrary
+        // JS makes a request. Leaving it out made a pre-script using `fetch`
+        // work through the API client's agent (whose bundle is the default)
+        // and die on a bare ReferenceError under a Postman LOAD run. One
+        // script, two answers, decided by which bundle the format picked.
+        "postman" => &[DeepEqual, K6Core, Pm, Chai, Lodash, CryptoJs, Exec, Fetch],
         // Bruno scripts reach the same library surface plus `bru`.
-        "bru" => &[DeepEqual, K6Core, Pm, Chai, Lodash, CryptoJs, Exec, Bru],
+        "bru" => &[DeepEqual, K6Core, Pm, Chai, Lodash, CryptoJs, Exec, Bru, Fetch],
         // The k6 InputAdapter fallback (used when the k6 Driver is not
         // registered) wraps the transpiled script as one item's `test`.
         // Arbitrary JS again — minus Bruno's API.
@@ -812,6 +819,39 @@ mod tests {
     ///
     /// Fails on pre-fix code: `ShimBundle::from_script` (the only selector
     /// that existed) appended `bru-shim` unconditionally, for every input.
+    /// TR-475: EVERY format that runs user scripts can call `fetch`.
+    ///
+    /// The bundles are narrowed per format, and `fetch` was added only to the
+    /// default one. So `await fetch(...)` in a pre-script worked through the
+    /// API client's agent and under a k6 run (both take the default bundle),
+    /// and died on `fetch is not defined` under a Postman or Bruno LOAD run.
+    /// One script, two answers, decided by which bundle the format picked —
+    /// and nothing said so, because a narrowed bundle looks deliberate.
+    ///
+    /// Measured, not reasoned: a real `tropel run` over a Postman collection
+    /// whose pre-script fetches printed `FETCH_FAIL fetch is not defined`
+    /// before this, and `FETCH_OK status=200` after.
+    #[test]
+    fn every_scripted_format_bundle_carries_fetch() {
+        for format in ["postman", "bru"] {
+            let shims = format_shims(format)
+                .unwrap_or_else(|| panic!("{format} should have a narrowed bundle"));
+            assert!(
+                shims.contains(&Shim::Fetch),
+                "`{format}` scripts are arbitrary JS, and `fetch` is how arbitrary JS \
+                 makes a request — leaving it out makes the same script behave \
+                 differently here than under the default bundle: {shims:?}"
+            );
+        }
+        // `k6` returns None on purpose (it takes the FULL default bundle), so
+        // its coverage comes from Shim::ALL rather than from this table.
+        assert!(
+            format_shims("k6").is_none(),
+            "k6 takes the full default bundle; if that changes, it needs Fetch too"
+        );
+        assert!(Shim::ALL.contains(&Shim::Fetch), "the default bundle carries fetch");
+    }
+
     #[test]
     fn postman_bundle_excludes_bru_and_keeps_the_assertion_libraries() {
         let collection = br#"{"info":{"schema":"getpostman.com/collection"},
