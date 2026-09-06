@@ -86,6 +86,7 @@ const DEFAULT_ORDER = [
   ["cryptojs-shim", "js/cryptojs-shim/cryptojs.js"],
   ["exec-shim", "js/exec/exec.js"],
   ["bru-shim", "js/scripting-api/bru.js"],
+  ["fetch-shim", "js/scripting-api/fetch.js"],
 ];
 const K6_ORDER = [
   ["k6-shim", "js/k6-shim/k6-shim.js"],

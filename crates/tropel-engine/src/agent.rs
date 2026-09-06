@@ -3133,6 +3133,54 @@ mod tests {
         );
     }
 
+    /// TR-475: `fetch` exists in the realm and rides the SAME client.
+    ///
+    /// QuickJS ships none, so a script written the way every modern one is
+    /// written — `await fetch(...)` — died on a bare ReferenceError, while
+    /// the identical call through `pm.sendRequest` worked. Two spellings of
+    /// one capability, one of which was a crash.
+    ///
+    /// Hermetic, like the send-request test: it fetches a port nothing
+    /// listens on, so the call MUST fail, and asserts WHICH failure. A
+    /// connection error proves the binding reached the client; "not
+    /// available here" proves it did not.
+    #[tokio::test]
+    async fn fetch_is_bound_to_the_same_host_client() {
+        let out = run_script_once(
+            "(async function () {\
+               try {\
+                 var r = await fetch('http://127.0.0.1:1/');\
+                 kp.environment.set('status', String(r.status));\
+               } catch (e) {\
+                 kp.environment.set('err', String(e && e.message));\
+               }\
+             })();",
+            ScriptScopes::default(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            },
+            test_http_client(),
+            None,
+        )
+        .await
+        .expect("the realm runs");
+
+        let env = out.get("environment").expect("environment comes back");
+        let err = env.get("err").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            !err.contains("not available here"),
+            "fetch must be bound to a real client, not refuse for lack of one: {out}"
+        );
+        assert!(
+            !err.is_empty() || env.get("status").is_some(),
+            "the call must have gone somewhere — neither a result nor an error \
+             means `fetch` never ran: {out}"
+        );
+    }
+
     /// TR-473: all FOUR scopes reach the realm and come back.
     ///
     /// `/script` carried only `environment`. The realm has always had four
@@ -3273,16 +3321,25 @@ mod tests {
         // Host capabilities a script must not be able to name. Read back
         // through the environment rather than asserted on a throw, so a probe
         // that never ran cannot be mistaken for a probe that found nothing.
+        // TR-475 removed `fetch` from this list, deliberately. It is now a
+        // BOUND capability — the same audited host client `pm.sendRequest`
+        // already rode — not an ambient one the realm happened to expose.
+        // The realm was never network-isolated; `pm.sendRequest` predates
+        // this test. Keeping `fetch` here would have asserted an isolation
+        // the realm did not have, which is worse than not asserting it.
+        //
+        // What remains is the set that would reach the HOST PROCESS: the
+        // module loader, `process`, and the Function-constructor route to a
+        // global. Those are the escape; a guarded HTTP call is not.
         let probe = "kp.environment.set('process', typeof process);\
                      kp.environment.set('require', typeof require);\
-                     kp.environment.set('fetch', typeof fetch);\
                      kp.environment.set('module', typeof module);\
                      kp.environment.set('viaFn', typeof Function('return this')().process);";
         let out = run_script_once(probe, ScriptScopes::default(), None, None, kp(), test_http_client(), None)
             .await
             .expect("the realm runs");
         let env = out.get("environment").expect("the environment comes back");
-        for name in ["process", "require", "fetch", "module", "viaFn"] {
+        for name in ["process", "require", "module", "viaFn"] {
             assert_eq!(
                 env.get(name).and_then(|v| v.as_str()),
                 Some("undefined"),
