@@ -28,6 +28,74 @@ use tropel_sdk::TropelError;
 const RATE_LIMIT_PER_SEC: u64 = 200;
 
 /// Shared agent state: the auth token and the engine's HTTP client.
+/// The per-script cookie jar (TR-476).
+///
+/// A SNAPSHOT, deliberately, not the authority. The caller owns the real jar;
+/// it seeds this one for the duration of the script and replays the recorded
+/// ops afterwards. That keeps one jar authoritative instead of two that drift,
+/// and it is why reads here need only be good enough to serve the script that
+/// is running — not to re-implement the caller's jar.
+#[derive(Default)]
+struct ScriptCookies {
+    jar: std::sync::Mutex<Vec<serde_json::Value>>,
+    /// What the script DID, in order. Returned as `cookieOps` so the caller
+    /// can apply the same changes to the jar that outlives the script.
+    ops: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+impl ScriptCookies {
+    fn lock_jar(&self) -> std::sync::MutexGuard<'_, Vec<serde_json::Value>> {
+        match self.jar.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        }
+    }
+    fn lock_ops(&self) -> std::sync::MutexGuard<'_, Vec<serde_json::Value>> {
+        match self.ops.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        }
+    }
+    fn record(&self, op: serde_json::Value) {
+        self.lock_ops().push(op);
+    }
+}
+
+/// Does `cookie` apply to `url`?
+///
+/// Host suffix + path prefix, which is the matching a script needs to read
+/// back what it and the caller put in. NOT a full RFC 6265 implementation and
+/// not trying to be: the caller's jar decides what is actually sent, and this
+/// snapshot only has to answer the script honestly for the values it holds.
+fn cookie_matches_url(cookie: &serde_json::Value, url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    let path = {
+        let after = url.split("://").nth(1).unwrap_or(url);
+        match after.find('/') {
+            Some(i) => after[i..].split('?').next().unwrap_or("/").to_string(),
+            None => "/".to_string(),
+        }
+    };
+    let domain = cookie
+        .get("domain")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .trim_start_matches('.');
+    let c_path = cookie.get("path").and_then(|p| p.as_str()).unwrap_or("/");
+    let domain_ok =
+        domain.is_empty() || host == domain || host.ends_with(&format!(".{domain}"));
+    domain_ok && path.starts_with(c_path)
+}
+
 /// One script→host call parked until the caller answers it (TR-474).
 #[derive(Clone, serde::Serialize)]
 struct PendingHostCall {
@@ -813,6 +881,15 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 .get("runId")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            // TR-476: an explicit `cookies` array opts the jar in — even an
+            // empty one. Absent entirely means "no jar", which the shim
+            // refuses by name rather than reporting as an empty one.
+            let cookies = payload.get("cookies").and_then(|c| c.as_array()).map(|arr| {
+                let sc = ScriptCookies::default();
+                *sc.lock_jar() = arr.clone();
+                Arc::new(sc)
+            });
+
             let callbacks = run_id.as_ref().map(|id| {
                 let cb = Arc::new(RunCallbacks::default());
                 let mut runs = match state.runs.lock() {
@@ -829,8 +906,11 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
                 script_request,
                 script_response,
                 sandbox_cfg,
-                state.client.clone(),
-                callbacks.clone(),
+                ScriptHost {
+                    http: state.client.clone(),
+                    callbacks: callbacks.clone(),
+                    cookies: cookies.clone(),
+                },
             )
             .await;
 
@@ -1713,15 +1793,38 @@ impl ScriptScopes {
     }
 }
 
+/// What the HOST lends the realm for one script run.
+///
+/// A struct because the alternative was eight positional parameters, three of
+/// them `Option<Arc<…>>` sitting next to each other — the exact shape where a
+/// call site transposes two and the compiler is happy.
+struct ScriptHost {
+    http: tropel_http::HttpClient,
+    /// TR-474: the bidirectional channel. `None` = no `bru.runRequest`.
+    callbacks: Option<Arc<RunCallbacks>>,
+    /// TR-476: the per-script cookie jar. `None` = no `bru.cookies`.
+    cookies: Option<Arc<ScriptCookies>>,
+}
+
 async fn run_script_once(
     code: &str,
     scopes: ScriptScopes,
     request: Option<TropelRequest>,
     response: Option<tropel_sdk::types::Response>,
     sandbox: tropel_sandbox::config::SandboxConfig,
-    http: tropel_http::HttpClient,
-    callbacks: Option<Arc<RunCallbacks>>,
+    host: ScriptHost,
 ) -> Result<serde_json::Value, String> {
+    let ScriptHost {
+        http,
+        callbacks,
+        cookies,
+    } = host;
+    // Captured BEFORE `request` is moved into the realm state below. The
+    // cookie bindings need the executing URL to scope reads and writes.
+    let request_url = request
+        .as_ref()
+        .map(|r| r.url.clone())
+        .unwrap_or_default();
     let mut ctx = tropel_js::JsContext::new(None, Some(std::time::Duration::from_secs(10)))
         .await
         .map_err(|e| format!("js context: {e:?}"))?;
@@ -1800,6 +1903,101 @@ async fn run_script_once(
     tropel_sandbox::bindings::trp::TrpBridge::with_http_client(state.clone(), driver_client)
         .install(&mut ctx)
         .map_err(|e| format!("bridge install: {e:?}"))?;
+
+    // TR-476: the cookie jar, installed ONLY when the caller supplied one.
+    // Absent, the bindings do not exist and `bru.cookies` refuses by name —
+    // "no jar" and "an empty jar" must not look the same to a script.
+    if let Some(cookies) = cookies.clone() {
+        let url_for_current = request_url.clone();
+        let installed: Result<(), String> = ctx.with_ctx(|rq| {
+            let globals = rq.globals();
+            let mut fail: Option<String> = None;
+
+            let u = url_for_current.clone();
+            if let Err(e) = globals.set(
+                "__tropel_cookies_current_url",
+                rquickjs::function::Func::from(move || -> String { u.clone() }),
+            ) {
+                fail = Some(e.to_string());
+            }
+
+            let c = cookies.clone();
+            if let Err(e) = globals.set(
+                "__tropel_cookies_all",
+                rquickjs::function::Func::from(move |url: String| -> String {
+                    let jar = c.lock_jar();
+                    let matching: Vec<&serde_json::Value> = jar
+                        .iter()
+                        .filter(|ck| cookie_matches_url(ck, &url))
+                        .collect();
+                    serde_json::to_string(&matching).unwrap_or_else(|_| "[]".to_string())
+                }),
+            ) {
+                fail = Some(e.to_string());
+            }
+
+            let c = cookies.clone();
+            if let Err(e) = globals.set(
+                "__tropel_cookies_set",
+                rquickjs::function::Func::from(move |url: String, cookie_json: String| {
+                    let Ok(cookie) = serde_json::from_str::<serde_json::Value>(&cookie_json) else {
+                        return;
+                    };
+                    let name = cookie
+                        .get("key")
+                        .or_else(|| cookie.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    {
+                        // Read-your-writes: the script must see what it just
+                        // set, not the seeded snapshot.
+                        let mut jar = c.lock_jar();
+                        jar.retain(|ck| {
+                            ck.get("key").and_then(|v| v.as_str()).unwrap_or("") != name
+                        });
+                        jar.push(cookie.clone());
+                    }
+                    c.record(serde_json::json!({ "op": "set", "url": url, "cookie": cookie }));
+                }),
+            ) {
+                fail = Some(e.to_string());
+            }
+
+            let c = cookies.clone();
+            if let Err(e) = globals.set(
+                "__tropel_cookies_delete",
+                rquickjs::function::Func::from(move |url: String, name: String| {
+                    {
+                        let mut jar = c.lock_jar();
+                        jar.retain(|ck| {
+                            ck.get("key").and_then(|v| v.as_str()).unwrap_or("") != name
+                        });
+                    }
+                    c.record(serde_json::json!({ "op": "delete", "url": url, "name": name }));
+                }),
+            ) {
+                fail = Some(e.to_string());
+            }
+
+            let c = cookies.clone();
+            if let Err(e) = globals.set(
+                "__tropel_cookies_clear",
+                rquickjs::function::Func::from(move |url: String| {
+                    c.lock_jar().clear();
+                    c.record(serde_json::json!({ "op": "clear", "url": url }));
+                }),
+            ) {
+                fail = Some(e.to_string());
+            }
+
+            match fail {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        });
+        installed.map_err(|e| format!("cookie bridge: {e}"))?;
+    }
 
     // TR-474: `bru.runRequest`'s host half, installed ONLY when the caller
     // opted in with a `runId`. Absent, `__tropel_trp_run_request` stays
@@ -1959,6 +2157,13 @@ async fn run_script_once(
         // was simply never returned, which made every one of them a no-op
         // from the caller's point of view.
         "request": st.request,
+        // TR-476: what the script DID to the jar, in order. The caller's jar
+        // stays authoritative — it replays these rather than being replaced,
+        // so a cookie the agent never saw is not lost.
+        "cookieOps": cookies
+            .as_ref()
+            .map(|c| serde_json::Value::Array(c.lock_ops().clone()))
+            .unwrap_or(serde_json::Value::Null),
         "scriptError": script_error,
     }))
 }
@@ -2871,8 +3076,7 @@ mod tests {
             None,
             Some(response),
             tropel_sandbox::config::SandboxConfig::default(),
-            test_http_client(),
-            None,
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -2926,8 +3130,7 @@ mod tests {
             Some(request),
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            test_http_client(),
-            None,
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -2990,8 +3193,7 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            test_http_client(),
-            None,
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -3014,8 +3216,7 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            test_http_client(),
-            None,
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -3079,8 +3280,7 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            test_http_client(),
-            Some(cb.clone()),
+            ScriptHost { http: test_http_client(), callbacks: Some(cb.clone()), cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -3117,8 +3317,7 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            test_http_client(),
-            None, // no channel
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -3130,6 +3329,102 @@ mod tests {
         assert!(
             err.contains("not available here"),
             "it must refuse by name rather than return undefined: {out}"
+        );
+    }
+
+    /// TR-476: the cookie jar round-trips, and refuses when absent.
+    ///
+    /// Three properties in one, because they only mean anything together:
+    /// the script READS what the caller seeded, it READS BACK its own writes
+    /// (not the seeded snapshot), and the caller gets the ops in order so it
+    /// can replay them onto the jar that outlives the script.
+    #[tokio::test]
+    async fn the_cookie_jar_round_trips_and_refuses_when_absent() {
+        let jar = Arc::new(ScriptCookies::default());
+        *jar.lock_jar() = vec![serde_json::json!({
+            "key": "sid", "value": "abc", "domain": "api.example.test", "path": "/"
+        })];
+
+        let out = run_script_once(
+            "kp.environment.set('seeded', String(bru.cookies.get('sid')));\
+             bru.cookies.add({ key: 'new', value: 'n1', domain: 'api.example.test', path: '/' });\
+             kp.environment.set('readback', String(bru.cookies.get('new')));\
+             bru.cookies.remove('sid');\
+             kp.environment.set('count', String(bru.cookies.count()));",
+            ScriptScopes::default(),
+            Some(TropelRequest {
+                url: "https://api.example.test/things".to_string(),
+                ..Default::default()
+            }),
+            None,
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            },
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: Some(jar.clone()) },
+        )
+        .await
+        .expect("the realm runs");
+
+        let env = out.get("environment").expect("environment comes back");
+        assert_eq!(
+            env.get("seeded").and_then(|v| v.as_str()),
+            Some("abc"),
+            "the script must read what the caller seeded: {out}"
+        );
+        assert_eq!(
+            env.get("readback").and_then(|v| v.as_str()),
+            Some("n1"),
+            "read-your-writes: a cookie the script just set must be visible to it, \
+             not shadowed by the seeded snapshot: {out}"
+        );
+        assert_eq!(
+            env.get("count").and_then(|v| v.as_str()),
+            Some("1"),
+            "the removed cookie must be gone from the script's view too: {out}"
+        );
+
+        let ops = out
+            .get("cookieOps")
+            .and_then(|o| o.as_array())
+            .expect("cookieOps come back");
+        let kinds: Vec<&str> = ops
+            .iter()
+            .filter_map(|o| o.get("op").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["set", "delete"],
+            "the caller replays these onto the real jar, so ORDER is part of the \
+             contract, not just the set of ops: {out}"
+        );
+    }
+
+    /// TR-476: no jar supplied is a NAMED refusal, not an empty jar.
+    ///
+    /// "No cookies" and "no cookie jar" must not look the same to a script —
+    /// the first is an answer, the second is a missing capability.
+    #[tokio::test]
+    async fn bru_cookies_refuses_when_no_jar_was_supplied() {
+        let out = run_script_once(
+            "bru.cookies.get('sid');",
+            ScriptScopes::default(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig::default(),
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+        )
+        .await
+        .expect("the realm runs");
+
+        let err = out.get("scriptError").and_then(|e| e.as_str()).unwrap_or("");
+        assert!(
+            err.contains("not available here"),
+            "it must refuse by name rather than read as an empty jar: {out}"
+        );
+        assert!(
+            out.get("cookieOps").map(|v| v.is_null()).unwrap_or(false),
+            "no jar means no ops, not an empty op list: {out}"
         );
     }
 
@@ -3162,8 +3457,7 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            test_http_client(),
-            None,
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -3216,8 +3510,7 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            test_http_client(),
-            None,
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -3273,8 +3566,7 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            test_http_client(),
-            None,
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
         .await
         .expect("the realm runs");
@@ -3335,7 +3627,7 @@ mod tests {
                      kp.environment.set('require', typeof require);\
                      kp.environment.set('module', typeof module);\
                      kp.environment.set('viaFn', typeof Function('return this')().process);";
-        let out = run_script_once(probe, ScriptScopes::default(), None, None, kp(), test_http_client(), None)
+        let out = run_script_once(probe, ScriptScopes::default(), None, None, kp(), ScriptHost { http: test_http_client(), callbacks: None, cookies: None })
             .await
             .expect("the realm runs");
         let env = out.get("environment").expect("the environment comes back");
@@ -3353,7 +3645,7 @@ mod tests {
             ("direct", "import('fs');"),
             ("indirect eval", "var e = eval; e(\"import\" + \"('fs')\");"),
         ] {
-            let result = run_script_once(code, ScriptScopes::default(), None, None, kp(), test_http_client(), None).await;
+            let result = run_script_once(code, ScriptScopes::default(), None, None, kp(), ScriptHost { http: test_http_client(), callbacks: None, cookies: None }).await;
             let refused = match &result {
                 Err(why) => why.contains("module"),
                 Ok(out) => out
@@ -3407,8 +3699,7 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            test_http_client(),
-            None,
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
         )
             .await
             .expect("the realm runs");
