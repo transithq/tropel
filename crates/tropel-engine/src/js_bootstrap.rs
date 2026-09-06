@@ -85,6 +85,11 @@ pub enum Shim {
     Exec,
     /// `bru`, `req`, `res` — the Bruno scripting API.
     Bru,
+    /// `fetch` — the same HTTP client `pm.sendRequest` rides, wearing the
+    /// interface every modern script is written against (TR-475). QuickJS
+    /// ships none, so a script using one got a bare ReferenceError. Last in
+    /// the bundle: it defines a global and depends on no other shim.
+    Fetch,
 }
 
 impl Shim {
@@ -93,7 +98,7 @@ impl Shim {
     /// [`Shim::DeepEqual`] MUST stay first: pm, chai and lodash all call
     /// `globalThis.__tropelDeepEqual`. The remaining order is preserved from
     /// the pre-TR-501 bundle so no behaviour moves with this refactor.
-    pub const ALL: [Shim; 8] = [
+    pub const ALL: [Shim; 9] = [
         Shim::DeepEqual,
         Shim::K6Core,
         Shim::Pm,
@@ -102,6 +107,7 @@ impl Shim {
         Shim::CryptoJs,
         Shim::Exec,
         Shim::Bru,
+        Shim::Fetch,
     ];
 
     /// The section-header name this shim is rendered under.
@@ -115,6 +121,7 @@ impl Shim {
             Shim::CryptoJs => "cryptojs-shim",
             Shim::Exec => "exec-shim",
             Shim::Bru => "bru-shim",
+            Shim::Fetch => "fetch-shim",
         }
     }
 
@@ -129,6 +136,7 @@ impl Shim {
             Shim::CryptoJs => include_str!("../../../js/cryptojs-shim/cryptojs.js"),
             Shim::Exec => include_str!("../../../js/exec/exec.js"),
             Shim::Bru => include_str!("../../../js/scripting-api/bru.js"),
+            Shim::Fetch => include_str!("../../../js/scripting-api/fetch.js"),
         }
     }
 }
@@ -769,7 +777,8 @@ mod tests {
                 "lodash-shim",
                 "cryptojs-shim",
                 "exec-shim",
-                "bru-shim"
+                "bru-shim",
+                "fetch-shim"
             ],
             "the default bundle is Shim::ALL, in canonical order"
         );

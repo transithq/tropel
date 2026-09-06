@@ -24,6 +24,7 @@ const DEFAULT_ORDER = [
   ["cryptojs-shim", "shim/cryptojs.js"],
   ["exec-shim", "shim/exec.js"],
   ["bru-shim", "shim/bru.js"],
+  ["fetch-shim", "shim/fetch.js"],
 ];
 
 // The k6 family — used by the k6 input driver, not part of the PM default
@@ -76,7 +77,7 @@ export interface ShimEntry {
   source: string;
 }
 
-/** The engine's ShimBundle::default() — pm, chai, lodash, cryptojs, exec, bru, in order. */
+/** The engine's ShimBundle::default() — pm, chai, lodash, cryptojs, exec, bru, fetch, in order. */
 export declare const defaultBundle: ShimEntry[];
 /** The k6 input-driver family: k6-shim, open-data-shim, sleep-shim. */
 export declare const k6Bundle: ShimEntry[];
