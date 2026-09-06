@@ -28,6 +28,71 @@ use tropel_sdk::TropelError;
 const RATE_LIMIT_PER_SEC: u64 = 200;
 
 /// Shared agent state: the auth token and the engine's HTTP client.
+/// Records every request a SCRIPT issued, in call order (TR-477).
+///
+/// The app renders these as timeline arms, the same view the main request
+/// gets. Without them a script-issued send is invisible on the agent tier —
+/// which is the KP-413 defect ("script-issued sends were invisible") landing
+/// again, one tier over.
+///
+/// Recorded at the HTTP CLIENT, not in the shims. `pm.sendRequest` and
+/// `fetch` are two spellings that both end at `__tropel_trp_send_request`,
+/// which ends here — so one wrapper catches both, and a third spelling added
+/// later is caught without anyone remembering to wire it up. Wrapping the
+/// shims instead would have meant one recorder per spelling.
+#[derive(Default)]
+struct ScriptSendLog {
+    sends: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+impl ScriptSendLog {
+    fn record(&self, entry: serde_json::Value) {
+        let mut g = match self.sends.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        g.push(entry);
+    }
+    fn drain(&self) -> Vec<serde_json::Value> {
+        let g = match self.sends.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        g.clone()
+    }
+}
+
+/// A `DriverHttpClient` that records what it sent and defers to the real one.
+struct RecordingHttpClient {
+    inner: Arc<dyn tropel_sdk::traits::DriverHttpClient>,
+    log: Arc<ScriptSendLog>,
+}
+
+#[async_trait::async_trait]
+impl tropel_sdk::traits::DriverHttpClient for RecordingHttpClient {
+    async fn execute(&self, req: &tropel_sdk::Request) -> tropel_sdk::Result<tropel_sdk::types::Response> {
+        let started = std::time::Instant::now();
+        let out = self.inner.execute(req).await;
+        // A FAILED script send is still a send. Dropping it here would make a
+        // script whose request never connected look like a script that never
+        // made one (invariant 7).
+        let (status, error) = match &out {
+            Ok(res) => (res.status_code, None),
+            Err(e) => (0u16, Some(e.to_string())),
+        };
+        self.log.record(serde_json::json!({
+            "source": "sendRequest",
+            "kind": "ad-hoc",
+            "method": req.method.to_string(),
+            "url": req.url,
+            "status": status,
+            "responseTime": started.elapsed().as_millis() as u64,
+            "error": error,
+        }));
+        out
+    }
+}
+
 /// The per-script cookie jar (TR-476).
 ///
 /// A SNAPSHOT, deliberately, not the authority. The caller owns the real jar;
@@ -1897,9 +1962,17 @@ async fn run_script_once(
     // Through `new_arc` rather than a plain `Arc::new`, which publishes this
     // client's cookie jar against it (TR-233) — a plain Arc leaves the jar
     // unreachable and the cookie surface degrades to a no-op shim.
+    // TR-477: everything the script sends is recorded here, at the ONE place
+    // both `pm.sendRequest` and `fetch` end up.
+    let sends = Arc::new(ScriptSendLog::default());
     let vu_client = tropel_http::VuCookieClient::new(http);
-    let driver_client: std::sync::Arc<dyn tropel_sdk::traits::DriverHttpClient> =
+    let base_client: std::sync::Arc<dyn tropel_sdk::traits::DriverHttpClient> =
         crate::vu_loop::DriverHttpClientImpl::new_arc(vu_client);
+    let driver_client: std::sync::Arc<dyn tropel_sdk::traits::DriverHttpClient> =
+        Arc::new(RecordingHttpClient {
+            inner: base_client,
+            log: sends.clone(),
+        });
     tropel_sandbox::bindings::trp::TrpBridge::with_http_client(state.clone(), driver_client)
         .install(&mut ctx)
         .map_err(|e| format!("bridge install: {e:?}"))?;
@@ -2004,11 +2077,14 @@ async fn run_script_once(
     // undefined and the shim refuses by name — the agent never pretends to
     // offer a callback nobody is listening for (invariant 4).
     if let Some(cb) = callbacks.clone() {
+        let sends_in_cb = sends.clone();
         let installed: Result<(), String> = ctx.with_ctx(|rq| {
             rq.globals()
                 .set(
                     "__tropel_trp_run_request",
                     rquickjs::function::Func::from(move |path: String| -> String {
+                        let sends_for_run = sends_in_cb.clone();
+                        let requested_path = path.clone();
                         // SYNCHRONOUS on purpose: QuickJS gives a host
                         // function no way to suspend, so the realm's thread
                         // parks here until the caller answers. The reply
@@ -2056,10 +2132,33 @@ async fn run_script_once(
                         // current-thread one. The agent builds a multi-thread
                         // runtime (4 workers by default), and the tests below
                         // ask for one explicitly.
+                        let started = std::time::Instant::now();
                         match tokio::task::block_in_place(|| {
                             rx.recv_timeout(std::time::Duration::from_secs(30))
                         }) {
-                            Ok(json) => json,
+                            Ok(json) => {
+                                // TR-477: a runRequest is a script-issued send
+                                // too — the HOST performed it, but the SCRIPT
+                                // caused it, and the timeline shows it either
+                                // way. Recorded here rather than at the client
+                                // because it never touches the agent's client.
+                                let parsed: serde_json::Value =
+                                    serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                                sends_for_run.record(serde_json::json!({
+                                    "source": "runRequest",
+                                    "kind": "collection",
+                                    "requestName": requested_path,
+                                    "method": parsed.get("method")
+                                        .and_then(|v| v.as_str()).unwrap_or(""),
+                                    "url": parsed.get("url")
+                                        .and_then(|v| v.as_str()).unwrap_or(""),
+                                    "status": parsed.get("status")
+                                        .and_then(|v| v.as_u64()).unwrap_or(0),
+                                    "responseTime": started.elapsed().as_millis() as u64,
+                                    "error": parsed.get("error").cloned(),
+                                }));
+                                json
+                            }
                             Err(_) => {
                                 // Drop the slot so a late reply cannot land on
                                 // a call nobody is waiting for any more.
@@ -2160,6 +2259,10 @@ async fn run_script_once(
         // TR-476: what the script DID to the jar, in order. The caller's jar
         // stays authoritative — it replays these rather than being replaced,
         // so a cookie the agent never saw is not lost.
+        // TR-477: what the SCRIPT sent, in call order. Absent sends are an
+        // empty list, never null — "the script sent nothing" is an answer,
+        // and it must not read the same as "this tier does not record".
+        "scriptSends": sends.drain(),
         "cookieOps": cookies
             .as_ref()
             .map(|c| serde_json::Value::Array(c.lock_ops().clone()))
@@ -3329,6 +3432,78 @@ mod tests {
         assert!(
             err.contains("not available here"),
             "it must refuse by name rather than return undefined: {out}"
+        );
+    }
+
+    /// TR-477: a script-issued send is RECORDED, including one that failed.
+    ///
+    /// The app renders these as timeline arms. Without them a script send is
+    /// invisible on this tier — the KP-413 defect ("script-issued sends were
+    /// invisible") landing again, one tier over.
+    ///
+    /// The failed send is the point. Recording only successes would make a
+    /// script whose request never connected look like a script that never
+    /// made one, which is the silent loss invariant 7 forbids. Hermetic: it
+    /// sends to a port nothing listens on, so the failure is the assertion
+    /// rather than the network's mood.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_script_send_is_still_recorded() {
+        let out = run_script_once(
+            "pm.sendRequest('http://127.0.0.1:1/nope', function () {});",
+            ScriptScopes::default(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig {
+                namespace: "kp".into(),
+                aliases: Vec::new(),
+            },
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+        )
+        .await
+        .expect("the realm runs");
+
+        let sends = out
+            .get("scriptSends")
+            .and_then(|v| v.as_array())
+            .expect("scriptSends is always an array, never null");
+        assert_eq!(sends.len(), 1, "the send must be recorded even though it failed: {out}");
+        let only = &sends[0];
+        assert_eq!(
+            only.get("url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:1/nope"),
+            "the recorded URL must be the one the script asked for: {out}"
+        );
+        assert_eq!(
+            only.get("status").and_then(|v| v.as_u64()),
+            Some(0),
+            "a send that never connected has no status — 0, not a fabricated one: {out}"
+        );
+        assert!(
+            only.get("error").map(|e| !e.is_null()).unwrap_or(false),
+            "the failure must be NAMED on the record, not implied by status 0: {out}"
+        );
+    }
+
+    /// TR-477: no sends is an EMPTY list, not null.
+    ///
+    /// "The script sent nothing" is an answer. It must not read the same as
+    /// "this tier does not record sends".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_script_that_sends_nothing_reports_an_empty_list() {
+        let out = run_script_once(
+            "kp.environment.set('x', '1');",
+            ScriptScopes::default(),
+            None,
+            None,
+            tropel_sandbox::config::SandboxConfig::default(),
+            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+        )
+        .await
+        .expect("the realm runs");
+        assert_eq!(
+            out.get("scriptSends").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(0),
+            "an empty array, not null: {out}"
         );
     }
 
