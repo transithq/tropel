@@ -20,6 +20,7 @@
 pub mod builders;
 
 #[cfg(feature = "reqwest")]
+pub mod edgegrid;
 pub mod signers;
 
 #[cfg(feature = "reqwest")]
