@@ -554,7 +554,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             items.push(ScenarioItem {
                 authoring: None,
                 // KP-524: the declaration, beside the example the Request is.
-                contract: build_contract(operation),
+                contract: build_contract(operation, &params, path_str),
                 name: item_name,
                 id: None,
                 request: Some(Request {
@@ -1183,9 +1183,18 @@ static NULL_STR: &str = "null";
 ///
 /// Returns `None` when the operation declares nothing at all, so an item from
 /// a spec with no parameters, body or responses serializes exactly as before.
-fn build_contract(operation: &OasOperation) -> Option<RequestContract> {
-    let parameters: Vec<DeclaredParameter> = operation
-        .parameters
+/// `params` is the MERGED list — path-item-level parameters followed by
+/// operation-level ones, the same list the Request is built from. Reading
+/// `operation.parameters` alone would drop every parameter declared once at
+/// the path-item level and shared across its operations, which OpenAPI
+/// explicitly allows and specs of any size use for `{id}`. The declaration
+/// would then disagree with the Request built beside it from the same spec.
+fn build_contract(
+    operation: &OasOperation,
+    params: &[&OasParameter],
+    path_str: &str,
+) -> Option<RequestContract> {
+    let parameters: Vec<DeclaredParameter> = params
         .iter()
         .filter(|p| !p.name.is_empty())
         .map(|p| DeclaredParameter {
@@ -1234,13 +1243,27 @@ fn build_contract(operation: &OasOperation) -> Option<RequestContract> {
         })
         .collect();
 
-    if parameters.is_empty() && body.is_none() && responses.is_empty() {
+    // Only when the path HAS a placeholder, which is exactly when the sent
+    // url stops being able to answer for it. `/ping` needs no template — its
+    // `Request::url` path IS the declaration — and setting one there would
+    // put a `contract` on every item of every spec, ending the "an item from
+    // a bare spec serializes as it did before the field existed" guarantee
+    // for no information gained. A consumer's rule is the one an `Option`
+    // asks for anyway: the template if present, else the url's path.
+    let path_template = if path_str.contains('{') {
+        Some(path_str.to_string())
+    } else {
+        None
+    };
+
+    if parameters.is_empty() && body.is_none() && responses.is_empty() && path_template.is_none() {
         return None;
     }
     Some(RequestContract {
         parameters,
         body,
         responses,
+        path_template,
     })
 }
 
@@ -2836,6 +2859,103 @@ mod contract_tests {
             .map(|f| f.name.as_str())
             .collect();
         assert_eq!(names, vec!["email", "name"]);
+    }
+
+    #[test]
+    fn a_parameterized_path_carries_the_template_the_url_no_longer_has() {
+        let spec = r#"{"openapi":"3.0.0","info":{"title":"t","version":"1"},
+          "paths":{"/users/{id}":{"get":{
+            "parameters":[{"name":"id","in":"path","required":true,
+              "schema":{"type":"string"}}],
+            "responses":{"200":{"description":"ok"}}}}}}"#;
+        let scenario = OpenApiInputAdapter.parse(spec.as_bytes()).expect("parses");
+        let item = scenario.items.first().expect("one item");
+        let contract = item.contract.as_ref().expect("has a contract");
+        assert_eq!(contract.path_template.as_deref(), Some("/users/{id}"));
+        // And the Request still holds the SUBSTITUTED url, because that is
+        // what a load run sends. Both facts, side by side — which is the
+        // entire point of the contract living beside the Request.
+        let url = &item.request.as_ref().expect("has a request").url;
+        assert!(url.ends_with("/users/example"), "got {url}");
+        // The `{{base_url}}` prefix is a tropel VARIABLE, resolved at run
+        // time — so only the path part is checked for a leftover path
+        // placeholder, which is the thing substitution was meant to remove.
+        let path = url.rsplit("}}").next().unwrap_or(url);
+        assert!(!path.contains('{'), "no path placeholder survives: {path}");
+    }
+
+    #[test]
+    fn a_path_with_no_placeholder_carries_no_template() {
+        // Nothing was destroyed, so there is nothing to carry — and setting
+        // one anyway would put a `contract` on every item of every spec.
+        let spec = r#"{"openapi":"3.0.0","info":{"title":"t","version":"1"},
+          "paths":{"/users":{"get":{"responses":{"200":{"description":"ok"}}}}}}"#;
+        let scenario = OpenApiInputAdapter.parse(spec.as_bytes()).expect("parses");
+        let contract = scenario.items[0]
+            .contract
+            .as_ref()
+            .expect("responses alone give a contract");
+        assert!(
+            contract.path_template.is_none(),
+            "got {:?}",
+            contract.path_template
+        );
+    }
+
+    #[test]
+    fn a_path_item_level_parameter_reaches_the_declaration() {
+        // The bug this signature change fixes. OpenAPI lets a parameter be
+        // declared ONCE on the path item and shared by its operations, which
+        // is how specs of any size declare `{id}`. `build_contract` read
+        // `operation.parameters` only, so those parameters were in the
+        // Request — built from the merged list — and absent from the
+        // declaration built beside it from the same spec. A consumer would
+        // have seen a request sending `id` that nothing declared.
+        let spec = r#"{"openapi":"3.0.0","info":{"title":"t","version":"1"},
+          "paths":{"/users/{id}":{
+            "parameters":[{"name":"id","in":"path","required":true,
+              "schema":{"type":"string"}}],
+            "get":{"parameters":[{"name":"verbose","in":"query",
+              "schema":{"type":"boolean"}}],
+             "responses":{"200":{"description":"ok"}}},
+            "delete":{"responses":{"204":{"description":"gone"}}}}}}"#;
+        let scenario = OpenApiInputAdapter.parse(spec.as_bytes()).expect("parses");
+        for item in &scenario.items {
+            let contract = item.contract.as_ref().expect("has a contract");
+            let names: Vec<&str> = contract
+                .parameters
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect();
+            assert!(
+                names.contains(&"id"),
+                "{}: the shared path parameter must be declared, got {names:?}",
+                item.name
+            );
+            let id = contract
+                .parameters
+                .iter()
+                .find(|p| p.name == "id")
+                .expect("found");
+            assert_eq!(id.location, "path");
+            assert!(id.required);
+        }
+        // Path-item first, then operation — the same order the Request is
+        // built from, so a positional consumer sees one story.
+        let get = scenario
+            .items
+            .iter()
+            .find(|i| i.name.contains("GET"))
+            .expect("the GET is there");
+        let names: Vec<&str> = get
+            .contract
+            .as_ref()
+            .unwrap()
+            .parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["id", "verbose"]);
     }
 
     #[test]
