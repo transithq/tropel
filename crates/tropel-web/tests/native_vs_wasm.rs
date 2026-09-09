@@ -140,6 +140,7 @@ fn fixture_response(req: &Request) -> Result<Response> {
 /// axis F3 names (status, headers, variable state, assertion results, trace).
 fn fixture_run_request() -> RunRequest {
     let item = |name: &str, url: &str, test: Option<&str>, body: Option<Body>| ScenarioItem {
+        contract: None,
         authoring: None,
         name: name.into(),
         id: None,
@@ -693,6 +694,7 @@ fn run_request_for(req: Request) -> RunRequest {
             schema: None,
         },
         items: vec![ScenarioItem {
+            contract: None,
             authoring: None,
             id: None,
             name: "corpus-item".into(),
@@ -882,6 +884,7 @@ fn native_and_wasm_agree_over_request_corpus() {
                 schema: None,
             },
             items: vec![ScenarioItem {
+                contract: None,
                 authoring: None,
                 id: None,
                 name: "fail-item".into(),

@@ -260,6 +260,9 @@ fn build_items(
                 let id = r.id.clone().unwrap_or_default();
                 out.push(ScenarioItem {
                     authoring: None,
+                    // Insomnia is a collection, not a schema — there is no
+                    // declaration to carry (see ScenarioItem.contract).
+                    contract: None,
                     name: r.name.clone().unwrap_or_else(|| "Folder".into()),
                     id: None,
                     request: None,
@@ -339,6 +342,7 @@ fn request_to_item(r: &InsomniaResource) -> Result<ScenarioItem> {
 
     Ok(ScenarioItem {
         authoring: None,
+        contract: None,
         name: r
             .name
             .clone()

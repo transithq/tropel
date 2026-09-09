@@ -1366,6 +1366,7 @@ mod tests {
 
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
+            contract: None,
             authoring: None,
             name: name.to_string(),
             id: None,
@@ -1392,6 +1393,7 @@ mod tests {
 
     fn folder(name: &str, items: Vec<ScenarioItem>) -> ScenarioItem {
         ScenarioItem {
+            contract: None,
             authoring: None,
             name: name.to_string(),
             id: None,
@@ -1522,6 +1524,7 @@ mod tests {
         // A leaf with no request and no scripts is not executable; it must
         // not appear in the run order.
         let inert = ScenarioItem {
+            contract: None,
             authoring: None,
             name: "inert".into(),
             id: None,
@@ -1656,6 +1659,7 @@ mod tests {
             auth: None,
             conversion_notes: Vec::new(),
             items: vec![ScenarioItem {
+                contract: None,
                 authoring: None,
                 name: "resolved-item".into(),
                 id: None,
@@ -1726,6 +1730,7 @@ mod tests {
             conversion_notes: Vec::new(),
             items: vec![
                 ScenarioItem {
+                    contract: None,
                     authoring: None,
                     name: "item-a".into(),
                     id: None,
@@ -1749,6 +1754,7 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
+                    contract: None,
                     authoring: None,
                     name: "item-b".into(),
                     id: None,
@@ -1822,6 +1828,7 @@ mod tests {
             // explicit. Both items are script-only — no network traffic.
             items: vec![
                 ScenarioItem {
+                    contract: None,
                     authoring: None,
                     name: "self".into(),
                     id: None,
@@ -1832,6 +1839,7 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
+                    contract: None,
                     authoring: None,
                     name: "after".into(),
                     id: None,
@@ -1930,6 +1938,7 @@ mod tests {
             items: vec![folder(
                 "Folder",
                 vec![ScenarioItem {
+                    contract: None,
                     authoring: None,
                     name: "inner".into(),
                     id: None,
@@ -2054,6 +2063,7 @@ mod tests {
             //      string would throw here) AND returns early
             //   2: request — must STILL run (return only exits script 1)
             items: vec![ScenarioItem {
+                contract: None,
                 authoring: None,
                 name: "scoped".into(),
                 id: None,
@@ -2180,6 +2190,7 @@ mod tests {
 
     fn script_item(name: &str, script: &str) -> ScenarioItem {
         ScenarioItem {
+            contract: None,
             authoring: None,
             id: None,
             name: name.into(),
@@ -2339,6 +2350,7 @@ mod tests {
             script_item("start", "postman.setNextRequest('t1');"),
             script_item("t1", "pm.environment.set('sawName', '1');"),
             ScenarioItem {
+                contract: None,
                 authoring: None,
                 id: Some("t1".into()),
                 name: "by-id".into(),

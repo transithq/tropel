@@ -30,10 +30,13 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, FormDataPart, Method, Request};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{
+    DeclaredBody, DeclaredField, DeclaredParameter, DeclaredResponse, RequestContract,
+};
 use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
 /// Parse an OpenAPI document as JSON, falling back to YAML (OpenAPI specs
@@ -550,6 +553,8 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
 
             items.push(ScenarioItem {
                 authoring: None,
+                // KP-524: the declaration, beside the example the Request is.
+                contract: build_contract(operation),
                 name: item_name,
                 id: None,
                 request: Some(Request {
@@ -1167,6 +1172,127 @@ fn resolve_pointer<'a>(root: &'a Value, pointer: &str) -> Option<&'a Value> {
 /// Static string for the nullable-array case since we can't return
 /// a reference into a temporary String.
 static NULL_STR: &str = "null";
+
+/// What the SPEC declares about this operation, for `ScenarioItem.contract`.
+///
+/// Everything here was ALREADY being parsed and thrown away — the structs
+/// above carried `#[allow(dead_code)]` and eleven `parsed for spec fidelity
+/// but not consumed` markers precisely because a Request has nowhere to put
+/// a declaration. The Request stays what it was (a synthesized EXAMPLE, which
+/// is what a load run needs); this carries the declaration beside it.
+///
+/// Returns `None` when the operation declares nothing at all, so an item from
+/// a spec with no parameters, body or responses serializes exactly as before.
+fn build_contract(operation: &OasOperation) -> Option<RequestContract> {
+    let parameters: Vec<DeclaredParameter> = operation
+        .parameters
+        .iter()
+        .filter(|p| !p.name.is_empty())
+        .map(|p| DeclaredParameter {
+            name: p.name.clone(),
+            location: p.r#in.clone(),
+            required: p.required,
+            // `None` rather than a guess: a `$ref` or a composition names no
+            // type here, and defaulting to "string" would have a consumer
+            // assert a type the spec never declared.
+            r#type: p.schema.as_ref().and_then(|s| schema_type(s)).map(str::to_string),
+        })
+        .collect();
+
+    let body = operation.request_body.as_ref().map(|rb| DeclaredBody {
+        required: rb.required,
+        content_types: sorted_keys(&rb.content),
+        fields: declared_fields(&rb.content),
+    });
+
+    let responses: BTreeMap<String, DeclaredResponse> = operation
+        .responses
+        .iter()
+        .map(|(status, response)| {
+            (
+                // The spec's own key, verbatim — `default` and `4XX` are
+                // legal and neither parses as a number.
+                status.clone(),
+                DeclaredResponse {
+                    description: response.description.clone(),
+                    content_types: response
+                        .content
+                        .as_ref()
+                        .map(sorted_keys)
+                        .unwrap_or_default(),
+                    fields: response
+                        .content
+                        .as_ref()
+                        .map(declared_fields)
+                        .unwrap_or_default(),
+                },
+            )
+        })
+        .collect();
+
+    if parameters.is_empty() && body.is_none() && responses.is_empty() {
+        return None;
+    }
+    Some(RequestContract { parameters, body, responses })
+}
+
+/// Content-type keys, SORTED.
+///
+/// `content` is a `HashMap`, so its iteration order varies run to run. An
+/// unsorted list would make the same spec serialize differently on each parse
+/// and break every golden test that compares Scenario JSON.
+fn sorted_keys(content: &HashMap<String, OasMediaType>) -> Vec<String> {
+    let mut keys: Vec<String> = content.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// Top-level property names and types from ONE media type.
+///
+/// `application/json` first when present, matching `build_request_body`'s own
+/// preference — so the declaration describes the same representation the
+/// synthesized example was built from. Otherwise the first in sorted
+/// content-type order, which makes "first" deterministic rather than whichever
+/// the HashMap happened to yield.
+///
+/// One media type, not a merge across all of them: `application/json` and
+/// `application/xml` on one body are two encodings of the same shape, and
+/// merging them would invent a union of properties no single representation
+/// declares.
+///
+/// No `$ref` resolution here, deliberately: `resolve_refs` has already run
+/// over the whole document before it was deserialized into these structs, so a
+/// schema reached from here is the resolved one. That is also why
+/// `build_request_body` reads `schema.properties` directly.
+fn declared_fields(content: &HashMap<String, OasMediaType>) -> Vec<DeclaredField> {
+    let mut order = sorted_keys(content);
+    if let Some(pos) = order.iter().position(|k| k == "application/json") {
+        let json = order.remove(pos);
+        order.insert(0, json);
+    }
+    for key in order {
+        let Some(media) = content.get(&key) else { continue };
+        let Some(schema) = media.schema.as_ref() else { continue };
+        let Some(properties) = schema.properties.as_ref() else { continue };
+        let mut fields: Vec<DeclaredField> = properties
+            .iter()
+            .map(|(name, prop)| DeclaredField {
+                name: name.clone(),
+                // `required` is a LIST on the PARENT schema, not a flag on
+                // the property — reading it off the property would report
+                // every field as optional.
+                required: schema.required.iter().any(|r| r == name),
+                r#type: schema_type(prop).map(str::to_string),
+            })
+            .collect();
+        // `properties` is a HashMap too. Same determinism reason.
+        fields.sort_by(|a, b| a.name.cmp(&b.name));
+        if !fields.is_empty() {
+            return fields;
+        }
+    }
+    Vec::new()
+}
 
 fn schema_type(schema: &OasSchema) -> Option<&str> {
     // P1 line 158: handle both "string" and ["string","null"] forms.
@@ -2555,5 +2681,151 @@ components:
             }
             other => panic!("expected Json body, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    //! KP-524: the declaration reaches the Scenario.
+    //!
+    //! Everything asserted here was ALREADY parsed by this adapter and thrown
+    //! away — the structs above carry `#[allow(dead_code)]` and eleven
+    //! `parsed for spec fidelity but not consumed` markers. So these tests are
+    //! about the carrier, not about new parsing.
+
+    use super::*;
+    use tropel_sdk::traits::InputAdapter;
+
+    const SPEC: &str = r#"{
+      "openapi":"3.0.0","info":{"title":"t","version":"1"},
+      "paths":{"/users":{
+        "get":{"parameters":[
+          {"name":"page","in":"query","required":false,"schema":{"type":"integer"}},
+          {"name":"limit","in":"query","required":true,"schema":{"type":"integer"}},
+          {"name":"X-Trace","in":"header","schema":{"type":"string"}}],
+         "responses":{
+           "200":{"description":"ok","content":{"application/json":{"schema":{
+              "type":"object","required":["id"],
+              "properties":{"id":{"type":"integer"},"name":{"type":"string"}}}}}},
+           "4XX":{"description":"client error"},
+           "default":{"description":"fallback"}}},
+        "post":{"requestBody":{"required":true,"content":{"application/json":{"schema":{
+           "type":"object","required":["name"],
+           "properties":{"name":{"type":"string"},"email":{"type":"string"}}}}}},
+         "responses":{"201":{"description":"created"}}}}}}"#;
+
+    fn contract_for(method: &str) -> RequestContract {
+        let scenario = OpenApiInputAdapter.parse(SPEC.as_bytes()).expect("parses");
+        scenario
+            .items
+            .iter()
+            .find(|i| i.name.starts_with(method))
+            .and_then(|i| i.contract.clone())
+            .unwrap_or_else(|| panic!("no contract on {method}"))
+    }
+
+    #[test]
+    fn parameters_carry_location_required_and_type() {
+        let c = contract_for("GET");
+        let names: Vec<&str> = c.parameters.iter().map(|p| p.name.as_str()).collect();
+        // Declaration order, not sorted: a spec's parameter order is
+        // meaningful to a reader and cheap to preserve.
+        assert_eq!(names, vec!["page", "limit", "X-Trace"]);
+        let limit = c.parameters.iter().find(|p| p.name == "limit").expect("limit");
+        assert_eq!(limit.location, "query");
+        assert!(limit.required, "the spec says required: true");
+        assert_eq!(limit.r#type.as_deref(), Some("integer"));
+        // The one the synthesized example cannot express: `page` is declared
+        // optional, and the Request carries a value for it regardless.
+        let page = c.parameters.iter().find(|p| p.name == "page").expect("page");
+        assert!(!page.required);
+        // And a HEADER parameter is distinguishable from a query one, which a
+        // Request's flat `headers` list cannot say.
+        let trace = c.parameters.iter().find(|p| p.name == "X-Trace").expect("X-Trace");
+        assert_eq!(trace.location, "header");
+    }
+
+    #[test]
+    fn responses_reach_the_scenario_at_all() {
+        // Before this, a Request had NOWHERE to put a declared response, so
+        // the `201` in a spec reached nothing.
+        let c = contract_for("GET");
+        assert!(c.responses.contains_key("200"));
+        assert_eq!(c.responses["200"].description.as_deref(), Some("ok"));
+        assert_eq!(c.responses["200"].content_types, vec!["application/json"]);
+    }
+
+    #[test]
+    fn non_numeric_response_keys_survive() {
+        // `4XX` and `default` are legal and neither parses as a number. A
+        // `u16` key would have dropped exactly these.
+        let c = contract_for("GET");
+        assert!(c.responses.contains_key("4XX"), "got {:?}", c.responses.keys());
+        assert!(c.responses.contains_key("default"));
+    }
+
+    #[test]
+    fn response_fields_read_required_off_the_parent_schema() {
+        // `required` is a list on the object schema, not a flag on each
+        // property. Reading it off the property would report every field as
+        // optional.
+        let c = contract_for("GET");
+        let fields = &c.responses["200"].fields;
+        let id = fields.iter().find(|f| f.name == "id").expect("id");
+        let name = fields.iter().find(|f| f.name == "name").expect("name");
+        assert!(id.required, "the schema lists id as required");
+        assert!(!name.required);
+        assert_eq!(id.r#type.as_deref(), Some("integer"));
+    }
+
+    #[test]
+    fn a_body_carries_required_content_types_and_field_types() {
+        let c = contract_for("POST");
+        let body = c.body.expect("POST declares a body");
+        assert!(body.required);
+        assert_eq!(body.content_types, vec!["application/json"]);
+        let name = body.fields.iter().find(|f| f.name == "name").expect("name");
+        assert!(name.required);
+        // The distinction the carrier exists for: a DECLARED string, beside a
+        // synthesized example whose VALUE is the string "string".
+        assert_eq!(name.r#type.as_deref(), Some("string"));
+    }
+
+    #[test]
+    fn fields_are_sorted_so_the_same_spec_serializes_identically() {
+        // `properties` is a HashMap: unsorted output would make one spec
+        // produce different Scenario JSON on each parse and break every
+        // golden test that compares it.
+        let c = contract_for("POST");
+        let names: Vec<&str> =
+            c.body.as_ref().unwrap().fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["email", "name"]);
+    }
+
+    #[test]
+    fn an_operation_declaring_nothing_gets_no_contract() {
+        // So an item from a bare spec serializes exactly as it did before the
+        // field existed.
+        let bare = r#"{"openapi":"3.0.0","info":{"title":"t","version":"1"},
+          "paths":{"/ping":{"get":{}}}}"#;
+        let scenario = OpenApiInputAdapter.parse(bare.as_bytes()).expect("parses");
+        let item = scenario.items.first().expect("one item");
+        assert!(item.contract.is_none(), "got {:?}", item.contract);
+        let json = serde_json::to_string(item).expect("serializes");
+        assert!(!json.contains("contract"), "got {json}");
+    }
+
+    #[test]
+    fn the_request_is_unchanged_by_any_of_this() {
+        // The whole design: the Request stays the synthesized example a load
+        // run needs. If this drifts, the contract has leaked into the wire
+        // view.
+        let scenario = OpenApiInputAdapter.parse(SPEC.as_bytes()).expect("parses");
+        let post = scenario.items.iter().find(|i| i.name.starts_with("POST")).expect("POST");
+        let request = post.request.as_ref().expect("a request");
+        let body = serde_json::to_value(request.body.as_ref().expect("a body")).expect("json");
+        // Still the example, with type-name placeholders — not the schema.
+        assert_eq!(body["name"], "string");
+        assert_eq!(body["email"], "string");
     }
 }

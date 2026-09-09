@@ -161,6 +161,7 @@ follow rule 4 and rule 5.
 | Function | Args | Returns |
 |---|---|---|
 | `__tropel_trp_test_skip` | `name: String` | `()` |
+| `__tropel_trp_get_test_results` | `—` | `String` (JSON `[{name, passed}]`) |
 
 ### Flow control
 

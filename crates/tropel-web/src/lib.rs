@@ -250,6 +250,7 @@ mod tests {
                 schema: None,
             },
             items: vec![ScenarioItem {
+                contract: None,
                 authoring: None,
                 name: "ping".into(),
                 id: None,
