@@ -62,7 +62,8 @@ fn main() -> tropel_sdk::Result<()> {
         // renamed or where it went. Any OTHER `agent` invocation falls through
         // to run_cli() -> Commands::Agent, the loopback agent.
         Some("agent")
-            if std::env::args().any(|a| a == "--controller" || a == "-C" || a == "--token-file") =>
+            if std::env::args()
+                .any(|a| a == "--controller" || a == "-C" || a == "--token-file") =>
         {
             eprintln!(
                 "tropel: `agent` is the loopback HTTP agent \

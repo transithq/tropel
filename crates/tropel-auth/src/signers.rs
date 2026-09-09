@@ -868,7 +868,10 @@ pub struct WsseAuth {
 
 impl WsseAuth {
     pub fn new(username: &str, password: &str) -> Self {
-        Self { username: username.to_string(), password: password.to_string() }
+        Self {
+            username: username.to_string(),
+            password: password.to_string(),
+        }
     }
 }
 
@@ -953,7 +956,10 @@ impl AuthSigner for EdgeGridAuth {
         // cannot be hashed without consuming it, so it signs as if there were
         // no body — which is what Akamai's own clients do, and is why
         // oversized bodies are skipped rather than truncated.
-        let body = request.body().and_then(|b| b.as_bytes()).map(|b| b.to_vec());
+        let body = request
+            .body()
+            .and_then(|b| b.as_bytes())
+            .map(|b| b.to_vec());
 
         let params = crate::edgegrid::EdgeGridBuildParams {
             method: request.method().as_str().to_string(),
@@ -1931,7 +1937,9 @@ mod tests {
             token_secret: None,
             signature_method: Some("PLAINTEXT".into()),
         };
-        let signer = build_auth_signer(&plaintext).expect("builds").expect("a signer");
+        let signer = build_auth_signer(&plaintext)
+            .expect("builds")
+            .expect("a signer");
 
         let mut secure = reqwest::Request::new(
             reqwest::Method::GET,
@@ -1943,7 +1951,10 @@ mod tests {
             .get(reqwest::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        assert!(header.contains("oauth_signature_method=\"PLAINTEXT\""), "got {header}");
+        assert!(
+            header.contains("oauth_signature_method=\"PLAINTEXT\""),
+            "got {header}"
+        );
 
         let mut insecure = reqwest::Request::new(
             reqwest::Method::GET,
@@ -1979,7 +1990,10 @@ mod tests {
             .get("x-wsse")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        assert!(token.starts_with("UsernameToken "), "the token rides X-WSSE: {token:?}");
+        assert!(
+            token.starts_with("UsernameToken "),
+            "the token rides X-WSSE: {token:?}"
+        );
         assert!(token.contains("PasswordDigest="), "got {token:?}");
         assert_eq!(
             request

@@ -11,8 +11,8 @@
 //! an error rather than a fuzzy match.
 
 use tropel_http::{
-    BypassRule, HttpClient, HttpConfig, ProxyConfig, ProxyMode, TlsConfig, bypasses, parse_bypass,
-    parse_bypass_list,
+    bypasses, parse_bypass, parse_bypass_list, BypassRule, HttpClient, HttpConfig, ProxyConfig,
+    ProxyMode, TlsConfig,
 };
 
 fn rules(entries: &[&str]) -> Vec<BypassRule> {
@@ -162,7 +162,10 @@ fn every_bad_entry_is_reported_at_once() {
 /// Did the client BUILD? Returns unit rather than the client because no test
 /// here uses one, and `HttpClient` has no `Debug` for `expect_err` to format.
 fn build(proxy: ProxyConfig) -> Result<(), String> {
-    let config = HttpConfig { proxy, ..HttpConfig::default() };
+    let config = HttpConfig {
+        proxy,
+        ..HttpConfig::default()
+    };
     HttpClient::with_tls(&config, &TlsConfig::default())
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -188,8 +191,11 @@ fn fixed_mode_builds_with_a_host() {
 #[test]
 fn fixed_mode_with_no_host_is_refused_by_name() {
     // The alternative is a client that says it proxies and doesn't.
-    let err = build(ProxyConfig { mode: ProxyMode::Fixed, ..Default::default() })
-        .expect_err("must refuse");
+    let err = build(ProxyConfig {
+        mode: ProxyMode::Fixed,
+        ..Default::default()
+    })
+    .expect_err("must refuse");
     assert!(err.contains("no host is set"), "got: {err}");
 }
 
@@ -207,7 +213,10 @@ fn fixed_mode_carries_credentials_without_putting_them_in_the_url() {
     };
     let url = cfg.fixed_url().expect("a url");
     assert_eq!(url, "http://proxy.internal:3128");
-    assert!(!url.contains('u') || !url.contains("u:p"), "no credentials in the URL: {url}");
+    assert!(
+        !url.contains('u') || !url.contains("u:p"),
+        "no credentials in the URL: {url}"
+    );
     assert!(build(cfg).is_ok());
 }
 
@@ -292,7 +301,10 @@ fn an_absent_proxy_block_is_off() {
 
 #[test]
 fn pac_fields_read_in_both_spellings() {
-    for json in [r#"{"mode":"pac","pac_url":"http://a/x.dat"}"#, r#"{"mode":"pac","pacUrl":"http://a/x.dat"}"#] {
+    for json in [
+        r#"{"mode":"pac","pac_url":"http://a/x.dat"}"#,
+        r#"{"mode":"pac","pacUrl":"http://a/x.dat"}"#,
+    ] {
         let cfg: ProxyConfig = serde_json::from_str(json).expect("reads");
         assert_eq!(cfg.pac_url.as_deref(), Some("http://a/x.dat"), "for {json}");
     }
@@ -305,7 +317,7 @@ fn pac_fields_read_in_both_spellings() {
 // config with a documented fallback into a single point of failure. These
 // tests are the parser and the ordering — the half where that bug lives.
 
-use tropel_http::{DEFAULT_PAC_TTL, PacDecision, PacDirective, parse_pac_result};
+use tropel_http::{parse_pac_result, PacDecision, PacDirective, DEFAULT_PAC_TTL};
 
 #[test]
 fn a_multi_directive_result_yields_every_candidate_in_order() {
@@ -380,12 +392,18 @@ fn a_directive_becomes_the_proxy_url_reqwest_needs() {
 #[test]
 fn failover_advances_through_the_candidates_in_order() {
     let mut decision = PacDecision::new(parse_pac_result("PROXY a:1; PROXY b:2; DIRECT"));
-    assert_eq!(decision.candidate(), Some(&PacDirective::Proxy("a:1".into())));
+    assert_eq!(
+        decision.candidate(),
+        Some(&PacDirective::Proxy("a:1".into()))
+    );
     assert_eq!(decision.advance(), Some(&PacDirective::Proxy("b:2".into())));
     assert_eq!(decision.advance(), Some(&PacDirective::Direct));
     assert!(!decision.exhausted());
     assert_eq!(decision.advance(), None);
-    assert!(decision.exhausted(), "only after the LAST one fails does the request fail");
+    assert!(
+        decision.exhausted(),
+        "only after the LAST one fails does the request fail"
+    );
 }
 
 #[test]
@@ -402,6 +420,9 @@ fn a_fresh_decision_is_not_stale_and_the_ttl_is_bounded() {
     // unbounded caching would pin the old answer for the process's life.
     let decision = PacDecision::new(parse_pac_result("DIRECT"));
     assert!(!decision.is_stale(DEFAULT_PAC_TTL));
-    assert!(decision.is_stale(std::time::Duration::ZERO), "a zero TTL is always stale");
+    assert!(
+        decision.is_stale(std::time::Duration::ZERO),
+        "a zero TTL is always stale"
+    );
     assert!(DEFAULT_PAC_TTL > std::time::Duration::ZERO);
 }

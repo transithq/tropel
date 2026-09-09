@@ -32,11 +32,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, FormDataPart, Method, Request};
-use tropel_sdk::{InputAdapter, InputAdapterRegistration};
-use tropel_sdk::{Result, TropelError};
 use tropel_sdk::{
     DeclaredBody, DeclaredField, DeclaredParameter, DeclaredResponse, RequestContract,
 };
+use tropel_sdk::{InputAdapter, InputAdapterRegistration};
+use tropel_sdk::{Result, TropelError};
 use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
 /// Parse an OpenAPI document as JSON, falling back to YAML (OpenAPI specs
@@ -1195,7 +1195,11 @@ fn build_contract(operation: &OasOperation) -> Option<RequestContract> {
             // `None` rather than a guess: a `$ref` or a composition names no
             // type here, and defaulting to "string" would have a consumer
             // assert a type the spec never declared.
-            r#type: p.schema.as_ref().and_then(|s| schema_type(s)).map(str::to_string),
+            r#type: p
+                .schema
+                .as_ref()
+                .and_then(|s| schema_type(s))
+                .map(str::to_string),
         })
         .collect();
 
@@ -1233,7 +1237,11 @@ fn build_contract(operation: &OasOperation) -> Option<RequestContract> {
     if parameters.is_empty() && body.is_none() && responses.is_empty() {
         return None;
     }
-    Some(RequestContract { parameters, body, responses })
+    Some(RequestContract {
+        parameters,
+        body,
+        responses,
+    })
 }
 
 /// Content-type keys, SORTED.
@@ -1271,9 +1279,15 @@ fn declared_fields(content: &HashMap<String, OasMediaType>) -> Vec<DeclaredField
         order.insert(0, json);
     }
     for key in order {
-        let Some(media) = content.get(&key) else { continue };
-        let Some(schema) = media.schema.as_ref() else { continue };
-        let Some(properties) = schema.properties.as_ref() else { continue };
+        let Some(media) = content.get(&key) else {
+            continue;
+        };
+        let Some(schema) = media.schema.as_ref() else {
+            continue;
+        };
+        let Some(properties) = schema.properties.as_ref() else {
+            continue;
+        };
         let mut fields: Vec<DeclaredField> = properties
             .iter()
             .map(|(name, prop)| DeclaredField {
@@ -2731,17 +2745,29 @@ mod contract_tests {
         // Declaration order, not sorted: a spec's parameter order is
         // meaningful to a reader and cheap to preserve.
         assert_eq!(names, vec!["page", "limit", "X-Trace"]);
-        let limit = c.parameters.iter().find(|p| p.name == "limit").expect("limit");
+        let limit = c
+            .parameters
+            .iter()
+            .find(|p| p.name == "limit")
+            .expect("limit");
         assert_eq!(limit.location, "query");
         assert!(limit.required, "the spec says required: true");
         assert_eq!(limit.r#type.as_deref(), Some("integer"));
         // The one the synthesized example cannot express: `page` is declared
         // optional, and the Request carries a value for it regardless.
-        let page = c.parameters.iter().find(|p| p.name == "page").expect("page");
+        let page = c
+            .parameters
+            .iter()
+            .find(|p| p.name == "page")
+            .expect("page");
         assert!(!page.required);
         // And a HEADER parameter is distinguishable from a query one, which a
         // Request's flat `headers` list cannot say.
-        let trace = c.parameters.iter().find(|p| p.name == "X-Trace").expect("X-Trace");
+        let trace = c
+            .parameters
+            .iter()
+            .find(|p| p.name == "X-Trace")
+            .expect("X-Trace");
         assert_eq!(trace.location, "header");
     }
 
@@ -2760,7 +2786,11 @@ mod contract_tests {
         // `4XX` and `default` are legal and neither parses as a number. A
         // `u16` key would have dropped exactly these.
         let c = contract_for("GET");
-        assert!(c.responses.contains_key("4XX"), "got {:?}", c.responses.keys());
+        assert!(
+            c.responses.contains_key("4XX"),
+            "got {:?}",
+            c.responses.keys()
+        );
         assert!(c.responses.contains_key("default"));
     }
 
@@ -2797,8 +2827,14 @@ mod contract_tests {
         // produce different Scenario JSON on each parse and break every
         // golden test that compares it.
         let c = contract_for("POST");
-        let names: Vec<&str> =
-            c.body.as_ref().unwrap().fields.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<&str> = c
+            .body
+            .as_ref()
+            .unwrap()
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
         assert_eq!(names, vec!["email", "name"]);
     }
 
@@ -2821,7 +2857,11 @@ mod contract_tests {
         // run needs. If this drifts, the contract has leaked into the wire
         // view.
         let scenario = OpenApiInputAdapter.parse(SPEC.as_bytes()).expect("parses");
-        let post = scenario.items.iter().find(|i| i.name.starts_with("POST")).expect("POST");
+        let post = scenario
+            .items
+            .iter()
+            .find(|i| i.name.starts_with("POST"))
+            .expect("POST");
         let request = post.request.as_ref().expect("a request");
         let body = serde_json::to_value(request.body.as_ref().expect("a body")).expect("json");
         // Still the example, with type-name placeholders — not the schema.

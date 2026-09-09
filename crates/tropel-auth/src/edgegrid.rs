@@ -119,10 +119,7 @@ pub fn edgegrid_build_header(
         )));
     }
 
-    let timestamp = params
-        .timestamp
-        .clone()
-        .unwrap_or_else(edgegrid_timestamp);
+    let timestamp = params.timestamp.clone().unwrap_or_else(edgegrid_timestamp);
     let nonce = params.nonce.clone().unwrap_or_else(edgegrid_nonce);
 
     // Built ONCE: it is both the header prefix and the seventh signing field,
@@ -153,8 +150,8 @@ pub fn edgegrid_build_header(
 fn base64_hmac(message: &[u8], key: &[u8]) -> String {
     // Same idiom as `signers.rs`: hmac 0.13 puts `new_from_slice` on
     // `KeyInit`, and HMAC accepts a key of any length so this cannot fail.
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(message);
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
@@ -196,7 +193,9 @@ fn canonical_headers(names: &[String], headers: &[(String, String)]) -> String {
     let mut out = String::new();
     for name in names {
         let wanted = name.to_ascii_lowercase();
-        let Some((_, value)) = headers.iter().find(|(k, _)| k.to_ascii_lowercase() == wanted)
+        let Some((_, value)) = headers
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == wanted)
         else {
             continue;
         };
@@ -234,7 +233,9 @@ fn split_url(url: &str) -> Result<(String, String, String)> {
 /// and produces a signature Akamai rejects with a 401 that says nothing about
 /// the format.
 pub fn edgegrid_timestamp() -> String {
-    chrono::Utc::now().format("%Y%m%dT%H:%M:%S+0000").to_string()
+    chrono::Utc::now()
+        .format("%Y%m%dT%H:%M:%S+0000")
+        .to_string()
 }
 
 /// A fresh nonce.
@@ -301,15 +302,26 @@ mod tests {
             prefix.clone(),
         ]
         .join("\t");
-        let key = base64_hmac(p.timestamp.as_deref().unwrap().as_bytes(), p.client_secret.as_bytes());
-        format!("{prefix}signature={}", base64_hmac(data.as_bytes(), key.as_bytes()))
+        let key = base64_hmac(
+            p.timestamp.as_deref().unwrap().as_bytes(),
+            p.client_secret.as_bytes(),
+        );
+        format!(
+            "{prefix}signature={}",
+            base64_hmac(data.as_bytes(), key.as_bytes())
+        )
     }
 
     #[test]
     fn the_header_has_the_documented_shape() {
         let header = edgegrid_build_header(&params(), &[]).expect("signs");
         assert!(header.starts_with("EG1-HMAC-SHA256 "), "got {header}");
-        for field in ["client_token=ctoken", "access_token=atoken", "nonce=abc123", "signature="] {
+        for field in [
+            "client_token=ctoken",
+            "access_token=atoken",
+            "nonce=abc123",
+            "signature=",
+        ] {
             assert!(header.contains(field), "missing {field} in {header}");
         }
         assert!(header.contains(&format!("timestamp={TS}")));
@@ -348,8 +360,13 @@ mod tests {
         let mut p = params();
         p.client_token = String::new();
         p.client_secret = String::new();
-        let err = edgegrid_build_header(&p, &[]).expect_err("must refuse").to_string();
-        assert!(err.contains("client_token") && err.contains("client_secret"), "got {err}");
+        let err = edgegrid_build_header(&p, &[])
+            .expect_err("must refuse")
+            .to_string();
+        assert!(
+            err.contains("client_token") && err.contains("client_secret"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -366,8 +383,14 @@ mod tests {
     fn an_oversized_body_is_skipped_not_truncated() {
         // Truncating would produce a signature the server cannot reproduce.
         let body = vec![b'x'; 10];
-        assert!(!content_hash("POST", Some(&body), 10).is_empty(), "exactly at the cap is hashed");
-        assert!(content_hash("POST", Some(&body), 9).is_empty(), "one byte over is skipped");
+        assert!(
+            !content_hash("POST", Some(&body), 10).is_empty(),
+            "exactly at the cap is hashed"
+        );
+        assert!(
+            content_hash("POST", Some(&body), 9).is_empty(),
+            "one byte over is skipped"
+        );
     }
 
     #[test]
@@ -424,7 +447,11 @@ mod tests {
         // goes into the signing data verbatim and produces a signature Akamai
         // rejects with a 401 that says nothing about the format.
         let ts = edgegrid_timestamp();
-        assert_eq!(ts.len(), 22, "yyyyMMddTHH:mm:ss+0000 is 22 chars, got {ts:?}");
+        assert_eq!(
+            ts.len(),
+            22,
+            "yyyyMMddTHH:mm:ss+0000 is 22 chars, got {ts:?}"
+        );
         assert!(ts.ends_with("+0000"), "got {ts}");
         assert_eq!(&ts[8..9], "T", "a literal T at position 8: {ts}");
         assert!(!ts.contains('-'), "no dashes in the date: {ts}");
@@ -446,7 +473,9 @@ mod tests {
     fn an_invalid_url_is_refused_by_name() {
         let mut p = params();
         p.url = "not a url".into();
-        let err = edgegrid_build_header(&p, &[]).expect_err("must refuse").to_string();
+        let err = edgegrid_build_header(&p, &[])
+            .expect_err("must refuse")
+            .to_string();
         assert!(err.contains("invalid URL"), "got {err}");
     }
 }

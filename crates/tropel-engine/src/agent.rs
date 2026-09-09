@@ -70,7 +70,10 @@ struct RecordingHttpClient {
 
 #[async_trait::async_trait]
 impl tropel_sdk::traits::DriverHttpClient for RecordingHttpClient {
-    async fn execute(&self, req: &tropel_sdk::Request) -> tropel_sdk::Result<tropel_sdk::types::Response> {
+    async fn execute(
+        &self,
+        req: &tropel_sdk::Request,
+    ) -> tropel_sdk::Result<tropel_sdk::types::Response> {
         let started = std::time::Instant::now();
         let out = self.inner.execute(req).await;
         // A FAILED script send is still a send. Dropping it here would make a
@@ -156,8 +159,7 @@ fn cookie_matches_url(cookie: &serde_json::Value, url: &str) -> bool {
         .unwrap_or("")
         .trim_start_matches('.');
     let c_path = cookie.get("path").and_then(|p| p.as_str()).unwrap_or("/");
-    let domain_ok =
-        domain.is_empty() || host == domain || host.ends_with(&format!(".{domain}"));
+    let domain_ok = domain.is_empty() || host == domain || host.ends_with(&format!(".{domain}"));
     domain_ok && path.starts_with(c_path)
 }
 
@@ -949,11 +951,14 @@ async fn handle_connection(sock: &mut TcpStream, state: Arc<AgentState>) -> trop
             // TR-476: an explicit `cookies` array opts the jar in — even an
             // empty one. Absent entirely means "no jar", which the shim
             // refuses by name rather than reporting as an empty one.
-            let cookies = payload.get("cookies").and_then(|c| c.as_array()).map(|arr| {
-                let sc = ScriptCookies::default();
-                *sc.lock_jar() = arr.clone();
-                Arc::new(sc)
-            });
+            let cookies = payload
+                .get("cookies")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    let sc = ScriptCookies::default();
+                    *sc.lock_jar() = arr.clone();
+                    Arc::new(sc)
+                });
 
             let callbacks = run_id.as_ref().map(|id| {
                 let cb = Arc::new(RunCallbacks::default());
@@ -1886,10 +1891,7 @@ async fn run_script_once(
     } = host;
     // Captured BEFORE `request` is moved into the realm state below. The
     // cookie bindings need the executing URL to scope reads and writes.
-    let request_url = request
-        .as_ref()
-        .map(|r| r.url.clone())
-        .unwrap_or_default();
+    let request_url = request.as_ref().map(|r| r.url.clone()).unwrap_or_default();
     let mut ctx = tropel_js::JsContext::new(None, Some(std::time::Duration::from_secs(10)))
         .await
         .map_err(|e| format!("js context: {e:?}"))?;
@@ -2649,7 +2651,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
-                runs: std::sync::Mutex::new(HashMap::new()),
+            runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -2904,7 +2906,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
-                runs: std::sync::Mutex::new(HashMap::new()),
+            runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -3006,7 +3008,7 @@ mod tests {
                 token: Some("s3cret".into()),
                 client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                     .expect("http client"),
-                    runs: std::sync::Mutex::new(HashMap::new()),
+                runs: std::sync::Mutex::new(HashMap::new()),
                 allowed_origins: origins,
             });
             tokio::spawn(async move {
@@ -3103,7 +3105,7 @@ mod tests {
             token: Some("s3cret".into()),
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
-                runs: std::sync::Mutex::new(HashMap::new()),
+            runs: std::sync::Mutex::new(HashMap::new()),
             allowed_origins: vec!["https://app.knockport.dev".into()],
         });
         tokio::spawn(async move {
@@ -3233,7 +3235,11 @@ mod tests {
             Some(request),
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3296,12 +3302,19 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
         assert!(
-            configured.get("scriptError").map(|e| e.is_null()).unwrap_or(false),
+            configured
+                .get("scriptError")
+                .map(|e| e.is_null())
+                .unwrap_or(false),
             "a kp.* script must run when the caller declares the kp namespace: {configured}"
         );
         assert_eq!(
@@ -3319,7 +3332,11 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3383,7 +3400,11 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            ScriptHost { http: test_http_client(), callbacks: Some(cb.clone()), cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: Some(cb.clone()),
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3420,7 +3441,11 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3457,7 +3482,11 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3466,7 +3495,11 @@ mod tests {
             .get("scriptSends")
             .and_then(|v| v.as_array())
             .expect("scriptSends is always an array, never null");
-        assert_eq!(sends.len(), 1, "the send must be recorded even though it failed: {out}");
+        assert_eq!(
+            sends.len(),
+            1,
+            "the send must be recorded even though it failed: {out}"
+        );
         let only = &sends[0];
         assert_eq!(
             only.get("url").and_then(|v| v.as_str()),
@@ -3496,12 +3529,18 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
         assert_eq!(
-            out.get("scriptSends").and_then(|v| v.as_array()).map(|a| a.len()),
+            out.get("scriptSends")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
             Some(0),
             "an empty array, not null: {out}"
         );
@@ -3561,7 +3600,11 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3605,7 +3648,11 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: Some(jar.clone()) },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: Some(jar.clone()),
+            },
         )
         .await
         .expect("the realm runs");
@@ -3656,12 +3703,19 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
 
-        let err = out.get("scriptError").and_then(|e| e.as_str()).unwrap_or("");
+        let err = out
+            .get("scriptError")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
         assert!(
             err.contains("not available here"),
             "it must refuse by name rather than read as an empty jar: {out}"
@@ -3701,7 +3755,11 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3737,7 +3795,9 @@ mod tests {
         scopes
             .collection
             .insert("colIn".into(), serde_json::json!("c"));
-        scopes.globals.insert("gloIn".into(), serde_json::json!("g"));
+        scopes
+            .globals
+            .insert("gloIn".into(), serde_json::json!("g"));
         scopes
             .variables
             .insert("varIn".into(), serde_json::json!("v"));
@@ -3754,7 +3814,11 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3810,7 +3874,11 @@ mod tests {
                 namespace: "kp".into(),
                 aliases: Vec::new(),
             },
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
         .await
         .expect("the realm runs");
@@ -3871,9 +3939,20 @@ mod tests {
                      kp.environment.set('require', typeof require);\
                      kp.environment.set('module', typeof module);\
                      kp.environment.set('viaFn', typeof Function('return this')().process);";
-        let out = run_script_once(probe, ScriptScopes::default(), None, None, kp(), ScriptHost { http: test_http_client(), callbacks: None, cookies: None })
-            .await
-            .expect("the realm runs");
+        let out = run_script_once(
+            probe,
+            ScriptScopes::default(),
+            None,
+            None,
+            kp(),
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
+        )
+        .await
+        .expect("the realm runs");
         let env = out.get("environment").expect("the environment comes back");
         for name in ["process", "require", "module", "viaFn"] {
             assert_eq!(
@@ -3889,7 +3968,19 @@ mod tests {
             ("direct", "import('fs');"),
             ("indirect eval", "var e = eval; e(\"import\" + \"('fs')\");"),
         ] {
-            let result = run_script_once(code, ScriptScopes::default(), None, None, kp(), ScriptHost { http: test_http_client(), callbacks: None, cookies: None }).await;
+            let result = run_script_once(
+                code,
+                ScriptScopes::default(),
+                None,
+                None,
+                kp(),
+                ScriptHost {
+                    http: test_http_client(),
+                    callbacks: None,
+                    cookies: None,
+                },
+            )
+            .await;
             let refused = match &result {
                 Err(why) => why.contains("module"),
                 Ok(out) => out
@@ -3943,10 +4034,14 @@ mod tests {
             None,
             None,
             tropel_sandbox::config::SandboxConfig::default(),
-            ScriptHost { http: test_http_client(), callbacks: None, cookies: None },
+            ScriptHost {
+                http: test_http_client(),
+                callbacks: None,
+                cookies: None,
+            },
         )
-            .await
-            .expect("the realm runs");
+        .await
+        .expect("the realm runs");
 
         let mut wrong: Vec<String> = Vec::new();
         for probe in probes {
@@ -4130,7 +4225,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
-                runs: std::sync::Mutex::new(HashMap::new()),
+            runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -4268,7 +4363,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
-                runs: std::sync::Mutex::new(HashMap::new()),
+            runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -4372,7 +4467,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
-                runs: std::sync::Mutex::new(HashMap::new()),
+            runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],
@@ -4472,7 +4567,7 @@ mod tests {
             token: None,
             client: tropel_http::HttpClient::new(&tropel_http::config::HttpConfig::default())
                 .expect("http client"),
-                runs: std::sync::Mutex::new(HashMap::new()),
+            runs: std::sync::Mutex::new(HashMap::new()),
             // No browser origin: these drive the socket directly, and an
             // empty allowlist is the default a real agent starts with.
             allowed_origins: vec![],

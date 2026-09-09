@@ -42,9 +42,9 @@ use serde::Deserialize;
 mod text;
 use std::collections::HashMap;
 use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, FormDataPart, Method, Request};
+use tropel_sdk::{AuthoredEntry, AuthoredSettings, RequestAuthoring};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, TropelError};
-use tropel_sdk::{AuthoredEntry, AuthoredSettings, RequestAuthoring};
 use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
 // ── Bruno collection JSON model (minimal — only what we need) ────
@@ -536,20 +536,18 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
 
     let settings = build_settings(&request.settings);
 
-    let authoring = if authored_headers.is_empty()
-        && query.is_empty()
-        && vars.is_empty()
-        && settings.is_none()
-    {
-        None
-    } else {
-        Some(RequestAuthoring {
-            headers: authored_headers,
-            query,
-            vars,
-            settings,
-        })
-    };
+    let authoring =
+        if authored_headers.is_empty() && query.is_empty() && vars.is_empty() && settings.is_none()
+        {
+            None
+        } else {
+            Some(RequestAuthoring {
+                headers: authored_headers,
+                query,
+                vars,
+                settings,
+            })
+        };
 
     let body = request.body.as_ref().and_then(build_body);
     let auth = request.auth.as_ref().and_then(build_auth);
@@ -1435,7 +1433,10 @@ mod bru_text_format {
         // enabled expression would invent a check the user switched off.
         let doc = "meta {\n  name: A\n}\n\nget {\n  url: https://e.com\n}\n\nassert {\n  ~res.status: eq 200\n  res.body.ok: eq true\n}\n";
         let s = BruInputAdapter.parse(doc.as_bytes()).expect("parses");
-        assert_eq!(s.items[0].assertions, vec!["response.body.ok === true".to_string()]);
+        assert_eq!(
+            s.items[0].assertions,
+            vec!["response.body.ok === true".to_string()]
+        );
     }
 
     #[test]
@@ -1443,7 +1444,10 @@ mod bru_text_format {
         // Not a skip: an assertion that can never run looks exactly like one
         // that passes.
         let doc = "meta {\n  name: A\n}\n\nget {\n  url: https://e.com\n}\n\nassert {\n  res.status: teleports 200\n}\n";
-        let err = BruInputAdapter.parse(doc.as_bytes()).unwrap_err().to_string();
+        let err = BruInputAdapter
+            .parse(doc.as_bytes())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("teleports"), "{err}");
     }
 
@@ -1499,10 +1503,18 @@ mod bru_text_format {
             req.headers
         );
 
-        let draft = a.headers.iter().find(|e| e.key == "x-draft").expect("~x-draft");
+        let draft = a
+            .headers
+            .iter()
+            .find(|e| e.key == "x-draft")
+            .expect("~x-draft");
         assert_eq!(draft.value, "true");
         assert!(!draft.enabled, "the ~ prefix means disabled, not absent");
-        let accept = a.headers.iter().find(|e| e.key == "accept").expect("accept");
+        let accept = a
+            .headers
+            .iter()
+            .find(|e| e.key == "accept")
+            .expect("accept");
         assert!(accept.enabled);
     }
 
@@ -1529,10 +1541,20 @@ mod bru_text_format {
         let item = only_item(POST_LOGIN);
         let a = item.authoring.as_ref().expect("authoring");
 
-        let vars: Vec<(&str, &str)> = a.vars.iter().map(|v| (v.key.as_str(), v.value.as_str())).collect();
+        let vars: Vec<(&str, &str)> = a
+            .vars
+            .iter()
+            .map(|v| (v.key.as_str(), v.value.as_str()))
+            .collect();
         // The `@` marker is Bruno's "request-local" prefix and is not part of
         // the name.
-        assert_eq!(vars, vec![("requestId", "req-1"), ("baseUrl", "https://api.example.com")]);
+        assert_eq!(
+            vars,
+            vec![
+                ("requestId", "req-1"),
+                ("baseUrl", "https://api.example.com")
+            ]
+        );
 
         let st = a.settings.as_ref().expect("settings");
         assert_eq!(st.timeout, Some(3000));
