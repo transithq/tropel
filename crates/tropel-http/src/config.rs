@@ -169,7 +169,6 @@ impl Default for HttpConfig {
 /// TLS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct TlsConfig {
     pub insecure_skip_verify: bool,
     pub min_version: Option<String>,
@@ -178,6 +177,50 @@ pub struct TlsConfig {
     pub client_key: Option<String>,
     pub client_passphrase: Option<String>,
     pub allowed_ciphers: Vec<String>,
+    /// PEM CA bundles to TRUST, in addition to the platform roots.
+    ///
+    /// A list, not one path, because a private CA is commonly a chain split
+    /// across files and because two independent CAs (a corporate root and a
+    /// test root) is the ordinary case. Each entry is read and added
+    /// separately, so one unreadable bundle names itself in the error rather
+    /// than failing the whole set anonymously.
+    #[serde(default, alias = "rootCertPaths")]
+    pub root_cert_paths: Vec<String>,
+    /// Keep the platform verifier's roots alongside `root_cert_paths`.
+    ///
+    /// TRUE by default, and that default is the important part: adding a
+    /// private CA is nearly always ADDITIVE — you still need to reach
+    /// github.com. Defaulting to false would make a config that adds one
+    /// internal root silently stop trusting the public internet, which
+    /// presents as "everything broke after I added our CA".
+    ///
+    /// Set false deliberately to pin: only the supplied bundles are trusted,
+    /// which is what a locked-down test environment wants.
+    #[serde(default = "default_true", alias = "keepSystemRoots")]
+    pub keep_system_roots: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        // Hand-written rather than derived because `keep_system_roots` must
+        // default TRUE and `#[derive(Default)]` would give false — the one
+        // field here whose zero value is the wrong answer.
+        Self {
+            insecure_skip_verify: false,
+            min_version: None,
+            max_version: None,
+            client_cert: None,
+            client_key: None,
+            client_passphrase: None,
+            allowed_ciphers: Vec::new(),
+            root_cert_paths: Vec::new(),
+            keep_system_roots: true,
+        }
+    }
 }
 
 #[cfg(test)]
