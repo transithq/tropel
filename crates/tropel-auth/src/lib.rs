@@ -19,8 +19,20 @@
 /// browser embedder can reach them. See the module docs for why.
 pub mod builders;
 
-#[cfg(feature = "reqwest")]
+/// Akamai EdgeGrid, beside `builders` and NOT behind the `reqwest` feature:
+/// it is pure hashing and encoding, and the browser core tier needs to reach
+/// it to sign in the auth tier rather than at the wire.
+///
+/// It was gated when it landed — by accident. `pub mod edgegrid;` was
+/// inserted directly under `signers`' `#[cfg(feature = "reqwest")]`, which
+/// STOLE the attribute: `signers` became unconditional and the
+/// `default-features = false` build (`tropel-core-wasm`) stopped compiling,
+/// because signers.rs needs `tropel-sdk` and that dependency is optional
+/// under the same feature. An attribute applies to the item that follows it,
+/// and inserting an item between the two is enough to move it.
 pub mod edgegrid;
+
+#[cfg(feature = "reqwest")]
 pub mod signers;
 
 #[cfg(feature = "reqwest")]
