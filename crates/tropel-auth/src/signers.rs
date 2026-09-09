@@ -973,7 +973,11 @@ impl AuthSigner for EdgeGridAuth {
             timestamp: None,
             max_body: self.max_body,
         };
-        let value = crate::edgegrid::edgegrid_build_header(&params, &headers)?;
+        // The adapter's job: `edgegrid` is pure and errors as `String` so the
+        // browser tier can reach it, and this is where that becomes a
+        // `TropelError` — the same division every builder in this crate uses.
+        let value = crate::edgegrid::edgegrid_build_header(&params, &headers)
+            .map_err(TropelError::Other)?;
         set_auth_header(request, &value)
     }
 }
