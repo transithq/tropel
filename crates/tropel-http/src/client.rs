@@ -285,6 +285,68 @@ impl HttpClient {
             builder = builder.max_tls_version(version);
         }
 
+        // ── TLS: private CA bundles ──
+        //
+        // Read BEFORE anything is applied so an error names the bundle rather
+        // than surfacing later as an opaque handshake failure.
+        //
+        // `from_pem_bundle`, not `from_pem`: the latter reads a SINGLE
+        // certificate, so a chain file handed to it whole contributes only
+        // its first cert — the intermediate is dropped and verification then
+        // fails against a leaf signed by it, which is a very confusing way to
+        // fail.
+        let mut roots: Vec<reqwest::Certificate> = Vec::new();
+        for path in &tls.root_cert_paths {
+            let pem = std::fs::read(path)
+                .map_err(|e| TropelError::Config(format!("cannot read CA bundle {path}: {e}")))?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+                // Names the FILE. A config with three bundles and one typo
+                // otherwise reports "invalid certificate" with no way to tell
+                // which one.
+                TropelError::Config(format!("CA bundle {path} is not valid PEM: {e}"))
+            })?;
+            // A file with no PEM blocks in it parses SUCCESSFULLY to zero
+            // certificates — `from_pem_bundle` reports no error for, say, a
+            // TOML file, it simply finds nothing. So the wrong path would be
+            // accepted, contribute no trust, and every request would then
+            // fail verification with nothing pointing at the cause. Refused
+            // by name instead (found by the test for exactly this).
+            if certs.is_empty() {
+                return Err(TropelError::Config(format!(
+                    "CA bundle {path} contains no certificates — \
+                     it parsed, but there is no PEM block in it"
+                )));
+            }
+            roots.extend(certs);
+        }
+
+        if tls.keep_system_roots {
+            // ADDITIVE, and this is the default: adding a private CA nearly
+            // always means "as well as", because you still need to reach
+            // github.com. A default of certs-only would make a config that
+            // adds one internal root silently stop trusting the public
+            // internet, which presents as "everything broke after I added our
+            // CA".
+            for cert in roots {
+                builder = builder.add_root_certificate(cert);
+            }
+        } else {
+            // PINNING, asked for deliberately. `tls_certs_only` both supplies
+            // the set and disables the built-in roots, so the two cannot get
+            // out of step.
+            if roots.is_empty() {
+                // Trusting nothing at all is a config error, not a pinning
+                // strategy — refused by name rather than producing a client
+                // that fails every request for no stated reason.
+                return Err(TropelError::Config(
+                    "keep_system_roots = false with no root_cert_paths trusts no CA at all — \
+                     supply at least one bundle, or leave the platform roots on"
+                        .to_string(),
+                ));
+            }
+            builder = builder.tls_certs_only(roots);
+        }
+
         // ── TLS: mTLS client identity ──
         if let Some(identity) = identity {
             builder = builder.identity(identity);
