@@ -836,6 +836,80 @@ fn generate_nonce() -> String {
 /// observe traffic — a time-seeded counter would let them predict/replay
 /// client nonces. `rand::rng()` is a CSPRNG (ChaCha12, OS-seeded); 128 bits
 /// of entropy is the conventional crypto-nonce strength.
+/// Akamai EdgeGrid (`EG1-HMAC-SHA256`)  [ask 10, KP-401]
+///
+/// The bytes are `crate::edgegrid`, which is NOT behind the `reqwest` feature
+/// — the same split Hawk uses, so a browser embedder can reach the identical
+/// signature without a reqwest dependency (TR-425).
+pub struct EdgeGridAuth {
+    client_token: String,
+    access_token: String,
+    client_secret: String,
+    headers_to_sign: Vec<String>,
+    max_body: usize,
+}
+
+impl EdgeGridAuth {
+    pub fn new(
+        client_token: &str,
+        access_token: &str,
+        client_secret: &str,
+        headers_to_sign: Vec<String>,
+        max_body: Option<usize>,
+    ) -> Self {
+        Self {
+            client_token: client_token.to_string(),
+            access_token: access_token.to_string(),
+            client_secret: client_secret.to_string(),
+            headers_to_sign,
+            max_body: max_body.unwrap_or(crate::edgegrid::DEFAULT_MAX_BODY),
+        }
+    }
+}
+
+impl AuthSigner for EdgeGridAuth {
+    fn name(&self) -> &str {
+        "akamai-edgegrid"
+    }
+
+    fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+        // The header list is read off the request BEFORE signing, because the
+        // canonical block must reflect what is actually going out — a header
+        // the caller named but did not set contributes nothing rather than an
+        // empty entry Akamai would not have.
+        let headers: Vec<(String, String)> = request
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
+        // `bytes()` is Some only for an in-memory body. A STREAMING body
+        // cannot be hashed without consuming it, so it signs as if there were
+        // no body — which is what Akamai's own clients do, and is why
+        // oversized bodies are skipped rather than truncated.
+        let body = request.body().and_then(|b| b.as_bytes()).map(|b| b.to_vec());
+
+        let params = crate::edgegrid::EdgeGridBuildParams {
+            method: request.method().as_str().to_string(),
+            url: request.url().to_string(),
+            headers_to_sign: self.headers_to_sign.clone(),
+            body,
+            access_token: self.access_token.clone(),
+            client_token: self.client_token.clone(),
+            client_secret: self.client_secret.clone(),
+            nonce: None,
+            timestamp: None,
+            max_body: self.max_body,
+        };
+        let value = crate::edgegrid::edgegrid_build_header(&params, &headers)?;
+        set_auth_header(request, &value)
+    }
+}
+
+pub(crate) fn crypto_nonce() -> String {
+    generate_crypto_nonce()
+}
+
 fn generate_crypto_nonce() -> String {
     let mut rng = rand::rng();
     let bytes: [u8; 16] = rng.random();
@@ -948,9 +1022,65 @@ pub fn build_auth_signer(auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>
         AuthConfig::Jwt { .. } => Err(TropelError::Other(
             "unsupported auth scheme: jwt — JWT bearer is not yet implemented as an AuthConfig variant (use bearer with a pre-signed token or oauth2/jwt via core-wasm sign_jwt) (TR-409)".into(),
         )),
-        AuthConfig::AkamaiEdgeGrid { .. } => Err(TropelError::Other(
-            "unsupported auth scheme: akamai-edgegrid — Akamai EdgeGrid signing is not yet implemented (TR-409 KP-401); request not sent".into(),
-        )),
+        // ask 10: was a TR-409 refusal. `client_secret`, `headers_to_sign`
+        // and `max_body` ride in `extra` because the variant predates them —
+        // read by name rather than by adding fields, so an older Scenario
+        // still deserializes.
+        AuthConfig::AkamaiEdgeGrid {
+            access_token,
+            client_token,
+            extra,
+        } => {
+            let secret = extra
+                .get("client_secret")
+                .or_else(|| extra.get("clientSecret"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let headers_to_sign = extra
+                .get("headers_to_sign")
+                .or_else(|| extra.get("headersToSign"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let max_body = extra
+                .get("max_body")
+                .or_else(|| extra.get("maxBody"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            // Validated HERE, not at sign time. `build_auth_signer` is where
+            // config problems are reported, and handing back a signer that
+            // will certainly fail moves the error further from the field that
+            // caused it. `edgegrid_build_header` keeps its own check for
+            // direct callers.
+            let ct = client_token.as_deref().unwrap_or_default();
+            let at = access_token.as_deref().unwrap_or_default();
+            let missing: Vec<&str> = [
+                ("client_token", ct.is_empty()),
+                ("access_token", at.is_empty()),
+                ("client_secret", secret.is_empty()),
+            ]
+            .iter()
+            .filter(|(_, empty)| *empty)
+            .map(|(name, _)| *name)
+            .collect();
+            if !missing.is_empty() {
+                return Err(TropelError::Other(format!(
+                    "unsupported auth scheme: akamai-edgegrid — missing {}; request not sent",
+                    missing.join(", ")
+                )));
+            }
+            Ok(Some(Box::new(EdgeGridAuth::new(
+                ct,
+                at,
+                secret,
+                headers_to_sign,
+                max_body,
+            ))))
+        }
     }
 }
 
@@ -1692,11 +1822,6 @@ mod tests {
                 token: Some("tok".into()),
                 extra: Default::default(),
             },
-            AuthConfig::AkamaiEdgeGrid {
-                access_token: Some("a".into()),
-                client_token: Some("c".into()),
-                extra: Default::default(),
-            },
             AuthConfig::OAuth1 {
                 consumer_key: "c".into(),
                 consumer_secret: "s".into(),
@@ -1722,6 +1847,33 @@ mod tests {
                 "error must mention unsupported: {err}"
             );
         }
+        // ask 10: EdgeGrid is supported now, but only with all three
+        // credentials. An INCOMPLETE config is still an Err — and at BUILD
+        // time, so the error names the missing field rather than surfacing
+        // when the request goes out.
+        let incomplete = AuthConfig::AkamaiEdgeGrid {
+            access_token: Some("a".into()),
+            client_token: Some("c".into()),
+            extra: Default::default(),
+        };
+        let err = match build_auth_signer(&incomplete) {
+            Ok(_) => panic!("edgegrid with no client_secret must be Err"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("client_secret"), "names the field: {err}");
+
+        let complete = AuthConfig::AkamaiEdgeGrid {
+            access_token: Some("a".into()),
+            client_token: Some("c".into()),
+            extra: [("client_secret".to_string(), serde_json::json!("s"))]
+                .into_iter()
+                .collect(),
+        };
+        let signer = build_auth_signer(&complete)
+            .expect("a complete edgegrid config builds")
+            .expect("a signer");
+        assert_eq!(signer.name(), "akamai-edgegrid");
+
         // HMAC-SHA256 is supported — proves the picker value round-trips
         let hmac256 = AuthConfig::OAuth1 {
             consumer_key: "c".into(),
