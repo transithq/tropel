@@ -467,6 +467,18 @@ impl OAuth1Auth {
             )));
         }
 
+        // ask 8: PLAINTEXT sends the consumer secret in the clear. RFC 5849
+        // §3.4.4 requires a secure channel, and over http:// this is not a
+        // weak signature — it is a DISCLOSED KEY. Refused rather than signed,
+        // because a leaked credential cannot be un-leaked by noticing later.
+        if method_str == "PLAINTEXT" && url.scheme() != "https" {
+            return Err(TropelError::Other(format!(
+                "OAuth1 PLAINTEXT over {}:// would send the consumer secret in the clear — \
+                 RFC 5849 requires a secure channel; request not sent",
+                url.scheme()
+            )));
+        }
+
         let base_uri = base_url(url);
         let out = crate::builders::oauth1_build_header(&crate::builders::OAuth1BuildParams {
             method,
@@ -1031,15 +1043,19 @@ pub fn build_auth_signer(auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>
         } => {
             // TR-409: validate the picker's signature method before constructing
             // the signer. Unsupported methods are reported, not degraded.
+            //
+            // Reads `OAUTH1_SIGNATURE_METHODS` rather than its own list. It
+            // had one — a hardcoded `matches!` over the three HMAC names —
+            // which is the THIRD copy of the same set and exactly the drift
+            // the builder exports that constant to prevent: ask 8 added
+            // PLAINTEXT to the list and the dispatch, and this guard went on
+            // refusing it. A list nobody remembers is worse than no list.
             if let Some(m) = signature_method {
-                let up = m.to_ascii_uppercase();
-                if !matches!(
-                    up.as_str(),
-                    "HMAC-SHA1" | "HMAC-SHA256" | "HMAC-SHA512"
-                ) {
+                if !crate::builders::oauth1_is_supported_signature_method(m) {
                     return Err(TropelError::Other(format!(
-                        "unsupported auth scheme: oauth1 signature_method '{}' — supported: HMAC-SHA1, HMAC-SHA256, HMAC-SHA512 (TR-409)",
-                        m
+                        "unsupported auth scheme: oauth1 signature_method '{}' — supported: {} (TR-409)",
+                        m,
+                        crate::builders::OAUTH1_SIGNATURE_METHODS.join(", ")
                     )));
                 }
             }
@@ -1894,13 +1910,6 @@ mod tests {
                 token_secret: None,
                 signature_method: Some("RSA-SHA1".into()),
             },
-            AuthConfig::OAuth1 {
-                consumer_key: "c".into(),
-                consumer_secret: "s".into(),
-                token: None,
-                token_secret: None,
-                signature_method: Some("PLAINTEXT".into()),
-            },
         ];
         for cfg in unsupported {
             let err = match build_auth_signer(&cfg) {
@@ -1912,6 +1921,41 @@ mod tests {
                 "error must mention unsupported: {err}"
             );
         }
+        // ask 8: PLAINTEXT is supported now — but only over TLS. RFC 5849
+        // §3.4.4 requires a secure channel, and over http:// this is not a
+        // weak signature but a DISCLOSED consumer secret.
+        let plaintext = AuthConfig::OAuth1 {
+            consumer_key: "c".into(),
+            consumer_secret: "s".into(),
+            token: None,
+            token_secret: None,
+            signature_method: Some("PLAINTEXT".into()),
+        };
+        let signer = build_auth_signer(&plaintext).expect("builds").expect("a signer");
+
+        let mut secure = reqwest::Request::new(
+            reqwest::Method::GET,
+            reqwest::Url::parse("https://example.test/x").unwrap(),
+        );
+        signer.sign(&mut secure).expect("https signs");
+        let header = secure
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(header.contains("oauth_signature_method=\"PLAINTEXT\""), "got {header}");
+
+        let mut insecure = reqwest::Request::new(
+            reqwest::Method::GET,
+            reqwest::Url::parse("http://example.test/x").unwrap(),
+        );
+        let err = match signer.sign(&mut insecure) {
+            Ok(()) => panic!("PLAINTEXT over http:// must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("in the clear"), "says what leaks: {err}");
+        assert!(err.contains("not sent"), "and that nothing went out: {err}");
+
         // ask 11: WSSE is supported now. The PLACEMENT is what matters —
         // `X-WSSE` carries the token and `Authorization` the profile marker,
         // matching KnockPort's wasm pipeline exactly. A native tier that put

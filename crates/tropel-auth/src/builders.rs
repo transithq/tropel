@@ -690,7 +690,8 @@ const RFC3986_UNRESERVED: AsciiSet = NON_ALPHANUMERIC
 /// dispatch read from ONE list. When they were separate, adding a method to
 /// one and not the other was a silent downgrade — the TR-004/TR-409 failure
 /// shape, where an unsupported method quietly signs as HMAC-SHA1.
-pub const OAUTH1_SIGNATURE_METHODS: [&str; 3] = ["HMAC-SHA1", "HMAC-SHA256", "HMAC-SHA512"];
+pub const OAUTH1_SIGNATURE_METHODS: [&str; 4] =
+    ["HMAC-SHA1", "HMAC-SHA256", "HMAC-SHA512", "PLAINTEXT"];
 
 /// Whether `method` (case-insensitive) is one of [`OAUTH1_SIGNATURE_METHODS`].
 pub fn oauth1_is_supported_signature_method(method: &str) -> bool {
@@ -769,6 +770,16 @@ pub fn oauth1_signature(
         "HMAC-SHA1" => sign_with!(Sha1),
         "HMAC-SHA256" => sign_with!(Sha256),
         "HMAC-SHA512" => sign_with!(Sha512),
+        // ask 8: RFC 5849 §3.4.4 — the PLAINTEXT signature IS the key, so
+        // the `key` built above is already it. No hashing, which is the
+        // point: the secrets travel in the clear.
+        //
+        // Which is also why the SIGNER refuses PLAINTEXT over a non-TLS URL.
+        // The spec says it "MUST only be used over a secure channel", and a
+        // consumer secret sent as plaintext over http:// is a credential
+        // leak — not a weak signature, a disclosed key. That guard belongs
+        // where the scheme is visible, not here where only a base string is.
+        "PLAINTEXT" => key.clone(),
         _ => return None,
     })
 }
@@ -1503,7 +1514,10 @@ mod tests {
         }
         // And the converse: unsupported methods must return None, NOT fall
         // back to HMAC-SHA1. A silent downgrade is the TR-004/TR-409 shape.
-        for method in ["RSA-SHA1", "RSA-SHA256", "PLAINTEXT", "HMAC-MD5", ""] {
+        // ask 8: PLAINTEXT left this list — it is implemented now. The RSA
+        // family stays: it needs key material (`private_key_pem` on the
+        // config) and an RSA crate, neither of which is in the graph.
+        for method in ["RSA-SHA1", "RSA-SHA256", "RSA-SHA512", "HMAC-MD5", ""] {
             assert!(
                 !oauth1_is_supported_signature_method(method),
                 "{method} must not be treated as supported"
@@ -1521,6 +1535,7 @@ mod tests {
         // digest type. A copy-paste slip that passed `Sha256` twice would
         // leave every test above green — they never compare the arms against
         // each other — while silently signing SHA-512 requests with SHA-256.
+        // Distinctness holds across EVERY listed method, PLAINTEXT included.
         let sigs: Vec<String> = OAUTH1_SIGNATURE_METHODS
             .iter()
             .map(|m| oauth1_signature("base-string", "cs", "ts", m).expect("listed method"))
@@ -1535,11 +1550,30 @@ mod tests {
             }
         }
         // Lengths follow the digest, so a wrong arm is visible even if two
-        // digests somehow collided.
+        // digests somehow collided. Scoped to the HMAC FAMILY: PLAINTEXT has
+        // no digest — its signature is the key itself, so its length is a
+        // function of the secrets and asserting a constant would be
+        // asserting the fixture rather than the algorithm (ask 8).
+        let hmac_lengths: Vec<usize> = OAUTH1_SIGNATURE_METHODS
+            .iter()
+            .zip(sigs.iter())
+            .filter(|(m, _)| m.starts_with("HMAC-"))
+            .map(|(_, s)| s.len())
+            .collect();
         assert_eq!(
-            sigs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            hmac_lengths,
             vec![28, 44, 88],
             "base64 lengths must match SHA-1 (20B), SHA-256 (32B), SHA-512 (64B)"
+        );
+        // And PLAINTEXT is the key verbatim, per RFC 5849 §3.4.4 — asserted
+        // rather than assumed, because "the signature is the key" is exactly
+        // the kind of claim that reads as a bug.
+        let plaintext = oauth1_signature("any-base-string", "cs", "ts", "PLAINTEXT").unwrap();
+        assert_eq!(plaintext, "cs&ts");
+        assert_eq!(
+            oauth1_signature("a-different-base-string", "cs", "ts", "PLAINTEXT").unwrap(),
+            plaintext,
+            "PLAINTEXT does not depend on the base string at all"
         );
     }
 
