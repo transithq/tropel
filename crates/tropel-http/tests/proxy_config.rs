@@ -297,3 +297,111 @@ fn pac_fields_read_in_both_spellings() {
         assert_eq!(cfg.pac_url.as_deref(), Some("http://a/x.dat"), "for {json}");
     }
 }
+
+// ── PAC directives and failover  [ask 17] ──────────────────────────────────
+//
+// "Bruno honours only the FIRST directive of the first matching return." A PAC
+// return value is a LIST separated by `;`, and honouring one of them turns a
+// config with a documented fallback into a single point of failure. These
+// tests are the parser and the ordering — the half where that bug lives.
+
+use tropel_http::{DEFAULT_PAC_TTL, PacDecision, PacDirective, parse_pac_result};
+
+#[test]
+fn a_multi_directive_result_yields_every_candidate_in_order() {
+    // THE test. Three candidates, in the order the script wrote them.
+    let got = parse_pac_result("PROXY a:8080; PROXY b:8080; DIRECT");
+    assert_eq!(
+        got,
+        vec![
+            PacDirective::Proxy("a:8080".into()),
+            PacDirective::Proxy("b:8080".into()),
+            PacDirective::Direct,
+        ]
+    );
+}
+
+#[test]
+fn socks_and_its_versioned_spellings_all_parse() {
+    let got = parse_pac_result("SOCKS a:1080; SOCKS4 b:1080; SOCKS5 c:1080");
+    assert_eq!(got.len(), 3);
+    assert!(got.iter().all(|d| matches!(d, PacDirective::Socks(_))));
+}
+
+#[test]
+fn the_keyword_is_case_insensitive_and_whitespace_is_flexible() {
+    // Generated scripts use tabs and mixed case. A strict single-space parse
+    // would silently drop directives that are perfectly valid.
+    let got = parse_pac_result("proxy   a:8080;\tPROXY\tb:8080 ; direct");
+    assert_eq!(got.len(), 3);
+}
+
+#[test]
+fn a_malformed_directive_is_skipped_not_fatal() {
+    // A PAC script is often generated; one malformed entry in a list of four
+    // must not take the other three down.
+    let got = parse_pac_result("PROXY a:8080; NONSENSE; PROXY b:8080");
+    assert_eq!(got.len(), 2, "the two good ones survive: {got:?}");
+}
+
+#[test]
+fn a_proxy_with_no_target_is_skipped_rather_than_becoming_direct() {
+    // Turning it into DIRECT would send traffic somewhere the script did not
+    // say — the silent misroute this whole surface exists to prevent.
+    let got = parse_pac_result("PROXY; DIRECT");
+    assert_eq!(got, vec![PacDirective::Direct]);
+}
+
+#[test]
+fn an_entirely_unparseable_result_is_empty_not_direct() {
+    // The caller must treat empty as a failure. Going direct on a PAC script
+    // we could not read is exactly the misroute to avoid, so the parser
+    // reports nothing rather than inventing a fallback.
+    assert!(parse_pac_result("garbage in").is_empty());
+    assert!(parse_pac_result("").is_empty());
+    assert!(parse_pac_result(";;;").is_empty());
+}
+
+#[test]
+fn a_directive_becomes_the_proxy_url_reqwest_needs() {
+    assert_eq!(PacDirective::Direct.proxy_url(), None);
+    assert_eq!(
+        PacDirective::Proxy("a:8080".into()).proxy_url().as_deref(),
+        Some("http://a:8080")
+    );
+    // socks5, not socks4: reqwest's SOCKS support is 5, and naming it is
+    // honest about what would actually be attempted.
+    assert_eq!(
+        PacDirective::Socks("a:1080".into()).proxy_url().as_deref(),
+        Some("socks5://a:1080")
+    );
+}
+
+#[test]
+fn failover_advances_through_the_candidates_in_order() {
+    let mut decision = PacDecision::new(parse_pac_result("PROXY a:1; PROXY b:2; DIRECT"));
+    assert_eq!(decision.candidate(), Some(&PacDirective::Proxy("a:1".into())));
+    assert_eq!(decision.advance(), Some(&PacDirective::Proxy("b:2".into())));
+    assert_eq!(decision.advance(), Some(&PacDirective::Direct));
+    assert!(!decision.exhausted());
+    assert_eq!(decision.advance(), None);
+    assert!(decision.exhausted(), "only after the LAST one fails does the request fail");
+}
+
+#[test]
+fn an_empty_decision_is_exhausted_immediately() {
+    // So a caller cannot mistake "no candidates" for "try the first".
+    let decision = PacDecision::new(Vec::new());
+    assert!(decision.exhausted());
+    assert_eq!(decision.candidate(), None);
+}
+
+#[test]
+fn a_fresh_decision_is_not_stale_and_the_ttl_is_bounded() {
+    // Bounded because a PAC answer changes when a laptop moves networks;
+    // unbounded caching would pin the old answer for the process's life.
+    let decision = PacDecision::new(parse_pac_result("DIRECT"));
+    assert!(!decision.is_stale(DEFAULT_PAC_TTL));
+    assert!(decision.is_stale(std::time::Duration::ZERO), "a zero TTL is always stale");
+    assert!(DEFAULT_PAC_TTL > std::time::Duration::ZERO);
+}
