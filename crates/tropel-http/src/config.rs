@@ -113,6 +113,10 @@ pub struct HttpConfig {
     /// k6's `--http-debug=full` also prints request/response bodies — that
     /// extra mode is `http_debug_full`.
     #[serde(default)]
+    /// Proxy configuration (ask 17). `ProxyMode::Off` by default, so every
+    /// existing config behaves exactly as before. The container's own
+    /// `#[serde(default)]` covers an absent key.
+    pub proxy: crate::proxy::ProxyConfig,
     pub http_debug: bool,
     /// `--http-debug=full` (k6 parity): also print the request/response
     /// bodies, not just the head lines. Only meaningful with `http_debug`.
@@ -160,6 +164,7 @@ impl Default for HttpConfig {
             hosts: HashMap::new(),
             blacklist_ips: Vec::new(),
             max_response_bytes: None,
+            proxy: crate::proxy::ProxyConfig::default(),
             http_debug: false,
             http_debug_full: false,
         }

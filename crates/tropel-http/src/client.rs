@@ -285,6 +285,58 @@ impl HttpClient {
             builder = builder.max_tls_version(version);
         }
 
+        // ── Proxy (ask 17) ──
+        //
+        // Applied at BUILD time because reqwest bakes proxies into the client
+        // — which is why the per-request story is a profile-keyed client map
+        // rather than a per-call argument, exactly as `cert_clients` already
+        // does for identities.
+        //
+        // The bypass list is parsed BEFORE any proxy is installed, so a typo
+        // fails the build rather than silently sending traffic through a proxy
+        // the user told it to skip.
+        match config.proxy.mode {
+            crate::proxy::ProxyMode::Off => {
+                // Explicit: reqwest reads `HTTP_PROXY` from the environment on
+                // its own, so "off" has to SAY so or a machine with the
+                // variable set would quietly proxy a config that asked for no
+                // proxy at all.
+                builder = builder.no_proxy();
+            }
+            crate::proxy::ProxyMode::Fixed => {
+                let url = config.proxy.fixed_url().ok_or_else(|| {
+                    TropelError::Config(
+                        "proxy mode is \"fixed\" but no host is set — name the proxy host, \
+                         or set mode to \"off\""
+                            .to_string(),
+                    )
+                })?;
+                builder = builder.proxy(Self::build_proxy(&url, config)?);
+            }
+            crate::proxy::ProxyMode::System => {
+                match crate::proxy::system_proxy_url() {
+                    Some(url) => builder = builder.proxy(Self::build_proxy(&url, config)?),
+                    // Found nothing. NOT an error — a machine with no proxy
+                    // variables is the normal case for `system`, and failing
+                    // would make the mode unusable as a default.
+                    None => builder = builder.no_proxy(),
+                }
+            }
+            crate::proxy::ProxyMode::Pac => {
+                // Refused BY NAME rather than silently degrading to direct.
+                // PAC needs per-URL evaluation with directive failover, which
+                // is a request-time decision this build-time hook cannot
+                // make; sending traffic direct while the config says `pac`
+                // would be the silent misroute the whole surface exists to
+                // prevent.
+                return Err(TropelError::Config(
+                    "proxy mode \"pac\" is not implemented yet (tropel ask 17): PAC needs \
+                     per-URL evaluation with directive failover. Use \"fixed\" or \"system\"."
+                        .to_string(),
+                ));
+            }
+        }
+
         // ── TLS: private CA bundles ──
         //
         // Read BEFORE anything is applied so an error names the bundle rather
@@ -445,6 +497,56 @@ impl HttpClient {
     /// (`BEGIN EC PRIVATE KEY`) keys. PKCS#12 bundles and encrypted PEM keys
     /// require the native-tls backend; a supplied passphrase logs a warning
     /// (its value is never logged) and the key must be unencrypted PEM.
+    /// One `reqwest::Proxy` from a URL plus the config's credentials and
+    /// bypass list.
+    ///
+    /// Credentials go through `basic_auth`, never the URL: a proxy URL with a
+    /// password in it is logged by everything that logs a URL.
+    fn build_proxy(url: &str, config: &HttpConfig) -> Result<reqwest::Proxy> {
+        // Parsed and validated FIRST: a bypass typo must fail the build, not
+        // silently send traffic through a proxy the user told it to skip.
+        //
+        // System mode inherits `NO_PROXY` as well as the proxy itself —
+        // honouring one without the other is how a "system proxy" ends up
+        // routing localhost through a corporate gateway.
+        let mut entries = config.proxy.bypass.clone();
+        if config.proxy.mode == crate::proxy::ProxyMode::System {
+            entries.extend(crate::proxy::system_no_proxy());
+        }
+        let rules = crate::proxy::parse_bypass_list(&entries)
+            .map_err(|e| TropelError::Config(format!("proxy bypass list: {e}")))?;
+
+        let target = reqwest::Url::parse(url)
+            .map_err(|e| TropelError::Config(format!("proxy URL {url:?} is invalid: {e}")))?;
+
+        // `Proxy::custom` is the CONSTRUCTOR, not a builder step — so the
+        // bypass predicate decides the proxy per URL rather than being layered
+        // onto an `all` proxy afterwards. reqwest's own `NoProxy` parser does
+        // not implement the subdomains-only rule this ask specifies, which is
+        // why the predicate is ours and reqwest only ever sees the answer.
+        let mut proxy = if rules.is_empty() {
+            // `all`, not `http`/`https` separately: a proxy configured for a
+            // test run is meant for the traffic that run makes, and two
+            // half-configured schemes is a footgun nobody asks for.
+            reqwest::Proxy::all(url)
+                .map_err(|e| TropelError::Config(format!("proxy URL {url:?} is invalid: {e}")))?
+        } else {
+            reqwest::Proxy::custom(move |requested| {
+                let host = requested.host_str().unwrap_or("");
+                if crate::proxy::bypasses(&rules, host) {
+                    None
+                } else {
+                    Some(target.clone())
+                }
+            })
+        };
+
+        if let Some(username) = config.proxy.username.as_deref() {
+            proxy = proxy.basic_auth(username, config.proxy.password.as_deref().unwrap_or(""));
+        }
+        Ok(proxy)
+    }
+
     fn load_pem_identity(
         cert_path: &str,
         key_path: &str,
