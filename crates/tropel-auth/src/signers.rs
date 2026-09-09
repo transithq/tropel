@@ -836,6 +836,60 @@ fn generate_nonce() -> String {
 /// observe traffic — a time-seeded counter would let them predict/replay
 /// client nonces. `rand::rng()` is a CSPRNG (ChaCha12, OS-seeded); 128 bits
 /// of entropy is the conventional crypto-nonce strength.
+/// WSSE UsernameToken  [ask 11, KP-401]
+///
+/// `sign_wsse` already existed, was exported, and KnockPort's wasm pipeline
+/// executed WSSE with it — only `build_auth_signer` refused the variant, so
+/// the NATIVE runtime had no WSSE while the browser one did.
+///
+/// The header PLACEMENT is copied from that pipeline deliberately
+/// (`packages/core/src/signed-auth.ts`): the UsernameToken rides `X-WSSE` and
+/// `Authorization` carries the profile marker. Getting this wrong is the whole
+/// risk of the ask — a native tier that put the token in `Authorization`
+/// would authenticate against some servers and not others, and the divergence
+/// would only show up per-server. Placement is not signing, so it has to
+/// match rather than be re-derived.
+pub struct WsseAuth {
+    username: String,
+    password: String,
+}
+
+impl WsseAuth {
+    pub fn new(username: &str, password: &str) -> Self {
+        Self { username: username.to_string(), password: password.to_string() }
+    }
+}
+
+impl AuthSigner for WsseAuth {
+    fn name(&self) -> &str {
+        "wsse"
+    }
+
+    fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+        // Nonce and `created` left empty so `sign_wsse` generates them: the
+        // server validates freshness, so a fixed pair would fail replay
+        // checks on the second request.
+        // `sign_wsse` reports an `OauthError`, which is the builders' own
+        // error type rather than the transport's — mapped rather than
+        // converted, so the message reaches the caller intact.
+        let signed = crate::oauth::sign_wsse(&crate::oauth::WsseParams {
+            username: self.username.clone(),
+            password: self.password.clone(),
+            nonce: String::new(),
+            created: String::new(),
+        })
+        .map_err(|e| TropelError::Other(format!("wsse: {e}")))?;
+        let headers = request.headers_mut();
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-wsse"),
+            reqwest::header::HeaderValue::from_str(&signed.authorization).map_err(|e| {
+                TropelError::Other(format!("wsse: token is not a valid header value: {e}"))
+            })?,
+        );
+        set_auth_header(request, "WSSE profile=\"UsernameToken\"")
+    }
+}
+
 /// Akamai EdgeGrid (`EG1-HMAC-SHA256`)  [ask 10, KP-401]
 ///
 /// The bytes are `crate::edgegrid`, which is NOT behind the `reqwest` feature
@@ -1016,9 +1070,25 @@ pub fn build_auth_signer(auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>
         AuthConfig::Ntlm { .. } => Err(TropelError::Other(
             "unsupported auth scheme: ntlm — NTLM proxy auth is not yet implemented (TR-409 KP-401); request not sent".into(),
         )),
-        AuthConfig::Wsse { .. } => Err(TropelError::Other(
-            "unsupported auth scheme: wsse — WSSE UsernameToken is not wired through the signer builder yet (TR-409); request not sent".into(),
-        )),
+        // ask 11: `sign_wsse` existed and only this arm refused. Validated
+        // here for the same reason EdgeGrid is — a signer that cannot sign is
+        // an error about a config field, reported where config errors go.
+        AuthConfig::Wsse {
+            username,
+            password,
+            ..
+        } => {
+            let user = username.as_deref().unwrap_or_default();
+            if user.is_empty() {
+                return Err(TropelError::Other(
+                    "unsupported auth scheme: wsse — missing username; request not sent".into(),
+                ));
+            }
+            Ok(Some(Box::new(WsseAuth::new(
+                user,
+                password.as_deref().unwrap_or_default(),
+            ))))
+        }
         AuthConfig::Jwt { .. } => Err(TropelError::Other(
             "unsupported auth scheme: jwt — JWT bearer is not yet implemented as an AuthConfig variant (use bearer with a pre-signed token or oauth2/jwt via core-wasm sign_jwt) (TR-409)".into(),
         )),
@@ -1813,11 +1883,6 @@ mod tests {
                 password: Some("p".into()),
                 extra: Default::default(),
             },
-            AuthConfig::Wsse {
-                username: Some("u".into()),
-                password: Some("p".into()),
-                extra: Default::default(),
-            },
             AuthConfig::Jwt {
                 token: Some("tok".into()),
                 extra: Default::default(),
@@ -1847,6 +1912,52 @@ mod tests {
                 "error must mention unsupported: {err}"
             );
         }
+        // ask 11: WSSE is supported now. The PLACEMENT is what matters —
+        // `X-WSSE` carries the token and `Authorization` the profile marker,
+        // matching KnockPort's wasm pipeline exactly. A native tier that put
+        // the token in `Authorization` would authenticate against some
+        // servers and not others, and the divergence would only show up
+        // per-server.
+        let wsse = AuthConfig::Wsse {
+            username: Some("u".into()),
+            password: Some("p".into()),
+            extra: Default::default(),
+        };
+        let signer = build_auth_signer(&wsse).expect("builds").expect("a signer");
+        assert_eq!(signer.name(), "wsse");
+        let mut request = reqwest::Request::new(
+            reqwest::Method::GET,
+            reqwest::Url::parse("https://example.test/x").unwrap(),
+        );
+        signer.sign(&mut request).expect("signs");
+        let token = request
+            .headers()
+            .get("x-wsse")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(token.starts_with("UsernameToken "), "the token rides X-WSSE: {token:?}");
+        assert!(token.contains("PasswordDigest="), "got {token:?}");
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("WSSE profile=\"UsernameToken\""),
+            "Authorization carries the PROFILE, not the token"
+        );
+
+        // No username is still an Err, at build time.
+        let no_user = AuthConfig::Wsse {
+            username: None,
+            password: Some("p".into()),
+            extra: Default::default(),
+        };
+        let err = match build_auth_signer(&no_user) {
+            Ok(_) => panic!("wsse with no username must be Err"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("username"), "names the field: {err}");
+
         // ask 10: EdgeGrid is supported now, but only with all three
         // credentials. An INCOMPLETE config is still an Err — and at BUILD
         // time, so the error names the missing field rather than surfacing
