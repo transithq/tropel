@@ -344,6 +344,9 @@ fn build_items(items: &[BruItem], notes: &mut Vec<String>) -> Vec<ScenarioItem> 
         match item.r#type.as_deref() {
             Some("folder") => out.push(ScenarioItem {
                 authoring: None,
+                // Bruno is a collection, not a schema — there is no
+                // declaration to carry (see ScenarioItem.contract).
+                contract: None,
                 name: item.name.clone().unwrap_or_else(|| "Folder".into()),
                 id: None,
                 request: None,
@@ -568,6 +571,7 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
 
     Ok(ScenarioItem {
         authoring,
+        contract: None,
         name: item
             .name
             .clone()

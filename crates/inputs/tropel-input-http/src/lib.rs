@@ -271,6 +271,9 @@ fn block_to_item(
 
     Ok(Some(ScenarioItem {
         authoring: None,
+        // an .http file is a collection, not a schema — there is no
+        // declaration to carry (see ScenarioItem.contract).
+        contract: None,
         name: item_name,
         id: None,
         request: Some(Request {

@@ -198,8 +198,10 @@ fn convert_items(
                 }
                 let scenario_item = ScenarioItem {
                     // Postman's own model has no disabled-entry or
-                    // request-vars concept to carry here.
+                    // request-vars concept to carry here, and a collection is
+                    // not a schema — there is no declaration to carry either.
                     authoring: None,
+                    contract: None,
                     id: folder.id.clone(),
                     name: folder.name.clone().unwrap_or_default(),
                     request: None,
@@ -249,8 +251,10 @@ fn convert_request_item(
 
     ScenarioItem {
         // Postman's own model has no disabled-entry or
-        // request-vars concept to carry here.
+        // request-vars concept to carry here, and a collection is not a
+        // schema — there is no declaration to carry either.
         authoring: None,
+        contract: None,
         id: req.id.clone(),
         name: req.name.clone().unwrap_or_default(),
         request: Some(request),

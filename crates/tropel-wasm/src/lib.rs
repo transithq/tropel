@@ -1018,6 +1018,7 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
         .iter()
         .map(|wi| -> Result<ScenarioItem> {
             Ok(ScenarioItem {
+                contract: None,
                 authoring: None,
                 id: wi.id.clone(),
                 name: wi.name.clone(),
@@ -1047,6 +1048,7 @@ fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
             .map(|wi| -> Result<ScenarioItem> {
                 let children = build_item_tree(&wi.items)?;
                 Ok(ScenarioItem {
+                    contract: None,
                     authoring: None,
                     id: wi.id.clone(),
                     name: wi.name.clone(),

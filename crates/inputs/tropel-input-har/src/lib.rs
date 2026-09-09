@@ -357,6 +357,9 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
 
     Ok(ScenarioItem {
         authoring: None,
+        // a HAR is a collection, not a schema — there is no
+        // declaration to carry (see ScenarioItem.contract).
+        contract: None,
         name: item_name,
         id: None,
         request: Some(Request {
