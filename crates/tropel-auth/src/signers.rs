@@ -1121,28 +1121,47 @@ pub fn build_auth_signer(auth: &AuthConfig) -> Result<Option<Box<dyn AuthSigner>
         AuthConfig::AkamaiEdgeGrid {
             access_token,
             client_token,
+            client_secret,
+            headers_to_sign,
+            max_body,
             extra,
         } => {
-            let secret = extra
-                .get("client_secret")
-                .or_else(|| extra.get("clientSecret"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let headers_to_sign = extra
-                .get("headers_to_sign")
-                .or_else(|| extra.get("headersToSign"))
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
+            // The named fields first, `extra` only as a fallback. They were
+            // read out of `extra` alone until tropel-sdk#30 gave them names —
+            // the variant existed to be REFUSED, so nothing needed them —
+            // and a caller that put `clientSecret` there while that was the
+            // only place must keep working.
+            let secret = client_secret
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    extra
+                        .get("client_secret")
+                        .or_else(|| extra.get("clientSecret"))
+                        .and_then(|v| v.as_str())
                 })
                 .unwrap_or_default();
-            let max_body = extra
-                .get("max_body")
-                .or_else(|| extra.get("maxBody"))
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
+            let headers_to_sign = if headers_to_sign.is_empty() {
+                extra
+                    .get("headers_to_sign")
+                    .or_else(|| extra.get("headersToSign"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            } else {
+                headers_to_sign.clone()
+            };
+            let max_body = max_body.or_else(|| {
+                extra
+                    .get("max_body")
+                    .or_else(|| extra.get("maxBody"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+            });
             // Validated HERE, not at sign time. `build_auth_signer` is where
             // config problems are reported, and handing back a signer that
             // will certainly fail moves the error further from the field that
@@ -2023,6 +2042,9 @@ mod tests {
         let incomplete = AuthConfig::AkamaiEdgeGrid {
             access_token: Some("a".into()),
             client_token: Some("c".into()),
+            client_secret: None,
+            headers_to_sign: Vec::new(),
+            max_body: None,
             extra: Default::default(),
         };
         let err = match build_auth_signer(&incomplete) {
@@ -2031,17 +2053,55 @@ mod tests {
         };
         assert!(err.contains("client_secret"), "names the field: {err}");
 
+        // The NAMED field (tropel-sdk#30).
         let complete = AuthConfig::AkamaiEdgeGrid {
             access_token: Some("a".into()),
             client_token: Some("c".into()),
-            extra: [("client_secret".to_string(), serde_json::json!("s"))]
-                .into_iter()
-                .collect(),
+            client_secret: Some("s".into()),
+            headers_to_sign: vec!["X-A".into()],
+            max_body: Some(4096),
+            extra: Default::default(),
         };
         let signer = build_auth_signer(&complete)
             .expect("a complete edgegrid config builds")
             .expect("a signer");
         assert_eq!(signer.name(), "akamai-edgegrid");
+
+        // And `extra`, which is where all three lived before they had names.
+        // A caller that still sends `clientSecret` must keep working — this
+        // is the fallback, not a leftover.
+        let via_extra = AuthConfig::AkamaiEdgeGrid {
+            access_token: Some("a".into()),
+            client_token: Some("c".into()),
+            client_secret: None,
+            headers_to_sign: Vec::new(),
+            max_body: None,
+            extra: [("clientSecret".to_string(), serde_json::json!("s"))]
+                .into_iter()
+                .collect(),
+        };
+        let signer = build_auth_signer(&via_extra)
+            .expect("the pre-#30 spelling still builds")
+            .expect("a signer");
+        assert_eq!(signer.name(), "akamai-edgegrid");
+
+        // An EMPTY named field is not a credential. Without the `filter`,
+        // `Some("")` would shadow a usable value in `extra` and the config
+        // would be refused for a secret it actually has.
+        let empty_named = AuthConfig::AkamaiEdgeGrid {
+            access_token: Some("a".into()),
+            client_token: Some("c".into()),
+            client_secret: Some(String::new()),
+            headers_to_sign: Vec::new(),
+            max_body: None,
+            extra: [("client_secret".to_string(), serde_json::json!("s"))]
+                .into_iter()
+                .collect(),
+        };
+        assert!(
+            build_auth_signer(&empty_named).is_ok(),
+            "an empty named field must not shadow a usable one in extra"
+        );
 
         // HMAC-SHA256 is supported — proves the picker value round-trips
         let hmac256 = AuthConfig::OAuth1 {
