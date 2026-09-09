@@ -276,3 +276,127 @@ pub fn system_no_proxy() -> Vec<String> {
     }
     Vec::new()
 }
+
+// ── PAC directives and failover  [ask 17] ──────────────────────────────────
+//
+// The ask carries the spec because this is the differentiator: "Bruno honours
+// only the FIRST directive of the first matching return." A PAC script's
+// return value is a LIST of candidates separated by `;`, and honouring one of
+// them turns a config with a documented fallback into a single point of
+// failure.
+//
+// This half is the parser and the ordering — pure, and where the bug is.
+// Evaluating `FindProxyForURL` needs a JS engine and its built-ins
+// (`isInNet`, `dnsDomainIs`, `shExpMatch`, …); that is the other half, and it
+// wants its own crate rather than a JS engine inside the HTTP client.
+
+/// One PAC directive — a single candidate to try.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PacDirective {
+    /// `DIRECT` — no proxy for this URL.
+    Direct,
+    /// `PROXY host:port` — an HTTP proxy.
+    Proxy(String),
+    /// `SOCKS host:port` (also `SOCKS4`/`SOCKS5`).
+    Socks(String),
+}
+
+impl PacDirective {
+    /// The proxy URL to hand reqwest, or `None` for `DIRECT`.
+    pub fn proxy_url(&self) -> Option<String> {
+        match self {
+            PacDirective::Direct => None,
+            PacDirective::Proxy(target) => Some(format!("http://{target}")),
+            // `socks5://`, not `socks4://`: reqwest's socks support is
+            // SOCKS5, and a PAC `SOCKS` directive predates the distinction.
+            // Naming 5 is honest about what would actually be attempted.
+            PacDirective::Socks(target) => Some(format!("socks5://{target}")),
+        }
+    }
+}
+
+/// Parse a PAC return value into candidates, IN ORDER.
+///
+/// `"PROXY a:8080; PROXY b:8080; DIRECT"` is three candidates, tried in that
+/// order. Returning only the first is the Bruno bug this exists to avoid.
+///
+/// Unparseable directives are SKIPPED rather than failing the whole result: a
+/// PAC script is often generated, and one malformed entry in a list of four
+/// should not take the other three down with it. An entirely unparseable
+/// result yields an empty list, which the caller must treat as a failure
+/// rather than as "go direct" — going direct on a PAC script we could not
+/// read is the silent misroute the whole surface exists to prevent.
+pub fn parse_pac_result(result: &str) -> Vec<PacDirective> {
+    result
+        .split(';')
+        .filter_map(|candidate| parse_pac_directive(candidate.trim()))
+        .collect()
+}
+
+fn parse_pac_directive(directive: &str) -> Option<PacDirective> {
+    if directive.is_empty() {
+        return None;
+    }
+    // Split on ANY whitespace, not just one space: `PROXY   host:80` and
+    // `PROXY\thost:80` both occur in generated scripts.
+    let mut parts = directive.split_whitespace();
+    let keyword = parts.next()?.to_ascii_uppercase();
+    let target = parts.next();
+    match (keyword.as_str(), target) {
+        ("DIRECT", _) => Some(PacDirective::Direct),
+        // `PROXY` with no target is malformed — skipped rather than turned
+        // into a DIRECT, which would send traffic somewhere the script did
+        // not say.
+        ("PROXY", Some(t)) | ("HTTP", Some(t)) => Some(PacDirective::Proxy(t.to_string())),
+        ("HTTPS", Some(t)) => Some(PacDirective::Proxy(t.to_string())),
+        ("SOCKS", Some(t)) | ("SOCKS4", Some(t)) | ("SOCKS5", Some(t)) => {
+            Some(PacDirective::Socks(t.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// A per-host PAC decision, cached for a bounded time.
+///
+/// Bounded because a PAC script's answer can change (a laptop moves networks)
+/// and unbounded caching would pin the old answer for the process's life. The
+/// ask names k6's `dns.ttl` discipline as the model.
+#[derive(Debug, Clone)]
+pub struct PacDecision {
+    pub candidates: Vec<PacDirective>,
+    /// Which candidate is currently believed good. Advanced on failure.
+    pub current: usize,
+    pub decided_at: std::time::Instant,
+}
+
+impl PacDecision {
+    pub fn new(candidates: Vec<PacDirective>) -> Self {
+        Self { candidates, current: 0, decided_at: std::time::Instant::now() }
+    }
+
+    /// The candidate to try now, or `None` when every one has failed.
+    pub fn candidate(&self) -> Option<&PacDirective> {
+        self.candidates.get(self.current)
+    }
+
+    /// This candidate failed to CONNECT — advance to the next.
+    ///
+    /// Only connect/TLS/unsatisfiable-407 failures advance. An HTTP error
+    /// RESPONSE (a 500 from the target) means the proxy worked, so advancing
+    /// on it would try every candidate for a fault none of them can fix.
+    pub fn advance(&mut self) -> Option<&PacDirective> {
+        self.current += 1;
+        self.candidate()
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.current >= self.candidates.len()
+    }
+
+    pub fn is_stale(&self, ttl: std::time::Duration) -> bool {
+        self.decided_at.elapsed() >= ttl
+    }
+}
+
+/// Default PAC decision TTL.
+pub const DEFAULT_PAC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
