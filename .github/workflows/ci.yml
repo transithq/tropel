@@ -30,26 +30,33 @@ on:
   schedule:
     - cron: "0 3 * * 0"   # Sundays 03:00 UTC
   pull_request:
-    # P4a (TROPEL_MODULARIZATION_TODO.md): docs-only PRs skip the full matrix.
-    # Everything that can affect a build is covered: crates, the shim bundle,
-    # workspace manifests, CI itself, and the vendored toolchain config.
+    # NO path filter, deliberately — and this is the note the previous one
+    # left for whoever hit the problem:
     #
-    # Branch-protection note: these trigger-level filters skip EVERY job
-    # (including ci-ok) for out-of-scope PRs, so if ci-ok is a required status,
-    # docs-only PRs will sit as "expected — waiting for status". Either keep
-    # ci-ok required only for code PRs, or switch this to paths-ignore if the
-    # block bites.
-    paths:
-      - 'crates/**'
-      - 'js/**'
-      - 'examples/**'
-      - '.github/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'deny.toml'
-      - 'package.json'
-      - 'packages/**'
+    #   > Branch-protection note: these trigger-level filters skip EVERY job
+    #   > (including ci-ok) for out-of-scope PRs, so if ci-ok is a required
+    #   > status, docs-only PRs will sit as "expected — waiting for status".
+    #   > Either keep ci-ok required only for code PRs, or switch this to
+    #   > paths-ignore if the block bites.
+    #
+    # It bit. `CI OK` IS a required status on master (with `strict: true`), so
+    # the changelog PR that gates the 0.5.5 release could not merge: no job
+    # ran, therefore no status, therefore blocked forever with nothing to
+    # re-run.
+    #
+    # `paths-ignore` would not have fixed it. A PR touching only ignored files
+    # still triggers nothing, so the trap survives with a different boundary —
+    # it just bites less often, which is worse, because it bites the release
+    # rather than the daily edit.
+    #
+    # The filter was also already WRONG in a second way: `scripts/**` was
+    # absent, and ci.yml runs `scripts/version-lockstep.sh`,
+    # `scripts/sdk-guard.sh` and `scripts/wasm-size.sh`. A PR editing only a
+    # gate script would have skipped the gate it edits.
+    #
+    # The cost of dropping the filter is CI minutes on docs PRs. Actions is
+    # free for this public repo, and a required status that cannot report is a
+    # worse trade than a redundant run.
 
   workflow_dispatch:
 
