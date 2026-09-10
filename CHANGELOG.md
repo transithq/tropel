@@ -26,8 +26,22 @@ out from behind that gate and got a JS facade:
   `reqwest::Request` and calls in, so there is one implementation rather than
   two.
 - **`@tropel/core-wasm` exports them**: `digestSign`, `hawkSign`,
-  `awsSigV4Sign`, `oauth1Sign`, plus `oauth1SignatureMethods()` so a picker
-  offers exactly what the signer accepts instead of keeping its own list.
+  `awsSigV4Sign`, `oauth1Sign`, `edgegridSign`, plus
+  `oauth1SignatureMethods()` so a picker offers exactly what the signer
+  accepts instead of keeping its own list. `edgegridSign` takes the whole
+  request, because the signature covers it — method, url, the *named*
+  headers' values and the body hash — and refuses a missing nonce or
+  timestamp rather than fabricating one: this tier has no clock and no
+  CSPRNG worth using, and `crypto.getRandomValues` is a better source anyway.
+- **`tropel agent`'s `/auth/sign` answers for EdgeGrid and WSSE too.** It had
+  the signers (via `build_auth_signer`, which `/execute` already calls) and
+  refused them as unknown at the endpoint the desktop tier actually calls —
+  one surface signing what the other called unsupported. Its refusal message
+  was worse than the gap: a hardcoded "supported: digest, hawk, awsSigV4,
+  oauth1" that went stale the moment a scheme was added, so a caller reading
+  it would conclude the agent could not sign something it could. Now derived
+  from one declaration, with a test asserting every entry appears in the
+  refusal.
 - **WSSE UsernameToken** and **Akamai EdgeGrid (EG1-HMAC-SHA256)** through the
   signer builder. EdgeGrid uses `yyyyMMddTHH:mm:ss+0000`, *not* RFC 3339 — an
   ISO stamp goes into the signing data verbatim and produces a 401 that
