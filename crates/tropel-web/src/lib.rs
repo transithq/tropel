@@ -262,6 +262,7 @@ mod tests {
                     body: None,
                     auth: None,
                     certificate: None,
+                    proxy: None,
                     follow_redirects: true,
                     host: None,
                     cookies: Vec::new(),

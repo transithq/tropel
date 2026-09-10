@@ -102,7 +102,28 @@ fn canonical_header_name(name: &str) -> String {
 
 /// Per-certificate-identity HTTP clients (`Arc<Mutex<…>>` because
 /// `std::sync::Mutex` is not `Clone` while `HttpClient` derives `Clone`).
-type CertClientMap = Arc<Mutex<HashMap<(String, String, bool), reqwest::Client>>>;
+/// What makes one `reqwest::Client` different from another.
+///
+/// reqwest bakes an mTLS identity, a redirect policy AND a proxy into the
+/// client at build time, so any request differing in one of the three needs
+/// its own. This is the cache key for all three at once — it was
+/// `(cert, key, follow)` when only identities were per-request (ask 17 adds
+/// the proxy), and naming it makes the next such field an added struct field
+/// rather than a re-tupling of every call site.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClientKey {
+    /// `(cert path, key path)` — paths, not contents, so each distinct
+    /// identity is read from disk exactly once.
+    identity: Option<(String, String)>,
+    follow_redirects: bool,
+    /// `None` means "the client's own configuration", which is NOT the same
+    /// as a `ProxyConfig` in `Off` mode — that one explicitly refuses the
+    /// client's proxy, and the two must key differently or one would serve
+    /// the other's requests.
+    proxy: Option<ProxyConfig>,
+}
+
+type CertClientMap = Arc<Mutex<HashMap<ClientKey, reqwest::Client>>>;
 
 /// Per-VU HTTP client with auth and response tracking.
 #[derive(Clone)]
@@ -209,6 +230,7 @@ impl HttpClient {
                     tls,
                     identity.clone(),
                     reqwest::redirect::Policy::none(),
+                    &config.proxy,
                 )
             })
             .collect::<Result<_>>()?;
@@ -237,11 +259,16 @@ impl HttpClient {
     /// optional mTLS identity and an explicit redirect policy. This is the
     /// single builder shared by the primary client, the no-redirect twin, and
     /// the lazily-built per-request-certificate clients.
+    /// `proxy` is passed rather than read off `config`, because a
+    /// per-request profile has to override it — and a function that reads the
+    /// client's config while claiming to build a per-request client is the
+    /// kind of thing that silently sends traffic through the wrong proxy.
     fn build_client(
         config: &HttpConfig,
         tls: &TlsConfig,
         identity: Option<reqwest::Identity>,
         redirect: reqwest::redirect::Policy,
+        proxy: &ProxyConfig,
     ) -> Result<reqwest::Client> {
         // k6 `noConnectionReuse`: close the connection after every request.
         // reqwest has no direct "reuse off" switch — setting the idle pool to
@@ -295,7 +322,7 @@ impl HttpClient {
         // The bypass list is parsed BEFORE any proxy is installed, so a typo
         // fails the build rather than silently sending traffic through a proxy
         // the user told it to skip.
-        match config.proxy.mode {
+        match proxy.mode {
             crate::proxy::ProxyMode::Off => {
                 // Explicit: reqwest reads `HTTP_PROXY` from the environment on
                 // its own, so "off" has to SAY so or a machine with the
@@ -304,18 +331,18 @@ impl HttpClient {
                 builder = builder.no_proxy();
             }
             crate::proxy::ProxyMode::Fixed => {
-                let url = config.proxy.fixed_url().ok_or_else(|| {
+                let url = proxy.fixed_url().ok_or_else(|| {
                     TropelError::Config(
                         "proxy mode is \"fixed\" but no host is set — name the proxy host, \
                          or set mode to \"off\""
                             .to_string(),
                     )
                 })?;
-                builder = builder.proxy(Self::build_proxy(&url, config)?);
+                builder = builder.proxy(Self::build_proxy(&url, proxy)?);
             }
             crate::proxy::ProxyMode::System => {
                 match crate::proxy::system_proxy_url() {
-                    Some(url) => builder = builder.proxy(Self::build_proxy(&url, config)?),
+                    Some(url) => builder = builder.proxy(Self::build_proxy(&url, proxy)?),
                     // Found nothing. NOT an error — a machine with no proxy
                     // variables is the normal case for `system`, and failing
                     // would make the mode unusable as a default.
@@ -502,15 +529,15 @@ impl HttpClient {
     ///
     /// Credentials go through `basic_auth`, never the URL: a proxy URL with a
     /// password in it is logged by everything that logs a URL.
-    fn build_proxy(url: &str, config: &HttpConfig) -> Result<reqwest::Proxy> {
+    fn build_proxy(url: &str, proxy_cfg: &ProxyConfig) -> Result<reqwest::Proxy> {
         // Parsed and validated FIRST: a bypass typo must fail the build, not
         // silently send traffic through a proxy the user told it to skip.
         //
         // System mode inherits `NO_PROXY` as well as the proxy itself —
         // honouring one without the other is how a "system proxy" ends up
         // routing localhost through a corporate gateway.
-        let mut entries = config.proxy.bypass.clone();
-        if config.proxy.mode == crate::proxy::ProxyMode::System {
+        let mut entries = proxy_cfg.bypass.clone();
+        if proxy_cfg.mode == crate::proxy::ProxyMode::System {
             entries.extend(crate::proxy::system_no_proxy());
         }
         let rules = crate::proxy::parse_bypass_list(&entries)
@@ -541,8 +568,8 @@ impl HttpClient {
             })
         };
 
-        if let Some(username) = config.proxy.username.as_deref() {
-            proxy = proxy.basic_auth(username, config.proxy.password.as_deref().unwrap_or(""));
+        if let Some(username) = proxy_cfg.username.as_deref() {
+            proxy = proxy.basic_auth(username, proxy_cfg.password.as_deref().unwrap_or(""));
         }
         Ok(proxy)
     }
@@ -682,7 +709,8 @@ impl HttpClient {
         // EVERY request, regardless of the per-request flag: the 3xx is
         // returned as-is (k6 always follows; this opt-out is a Tropel extra).
         let follow = follow && !self.config.no_redirects;
-        match &request.certificate {
+
+        let identity_paths = match &request.certificate {
             Some(cert) => {
                 let cert_path = cert.cert.as_deref().ok_or_else(|| {
                     TropelError::Config("per-request certificate requires a cert path".into())
@@ -690,34 +718,67 @@ impl HttpClient {
                 let key_path = cert.key.as_deref().ok_or_else(|| {
                     TropelError::Config("per-request certificate requires a key path".into())
                 })?;
-                let cache_key = (cert_path.to_string(), key_path.to_string(), follow);
-                // Poison-tolerant: a single panicked thread must not disable
-                // the cert-client cache for the whole run (backlog P3).
-                let mut cache = self.cert_clients.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(client) = cache.get(&cache_key) {
-                    return Ok(client.clone());
-                }
-                let identity =
-                    Self::load_pem_identity(cert_path, key_path, cert.passphrase.as_deref())?;
-                let redirect = if follow && self.config.max_redirects > 0 {
-                    reqwest::redirect::Policy::limited(self.config.max_redirects as usize)
-                } else {
-                    reqwest::redirect::Policy::none()
-                };
-                let client = Self::build_client(&self.config, &self.tls, Some(identity), redirect)?;
-                cache.insert(cache_key, client.clone());
-                Ok(client)
+                Some((cert_path.to_string(), key_path.to_string()))
             }
-            None => {
-                if follow {
-                    Ok(self.pick_lane(&self.inner).clone())
-                } else if let Some(no_redirect) = &self.no_redirect {
-                    Ok(self.pick_lane(no_redirect).clone())
-                } else {
-                    Ok(self.pick_lane(&self.inner).clone())
-                }
+            None => None,
+        };
+
+        // A per-request proxy that MATCHES the client's own needs no separate
+        // client. Worth the comparison: a collection whose requests all carry
+        // the same proxy block — which is what a UI writing one setting onto
+        // every request produces — would otherwise build a second full client
+        // and pool, halving connection reuse for no behavioural difference.
+        let proxy = request
+            .proxy
+            .as_ref()
+            .filter(|p| **p != self.config.proxy)
+            .cloned();
+
+        // Neither override: the pre-built lanes, exactly as before. This is
+        // the hot path and it must stay allocation-free.
+        if identity_paths.is_none() && proxy.is_none() {
+            if follow {
+                return Ok(self.pick_lane(&self.inner).clone());
             }
+            return match &self.no_redirect {
+                Some(no_redirect) => Ok(self.pick_lane(no_redirect).clone()),
+                None => Ok(self.pick_lane(&self.inner).clone()),
+            };
         }
+
+        let cache_key = ClientKey {
+            identity: identity_paths.clone(),
+            follow_redirects: follow,
+            proxy: proxy.clone(),
+        };
+        // Poison-tolerant: a single panicked thread must not disable the
+        // client cache for the whole run (backlog P3).
+        let mut cache = self.cert_clients.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(client) = cache.get(&cache_key) {
+            return Ok(client.clone());
+        }
+        let identity = match (&identity_paths, &request.certificate) {
+            (Some((cert_path, key_path)), Some(cert)) => Some(Self::load_pem_identity(
+                cert_path,
+                key_path,
+                cert.passphrase.as_deref(),
+            )?),
+            _ => None,
+        };
+        let redirect = if follow && self.config.max_redirects > 0 {
+            reqwest::redirect::Policy::limited(self.config.max_redirects as usize)
+        } else {
+            reqwest::redirect::Policy::none()
+        };
+        let client = Self::build_client(
+            &self.config,
+            &self.tls,
+            identity,
+            redirect,
+            proxy.as_ref().unwrap_or(&self.config.proxy),
+        )?;
+        cache.insert(cache_key, client.clone());
+        Ok(client)
     }
 
     /// Round-robin lane selection (TR-303). A single `HttpClient` is shared
@@ -2215,19 +2276,14 @@ mod tests {
     }
 
     fn get_request(url: &str) -> Request {
+        // `..Default::default()` so the next per-request field does not
+        // require editing this helper — the SDK's `Default` gives
+        // `follow_redirects: true` and `ResponseType::Text`, both of which
+        // this named explicitly before.
         Request {
             url: url.to_string(),
             method: Method::GET,
-            headers: Vec::new(),
-            query_params: HashMap::new(),
-            body: None,
-            auth: None,
-            certificate: None,
-            follow_redirects: true,
-            host: None,
-            cookies: Vec::new(),
-            timeout: None,
-            response_type: ResponseType::Text,
+            ..Default::default()
         }
     }
 
@@ -2722,16 +2778,174 @@ mod tests {
         // exercised) rather than being silently ignored.
         let follow_req = Request {
             certificate: Some(cert.clone()),
+            proxy: None,
             follow_redirects: true,
             ..Default::default()
         };
         let no_follow_req = Request {
             certificate: Some(cert),
+            proxy: None,
             follow_redirects: false,
             ..Default::default()
         };
         assert!(client.select_client(&follow_req).is_err());
         assert!(client.select_client(&no_follow_req).is_err());
+    }
+
+    // ── Per-request proxy (the half of ask 17 that was missing) ──────────
+    //
+    // The ask asks for "per-request (or per-client-profile)" proxying and
+    // names the mechanism, because reqwest bakes a proxy into the client at
+    // build time:
+    //
+    //   > the `cert_clients` lazy-client pattern … generalizes to a
+    //   > profile-keyed map `HashMap<ProxyProfileKey, reqwest::Client>`
+    //
+    // What shipped first was per-CLIENT — `ProxyConfig` on `HttpConfig` — so a
+    // run had one proxy and a collection could not route two requests
+    // differently. These cover the keyed-client half.
+
+    fn fixed_proxy(host: &str) -> ProxyConfig {
+        ProxyConfig {
+            mode: ProxyMode::Fixed,
+            host: Some(host.to_string()),
+            port: Some(3128),
+            ..Default::default()
+        }
+    }
+
+    fn cached(client: &HttpClient) -> usize {
+        client.cert_clients.lock().unwrap().len()
+    }
+
+    #[test]
+    fn a_request_can_carry_its_own_proxy() {
+        // The client is built with NO proxy and the request supplies one.
+        // Before this the field did not exist and there was nowhere to put it.
+        let client = HttpClient::new(&HttpConfig::default()).unwrap();
+        let req = Request {
+            proxy: Some(fixed_proxy("p.internal")),
+            ..Default::default()
+        };
+        assert!(
+            client.select_client(&req).is_ok(),
+            "a per-request proxy must build a client"
+        );
+        assert_eq!(cached(&client), 1);
+    }
+
+    #[test]
+    fn two_proxy_profiles_get_two_clients_and_the_same_profile_gets_one() {
+        // Keying the cache on the profile is the difference between "a
+        // collection can route two requests differently" and "the second
+        // request silently uses the first's proxy".
+        let client = HttpClient::new(&HttpConfig::default()).unwrap();
+        let a = Request {
+            proxy: Some(fixed_proxy("a.internal")),
+            ..Default::default()
+        };
+        let b = Request {
+            proxy: Some(fixed_proxy("b.internal")),
+            ..Default::default()
+        };
+        client.select_client(&a).unwrap();
+        client.select_client(&b).unwrap();
+        client.select_client(&a).unwrap();
+        assert_eq!(
+            cached(&client),
+            2,
+            "two profiles, two clients — not three, and not one"
+        );
+    }
+
+    #[test]
+    fn a_request_proxy_equal_to_the_clients_reuses_the_prebuilt_lanes() {
+        // A UI that writes one proxy setting onto every request produces
+        // exactly this. A second identical client would halve connection
+        // reuse for no behavioural difference, so an equal profile is not an
+        // override.
+        let cfg = HttpConfig {
+            proxy: fixed_proxy("p.internal"),
+            ..Default::default()
+        };
+        let client = HttpClient::new(&cfg).unwrap();
+        let req = Request {
+            proxy: Some(fixed_proxy("p.internal")),
+            ..Default::default()
+        };
+        client.select_client(&req).unwrap();
+        assert_eq!(
+            cached(&client),
+            0,
+            "an identical profile uses the pre-built lanes"
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_proxy_still_uses_the_prebuilt_lanes() {
+        // Nothing about this ask may change a request that does not use it —
+        // the hot path stays the round-robin lanes, allocation-free.
+        let client = HttpClient::new(&HttpConfig::default()).unwrap();
+        client.select_client(&Request::default()).unwrap();
+        assert_eq!(cached(&client), 0, "no lazy client is built");
+    }
+
+    #[test]
+    fn an_explicit_off_is_not_the_same_as_absent() {
+        // `Off` REFUSES the client's proxy; absent INHERITS it. Keying them
+        // alike would have one serve the other's requests — a request that
+        // said "no proxy" going through the corporate gateway, or the
+        // reverse.
+        let cfg = HttpConfig {
+            proxy: fixed_proxy("p.internal"),
+            ..Default::default()
+        };
+        let client = HttpClient::new(&cfg).unwrap();
+        let off = Request {
+            proxy: Some(ProxyConfig::default()),
+            ..Default::default()
+        };
+        client.select_client(&off).unwrap();
+        assert_eq!(
+            cached(&client),
+            1,
+            "an explicit Off builds its own no-proxy client"
+        );
+    }
+
+    #[test]
+    fn a_per_request_proxy_with_no_host_is_refused_by_name() {
+        // Not accepted-and-ignored: a request that asks for a proxy and
+        // silently goes direct is the failure this surface exists to avoid.
+        let client = HttpClient::new(&HttpConfig::default()).unwrap();
+        let req = Request {
+            proxy: Some(ProxyConfig {
+                mode: ProxyMode::Fixed,
+                port: Some(3128),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = client.select_client(&req).unwrap_err().to_string();
+        assert!(err.contains("fixed"), "names the mode: {err}");
+        assert!(err.contains("host"), "names what is missing: {err}");
+    }
+
+    #[test]
+    fn a_per_request_bypass_typo_fails_rather_than_misrouting() {
+        // Same rule as the client-level list: a wildcard anywhere but a
+        // leading `*.` is a config error. A fuzzy match would send traffic
+        // through a proxy the user excluded, or direct when they did not.
+        let client = HttpClient::new(&HttpConfig::default()).unwrap();
+        let req = Request {
+            proxy: Some(ProxyConfig {
+                bypass: vec!["inter*al".into()],
+                ..fixed_proxy("p.internal")
+            }),
+            ..Default::default()
+        };
+        let err = client.select_client(&req).unwrap_err().to_string();
+        assert!(err.contains("bypass"), "got {err}");
     }
 
     #[test]
