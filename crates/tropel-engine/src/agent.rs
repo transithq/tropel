@@ -1788,11 +1788,94 @@ fn sign_with_scheme(
                 )
             })
         }
+        "akamai-edgegrid" => {
+            let body = opt("body").map(|b| b.into_bytes());
+            let headers_to_sign: Vec<String> = p
+                .get("headersToSign")
+                .or_else(|| p.get("headers_to_sign"))
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let params = tropel_auth::edgegrid::EdgeGridBuildParams {
+                method: s("method"),
+                url: s("url"),
+                headers_to_sign,
+                body,
+                access_token: s("accessToken"),
+                client_token: s("clientToken"),
+                client_secret: s("clientSecret"),
+                // Absent means GENERATE, not empty. A caller pinning either
+                // is a test reproducing a vector; a caller omitting both
+                // wants a fresh nonce and the host clock, and passing empty
+                // strings through would produce a signature Akamai rejects
+                // for a stale timestamp.
+                nonce: opt("nonce"),
+                timestamp: opt("timestamp"),
+                max_body: p
+                    .get("maxBody")
+                    .or_else(|| p.get("max_body"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(tropel_auth::edgegrid::DEFAULT_MAX_BODY),
+            };
+            // The VALUES of the headers being signed, which the canonical
+            // string needs and `headers_to_sign` only names.
+            let signed_headers = pairs("headers");
+            tropel_auth::edgegrid::edgegrid_build_header(&params, &signed_headers)
+                .map(|value| {
+                    vec![tropel_auth::builders::HeaderOut {
+                        name: "Authorization".to_string(),
+                        value,
+                    }]
+                })
+                .map_err(|e| e.to_string())
+        }
+        "wsse" => {
+            let signed = tropel_auth::oauth::sign_wsse(&tropel_auth::oauth::WsseParams {
+                username: s("username"),
+                password: s("password"),
+                nonce: s("nonce"),
+                created: s("created"),
+            })
+            .map_err(|e| e.to_string())?;
+            // BOTH headers, which is the WSSE UsernameToken profile's wire
+            // shape: the token rides `X-WSSE` and the profile marker rides
+            // `Authorization`. Returning only one would serve half the
+            // servers that implement the profile, and the caller has no way
+            // to know which half.
+            Ok(vec![
+                tropel_auth::builders::HeaderOut {
+                    name: "X-WSSE".to_string(),
+                    value: signed.authorization,
+                },
+                tropel_auth::builders::HeaderOut {
+                    name: "Authorization".to_string(),
+                    value: "WSSE profile=\"UsernameToken\"".to_string(),
+                },
+            ])
+        }
         other => Err(format!(
-            "unknown auth scheme '{other}' — supported: digest, hawk, awsSigV4, oauth1"
+            "unknown auth scheme '{other}' — supported: {}",
+            AUTH_SIGN_SCHEMES.join(", ")
         )),
     }
 }
+
+/// The schemes `sign_with_scheme` answers for, in one place.
+///
+/// It used to be a hardcoded string in the error arm, and it drifted the
+/// moment a scheme was added — the message still read "digest, hawk,
+/// awsSigV4, oauth1" while `build_auth_signer` had grown EdgeGrid and WSSE.
+/// A caller reading that message would conclude the agent could not sign
+/// something it could, so the list is derived from one declaration and
+/// asserted against the dispatcher below.
+pub const AUTH_SIGN_SCHEMES: &[&str] = &[
+    "digest",
+    "hawk",
+    "awsSigV4",
+    "oauth1",
+    "akamai-edgegrid",
+    "wsse",
+];
 
 /// Base64 encode, beside the decoder — the same engine, so a round trip
 /// through the agent cannot disagree with itself.
@@ -4398,12 +4481,76 @@ mod tests {
         assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
         assert!(raw.contains("RSA-SHA1"), "{raw}");
 
+        // EdgeGrid: the signature covers method, url, the NAMED headers and
+        // the body, so the whole lot goes over the wire. Nonce and timestamp
+        // are pinned here to make the header reproducible; omitting them
+        // generates both, which is what a real caller wants.
+        let raw = sign(
+            serde_json::json!({
+                "scheme": "akamai-edgegrid",
+                "params": {
+                    "method": "GET", "url": "https://akaa-x.luna.akamaiapis.net/diagnostic/v1/x",
+                    "clientToken": "ct", "accessToken": "at", "clientSecret": "cs",
+                    "nonce": "nnn", "timestamp": "20260909T12:00:00+0000"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.contains("EG1-HMAC-SHA256 "), "{raw}");
+        assert!(raw.contains("client_token=ct"), "{raw}");
+        assert!(raw.contains("nonce=nnn"), "{raw}");
+        // The secret must never appear in a response the caller logs.
+        assert!(
+            !raw.contains("cs\""),
+            "the client secret must not echo: {raw}"
+        );
+
+        // A missing credential is a NAMED 400. Three opaque tokens are easy
+        // to paste into the wrong field and Akamai's 401 will not say which.
+        let raw = sign(
+            serde_json::json!({
+                "scheme": "akamai-edgegrid",
+                "params": {"method": "GET", "url": "https://x/y", "clientToken": "ct"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(raw.contains("access_token"), "{raw}");
+        assert!(raw.contains("client_secret"), "{raw}");
+
+        // WSSE returns BOTH headers of the UsernameToken profile: the token
+        // on X-WSSE and the profile marker on Authorization. Returning one
+        // would serve half the servers implementing it, and the caller has
+        // no way to tell which half.
+        let raw = sign(
+            serde_json::json!({
+                "scheme": "wsse",
+                "params": {"username": "u", "password": "p", "nonce": "n", "created": "2026-01-01T00:00:00Z"}
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(raw.contains("X-WSSE"), "{raw}");
+        assert!(raw.contains("UsernameToken"), "{raw}");
+        assert!(raw.contains("PasswordDigest"), "{raw}");
+
         // An unknown scheme is refused, not silently unsigned — sending a
         // request the config calls authenticated with no Authorization is
         // invariant #7's silent data loss.
         let raw = sign(serde_json::json!({"scheme": "ntlm", "params": {}}).to_string()).await;
         assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
         assert!(raw.contains("unknown auth scheme"), "{raw}");
+        // And the refusal names what IS supported, from the one declaration.
+        // The hardcoded list drifted the moment a scheme was added: it still
+        // read "digest, hawk, awsSigV4, oauth1" while both arms above worked.
+        for scheme in AUTH_SIGN_SCHEMES {
+            assert!(
+                raw.contains(scheme),
+                "the refusal must name {scheme}: {raw}"
+            );
+        }
     }
     /// TR-446: `POST /script`, over the socket.
     ///
