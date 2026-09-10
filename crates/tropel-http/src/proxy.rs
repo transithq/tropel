@@ -26,71 +26,18 @@
 
 use std::net::IpAddr;
 
-use serde::{Deserialize, Serialize};
-
-/// How a proxy is chosen for a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ProxyMode {
-    /// No proxy. The default, and what every existing config gets.
-    #[default]
-    Off,
-    /// One explicitly configured proxy.
-    Fixed,
-    /// The environment's proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`,
-    /// `NO_PROXY`).
-    System,
-    /// A PAC script, evaluated per URL.
-    Pac,
-}
-
-/// Proxy configuration.
-///
-/// One struct for all four modes rather than an enum with per-mode payloads:
-/// it crosses a JSON wire (KnockPort's `settings.proxy`) where an
-/// externally-tagged enum would change shape per mode, and a UI that lets the
-/// user switch mode must not lose the host they typed for `fixed` when they
-/// look at `system`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct ProxyConfig {
-    pub mode: ProxyMode,
-    /// `http`, `https`, `socks5` — the proxy's own scheme, not the target's.
-    pub protocol: Option<String>,
-    pub host: Option<String>,
-    pub port: Option<u16>,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    /// Hosts that must NOT go through the proxy. See the module docs.
-    pub bypass: Vec<String>,
-    /// `pac` mode: where to fetch the script, or the script itself.
-    #[serde(alias = "pacUrl")]
-    pub pac_url: Option<String>,
-    #[serde(alias = "pacScript")]
-    pub pac_script: Option<String>,
-}
-
-impl ProxyConfig {
-    /// The proxy URL for `fixed` mode, without credentials.
-    ///
-    /// Credentials go through `Proxy::basic_auth`, never the URL: a proxy URL
-    /// with a password in it is logged by everything that logs a URL, and
-    /// reqwest would also have to re-encode it.
-    pub fn fixed_url(&self) -> Option<String> {
-        let host = self.host.as_deref()?.trim();
-        if host.is_empty() {
-            return None;
-        }
-        let scheme = self.protocol.as_deref().unwrap_or("http").trim();
-        let scheme = if scheme.is_empty() { "http" } else { scheme };
-        Some(match self.port {
-            Some(port) => format!("{scheme}://{host}:{port}"),
-            // No port: let the proxy's own scheme default apply rather than
-            // inventing 8080.
-            None => format!("{scheme}://{host}"),
-        })
-    }
-}
+// ── The config TYPES live in tropel-sdk ─────────────────────────────────────
+//
+// `Request` is in the SDK and the SDK is a leaf, so a `ProxyConfig` defined
+// HERE could never be a field of a request — and ask 17 is about a
+// per-request proxy. They moved for the same reason `AuthConfig` lives there
+// while the signers live in `tropel-auth`: that is the data a request
+// carries.
+//
+// Re-exported rather than referenced through `tropel_sdk::types::` at every
+// call site, so `crate::proxy::ProxyMode` keeps meaning what it did and this
+// module stays the one place a reader looks for proxy behaviour.
+pub use tropel_sdk::types::{ProxyConfig, ProxyMode};
 
 /// A parsed bypass entry.
 #[derive(Debug, Clone, PartialEq, Eq)]

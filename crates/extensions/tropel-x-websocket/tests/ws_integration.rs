@@ -22,6 +22,7 @@ fn make_request(url: &str, body: Option<Body>) -> Request {
         body,
         auth: None,
         certificate: None,
+        proxy: None,
         follow_redirects: true,
         host: None,
         cookies: Vec::new(),
