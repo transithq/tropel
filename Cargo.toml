@@ -22,6 +22,7 @@ members = [
     "crates/inputs/tropel-input-postman",
     "crates/inputs/tropel-input-k6",
     "crates/inputs/tropel-input-har",
+    "crates/inputs/tropel-input-knockport",
     "crates/inputs/tropel-input-openapi",
     "crates/inputs/tropel-input-insomnia",
     "crates/inputs/tropel-input-bru",
@@ -265,6 +266,7 @@ tropel-build = { path = "crates/tropel-build", version = "0.6.0" }
 tropel-input-postman = { path = "crates/inputs/tropel-input-postman", version = "0.6.0" }
 tropel-input-k6 = { path = "crates/inputs/tropel-input-k6", version = "0.6.0" }
 tropel-input-har = { path = "crates/inputs/tropel-input-har", version = "0.6.0" }
+tropel-input-knockport = { path = "crates/inputs/tropel-input-knockport", version = "0.6.0" }
 tropel-input-openapi = { path = "crates/inputs/tropel-input-openapi", version = "0.6.0" }
 tropel-input-insomnia = { path = "crates/inputs/tropel-input-insomnia", version = "0.6.0" }
 tropel-input-bru = { path = "crates/inputs/tropel-input-bru", version = "0.6.0" }

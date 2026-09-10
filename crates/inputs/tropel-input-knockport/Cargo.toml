@@ -1,0 +1,15 @@
+[package]
+name = "tropel-input-knockport"
+version = "0.6.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Input adapter that reads a KnockPort collection directory (knockport.yaml + requests/) and produces a Scenario"
+
+[dependencies]
+tropel-sdk.workspace = true
+inventory.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+yaml_serde = "0.10.4"

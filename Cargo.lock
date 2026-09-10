@@ -4419,6 +4419,7 @@ dependencies = [
  "tropel-input-http",
  "tropel-input-insomnia",
  "tropel-input-k6",
+ "tropel-input-knockport",
  "tropel-input-openapi",
  "tropel-input-postman",
  "tropel-input-subprocess",
@@ -4563,6 +4564,17 @@ dependencies = [
  "tropel-sdk",
  "tropel-x-grpc",
  "url",
+]
+
+[[package]]
+name = "tropel-input-knockport"
+version = "0.6.0"
+dependencies = [
+ "inventory",
+ "serde",
+ "serde_json",
+ "tropel-sdk",
+ "yaml_serde",
 ]
 
 [[package]]
