@@ -1,11 +1,11 @@
 [package]
 name = "tropel-engine"
-version = "0.5.5"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
+description = "The tropel load-test engine: scenario execution, VU scheduling, the protocol registry and the metrics pipeline."
 repository.workspace = true
 rust-version.workspace = true
-publish = false
 
 [dependencies]
 tropel-sdk.workspace = true
