@@ -306,6 +306,89 @@ fn oauth1_sign_inner(request_json: &str) -> Result<String, String> {
     })
 }
 
+// ── Akamai EdgeGrid ──────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EdgeGridSignRequest {
+    method: String,
+    /// The FULL url. EdgeGrid signs path+query as one string and derives the
+    /// host from it, so splitting it into components here would only give the
+    /// caller a way to reassemble it differently than Akamai does.
+    url: String,
+    /// Header names to fold into the signature, in the caller's order.
+    ///
+    /// Not sorted: Akamai rebuilds the canonical string from the same list,
+    /// so a different order is a different signature.
+    #[serde(default)]
+    headers_to_sign: Vec<String>,
+    /// The request's headers, `[[name, value], …]`. `headersToSign` names
+    /// which of these participate; this is where their VALUES come from.
+    #[serde(default)]
+    headers: HeaderList,
+    /// Base64, matching `digestSign`/`awsSigV4Sign`. A JSON string would
+    /// have made a binary body unsignable, and EdgeGrid hashes raw bytes.
+    body_base64: Option<String>,
+    client_token: String,
+    access_token: String,
+    client_secret: String,
+    /// Caller-supplied, like every other nonce in this file:
+    /// `crypto.getRandomValues` is a better source than anything this crate
+    /// can reach on wasm32-unknown-unknown.
+    nonce: String,
+    /// `yyyyMMddTHH:mm:ss+0000`. Caller-supplied for the same reason the
+    /// OAuth1 timestamp is — the host clock is the browser's.
+    timestamp: String,
+    /// Bodies above this are NOT hashed rather than truncated: a truncated
+    /// content hash is a signature the server cannot reproduce. `null` uses
+    /// Akamai's own 128 KiB default.
+    max_body: Option<usize>,
+}
+
+/// Sign a request with Akamai EdgeGrid → JSON `{name, value}`.
+///
+/// The whole request crosses the boundary because the signature covers it:
+/// method, url, the named headers' values, and the body hash. A caller
+/// passing only credentials could not produce this.
+#[wasm_bindgen(js_name = "edgegridSign")]
+pub fn edgegrid_sign(request_json: &str) -> Result<String, JsValue> {
+    edgegrid_sign_inner(request_json).map_err(err)
+}
+
+fn edgegrid_sign_inner(request_json: &str) -> Result<String, String> {
+    let r: EdgeGridSignRequest = from_json(request_json)?;
+    if r.nonce.is_empty() || r.timestamp.is_empty() {
+        // Refused rather than generated. This crate has no clock and no
+        // CSPRNG worth using on wasm32-unknown-unknown, and generating an
+        // empty-string nonce would produce a header Akamai rejects with a
+        // message about neither.
+        return Err(
+            "edgegridSign needs a nonce and a timestamp — pass crypto.getRandomValues and the              host clock, formatted yyyyMMddTHH:mm:ss+0000"
+                .to_string(),
+        );
+    }
+    let params = tropel_auth::edgegrid::EdgeGridBuildParams {
+        method: r.method,
+        url: r.url,
+        headers_to_sign: r.headers_to_sign,
+        body: decode_body(r.body_base64.as_deref())?,
+        access_token: r.access_token,
+        client_token: r.client_token,
+        client_secret: r.client_secret,
+        nonce: Some(r.nonce),
+        timestamp: Some(r.timestamp),
+        max_body: r
+            .max_body
+            .unwrap_or(tropel_auth::edgegrid::DEFAULT_MAX_BODY),
+    };
+    let value = tropel_auth::edgegrid::edgegrid_build_header(&params, &r.headers)
+        .map_err(|e| e.to_string())?;
+    as_json(&HeaderJson {
+        name: "Authorization",
+        value: &value,
+    })
+}
+
 /// The OAuth1 signature methods `oauth1Sign` accepts → JSON array. Exported so
 /// a picker UI offers exactly what is implemented instead of keeping its own
 /// list, which is how an unsupported method reaches the signer at all.
@@ -320,6 +403,111 @@ mod tests {
 
     fn v(json: &str) -> serde_json::Value {
         serde_json::from_str(json).expect("export returned valid JSON")
+    }
+
+    #[test]
+    fn edgegrid_sign_produces_the_header_the_browser_tier_cannot() {
+        // The reason this export exists: KnockPort's auth tier signs and
+        // forwards a header, exactly as it does for oauth1/hawk/sigv4. With
+        // no export, an EdgeGrid config was creatable, importable — and
+        // refused at every send.
+        let out = v(&edgegrid_sign_inner(
+            r#"{"method":"GET",
+                "url":"https://akaa-x.luna.akamaiapis.net/diagnostic/v1/locations",
+                "clientToken":"ct","accessToken":"at","clientSecret":"cs",
+                "nonce":"nnn","timestamp":"20260909T12:00:00+0000"}"#,
+        )
+        .expect("signs"));
+        assert_eq!(out["name"], "Authorization");
+        let value = out["value"].as_str().expect("a string");
+        assert!(value.starts_with("EG1-HMAC-SHA256 "), "got {value}");
+        assert!(value.contains("client_token=ct;"), "got {value}");
+        assert!(value.contains("access_token=at;"), "got {value}");
+        assert!(value.contains("nonce=nnn;"), "got {value}");
+        assert!(
+            value.contains("timestamp=20260909T12:00:00+0000;"),
+            "got {value}"
+        );
+        // The secret authenticates; it is never transmitted.
+        assert!(
+            !value.contains("cs"),
+            "the client secret must not appear: {value}"
+        );
+    }
+
+    #[test]
+    fn edgegrid_sign_is_deterministic_for_a_pinned_nonce_and_timestamp() {
+        // Which is what makes the header reproducible from a saved request —
+        // and what lets Akamai recompute it. Two calls with the same inputs
+        // must agree, or something in the canonical string is order- or
+        // clock-dependent.
+        let req = r#"{"method":"POST","url":"https://h/v1/x?b=2&a=1",
+            "headersToSign":["X-Second","X-First"],
+            "headers":[["X-First","1"],["X-Second","2"],["X-Ignored","3"]],
+            "bodyBase64":"aGVsbG8=",
+            "clientToken":"ct","accessToken":"at","clientSecret":"cs",
+            "nonce":"n","timestamp":"20260909T12:00:00+0000"}"#;
+        let a = edgegrid_sign_inner(req).expect("signs");
+        let b = edgegrid_sign_inner(req).expect("signs");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn edgegrid_sign_signs_the_named_headers_in_the_callers_order() {
+        // Akamai rebuilds the canonical string from the same list, so the
+        // order is data — sorting it here would produce a signature the
+        // server cannot reproduce.
+        let base = r#""url":"https://h/v1","clientToken":"ct","accessToken":"at",
+            "clientSecret":"cs","nonce":"n","timestamp":"20260909T12:00:00+0000",
+            "headers":[["X-First","1"],["X-Second","2"]]"#;
+        let forward = edgegrid_sign_inner(&format!(
+            r#"{{"method":"GET",{base},"headersToSign":["X-First","X-Second"]}}"#
+        ))
+        .expect("signs");
+        let reversed = edgegrid_sign_inner(&format!(
+            r#"{{"method":"GET",{base},"headersToSign":["X-Second","X-First"]}}"#
+        ))
+        .expect("signs");
+        assert_ne!(forward, reversed, "the order changes the signature");
+    }
+
+    #[test]
+    fn edgegrid_sign_refuses_a_missing_nonce_or_timestamp_by_name() {
+        // NOT generated. This crate has no clock and no CSPRNG worth using on
+        // wasm32-unknown-unknown, and an empty nonce would produce a header
+        // Akamai rejects with a message about neither.
+        let err = edgegrid_sign_inner(
+            r#"{"method":"GET","url":"https://h/v1","clientToken":"ct",
+                "accessToken":"at","clientSecret":"cs","nonce":"","timestamp":"x"}"#,
+        )
+        .expect_err("must refuse");
+        assert!(err.contains("nonce"), "got {err}");
+        assert!(err.contains("getRandomValues"), "names the source: {err}");
+        assert!(err.contains("yyyyMMdd"), "names the format: {err}");
+    }
+
+    #[test]
+    fn edgegrid_sign_names_the_missing_credential() {
+        let err = edgegrid_sign_inner(
+            r#"{"method":"GET","url":"https://h/v1","clientToken":"ct",
+                "accessToken":"","clientSecret":"","nonce":"n","timestamp":"t"}"#,
+        )
+        .expect_err("must refuse");
+        assert!(err.contains("access_token"), "got {err}");
+        assert!(err.contains("client_secret"), "got {err}");
+    }
+
+    #[test]
+    fn edgegrid_sign_rejects_a_body_that_is_not_base64() {
+        // Base64 like `digestSign`/`awsSigV4Sign`, so a binary body is
+        // signable at all — EdgeGrid hashes raw bytes.
+        let err = edgegrid_sign_inner(
+            r#"{"method":"POST","url":"https://h/v1","bodyBase64":"not base64!!",
+                "clientToken":"ct","accessToken":"at","clientSecret":"cs",
+                "nonce":"n","timestamp":"t"}"#,
+        )
+        .expect_err("must refuse");
+        assert!(err.contains("body_base64"), "got {err}");
     }
 
     #[test]
