@@ -279,7 +279,9 @@ fn format_shims(format: &str) -> Option<&'static [Shim]> {
         // script, two answers, decided by which bundle the format picked.
         "postman" => &[DeepEqual, K6Core, Pm, Chai, Lodash, CryptoJs, Exec, Fetch],
         // Bruno scripts reach the same library surface plus `bru`.
-        "bru" => &[DeepEqual, K6Core, Pm, Chai, Lodash, CryptoJs, Exec, Bru, Fetch],
+        "bru" => &[
+            DeepEqual, K6Core, Pm, Chai, Lodash, CryptoJs, Exec, Bru, Fetch,
+        ],
         // The k6 InputAdapter fallback (used when the k6 Driver is not
         // registered) wraps the transpiled script as one item's `test`.
         // Arbitrary JS again — minus Bruno's API.
@@ -849,7 +851,10 @@ mod tests {
             format_shims("k6").is_none(),
             "k6 takes the full default bundle; if that changes, it needs Fetch too"
         );
-        assert!(Shim::ALL.contains(&Shim::Fetch), "the default bundle carries fetch");
+        assert!(
+            Shim::ALL.contains(&Shim::Fetch),
+            "the default bundle carries fetch"
+        );
     }
 
     #[test]

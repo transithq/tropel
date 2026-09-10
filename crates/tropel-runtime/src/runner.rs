@@ -1206,10 +1206,23 @@ fn resolve_auth(
         AuthConfig::AkamaiEdgeGrid {
             access_token,
             client_token,
+            client_secret,
+            headers_to_sign,
+            max_body,
             extra,
         } => AuthConfig::AkamaiEdgeGrid {
             access_token: access_token.as_deref().map(r),
             client_token: client_token.as_deref().map(r),
+            // Resolved like the other two. This function ENUMERATES fields,
+            // so a field added to the variant without a line here silently
+            // skips resolution — and a `client_secret` of
+            // `{{akamai_secret}}` would then sign with the literal template
+            // and 401, with the config looking correct.
+            client_secret: client_secret.as_deref().map(r),
+            // Header NAMES can be templated too; `max_body` is a number and
+            // has nothing to resolve.
+            headers_to_sign: headers_to_sign.iter().map(|h| r(h)).collect(),
+            max_body: *max_body,
             extra: extra
                 .iter()
                 .map(|(k, v)| {
@@ -1492,6 +1505,49 @@ mod tests {
                 assert_eq!(token, "my-secret-jwt");
             }
             other => panic!("expected Bearer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_auth_edgegrid_named_fields() {
+        // `resolve_auth` ENUMERATES the fields of every variant, so a field
+        // added to one without a line in the match silently skips
+        // resolution. For EdgeGrid that means a `client_secret` of
+        // `{{akamai_secret}}` signs with the literal template and comes back
+        // 401 — with a config that reads as correct.
+        let resolver = tropel_variables::VariableResolver::new();
+        let scope = tropel_variables::VariableScope {
+            env: HashMap::from([
+                ("ak_token".into(), "real-client-token".into()),
+                ("ak_secret".into(), "real-secret".into()),
+                ("trace_header".into(), "X-Trace-Id".into()),
+            ]),
+            ..Default::default()
+        };
+        let auth = tropel_sdk::types::AuthConfig::AkamaiEdgeGrid {
+            access_token: Some("at".into()),
+            client_token: Some("{{ak_token}}".into()),
+            client_secret: Some("{{ak_secret}}".into()),
+            headers_to_sign: vec!["{{trace_header}}".into()],
+            max_body: Some(2048),
+            extra: Default::default(),
+        };
+        match resolve_auth(&auth, &resolver, &scope) {
+            tropel_sdk::types::AuthConfig::AkamaiEdgeGrid {
+                client_token,
+                client_secret,
+                headers_to_sign,
+                max_body,
+                ..
+            } => {
+                assert_eq!(client_token.as_deref(), Some("real-client-token"));
+                assert_eq!(client_secret.as_deref(), Some("real-secret"));
+                // Header NAMES are templatable too — they are part of the
+                // signature, so an unresolved one signs the wrong thing.
+                assert_eq!(headers_to_sign, vec!["X-Trace-Id".to_string()]);
+                assert_eq!(max_body, Some(2048), "a number passes through");
+            }
+            other => panic!("expected AkamaiEdgeGrid, got {other:?}"),
         }
     }
 

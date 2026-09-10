@@ -28,7 +28,11 @@ fn tls(paths: &[&str], keep_system_roots: bool) -> TlsConfig {
 #[test]
 fn a_client_builds_with_a_single_private_ca() {
     let client = HttpClient::with_tls(&HttpConfig::default(), &tls(&[ONE], true));
-    assert!(client.is_ok(), "one PEM root should build: {:?}", client.err().map(|e| e.to_string()));
+    assert!(
+        client.is_ok(),
+        "one PEM root should build: {:?}",
+        client.err().map(|e| e.to_string())
+    );
 }
 
 #[test]
@@ -36,7 +40,11 @@ fn two_separate_bundles_both_load() {
     // A list rather than one path, because two independent CAs — a corporate
     // root and a test root — is the ordinary case.
     let client = HttpClient::with_tls(&HttpConfig::default(), &tls(&[ONE, TWO], true));
-    assert!(client.is_ok(), "two roots should build: {:?}", client.err().map(|e| e.to_string()));
+    assert!(
+        client.is_ok(),
+        "two roots should build: {:?}",
+        client.err().map(|e| e.to_string())
+    );
 }
 
 #[test]
@@ -52,7 +60,11 @@ fn a_multi_cert_bundle_loads_every_certificate_in_it() {
     // build succeeds is therefore necessary but not sufficient, which is why
     // the parse itself is checked directly below.
     let client = HttpClient::with_tls(&HttpConfig::default(), &tls(&[CHAIN], true));
-    assert!(client.is_ok(), "a 2-cert bundle should build: {:?}", client.err().map(|e| e.to_string()));
+    assert!(
+        client.is_ok(),
+        "a 2-cert bundle should build: {:?}",
+        client.err().map(|e| e.to_string())
+    );
 
     let pem = std::fs::read(CHAIN).expect("fixture readable");
     let certs = reqwest::Certificate::from_pem_bundle(&pem).expect("bundle parses");
@@ -80,13 +92,21 @@ fn a_config_that_names_no_roots_still_builds() {
     // Nothing about this ask may change the behaviour of a config that does
     // not use it.
     let client = HttpClient::with_tls(&HttpConfig::default(), &TlsConfig::default());
-    assert!(client.is_ok(), "the untouched path still builds: {:?}", client.err().map(|e| e.to_string()));
+    assert!(
+        client.is_ok(),
+        "the untouched path still builds: {:?}",
+        client.err().map(|e| e.to_string())
+    );
 }
 
 #[test]
 fn pinning_to_only_the_supplied_bundles_builds() {
     let client = HttpClient::with_tls(&HttpConfig::default(), &tls(&[ONE], false));
-    assert!(client.is_ok(), "certs-only should build: {:?}", client.err().map(|e| e.to_string()));
+    assert!(
+        client.is_ok(),
+        "certs-only should build: {:?}",
+        client.err().map(|e| e.to_string())
+    );
 }
 
 #[test]
@@ -100,7 +120,10 @@ fn pinning_with_no_bundle_is_refused_by_name() {
     };
     let message = err.to_string();
     assert!(message.contains("trusts no CA at all"), "got: {message}");
-    assert!(message.contains("root_cert_paths"), "names the field to fix: {message}");
+    assert!(
+        message.contains("root_cert_paths"),
+        "names the field to fix: {message}"
+    );
 }
 
 #[test]
@@ -115,7 +138,10 @@ fn an_unreadable_bundle_names_the_file() {
         Err(e) => e,
     };
     let message = err.to_string();
-    assert!(message.contains("nope.pem"), "names the missing file: {message}");
+    assert!(
+        message.contains("nope.pem"),
+        "names the missing file: {message}"
+    );
     assert!(message.contains("cannot read CA bundle"), "got: {message}");
 }
 
@@ -139,10 +165,9 @@ fn a_bundle_that_is_not_pem_names_the_file_too() {
 fn the_json_surface_accepts_both_spellings() {
     // KnockPort writes camelCase; the engine's own configs are snake_case.
     // Both have to read, or one of the two callers silently gets defaults.
-    let snake: TlsConfig = serde_json::from_str(
-        r#"{"root_cert_paths":["a.pem"],"keep_system_roots":false}"#,
-    )
-    .expect("snake_case reads");
+    let snake: TlsConfig =
+        serde_json::from_str(r#"{"root_cert_paths":["a.pem"],"keep_system_roots":false}"#)
+            .expect("snake_case reads");
     assert_eq!(snake.root_cert_paths, vec!["a.pem".to_string()]);
     assert!(!snake.keep_system_roots);
 
@@ -157,7 +182,9 @@ fn the_json_surface_accepts_both_spellings() {
 fn an_absent_keep_system_roots_defaults_to_true_through_serde_too() {
     // `#[derive(Default)]` would have given false here — the one field whose
     // zero value is the wrong answer, which is why `Default` is hand-written.
-    let cfg: TlsConfig = serde_json::from_str(r#"{"root_cert_paths":["a.pem"]}"#)
-        .expect("reads");
-    assert!(cfg.keep_system_roots, "serde default must match the Default impl");
+    let cfg: TlsConfig = serde_json::from_str(r#"{"root_cert_paths":["a.pem"]}"#).expect("reads");
+    assert!(
+        cfg.keep_system_roots,
+        "serde default must match the Default impl"
+    );
 }

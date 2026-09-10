@@ -371,7 +371,11 @@ pub struct PacDecision {
 
 impl PacDecision {
     pub fn new(candidates: Vec<PacDirective>) -> Self {
-        Self { candidates, current: 0, decided_at: std::time::Instant::now() }
+        Self {
+            candidates,
+            current: 0,
+            decided_at: std::time::Instant::now(),
+        }
     }
 
     /// The candidate to try now, or `None` when every one has failed.

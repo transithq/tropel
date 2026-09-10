@@ -314,7 +314,8 @@ fn assertion_literal(value: &str) -> String {
     let v = value.trim();
     if !v.is_empty()
         && v.parse::<f64>().is_ok()
-        && v.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+        && v.chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
     {
         return v.to_string();
     }
