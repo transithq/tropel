@@ -623,6 +623,7 @@ impl WasmHttpRequest {
             body: req_body,
             auth: None,
             certificate: None,
+            proxy: None,
             follow_redirects: self.follow_redirects,
             host: None,
             cookies: Vec::new(),

@@ -583,6 +583,7 @@ fn http_item_to_item(item: &BruItem) -> Result<ScenarioItem> {
             body,
             auth,
             certificate: None,
+            proxy: None,
             follow_redirects: true,
             host: None,
             cookies: Vec::new(),

@@ -1490,21 +1490,22 @@ impl TrpBridge {
                                 .to_string();
                             };
 
+                            // Functional update: a script-realm request
+                            // carries no certificate, no per-request proxy
+                            // and no auth, and naming every inert field here
+                            // means a new one breaks this call site for no
+                            // reason. `Default` already gives
+                            // `follow_redirects: true`.
                             let req = Request {
                                 url: resolved_url,
                                 method,
                                 headers,
-                                query_params: HashMap::new(),
                                 body: request_body,
-                                auth: None,
-                                certificate: None,
-                                follow_redirects: true,
-                                host: None,
-                                cookies: Vec::new(),
                                 timeout,
                                 response_type: tropel_sdk::types::ResponseType::from_k6(
                                     &response_type,
                                 ),
+                                ..Default::default()
                             };
 
                             // Execute on the dedicated I/O runtime via a

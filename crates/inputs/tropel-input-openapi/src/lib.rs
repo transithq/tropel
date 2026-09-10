@@ -565,6 +565,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                     body,
                     auth,
                     certificate: None,
+                    proxy: None,
                     follow_redirects: true,
                     host: None,
                     cookies: Vec::new(),

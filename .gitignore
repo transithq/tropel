@@ -63,6 +63,15 @@ $RECYCLE.BIN/
 *.pem
 *.key
 *.crt
+# …except the CA-bundle test fixtures, which are self-signed roots holding
+# CERTIFICATES ONLY — no private keys, checked. The blanket rules above exist
+# to stop a real credential being committed, and they silently swallowed these
+# three, so ask 18's tests passed locally and failed in CI from the day they
+# landed with "cannot read CA bundle … No such file or directory".
+#
+# Narrow on purpose: one directory, not `!**/fixtures/*.pem`. A wide negation
+# would re-open the hole the rules are for.
+!crates/tropel-http/tests/fixtures/*.pem
 
 # ── Node / JS vendored deps ───────────────────────────────────
 node_modules/

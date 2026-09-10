@@ -103,31 +103,35 @@ use tropel_sdk::scenario::{Scenario, ScenarioInfo, ScenarioItem};
 pub fn build_scenario() -> Scenario {
     Scenario {
         info: ScenarioInfo { name: "sample".into(), description: None, schema: None },
+        // FUNCTIONAL UPDATE, not an exhaustive literal, and that is the
+        // interesting part of this guard rather than an incidental style.
+        //
+        // The sample used to name every field of both structs. It broke on
+        // tropel-sdk 0.4.0 with `missing fields \`authoring\` and \`contract\``
+        // — which is the guard doing its job: an out-of-workspace extension
+        // author meeting a field addition. But a guard that has to be edited
+        // for every new field tests the editor's diligence, not the contract.
+        //
+        // `..Default::default()` is the construction that survives a field
+        // addition (tropel-sdk#31 added `Default` to these types precisely so
+        // it could be). Writing the sample this way means the guard keeps
+        // asserting what it is FOR — that the contract types resolve from the
+        // SDK alone — instead of re-failing on every additive change.
         items: vec![ScenarioItem {
-            id: None,
             name: "GET /ping".into(),
             request: Some(Request {
                 url: "https://example.com/ping".into(),
                 method: Method::GET,
-                headers: vec![],
-                query_params: std::collections::HashMap::new(),
-                body: None,
-                auth: None,
-                certificate: None,
+                // Named explicitly, unlike the rest: `Default` gives `true`
+                // here, and an extension author reading this sample should
+                // see that the value is a decision rather than a zero.
                 follow_redirects: true,
-                host: None,
-                cookies: vec![],
-                timeout: None,
                 response_type: ResponseType::Text,
+                ..Default::default()
             }),
-            prerequest: vec![],
-            test: vec![],
-            assertions: vec![],
-            items: vec![],
+            ..Default::default()
         }],
-        variables: std::collections::HashMap::new(),
-        auth: None,
-        conversion_notes: vec![],
+        ..Default::default()
     }
 }
 
