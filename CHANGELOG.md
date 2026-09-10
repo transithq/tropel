@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.6.0] - 2026-09-11
+
+The release that makes tropel **installable as a dependency**. Every crate is
+published to crates.io, so a consumer — KnockPort first — depends on
+`version = "0.6.0"` instead of a git SHA.
+
+**The API is unstable pre-1.0.** `tropel-sdk` is deliberately NOT in this
+lockstep: it is the contract a third-party adapter author depends on, in its
+own repo with its own history, and its version tracks its own API.
+
+### Added — tropel reads KnockPort collections
+
+`tropel-input-knockport`. tropel could already import Postman, Bruno,
+Insomnia, HAR, OpenAPI, k6 and `.http` — every competitor's format — and not
+the one format both products own, so `tropel run my-collection/` failed on it.
+
+The format is a **directory**, not a file (`knockport.yaml` +
+`requests/**/*.yaml`), so the adapter uses `parse_with_path` — the hook that
+already existed for k6's module resolution. It follows the client's own rules
+rather than convenient ones: the **filename is the identity** (KP-101, so no
+`id:` keys and a missing `name:` takes the file stem), `order:` is
+authoritative and lists filenames, files *absent* from `order:` still import
+rather than being dropped, and disabled rows are not sent. Scripts and
+assertions are **reported, not silently dropped** — tropel's script realm is
+the pm/k6 surface, and running a KnockPort script there would not be the same
+script.
+
+### Changed — the whole crate tree is published
+
+- **35 crates at 0.6.0**, with the binary, `tropel-web` and the four npm
+  packages. `version-lockstep.sh` reports all seven surfaces agreeing.
+- **28 `publish = false` lines removed.** Six of the seven crates KnockPort
+  links were opted out of the registry, which is why it had to pin a git SHA.
+- **14 crates gained a `description`** — cargo refuses to publish without
+  one, so this was the hard prerequisite.
+- Every workspace `tropel-*` declaration carries a `version`. A path-only
+  dependency cannot be published at all: consumers resolve the version.
+
+0.6.0 rather than 0.5.6 because the release is breaking — `tropel-auth`'s
+EdgeGrid error type went `TropelError` → `String` and its clock/CSPRNG
+helpers became feature-gated; `Request` gained a `proxy` field. Pre-1.0 that
+is a minor bump by this repo's own policy.
+
+### Fixed — `publish-dry-run.sh` cried wolf on a first full-tree publish
+
+It read *"no matching package named X found"* as a hard failure. Cargo words
+"a workspace sibling is not on crates.io yet" two ways and only the other one
+was recognised, so the first full-tree run reported **"BLOCKED: 12 of 35 …
+the gate is NOT met"** for the entirely normal pre-publish state. The guard
+against a real failure is unchanged: the named crate must be a workspace
+member whose own version is the one being asked for.
+
+It also now prints the **topological publish order**. Sequencing 35 crates by
+hand is how a version number gets burned on a failed publish.
+
 ## [0.5.5] - 2026-09-10
 
 Three tagged versions shipped without a changelog entry — 0.3.0 and 0.5.4 were
