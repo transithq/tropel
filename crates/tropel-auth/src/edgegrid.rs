@@ -36,7 +36,13 @@ use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use tropel_sdk::{Result, TropelError};
+// No `tropel_sdk` and no `reqwest` — this module is PURE, for the reason
+// `builders` is: `tropel-core-wasm` turns the `reqwest` feature off, and a
+// browser embedder that cannot reach the EdgeGrid signer must refuse every
+// EdgeGrid send. Errors are `String` here and the `signers.rs` adapter maps
+// them onto `TropelError`, which is the same division of labour every
+// builder in this crate already uses.
+type Result<T> = std::result::Result<T, String>;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -113,14 +119,35 @@ pub fn edgegrid_build_header(
         .filter(|(_, empty)| *empty)
         .map(|(name, _)| *name)
         .collect();
-        return Err(TropelError::Other(format!(
+        return Err(format!(
             "akamai-edgegrid: missing {} — the request was not signed",
             missing.join(", ")
-        )));
+        ));
     }
 
+    // No default when the feature is off: this module has no clock there, and
+    // a fabricated stamp signs data Akamai rejects for staleness with a 401
+    // that mentions neither the clock nor the format.
+    #[cfg(feature = "reqwest")]
     let timestamp = params.timestamp.clone().unwrap_or_else(edgegrid_timestamp);
+    #[cfg(not(feature = "reqwest"))]
+    let timestamp = params.timestamp.clone().ok_or_else(|| {
+        "akamai-edgegrid: no timestamp, and this build has no clock — pass one formatted \
+         yyyyMMddTHH:mm:ss+0000"
+            .to_string()
+    })?;
+    // Same split as the timestamp, and the same reason it is not a fallback:
+    // this crate's CSPRNG is `rand`'s OS source, which the browser tier does
+    // not have. `crypto.getRandomValues` is a better source anyway — the
+    // precedent every other signer in `tropel-core-wasm` follows.
+    #[cfg(feature = "reqwest")]
     let nonce = params.nonce.clone().unwrap_or_else(edgegrid_nonce);
+    #[cfg(not(feature = "reqwest"))]
+    let nonce = params.nonce.clone().ok_or_else(|| {
+        "akamai-edgegrid: no nonce, and this build has no CSPRNG — pass one from \
+         crypto.getRandomValues"
+            .to_string()
+    })?;
 
     // Built ONCE: it is both the header prefix and the seventh signing field,
     // so formatting it twice invites the two copies to drift.
@@ -212,19 +239,46 @@ fn collapse_whitespace(value: &str) -> String {
 }
 
 /// Scheme, host and path-with-query, as the three signing fields need them.
+///
+/// Hand-rolled rather than `Url::parse`. `url` (and its `idna`, and ICU's
+/// tables behind that) is tens of kilobytes of wasm against a 700 KB budget,
+/// for three fields a split already gives — and EdgeGrid needs none of what
+/// a real parser adds: no IDNA, no path normalisation, no percent-decoding.
+/// The signature covers the target VERBATIM, so normalising it would be
+/// actively wrong.
+///
+/// `oauth1_base_uri` in `builders` takes the same position for the same
+/// reason: the caller has the components.
 fn split_url(url: &str) -> Result<(String, String, String)> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| TropelError::Other(format!("akamai-edgegrid: invalid URL {url:?}: {e}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| TropelError::Other(format!("akamai-edgegrid: URL {url:?} has no host")))?
-        .to_string();
-    let mut path = parsed.path().to_string();
-    if let Some(query) = parsed.query() {
-        path.push('?');
-        path.push_str(query);
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("akamai-edgegrid: URL {url:?} has no scheme"))?;
+    if scheme.is_empty() {
+        return Err(format!("akamai-edgegrid: URL {url:?} has no scheme"));
     }
-    Ok((parsed.scheme().to_string(), host, path))
+    // Authority ends at the first `/`, `?` or `#`; everything from there is
+    // the request target.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, target) = rest.split_at(end);
+    // Userinfo is stripped: it is not part of the canonical host, and
+    // signing it would embed a credential in the signature.
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if authority.is_empty() {
+        return Err(format!("akamai-edgegrid: URL {url:?} has no host"));
+    }
+    // The PORT stays on the host, because Akamai signs the Host header's
+    // value and that carries a non-default port. An IPv6 literal keeps its
+    // brackets, so the last colon is only a port separator outside them.
+    let host = authority.to_ascii_lowercase();
+    // A fragment never goes on the wire, so it is not part of the target.
+    let target = target.split('#').next().unwrap_or("");
+    let path = if target.is_empty() || target.starts_with('?') {
+        // An empty path is `/` on the wire, and that is what gets signed.
+        format!("/{target}")
+    } else {
+        target.to_string()
+    };
+    Ok((scheme.to_ascii_lowercase(), host, path))
 }
 
 /// `yyyyMMddTHH:mm:ss+0000` — EdgeGrid's format, NOT RFC 3339.
@@ -232,6 +286,11 @@ fn split_url(url: &str) -> Result<(String, String, String)> {
 /// See the module docs: an RFC 3339 stamp goes into the signing data verbatim
 /// and produces a signature Akamai rejects with a 401 that says nothing about
 /// the format.
+///
+/// The one gated item in this module, because it is the one that needs a
+/// clock: `chrono` is a `reqwest`-feature dependency and does not belong in
+/// the browser tier, which has `Date` and passes its own stamp in.
+#[cfg(feature = "reqwest")]
 pub fn edgegrid_timestamp() -> String {
     chrono::Utc::now()
         .format("%Y%m%dT%H:%M:%S+0000")
@@ -240,11 +299,17 @@ pub fn edgegrid_timestamp() -> String {
 
 /// A fresh nonce.
 ///
+/// Gated with the timestamp, and for the matching reason: `rand`'s OS source
+/// is not what a browser build should reach for, and the wasm tier's callers
+/// pass `crypto.getRandomValues` — which is stronger than anything this crate
+/// can offer there.
+///
 /// The crate's existing CSPRNG generator, not a new one and not a counter:
 /// the nonce is a replay defence, and `signers.rs` already carries the
 /// reasoning for why a time-seeded counter is the wrong tool (an observer can
 /// predict the next value). Reusing it also keeps one source of nonce
 /// strength rather than two that can drift apart.
+#[cfg(feature = "reqwest")]
 pub fn edgegrid_nonce() -> String {
     crate::signers::crypto_nonce()
 }
@@ -476,6 +541,95 @@ mod tests {
         let err = edgegrid_build_header(&p, &[])
             .expect_err("must refuse")
             .to_string();
-        assert!(err.contains("invalid URL"), "got {err}");
+        // The hand-rolled split says WHICH part is missing, where
+        // `Url::parse` said only "invalid URL" — a better error, and the
+        // reason this assertion changed when the parser did.
+        assert!(err.contains("no scheme"), "got {err}");
+    }
+
+    // ── the hand-rolled split ────────────────────────────────────────────
+    //
+    // `Url::parse` was replaced to keep `url` + `idna` + ICU out of a 700 KB
+    // wasm budget, so these cover the cases a real parser would have handled
+    // for free. Each one changes the SIGNED STRING, so getting any wrong is
+    // a 401 with nothing pointing at the cause.
+
+    #[test]
+    fn the_split_takes_scheme_host_and_target() {
+        let (scheme, host, path) =
+            split_url("https://akaa-x.luna.akamaiapis.net/diagnostic/v1/x").expect("splits");
+        assert_eq!(scheme, "https");
+        assert_eq!(host, "akaa-x.luna.akamaiapis.net");
+        assert_eq!(path, "/diagnostic/v1/x");
+    }
+
+    #[test]
+    fn the_query_is_part_of_the_signed_target() {
+        let (_, _, path) = split_url("https://h/v1/x?b=2&a=1").expect("splits");
+        // NOT sorted and NOT re-encoded: EdgeGrid signs the target verbatim,
+        // so normalising it would sign a request that was never sent.
+        assert_eq!(path, "/v1/x?b=2&a=1");
+    }
+
+    #[test]
+    fn an_empty_path_signs_as_a_slash() {
+        // What goes on the wire for `https://h` is `GET / HTTP/1.1`.
+        assert_eq!(split_url("https://h").expect("splits").2, "/");
+        assert_eq!(split_url("https://h?a=1").expect("splits").2, "/?a=1");
+    }
+
+    #[test]
+    fn a_fragment_is_not_signed_because_it_is_not_sent() {
+        assert_eq!(split_url("https://h/v1/x#frag").expect("splits").2, "/v1/x");
+        assert_eq!(
+            split_url("https://h/v1/x?a=1#frag").expect("splits").2,
+            "/v1/x?a=1"
+        );
+    }
+
+    #[test]
+    fn a_port_stays_on_the_host() {
+        // Akamai signs the Host header's value, and that carries a
+        // non-default port. Stripping it would sign a different host.
+        assert_eq!(split_url("https://h:8443/v1").expect("splits").1, "h:8443");
+    }
+
+    #[test]
+    fn userinfo_is_stripped_rather_than_signed() {
+        // It is not part of the canonical host, and signing it would embed a
+        // credential in the signature — and in anything that logs the header.
+        let (_, host, _) = split_url("https://user:pw@h/v1").expect("splits");
+        assert_eq!(host, "h");
+        assert!(!host.contains("pw"), "no credential in the signed host");
+    }
+
+    #[test]
+    fn an_ipv6_literal_keeps_its_brackets() {
+        // The brackets are part of the authority. A "strip everything after
+        // the last colon" port rule would have eaten the address.
+        assert_eq!(
+            split_url("https://[::1]:9000/v1").expect("splits").1,
+            "[::1]:9000"
+        );
+        assert_eq!(
+            split_url("https://[2001:db8::1]/v1").expect("splits").1,
+            "[2001:db8::1]"
+        );
+    }
+
+    #[test]
+    fn the_scheme_and_host_fold_case_but_the_target_does_not() {
+        let (scheme, host, path) = split_url("HTTPS://Example.COM/V1/Path").expect("splits");
+        assert_eq!(scheme, "https");
+        assert_eq!(host, "example.com");
+        // Case-SENSITIVE, because a path is: `/V1/Path` and `/v1/path` are
+        // two different resources, and the signature covers what was sent.
+        assert_eq!(path, "/V1/Path");
+    }
+
+    #[test]
+    fn a_url_with_no_host_is_refused() {
+        let err = split_url("https:///v1/x").expect_err("must refuse");
+        assert!(err.contains("no host"), "got {err}");
     }
 }
