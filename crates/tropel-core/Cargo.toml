@@ -1,11 +1,11 @@
 [package]
 name = "tropel-core"
-version = "0.1.0"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
+description = "Core tropel types shared across the engine: job configuration, scenario resolution and the execution plan."
 repository.workspace = true
 rust-version.workspace = true
-publish = false
 
 [dependencies]
 tropel-sdk.workspace = true

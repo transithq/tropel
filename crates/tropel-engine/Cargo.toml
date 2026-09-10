@@ -1,11 +1,11 @@
 [package]
 name = "tropel-engine"
-version = "0.5.5"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
+description = "The tropel load-test engine: scenario execution, VU scheduling, the protocol registry and the metrics pipeline."
 repository.workspace = true
 rust-version.workspace = true
-publish = false
 
 [dependencies]
 tropel-sdk.workspace = true
@@ -41,6 +41,7 @@ tropel-input-subprocess.workspace = true
 tropel-input-http.workspace = true
 tropel-input-bru.workspace = true
 tropel-input-insomnia.workspace = true
+tropel-input-knockport.workspace = true
 tropel-wasm.workspace = true
 tropel-x-grpc.workspace = true
 tropel-x-websocket.workspace = true

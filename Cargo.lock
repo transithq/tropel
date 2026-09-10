@@ -4250,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "tropel"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4272,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-auth"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.0",
  "chrono",
@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-bench"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "criterion",
  "libc",
@@ -4312,7 +4312,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-build"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4326,7 +4326,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-collection"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "insta",
  "percent-encoding",
@@ -4339,7 +4339,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "indexmap",
@@ -4356,7 +4356,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-core-wasm"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.0",
  "getrandom 0.4.3",
@@ -4371,7 +4371,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-distributed"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "mimalloc",
@@ -4392,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-engine"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4419,6 +4419,7 @@ dependencies = [
  "tropel-input-http",
  "tropel-input-insomnia",
  "tropel-input-k6",
+ "tropel-input-knockport",
  "tropel-input-openapi",
  "tropel-input-postman",
  "tropel-input-subprocess",
@@ -4438,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-es"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -4461,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-ext"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4476,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-http"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "h2",
@@ -4496,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-bru"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "inventory",
  "serde",
@@ -4506,7 +4507,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-har"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.0",
  "inventory",
@@ -4518,7 +4519,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-http"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "inventory",
  "serde_json",
@@ -4527,7 +4528,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-insomnia"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "inventory",
  "serde",
@@ -4537,7 +4538,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-k6"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
@@ -4566,8 +4567,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tropel-input-knockport"
+version = "0.6.0"
+dependencies = [
+ "inventory",
+ "serde",
+ "serde_json",
+ "tropel-sdk",
+ "yaml_serde",
+]
+
+[[package]]
 name = "tropel-input-openapi"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "inventory",
  "serde",
@@ -4578,7 +4590,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-postman"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "inventory",
  "serde",
@@ -4589,7 +4601,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-subprocess"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "rand",
  "serde_json",
@@ -4599,7 +4611,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-wasm"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -4615,7 +4627,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-js"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "rquickjs",
@@ -4627,7 +4639,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-metrics"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
@@ -4645,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-native"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4676,7 +4688,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-report"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4697,7 +4709,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-runtime"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -4713,7 +4725,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-sandbox"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "rquickjs",
@@ -4730,7 +4742,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-scheduler"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "futures",
  "tokio",
@@ -4756,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-variables"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "rand",
@@ -4770,7 +4782,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-wasm"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4791,7 +4803,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-web"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "postcard",
@@ -4814,7 +4826,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-x-grpc"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4839,7 +4851,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-x-prometheus"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -4852,7 +4864,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-x-websocket"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures-util",

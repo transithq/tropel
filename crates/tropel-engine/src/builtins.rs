@@ -28,6 +28,10 @@ pub fn link_builtins() -> usize {
         Box::new(tropel_input_http::HttpFileAdapter),
         Box::new(tropel_input_bru::BruInputAdapter),
         Box::new(tropel_input_insomnia::InsomniaInputAdapter),
+        // The sibling product's own format. tropel could read every
+        // competitor's collection and not KnockPort's, which is the one
+        // format both products own.
+        Box::new(tropel_input_knockport::KnockPortInputAdapter),
     ];
     let drivers: Vec<Box<dyn Driver>> = vec![
         Box::new(tropel_input_k6::driver::K6Driver),

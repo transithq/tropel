@@ -1,13 +1,12 @@
 [package]
 name = "tropel-core-wasm"
-version = "0.1.0"
+version = "0.6.0"
 # Explicit (not `.workspace = true`): wasm-pack 0.10's manifest parser
 # rejects inherited table fields ("invalid type: map, expected a string").
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/transithq/tropel"
 rust-version = "1.85"
-publish = false
 description = "Core tier of Tropel for browser embedders (KnockPort): variables/auth/import compiled to wasm32-unknown-unknown with a wasm-bindgen surface. No QuickJS — see API_CLIENT_WEB_PAYLOAD.md §2.3 (two-tier wasm)."
 
 [lib]
