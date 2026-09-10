@@ -284,6 +284,7 @@ fn block_to_item(
             body,
             auth: None,
             certificate: None,
+            proxy: None,
             follow_redirects: true,
             host: None,
             cookies: Vec::new(),

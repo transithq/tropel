@@ -293,6 +293,7 @@ fn make_req(url: String) -> TpRequest {
         body: Some(ReqBody::Json(serde_json::json!({"name": "tropel"}))),
         auth: None,
         certificate: None,
+        proxy: None,
         follow_redirects: true,
         host: None,
         cookies: Vec::new(),

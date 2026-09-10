@@ -1121,6 +1121,7 @@ fn convert_request(wr: &WasmRequest) -> Result<Request> {
         body,
         auth: wr.auth.as_ref().and_then(convert_auth),
         certificate: None,
+        proxy: None,
         follow_redirects: wr.follow_redirects,
         host: None,
         cookies: Vec::new(),

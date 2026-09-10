@@ -356,6 +356,7 @@ fn request_to_item(r: &InsomniaResource) -> Result<ScenarioItem> {
             body,
             auth,
             certificate: None,
+            proxy: None,
             follow_redirects: true,
             host: None,
             cookies: Vec::new(),
