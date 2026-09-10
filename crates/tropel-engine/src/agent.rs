@@ -2518,6 +2518,20 @@ async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_js
     let certificate: Option<tropel_sdk::types::CertificateConfig> = req
         .get("certificate")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
+    // Ask 17's per-request half, read off the wire like `certificate` above.
+    // KnockPort declares every `proxy.*` capability false with "the agent's
+    // client is built once from HttpConfig::default() and /execute carries no
+    // proxy field" as the stated reason — this is that field. Additive, so a
+    // client that sends no `proxy` is unaffected.
+    //
+    // `.ok()` rather than a hard error, matching `certificate`: a malformed
+    // block is the same class of caller mistake and the request is refused
+    // downstream by name (`fixed` with no host, a bypass typo) rather than
+    // failing to parse with a serde message about a field the caller cannot
+    // see.
+    let proxy: Option<tropel_sdk::types::ProxyConfig> = req
+        .get("proxy")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
     let host: Option<String> = req.get("host").and_then(|h| h.as_str()).map(str::to_string);
     let cookies: Vec<tropel_sdk::types::RequestCookie> = req
         .get("cookies")
@@ -2550,6 +2564,7 @@ async fn execute_single(state: &AgentState, req: &serde_json::Value) -> serde_js
             .map(|s| Body::Raw(s.to_string())),
         auth: auth.clone(),
         certificate,
+        proxy,
         follow_redirects: follow,
         host,
         cookies,
@@ -3305,6 +3320,7 @@ mod tests {
             body: None,
             auth: None,
             certificate: None,
+            proxy: None,
             follow_redirects: true,
             host: None,
             cookies: Vec::new(),
@@ -4162,6 +4178,46 @@ mod tests {
     ///
     /// Pins the ARRAY form carrying both, and the object form still working,
     /// because breaking the old shape would break every existing caller.
+    #[test]
+    fn the_execute_wire_carries_a_per_request_proxy() {
+        // Exactly the parsing branch `execute_single` runs for `proxy`.
+        // KnockPort declares every `proxy.*` capability false with "the
+        // agent's client is built once from HttpConfig::default() and
+        // /execute carries no proxy field" as its stated reason — this is
+        // that field, so the reason has to stop being true.
+        fn parse(v: &serde_json::Value) -> Option<tropel_sdk::types::ProxyConfig> {
+            v.get("proxy")
+                .and_then(|p| serde_json::from_value(p.clone()).ok())
+        }
+
+        let cfg = parse(&serde_json::json!({
+            "proxy": {"mode": "fixed", "protocol": "http", "host": "p.internal",
+                      "port": 3128, "username": "u", "password": "p",
+                      "bypass": ["localhost", "*.internal"]}
+        }))
+        .expect("a fixed proxy reads");
+        assert_eq!(cfg.mode, tropel_sdk::types::ProxyMode::Fixed);
+        assert_eq!(cfg.fixed_url().as_deref(), Some("http://p.internal:3128"));
+        assert_eq!(cfg.bypass.len(), 2);
+
+        // camelCase, which is what KnockPort writes.
+        let pac = parse(&serde_json::json!({
+            "proxy": {"mode": "pac", "pacUrl": "http://wpad/proxy.pac"}
+        }))
+        .expect("a pac proxy reads");
+        assert_eq!(pac.pac_url.as_deref(), Some("http://wpad/proxy.pac"));
+
+        // ABSENT is the common case and must stay `None` — additive means a
+        // client that sends no `proxy` is unaffected.
+        assert!(parse(&serde_json::json!({"url": "https://x/y"})).is_none());
+
+        // A malformed block is `None` rather than a parse failure, matching
+        // `certificate`: the request is then refused downstream BY NAME
+        // (`fixed` with no host, a bypass typo) rather than with a serde
+        // message about a field the caller cannot see.
+        assert!(parse(&serde_json::json!({"proxy": "http://p:3128"})).is_none());
+    }
+
     #[test]
     fn duplicate_header_names_survive_the_execute_wire_format() {
         // Exactly the parsing branch `execute_single` runs.
