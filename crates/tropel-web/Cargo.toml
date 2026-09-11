@@ -9,6 +9,15 @@ description = "Browser slice of Tropel: a wasm32-wasip1 cdylib exposing a postca
 
 # cdylib exports the C ABI (`tropel_alloc` / `tropel_free` / `tropel_run`)
 # for the wasm build; rlib lets native tests link the crate.
+
+# The shared JS shim tree is reached through the in-crate `js` symlink (-> the
+# repo-root js/), because include_str! cannot read outside the package root and
+# cargo would otherwise package nothing for it. Cargo DEREFERENCES the symlink
+# into the tarball, so the sources ship as real files; it also walks the linked
+# directory directly rather than via git, so untracked macOS junk in there would
+# ship too. Excluded so the tarball does not depend on who opened Finder.
+exclude = ["js/**/.DS_Store"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

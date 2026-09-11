@@ -1933,14 +1933,14 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
-            .eval(include_str!("../../../js/shared/deep-equal.js"))
+            .eval(include_str!("../js/shared/deep-equal.js"))
             .await
             .expect("shared deep-equal should eval");
         js_ctx
             .eval(concat!(
-                include_str!("../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .await
             .expect("pm shim should eval");
@@ -2051,14 +2051,14 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
-            .eval(include_str!("../../../js/shared/deep-equal.js"))
+            .eval(include_str!("../js/shared/deep-equal.js"))
             .await
             .expect("shared deep-equal should eval");
         js_ctx
             .eval(concat!(
-                include_str!("../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .await
             .expect("pm shim should eval");
@@ -2159,14 +2159,14 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
-            .eval(include_str!("../../../js/shared/deep-equal.js"))
+            .eval(include_str!("../js/shared/deep-equal.js"))
             .await
             .expect("shared deep-equal should eval");
         js_ctx
             .eval(concat!(
-                include_str!("../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .await
             .expect("pm shim should eval");
@@ -2225,14 +2225,14 @@ mod tests {
                 .expect("js context should construct"),
         );
         js_ctx
-            .eval(include_str!("../../../js/shared/deep-equal.js"))
+            .eval(include_str!("../js/shared/deep-equal.js"))
             .await
             .expect("shared deep-equal should eval");
         js_ctx
             .eval(concat!(
-                include_str!("../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .await
             .expect("pm shim should eval");
@@ -2682,13 +2682,13 @@ mod tests {
         let mut ctx = JsContext::new(None, None)
             .await
             .expect("js context should construct");
-        ctx.eval(include_str!("../../../js/shared/deep-equal.js"))
+        ctx.eval(include_str!("../js/shared/deep-equal.js"))
             .await
             .expect("deep-equal evals");
         ctx.eval(concat!(
-            include_str!("../../../js/shared/k6-core.js"),
+            include_str!("../js/shared/k6-core.js"),
             "\n",
-            include_str!("../../../js/scripting-api/pm.js")
+            include_str!("../js/scripting-api/pm.js")
         ))
         .await
         .expect("pm shim evals");

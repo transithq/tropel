@@ -818,7 +818,7 @@ fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix:
 
 /// The k6 `open()` + `k6/data` SharedArray shim (globals `open` and
 /// `SharedArray`), which delegates to the native bridges above.
-const OPEN_DATA_SHIM: &str = include_str!("../../../../js/k6-shim/open-data-shim.js");
+const OPEN_DATA_SHIM: &str = include_str!("../js/k6-shim/open-data-shim.js");
 
 // ══════════════════════════════════════════════════════════════════
 // K6DriverInstance — per-iteration execution
@@ -4848,19 +4848,19 @@ fn is_typescript_ext(path: &Path) -> bool {
 /// overhead ~4× beyond the bytecode win.
 const K6_BASE_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: deep-equal-shim ====\n",
-    include_str!("../../../../js/shared/deep-equal.js"),
+    include_str!("../js/shared/deep-equal.js"),
     "\n",
     "// ==== shim: chai-shim ====\n",
-    include_str!("../../../../js/chai/chai-shim.js"),
+    include_str!("../js/chai/chai-shim.js"),
     "\n",
     "// ==== shim: lodash-shim ====\n",
-    include_str!("../../../../js/lodash/lodash-shim.js"),
+    include_str!("../js/lodash/lodash-shim.js"),
     "\n",
     "// ==== shim: cryptojs-shim ====\n",
-    include_str!("../../../../js/cryptojs-shim/cryptojs.js"),
+    include_str!("../js/cryptojs-shim/cryptojs.js"),
     "\n",
     "// ==== shim: exec-shim ====\n",
-    include_str!("../../../../js/exec/exec.js"),
+    include_str!("../js/exec/exec.js"),
 );
 
 /// Native-dependent shim libraries (pm-api, sleep, k6-shim, open/SharedArray)
@@ -4868,29 +4868,29 @@ const K6_BASE_SHIM_BUNDLE: &str = concat!(
 const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: pm-api ====\n",
     concat!(
-        include_str!("../../../../js/shared/k6-core.js"),
+        include_str!("../js/shared/k6-core.js"),
         "\n",
-        include_str!("../../../../js/scripting-api/pm.js")
+        include_str!("../js/scripting-api/pm.js")
     ),
     "\n",
     "// ==== shim: sleep-shim ====\n",
-    include_str!("../../../../js/k6-shim/sleep-shim.js"),
+    include_str!("../js/k6-shim/sleep-shim.js"),
     "\n",
     "// ==== shim: k6-shim ====\n",
-    include_str!("../../../../js/k6-shim/k6-shim.js"),
+    include_str!("../js/k6-shim/k6-shim.js"),
     "\n",
     "// ==== shim: jslib-shim ====\n",
-    include_str!("../../../../js/k6-shim/jslib-shim.js"),
+    include_str!("../js/k6-shim/jslib-shim.js"),
     "\n",
     "// ==== shim: open-data-shim ====\n",
-    include_str!("../../../../js/k6-shim/open-data-shim.js"),
+    include_str!("../js/k6-shim/open-data-shim.js"),
     "\n",
     // TR-245: deferred modules — k6/websockets, k6/html, k6/net/grpc,
     // k6/experimental/{csv,fs,streams}. MUST run after k6-shim.js (needs
     // K6Response for the html upgrade) and open-data-shim.js (fs fallback
     // uses open(path, 'b')).
     "// ==== shim: deferred-modules ====\n",
-    include_str!("../../../../js/k6-shim/deferred-modules-shim.js"),
+    include_str!("../js/k6-shim/deferred-modules-shim.js"),
 );
 
 /// Process-wide cache of a compiled k6 shim bundle's QuickJS bytecode.
@@ -5546,7 +5546,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             // Stub the native HTTP bridge so no real network is needed;
             // capture exactly what the shim would hand to the bridge.
@@ -5667,7 +5667,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             // Stub the native HTTP bridge; capture the body handed to it.
             ctx.eval::<(), _>(
@@ -5702,7 +5702,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -5761,7 +5761,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -5818,7 +5818,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -5925,7 +5925,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -5997,7 +5997,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6111,7 +6111,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6251,9 +6251,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6310,12 +6310,12 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
             ctx.eval::<(), _>(concat!(
-                include_str!("../../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .expect("pm shim should eval");
             ctx.eval::<(), _>(
@@ -6381,12 +6381,12 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
             ctx.eval::<(), _>(concat!(
-                include_str!("../../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .expect("pm shim should eval");
             ctx.eval::<(), _>(
@@ -6443,12 +6443,12 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
             ctx.eval::<(), _>(concat!(
-                include_str!("../../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .expect("pm shim should eval");
             // Stub the response bridges with known values.
@@ -6585,7 +6585,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+            ctx.eval::<(), _>(include_str!("../js/scripting-api/bru.js"))
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6653,7 +6653,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+            ctx.eval::<(), _>(include_str!("../js/scripting-api/bru.js"))
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6749,7 +6749,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+            ctx.eval::<(), _>(include_str!("../js/scripting-api/bru.js"))
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6804,7 +6804,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+            ctx.eval::<(), _>(include_str!("../js/scripting-api/bru.js"))
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6853,7 +6853,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/scripting-api/bru.js"))
+            ctx.eval::<(), _>(include_str!("../js/scripting-api/bru.js"))
                 .expect("bru shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -6952,9 +6952,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7019,17 +7019,17 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/chai/chai-shim.js"))
                 .expect("chai shim should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/lodash/lodash-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/lodash/lodash-shim.js"))
                 .expect("lodash shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7132,9 +7132,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7212,13 +7212,13 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/chai/chai-shim.js"))
                 .expect("chai shim should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7375,13 +7375,13 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/chai/chai-shim.js"))
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7447,16 +7447,16 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/chai/chai-shim.js"))
                 .expect("chai shim should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
             ctx.eval::<(), _>(concat!(
-                include_str!("../../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .expect("pm shim should eval");
             ctx.eval::<(), _>(
@@ -7692,13 +7692,13 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/chai/chai-shim.js"))
                 .expect("chai shim should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7826,9 +7826,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7894,9 +7894,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/chai/chai-shim.js"))
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -7965,9 +7965,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -8102,9 +8102,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -8225,9 +8225,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -8364,7 +8364,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             // Stub the native ws bridges — no real socket needed.
             ctx.eval::<(), _>(
@@ -8639,7 +8639,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             // Stub the custom-metric bridge + group bridges.
             ctx.eval::<(), _>(
@@ -9567,9 +9567,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9655,9 +9655,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -9754,7 +9754,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -10172,9 +10172,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -10385,13 +10385,13 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/chai/chai-shim.js"))
                 .expect("chai shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -10446,9 +10446,9 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
-            ctx.eval::<(), _>(concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")))
+            ctx.eval::<(), _>(concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")))
                 .expect("pm shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -10544,12 +10544,12 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
             ctx.eval::<(), _>(concat!(
-                include_str!("../../../../js/shared/k6-core.js"),
+                include_str!("../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../../js/scripting-api/pm.js")
+                include_str!("../js/scripting-api/pm.js")
             ))
             .expect("pm shim should eval");
             ctx.eval::<(), _>(
@@ -10675,7 +10675,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/exec/exec.js"))
+            ctx.eval::<(), _>(include_str!("../js/exec/exec.js"))
                 .expect("exec shim should eval");
             // Stub the native bridges with known values.
             ctx.eval::<(), _>(
@@ -12784,8 +12784,8 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         ctx.with(|ctx| {
             let bundle = format!(
                 "{}\n{}\n",
-                include_str!("../../../../js/k6-shim/k6-shim.js"),
-                include_str!("../../../../js/k6-shim/open-data-shim.js")
+                include_str!("../js/k6-shim/k6-shim.js"),
+                include_str!("../js/k6-shim/open-data-shim.js")
             );
             ctx.eval::<(), _>(bundle.as_str())
                 .expect("shims in production order must eval");
@@ -12811,8 +12811,8 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         ctx.with(|ctx| {
             let bundle = format!(
                 "{}\n{}\n",
-                include_str!("../../../../js/k6-shim/k6-shim.js"),
-                include_str!("../../../../js/k6-shim/open-data-shim.js")
+                include_str!("../js/k6-shim/k6-shim.js"),
+                include_str!("../js/k6-shim/open-data-shim.js")
             );
             ctx.eval::<(), _>(bundle.as_str())
                 .expect("shims in production order must eval");
@@ -12871,8 +12871,8 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             .expect("native bridge stubs must eval");
             let bundle = format!(
                 "{}\n{}\n",
-                include_str!("../../../../js/k6-shim/k6-shim.js"),
-                include_str!("../../../../js/k6-shim/open-data-shim.js")
+                include_str!("../js/k6-shim/k6-shim.js"),
+                include_str!("../js/k6-shim/open-data-shim.js")
             );
             ctx.eval::<(), _>(bundle.as_str())
                 .expect("shims in production order must eval");
@@ -12930,7 +12930,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -13041,7 +13041,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+            ctx.eval::<(), _>(include_str!("../js/k6-shim/k6-shim.js"))
                 .expect("k6 shim should eval");
             ctx.eval::<(), _>(
                 r#"
@@ -13158,8 +13158,8 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             .expect("native bridge stubs must eval");
             let bundle = format!(
                 "{}\n{}\n",
-                include_str!("../../../../js/k6-shim/k6-shim.js"),
-                include_str!("../../../../js/k6-shim/open-data-shim.js")
+                include_str!("../js/k6-shim/k6-shim.js"),
+                include_str!("../js/k6-shim/open-data-shim.js")
             );
             ctx.eval::<(), _>(bundle.as_str())
                 .expect("shims in production order must eval");
@@ -13257,7 +13257,7 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            let shim = include_str!("../../../../js/k6-shim/k6-shim.js");
+            let shim = include_str!("../js/k6-shim/k6-shim.js");
             ctx.eval::<(), _>(shim).expect("k6-shim must eval");
             // Built-in names must throw
             for name in ["http_reqs", "http_req_duration", "checks", "vus"] {
@@ -13422,12 +13422,12 @@ wbHEy5icnC8tmXV0duDtg4Xky4q9zw84BSC8yzDIijhZYsCMvSWnVcH8Xkyc585q
             .expect("native bridge stubs must eval");
             let bundle = format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n",
-                concat!(include_str!("../../../../js/shared/k6-core.js"), "\n", include_str!("../../../../js/scripting-api/pm.js")),
-                include_str!("../../../../js/k6-shim/sleep-shim.js"),
-                include_str!("../../../../js/k6-shim/k6-shim.js"),
-                include_str!("../../../../js/k6-shim/jslib-shim.js"),
-                include_str!("../../../../js/k6-shim/open-data-shim.js"),
-                include_str!("../../../../js/k6-shim/deferred-modules-shim.js"),
+                concat!(include_str!("../js/shared/k6-core.js"), "\n", include_str!("../js/scripting-api/pm.js")),
+                include_str!("../js/k6-shim/sleep-shim.js"),
+                include_str!("../js/k6-shim/k6-shim.js"),
+                include_str!("../js/k6-shim/jslib-shim.js"),
+                include_str!("../js/k6-shim/open-data-shim.js"),
+                include_str!("../js/k6-shim/deferred-modules-shim.js"),
             );
             ctx.eval::<(), _>(bundle.as_str())
                 .expect("full shim bundle must eval");

@@ -8,6 +8,14 @@ rust-version.workspace = true
 publish = true
 description = "Internal to tropel-runtime. No stability guarantee — depend on tropel-runtime instead."
 
+# The shared JS shim tree is reached through the in-crate `js` symlink (-> the
+# repo-root js/), because include_str! cannot read outside the package root and
+# cargo would otherwise package nothing for it. Cargo DEREFERENCES the symlink
+# into the tarball, so the sources ship as real files; it also walks the linked
+# directory directly rather than via git, so untracked macOS junk in there would
+# ship too. Excluded so the tarball does not depend on who opened Finder.
+exclude = ["js/**/.DS_Store"]
+
 [features]
 # P5b (TROPEL_WASM_BUILD.md Step 4): tropel-sandbox's default `send-request`
 # feature drags tropel-http → reqwest → tokio-net into the wasm graph, which
