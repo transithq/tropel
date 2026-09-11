@@ -128,7 +128,24 @@ jobs:
         run: |
           set -euo pipefail
           tool=$([[ "$CROSS" == "true" ]] && echo cross || echo cargo)
+          # FAT LTO for the binaries we actually ship.
+          #
+          # [profile.release] uses thin LTO because every PR compiles it and
+          # fat + codegen-units=1 is the slowest configuration cargo offers —
+          # the release-wasm profile documents that trade with a measurement
+          # (thin cost core-wasm 15,396 B, +2.7%, against fat). None of that
+          # reasoning applies here: this job runs once per tag, so build time
+          # is worth nothing and the shipped binary should be the best one the
+          # toolchain can produce. With codegen-units = 1 already set, fat is
+          # the maximal configuration.
+          #
+          # Passed as --config rather than CARGO_PROFILE_RELEASE_LTO because
+          # two of the five targets build through `cross`, which runs cargo in
+          # a container and does not forward arbitrary CARGO_* env vars — the
+          # env form would have silently skipped both musl targets while
+          # appearing to work.
           $tool build --release --locked --target "$T" \
+            --config 'profile.release.lto="fat"' \
             -p tropel -p tropel-distributed
 
       # Ship the distributed binaries too: a load generator that cannot be run
