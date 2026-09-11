@@ -2974,8 +2974,7 @@ mod tests {
     /// smoke.mjs, which IS the TypeScript leg.
     #[tokio::test]
     async fn the_resolution_corpus_agrees_over_the_socket() {
-        const CORPUS: &str =
-            include_str!("../../../packages/core-wasm/fixtures/resolve-corpus.json");
+        const CORPUS: &str = include_str!("../testdata/resolve-corpus.json");
 
         /// Mirrors `tropel-core-wasm`'s `generated_vars` — same kind, same
         /// construction from the SAME constant, so the two legs cannot drift
@@ -4108,8 +4107,7 @@ mod tests {
     /// bug the `bru` probe found.
     #[tokio::test]
     async fn the_script_realm_matches_the_committed_corpus() {
-        const CORPUS: &str =
-            include_str!("../../../packages/shims/fixtures/script-realm-corpus.json");
+        const CORPUS: &str = include_str!("../testdata/script-realm-corpus.json");
         let doc: serde_json::Value = serde_json::from_str(CORPUS).expect("corpus is valid JSON");
         let probes = doc["probes"].as_array().expect("probes array");
         assert!(!probes.is_empty(), "an empty corpus asserts nothing");

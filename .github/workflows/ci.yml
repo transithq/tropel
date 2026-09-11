@@ -87,6 +87,23 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
 jobs:
+  include-paths:
+    name: include! paths confined to their crate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Catches the class of bug that published tropel-input-k6 0.6.0 broken:
+    # an include_str! reaching outside its own crate packages into a tarball
+    # without the file, and `cargo publish` still says OK, because it verifies
+    # inside target/package/ where the escape can climb back out to the real
+    # repo. Static, needs no toolchain, runs in a second.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # crates/tropel-sdk is a git submodule of transithq/tropel-sdk
+          # (see .gitmodules) — it carries crates of its own to check.
+          submodules: recursive
+      - run: bash scripts/include-paths-in-crate.sh
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -869,7 +886,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages, k6-conformance, soak-smoke]
+    needs: [fmt, clippy, test, msrv, perf-regression, semver, deny, sdk-gates, wasm, smoke, npm-packages, k6-conformance, soak-smoke, include-paths]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
