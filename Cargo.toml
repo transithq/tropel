@@ -45,8 +45,19 @@ license = "Apache-2.0"
 repository = "https://github.com/transithq/tropel"
 rust-version = "1.94"
 
-# Native release profile. Optimized for load generation: thin LTO for
-# size, single codegen unit for best optimization, symbols stripped.
+# Native release profile. Optimized for load generation: single codegen unit
+# for best optimization, symbols stripped.
+#
+# `lto = "thin"` is a BUILD-TIME choice, not a size one. This profile said
+# "thin LTO for size" and had it backwards — the release-wasm profile below
+# measures the trade the other way: thin cost core-wasm 15,396 B (+2.7%)
+# against fat. Thin is here because every PR compiles this profile and fat
+# with codegen-units = 1 is the slowest configuration cargo offers.
+#
+# The binaries we SHIP do not inherit that compromise: release.yml overrides
+# this to `fat` per build, where the job runs once per tag and wall-clock is
+# worth nothing.
+#
 # Do NOT set panic = "abort" — the VU pool depends on unwinding.
 [profile.release]
 lto           = "thin"
