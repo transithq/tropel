@@ -725,7 +725,7 @@ mod tests {
     // Shipped in the npm package so an embedder reads the same bytes instead
     // of copying cases into its own suite, where they would drift exactly
     // like the code did.
-    const CORPUS: &str = include_str!("../../../packages/core-wasm/fixtures/resolve-corpus.json");
+    const CORPUS: &str = include_str!("../testdata/resolve-corpus.json");
 
     /// The generated `vars` for a case that needs more than a literal map.
     fn generated_vars(kind: &str) -> serde_json::Value {
@@ -966,7 +966,7 @@ mod tests {
             &s[..end]
         }
 
-        let facade = include_str!("../../../packages/core-wasm/src/index.js");
+        let facade = include_str!("../testdata/index.js");
 
         // The facade reaches the wasm through NAMED HANDLES: the module-level
         // `glue`, and any local alias bound from `requireGlue(...)` (today
