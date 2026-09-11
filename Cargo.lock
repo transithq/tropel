@@ -4538,7 +4538,7 @@ dependencies = [
 
 [[package]]
 name = "tropel-input-k6"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
