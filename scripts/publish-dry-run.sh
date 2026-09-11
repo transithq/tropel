@@ -4,7 +4,8 @@
 # The 0.1.0 release gate carries the line "cargo publish --dry-run succeeds
 # for every publishable crate", and it was ticked while four of the seven
 # failed. This script is the check, so the claim can be re-derived in one
-# command instead of asserted.
+# command instead of asserted — including the verify build, which is the half
+# the check used to skip (see the --no-verify note at the publish call).
 #
 # The blocker is structural, not a bug: a `path` + `version` dependency only
 # resolves at publish time if that EXACT version is already on crates.io.
@@ -71,7 +72,20 @@ failed=()
 pending=()
 for crate in "${PUBLISHABLE[@]}"; do
   printf '%-22s ' "$crate"
-  if out=$(cargo publish --dry-run -p "$crate" --allow-dirty --no-verify 2>&1); then
+  # NO --no-verify. `cargo publish --dry-run --no-verify` checks only that the
+  # tarball can be BUILT, never that it COMPILES, and those are different
+  # claims: a crate whose lib reaches outside its own package root — an
+  # `include_str!("../../../js/...")`, say — packages perfectly and then fails
+  # to build for everyone, because cargo cannot put files from outside the
+  # package root into the tarball. That is exactly what shipped: this gate was
+  # green while tropel-web, tropel-engine and tropel-input-k6 could not be
+  # published at all, and the first anyone knew of it was a real `cargo
+  # publish` failing at the verify step.
+  #
+  # Verifying is slow (each crate is compiled from its tarball), which is the
+  # only thing --no-verify bought. A release gate that cannot fail is worth
+  # less than the minutes it saves.
+  if out=$(cargo publish --dry-run -p "$crate" --allow-dirty 2>&1); then
     echo "ok"
   elif dep_name=$(unpublished_sibling "$out"); [[ -n "$dep_name" ]]; then
     # NOT a defect: this crate needs a workspace sibling at a version that is
