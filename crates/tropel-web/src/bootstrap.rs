@@ -19,17 +19,17 @@ use tropel_sandbox::state::SharedPmState;
 /// JS asset with the web app — no wasm rebuild, no release).
 #[cfg(not(target_arch = "wasm32"))]
 const SHIM_SOURCES: [&str; 7] = [
-    include_str!("../../../js/shared/deep-equal.js"),
+    include_str!("../js/shared/deep-equal.js"),
     concat!(
-        include_str!("../../../js/shared/k6-core.js"),
+        include_str!("../js/shared/k6-core.js"),
         "\n",
-        include_str!("../../../js/scripting-api/pm.js")
+        include_str!("../js/scripting-api/pm.js")
     ),
-    include_str!("../../../js/chai/chai-shim.js"),
-    include_str!("../../../js/lodash/lodash-shim.js"),
-    include_str!("../../../js/cryptojs-shim/cryptojs.js"),
-    include_str!("../../../js/exec/exec.js"),
-    include_str!("../../../js/scripting-api/bru.js"),
+    include_str!("../js/chai/chai-shim.js"),
+    include_str!("../js/lodash/lodash-shim.js"),
+    include_str!("../js/cryptojs-shim/cryptojs.js"),
+    include_str!("../js/exec/exec.js"),
+    include_str!("../js/scripting-api/bru.js"),
 ];
 
 // ── wasm: the shim host import (N1, TROPEL_MODULARIZATION_REVIEW_R2.md) ──

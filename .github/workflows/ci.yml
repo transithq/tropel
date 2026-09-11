@@ -142,6 +142,20 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
+      # The crates that embed the shared JS shim tree reach it through an
+      # in-crate `js` symlink (-> the repo-root js/), because include_str!
+      # cannot read outside a package root and cargo packages nothing for a
+      # path that does. Git for Windows checks a symlink out as a TEXT FILE
+      # containing its target unless core.symlinks is on, which would turn
+      # every `include_str!("../js/...")` into a missing-file error on this
+      # leg alone. Must run BEFORE checkout to affect it.
+      #
+      # Only the Windows CHECKOUT is affected. Published tarballs carry the
+      # sources as real files — cargo dereferences the symlink when packaging
+      # — so no consumer of the crate needs this.
+      - name: Allow symlinks in the Windows checkout
+        if: runner.os == 'Windows'
+        run: git config --global core.symlinks true
       - uses: actions/checkout@v4
         with:
           # crates/tropel-sdk is a git submodule of transithq/tropel-sdk

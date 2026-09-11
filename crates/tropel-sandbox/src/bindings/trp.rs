@@ -2144,12 +2144,12 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
             ctx.eval::<(), _>(concat!(
-                include_str!("../../../../js/shared/k6-core.js"),
+                include_str!("../../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../../js/scripting-api/pm.js")
+                include_str!("../../js/scripting-api/pm.js")
             ))
             .expect("pm shim should eval");
 
@@ -2221,9 +2221,9 @@ mod tests {
             .install(&mut ctx)
             .expect("install");
         ctx.eval(concat!(
-            include_str!("../../../../js/shared/k6-core.js"),
+            include_str!("../../js/shared/k6-core.js"),
             "\n",
-            include_str!("../../../../js/scripting-api/pm.js")
+            include_str!("../../js/scripting-api/pm.js")
         ))
         .await
         .expect("pm shim must eval");
@@ -2273,9 +2273,9 @@ mod tests {
             .install(&mut ctx)
             .expect("install");
         ctx.eval(concat!(
-            include_str!("../../../../js/shared/k6-core.js"),
+            include_str!("../../js/shared/k6-core.js"),
             "\n",
-            include_str!("../../../../js/scripting-api/pm.js")
+            include_str!("../../js/scripting-api/pm.js")
         ))
         .await
         .expect("pm shim must eval");
@@ -2331,12 +2331,12 @@ mod tests {
             };
             ctx.eval::<(), _>(cfg.render_js_preamble())
                 .expect("config preamble should eval");
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
             ctx.eval::<(), _>(concat!(
-                include_str!("../../../../js/shared/k6-core.js"),
+                include_str!("../../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../../js/scripting-api/pm.js")
+                include_str!("../../js/scripting-api/pm.js")
             ))
             .expect("pm shim should eval");
 
@@ -2404,12 +2404,12 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(include_str!("../../../../js/shared/deep-equal.js"))
+            ctx.eval::<(), _>(include_str!("../../js/shared/deep-equal.js"))
                 .expect("shared deep-equal should eval");
             ctx.eval::<(), _>(concat!(
-                include_str!("../../../../js/shared/k6-core.js"),
+                include_str!("../../js/shared/k6-core.js"),
                 "\n",
-                include_str!("../../../../js/scripting-api/pm.js")
+                include_str!("../../js/scripting-api/pm.js")
             ))
             .expect("pm shim should eval");
 

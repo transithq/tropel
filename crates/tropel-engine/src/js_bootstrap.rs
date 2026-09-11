@@ -128,15 +128,15 @@ impl Shim {
     /// The embedded source text.
     pub fn source(self) -> &'static str {
         match self {
-            Shim::DeepEqual => include_str!("../../../js/shared/deep-equal.js"),
-            Shim::K6Core => include_str!("../../../js/shared/k6-core.js"),
-            Shim::Pm => include_str!("../../../js/scripting-api/pm.js"),
-            Shim::Chai => include_str!("../../../js/chai/chai-shim.js"),
-            Shim::Lodash => include_str!("../../../js/lodash/lodash-shim.js"),
-            Shim::CryptoJs => include_str!("../../../js/cryptojs-shim/cryptojs.js"),
-            Shim::Exec => include_str!("../../../js/exec/exec.js"),
-            Shim::Bru => include_str!("../../../js/scripting-api/bru.js"),
-            Shim::Fetch => include_str!("../../../js/scripting-api/fetch.js"),
+            Shim::DeepEqual => include_str!("../js/shared/deep-equal.js"),
+            Shim::K6Core => include_str!("../js/shared/k6-core.js"),
+            Shim::Pm => include_str!("../js/scripting-api/pm.js"),
+            Shim::Chai => include_str!("../js/chai/chai-shim.js"),
+            Shim::Lodash => include_str!("../js/lodash/lodash-shim.js"),
+            Shim::CryptoJs => include_str!("../js/cryptojs-shim/cryptojs.js"),
+            Shim::Exec => include_str!("../js/exec/exec.js"),
+            Shim::Bru => include_str!("../js/scripting-api/bru.js"),
+            Shim::Fetch => include_str!("../js/scripting-api/fetch.js"),
         }
     }
 }

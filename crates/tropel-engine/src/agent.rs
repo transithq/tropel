@@ -1987,7 +1987,7 @@ async fn run_script_once(
         .await
         .map_err(|e| format!("sandbox config preamble: {e:?}"))?;
 
-    ctx.eval(include_str!("../../../js/shared/deep-equal.js"))
+    ctx.eval(include_str!("../js/shared/deep-equal.js"))
         .await
         .map_err(|e| format!("deep-equal shim: {e:?}"))?;
     // TR-465: the SHARED bundle, not a hand-rolled list.

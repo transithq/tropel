@@ -7,6 +7,14 @@ description = "The tropel load-test engine: scenario execution, VU scheduling, t
 repository.workspace = true
 rust-version.workspace = true
 
+# The shared JS shim tree is reached through the in-crate `js` symlink (-> the
+# repo-root js/), because include_str! cannot read outside the package root and
+# cargo would otherwise package nothing for it. Cargo DEREFERENCES the symlink
+# into the tarball, so the sources ship as real files; it also walks the linked
+# directory directly rather than via git, so untracked macOS junk in there would
+# ship too. Excluded so the tarball does not depend on who opened Finder.
+exclude = ["js/**/.DS_Store"]
+
 [dependencies]
 tropel-sdk.workspace = true
 tropel-core.workspace = true
