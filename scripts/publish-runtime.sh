@@ -11,16 +11,22 @@
 #   variables → js → native → auth → sandbox → runtime
 #
 # Notes:
-#   - tropel-sdk must be live at the workspace version (currently 0.3.0) — the
+#   - tropel-sdk must be live at the workspace version (currently 0.4.0) — the
 #     leaf everything else builds on; publish it before running --execute (the
 #     API-presence gate verifies the exact published artifact).
-#   - tropel-http is NOT in the set (F1, review fix): it was published by
-#     accident because sandbox's `send-request` used `dep:tropel-http`; the
-#     sandbox now routes pm.sendRequest through the SDK `DriverHttpClient`
-#     trait and `publish = false` blocks future publishes. The accidental
-#     0.1.0 has been YANKED on crates.io (cargo yank --version 0.1.0
-#     tropel-http, 2026-08-10), so consumers resolving it get an error instead
-#     of a stale internal crate; no new publish step references it.
+#   - CRATES below is no longer "the published crates". As of 0.6.0 the WHOLE
+#     tree is on crates.io (`chore: 0.6.0, and publish the whole crate tree`),
+#     36 crates including every one this list omits. What survives is the
+#     ordered RUNTIME release: the set whose publish order is load-bearing and
+#     whose API presence the gate below verifies.
+#   - tropel-http therefore is published, at 0.6.0, deliberately. This comment
+#     used to say it was excluded because a 0.1.0 went out by accident (it did,
+#     via sandbox's `dep:tropel-http`, and that version is still YANKED) and
+#     that "`publish = false` blocks future publishes". That guard was never
+#     added — no crate in this workspace carries `publish = false` — so it
+#     blocked nothing, and the 0.6.0 tree publish took tropel-http with it.
+#     Saying so plainly because the old wording would have a reader believe a
+#     live crate is unpublishable.
 #   - Real publishes happen only after the BACKLOG_V2 Phase 0–2 release gate;
 #     this script defaults to --dry-run so the sequence is exercised, not
 #     executed, until you pass --execute.
